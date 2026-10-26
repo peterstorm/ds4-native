@@ -49,8 +49,7 @@ __device__ __forceinline__ int warps_of(const GemvJob& j) { return j.rows / 16 *
 
 __global__ void __launch_bounds__(kThreads) resolve_kernel(const moe::Plan* __restrict__ plan, int layer,
                                                            ExpertDirectory dir, RoutedShape shape, MoeBuffers buf,
-                                                           ActFragments act, const GemvJob* __restrict__ shared,
-                                                           ResolvedMoe out) {
+                                                           ActFragments act, ResolvedMoe out) {
   __shared__ int any_miss;
   const int t = threadIdx.x;
   const int raw_jobs = plan->jobs;
@@ -93,9 +92,9 @@ __global__ void __launch_bounds__(kThreads) resolve_kernel(const moe::Plan* __re
     }
   }
 
-  // The job lists: gate/up = [gate 0, up 0, gate 1, up 1, ..., shared gate, shared up],
-  // down = [down 0, ..., shared down], each routed job writing its own buffer slot.
-  const int n_gate_up = 2 * jobs + 2, n_down = jobs + 1;
+  // The job lists: gate/up = [gate 0, up 0, gate 1, up 1, ...], down = [down 0, ...], each job
+  // writing its own buffer slot.
+  const int n_gate_up = 2 * jobs, n_down = jobs;
   GemvJob* gate_up = out.jobs;
   GemvJob* down = out.jobs + ResolvedMoe::kDownList;
   if (mine) {
@@ -107,11 +106,6 @@ __global__ void __launch_bounds__(kThreads) resolve_kernel(const moe::Plan* __re
                           shape.blocks, shape.splits, shape.split_blocks};
     down[t] = {WeightFormat::Mxfp4, half + 2 * shape.part_bytes, hidden.codes, hidden.scales, buf.down_of(t),
                shape.down_rows, shape.down_blocks, 1, shape.down_blocks};
-  }
-  if (t == 0) {
-    gate_up[2 * jobs] = shared[0];
-    gate_up[2 * jobs + 1] = shared[1];
-    down[jobs] = shared[2];
   }
   __syncthreads();
   if (t == 0) {
@@ -136,8 +130,8 @@ __global__ void __launch_bounds__(kThreads) resolve_kernel(const moe::Plan* __re
 }  // namespace
 
 void resolve_experts(const moe::Plan* plan, int layer, ExpertDirectory dir, RoutedShape shape, MoeBuffers buf,
-                     ActFragments act_xf, const GemvJob* shared_jobs, ResolvedMoe out, cudaStream_t stream) {
-  resolve_kernel<<<1, kThreads, 0, stream>>>(plan, layer, dir, shape, buf, act_xf, shared_jobs, out);
+                     ActFragments act_xf, ResolvedMoe out, cudaStream_t stream) {
+  resolve_kernel<<<1, kThreads, 0, stream>>>(plan, layer, dir, shape, buf, act_xf, out);
 }
 
 }  // namespace ds4n::cuda

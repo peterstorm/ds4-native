@@ -145,16 +145,23 @@ __device__ __forceinline__ float swiglu(float gate, float up, float weight, floa
  * n's hidden values 4q..4q+3 and 16+4q..16+4q+3 of the block: exactly its B
  * fragment bytes, so the codes go out as one 8-byte store per lane.
  */
-__global__ void __launch_bounds__(128) swiglu_kernel(const moe::Plan* __restrict__ plan, MoeBuffers buf, float limit) {
+/** Which slots a SwiGLU launch covers; Shared reads no Plan (it may run while routing writes one). */
+enum class Slots { All, Routed, Shared };
+
+template <Slots S>
+__global__ void __launch_bounds__(128) swiglu_kernel(const moe::Plan* __restrict__ plan, int shared_tokens, MoeBuffers buf,
+                                                     float limit) {
   const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
   const int lane = threadIdx.x & 31;
   const int blocks = buf.rows / 32;
-  if (warp >= kJobSlots * blocks) return;
-  const int slot = warp / blocks, b = warp % blocks;
+  constexpr int kSlots = S == Slots::All ? kJobSlots : (S == Slots::Routed ? moe::kMaxJobs : 1);
+  if (warp >= kSlots * blocks) return;
+  const int slot = S == Slots::Shared ? kSharedJob : warp / blocks, b = warp % blocks;
   const bool shared = slot == kSharedJob;
   if (!shared && slot >= plan->jobs) return;  // warp-uniform
   const int n = lane >> 2, q = lane & 3;
-  const bool live = n < plan->tokens && (shared || ((plan->token_mask[slot] >> n) & 1));
+  const int tokens = S == Slots::Shared ? shared_tokens : plan->tokens;
+  const bool live = n < tokens && (shared || ((plan->token_mask[slot] >> n) & 1));
   const float weight = shared ? 1.0f : plan->weight[slot][n];
   const size_t plane = static_cast<size_t>(buf.rows) * kMaxTokens;
   const float* g = buf.gate_of(slot);
@@ -227,7 +234,17 @@ void route(const float* logits, int logit_splits, int tokens, const uint8_t* ima
 
 void swiglu_quantize(const moe::Plan* plan, MoeBuffers buf, float limit, cudaStream_t stream) {
   const int warps = kJobSlots * (buf.rows / 32);
-  swiglu_kernel<<<(warps * 32 + 127) / 128, 128, 0, stream>>>(plan, buf, limit);
+  swiglu_kernel<Slots::All><<<(warps * 32 + 127) / 128, 128, 0, stream>>>(plan, 0, buf, limit);
+}
+
+void swiglu_quantize_routed(const moe::Plan* plan, MoeBuffers buf, float limit, cudaStream_t stream) {
+  const int warps = moe::kMaxJobs * (buf.rows / 32);
+  swiglu_kernel<Slots::Routed><<<(warps * 32 + 127) / 128, 128, 0, stream>>>(plan, 0, buf, limit);
+}
+
+void swiglu_quantize_shared(int tokens, MoeBuffers buf, float limit, cudaStream_t stream) {
+  const int warps = buf.rows / 32;
+  swiglu_kernel<Slots::Shared><<<(warps * 32 + 127) / 128, 128, 0, stream>>>(nullptr, tokens, buf, limit);
 }
 
 void combine(const moe::Plan* plan, MoeBuffers buf, float* y, cudaStream_t stream) {

@@ -72,6 +72,12 @@ struct MoeBuffers {
  */
 void swiglu_quantize(const moe::Plan* plan, MoeBuffers buf, float limit, cudaStream_t stream);
 
+/** The routed slots only (below plan->jobs). */
+void swiglu_quantize_routed(const moe::Plan* plan, MoeBuffers buf, float limit, cudaStream_t stream);
+
+/** The shared slot only, for `tokens` tokens: reads no Plan, so it can run beside routing. */
+void swiglu_quantize_shared(int tokens, MoeBuffers buf, float limit, cudaStream_t stream);
+
 /**
  * y[n][r] = 0 + down outputs of the routed slots serving token n (Plan order,
  * ascending Expert id) + the shared slot's, in FP32. y is [tokens][dim].

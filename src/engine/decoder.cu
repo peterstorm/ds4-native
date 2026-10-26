@@ -63,13 +63,12 @@ cuda::GemvJob fp8_job(const DeviceFp8& w, int row0, const cuda::ActFragments& ac
           cuda::split_blocks_for(w.blocks, splits)};
 }
 
-/** Per-layer launches prepared once; `shared_moe` holds the shared Expert's gate, up and down jobs. */
+/** Per-layer launches prepared once (the shared Expert's too: it needs no routing). */
 struct LayerLaunches {
-  Launch qa_kv, qb, oa, ob, engram;
-  cuda::GemvJob* shared_moe = nullptr;
+  Launch qa_kv, qb, oa, ob, engram, shared_gate_up, shared_down;
 };
 
-// Routed and shared Expert jobs alike: gate/up 72 tiles x 2 splits, down 320 tiles unsplit.
+// A routed Half's jobs: gate/up 72 tiles x 2 splits, down 320 tiles unsplit.
 constexpr int kGateUpWarps = kExpertRows / 16 * kSplitsExpert, kDownWarps = kDim / 16;
 constexpr int kStepJobs = moe::kTopK;  // routed Experts in a one-token step, at most
 
@@ -117,15 +116,17 @@ struct Decoder::Gpu {
   std::array<cudaEvent_t, 2> staged_rows{};
   int rank = 0, device = 0;
   cudaStream_t stream = nullptr;
-  // A layer step's parallel branches: work only a later stage needs runs on `side`, forked from and
-  // joined back into `stream` with events (captured into the graphs as branches).
-  cudaStream_t side = nullptr;
-  std::array<cudaEvent_t, 6> branch{};  // fork, join per branch
+  // A layer step's parallel branches: work only a later stage needs runs on a side stream, forked from
+  // and joined back into `stream` with events (captured into the graphs as branches). Branches 0 and 2
+  // (the hc mixes) share side stream 0; 1 (the KV row) and 3 (the shared Expert) side stream 1.
+  std::array<cudaStream_t, 2> sides{};
+  std::array<cudaEvent_t, 8> branch{};  // fork, join per branch
+  cudaStream_t side(int b) const { return sides[b & 1]; }
   void fork(int b) {
     check(cudaEventRecord(branch[2 * b], stream), "cudaEventRecord");
-    check(cudaStreamWaitEvent(side, branch[2 * b], 0), "cudaStreamWaitEvent");
+    check(cudaStreamWaitEvent(side(b), branch[2 * b], 0), "cudaStreamWaitEvent");
   }
-  void branch_done(int b) { check(cudaEventRecord(branch[2 * b + 1], side), "cudaEventRecord"); }
+  void branch_done(int b) { check(cudaEventRecord(branch[2 * b + 1], side(b)), "cudaEventRecord"); }
   void join(int b) { check(cudaStreamWaitEvent(stream, branch[2 * b + 1], 0), "cudaStreamWaitEvent"); }
   DeviceArena arena;
   cuda::ExchangeLink link{};
@@ -192,7 +193,7 @@ Decoder::Decoder(std::array<int, 2> devices, std::array<cuda::ExpertDirectory, 2
     s.rank = g;
     s.device = devices[g];
     check(cudaStreamCreateWithFlags(&s.stream, cudaStreamNonBlocking), "cudaStreamCreate");
-    check(cudaStreamCreateWithFlags(&s.side, cudaStreamNonBlocking), "cudaStreamCreate");
+    for (cudaStream_t& side : s.sides) check(cudaStreamCreateWithFlags(&side, cudaStreamNonBlocking), "cudaStreamCreate");
     for (cudaEvent_t& ev : s.branch) check(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "cudaEventCreate");
     check(cudaMallocHost(&s.staging, sizeof(Staging)), "cudaMallocHost");
     s.experts = experts[g];
@@ -303,9 +304,11 @@ Decoder::~Decoder() {
         if (exec) cudaGraphExecDestroy(exec);
       for (cudaEvent_t ev : {g->staged_token, g->staged_rows[0], g->staged_rows[1]}) cudaEventDestroy(ev);
       cudaStreamDestroy(g->stream);
-      cudaStreamSynchronize(g->side);
+      for (cudaStream_t side : g->sides) {
+        cudaStreamSynchronize(side);
+        cudaStreamDestroy(side);
+      }
       for (cudaEvent_t ev : g->branch) cudaEventDestroy(ev);
-      cudaStreamDestroy(g->side);
       cudaFreeHost(g->staging);
     }
 }
@@ -331,11 +334,9 @@ void Decoder::add_layer(const HostLayer& w) {
     l.ob = prepare(s.arena, {fp8_job(d.wo_b, 0, s.act_lora, s.planes_ob, kDim, kSplitsWoB)});
     if (kind.engram) l.engram = prepare(s.arena, {fp8_job(d.engram_wkv, 0, s.act_engram, s.planes_eg, cuda::kEngramKvRows, 1)});
     const int shared = cuda::kSharedJob;
-    const cuda::GemvJob shared_moe[3] = {
-        fp8_job(d.shared_gate, 0, s.act_xf, s.moe.gate_of(shared), kExpertRows, kSplitsExpert),
-        fp8_job(d.shared_up, 0, s.act_xf, s.moe.up_of(shared), kExpertRows, kSplitsExpert),
-        fp8_job(d.shared_down, 0, s.moe.hidden_of(shared), s.moe.down_of(shared), kDim, 1)};
-    l.shared_moe = s.arena.upload(shared_moe, 3);
+    l.shared_gate_up = prepare(s.arena, {fp8_job(d.shared_gate, 0, s.act_xf, s.moe.gate_of(shared), kExpertRows, kSplitsExpert),
+                                         fp8_job(d.shared_up, 0, s.act_xf, s.moe.up_of(shared), kExpertRows, kSplitsExpert)});
+    l.shared_down = prepare(s.arena, {fp8_job(d.shared_down, 0, s.moe.hidden_of(shared), s.moe.down_of(shared), kDim, 1)});
     // Caches this layer owns.
     s.window[w.id] = s.arena.alloc<bf16>(static_cast<size_t>(kWindow) * kHeadDim);
     check(cudaMemset(s.window[w.id], 0, static_cast<size_t>(kWindow) * kHeadDim * 2), "memset");
@@ -418,7 +419,7 @@ void Decoder::Gpu::enqueue_layer(int layer, bool produced_now) {
   // Fused glue where the work stays wide (cuda/fused.cuh): same arithmetic as the standalone kernels.
   // Branch 0: this sub-block's mixes, which only its hc_post needs, beside the attention path.
   fork(0);
-  cuda::hc_mixes(h_in, attn_params, kDim, 1, hc_scratch, mix_attn, side);
+  cuda::hc_mixes(h_in, attn_params, kDim, 1, hc_scratch, mix_attn, side(0));
   branch_done(0);
   cuda::hc_pre(h_in, mix_ffn, kDim, 1, x0, st);
   cuda::rmsnorm(x0, d.attn_norm, kDim, 1, kNormEps, xa, st);
@@ -431,7 +432,7 @@ void Decoder::Gpu::enqueue_layer(int layer, bool produced_now) {
   // Branch 1: the KV row into the window ring (only attention reads it) beside the q path.
   fork(1);
   cuda::kv_to_cache({planes_kv, kSplitsWkv, kHeadDim}, d.kv_norm, kNormEps, d.rope_freqs, kRopeDim, pos, window.at(layer),
-                    IntArg::at(&step->ring_slot, kWindow - 1), side);
+                    IntArg::at(&step->ring_slot, kWindow - 1), side(1));
   branch_done(1);
   run(l.qb, st);
   cuda::planes_rope({planes_qb, kSplitsWqB, kLocalHeads * kHeadDim}, kLocalHeads, kHeadDim, kRopeDim, d.rope_freqs, pos, q,
@@ -490,26 +491,33 @@ void Decoder::Gpu::enqueue_layer(int layer, bool produced_now) {
   const cuda::HcParams ffn_params{d.hc_ffn_fn, d.hc_ffn_scale, d.hc_ffn_base, kNormEps, kHcEps, kSinkhornIters};
   // Branch 2: the FFN's mixes (its hc_post, the next layer's hc_pre) beside routing and the Experts.
   fork(2);
-  cuda::hc_mixes(h_mid, ffn_params, kDim, 1, hc_scratch, mix_ffn, side);
+  cuda::hc_mixes(h_mid, ffn_params, kDim, 1, hc_scratch, mix_ffn, side(2));
   branch_done(2);
   cuda::hc_pre(h_mid, mix_attn, kDim, 1, x0, st);
   cuda::rmsnorm(x0, d.ffn_norm, kDim, 1, kNormEps, xf, st);
   cuda::quantize_activations(xf, 1, act_xf, st);
   cuda::bf16_to_f32(xf, kDim, xf_f, st);
+  // Branch 3: the shared Expert, which needs no routing, beside the router, routing and resolution.
+  fork(3);
+  run(l.shared_gate_up, side(3));
+  cuda::swiglu_quantize_shared(1, moe, moe::kSwigluLimit, side(3));
+  run(l.shared_down, side(3));
+  branch_done(3);
   cuda::bf16_gemv(d.router, xf_f, moe::kExperts, kDim, 1, kSplitsBf16, logits, st);
   cuda::route(logits, kSplitsBf16, 1, nullptr, {d.router_bias, nullptr, kRouteScale}, route_experts, route_weights, plan,
               st);
 
-  // The Experts: resolved on the device (a Miss waits for the Expert cache's service), then gate/up,
-  // SwiGLU, down, the combine in Plan order, the exchange and hc_post.
+  // The routed Experts: resolved on the device (a Miss waits for the Expert cache's service), then
+  // gate/up, SwiGLU, down; then the combine in Plan order with the shared Expert, the exchange, hc_post.
   const cuda::RoutedShape shape{kExpertRows, kDimBlocks, kSplitsExpert, cuda::split_blocks_for(kDimBlocks, kSplitsExpert),
                                 kDim,        kExpertDownBlocks, kExpertPartBytes};
-  cuda::resolve_experts(plan, layer, experts, shape, moe, act_xf, l.shared_moe, resolved, st);
-  cuda::gemv(resolved.jobs, resolved.first, resolved.gate_up_jobs(kStepJobs),
-             resolved.gate_up_warps(kStepJobs, kGateUpWarps, kGateUpWarps), st);
-  cuda::swiglu_quantize(plan, moe, moe::kSwigluLimit, st);
+  cuda::resolve_experts(plan, layer, experts, shape, moe, act_xf, resolved, st);
+  cuda::gemv(resolved.jobs, resolved.first, resolved.gate_up_jobs(kStepJobs), resolved.gate_up_warps(kStepJobs, kGateUpWarps),
+             st);
+  cuda::swiglu_quantize_routed(plan, moe, moe::kSwigluLimit, st);
   cuda::gemv(resolved.jobs + cuda::ResolvedMoe::kDownList, resolved.first + cuda::ResolvedMoe::kDownList,
-             resolved.down_jobs(kStepJobs), resolved.down_warps(kStepJobs, kDownWarps, kDownWarps), st);
+             resolved.down_jobs(kStepJobs), resolved.down_warps(kStepJobs, kDownWarps), st);
+  join(3);
   cuda::combine(plan, moe, y, st);
   cuda::exchange_add(link, y, kDim, moe_out, st);
   join(2);

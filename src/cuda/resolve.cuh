@@ -1,7 +1,7 @@
 #pragma once
 // Device-side Expert resolution: after routing, one block turns the step's Plan
-// into the MoE GEMV job lists -- gate/up (routed Halves in Plan order, then the
-// shared Expert) and down (likewise) -- with each routed Half read from the
+// into the routed MoE GEMV job lists -- gate/up and down, Halves in Plan order (the
+// shared Expert runs from its own static launches, needing no routing) -- with each routed Half read from the
 // Slot the residency table gives. GPU 0 posts every step for the host's Expert
 // cache; a GPU that meets a Miss waits until the host served the step
 // (core/miss_protocol.hpp). So a decode step needs no host round trip unless an
@@ -29,21 +29,17 @@ struct ExpertDirectory {
 
 /** Where resolve leaves the job lists and their launch counts (device memory). */
 struct ResolvedMoe {
-  GemvJob* jobs;    // [3 * kJobSlots]: the gate/up list (2 jobs + 2) from 0, the down list (jobs + 1) from kDownList
+  GemvJob* jobs;    // [3 * kJobSlots]: the gate/up list (2 per job) from 0, the down list (1 per job) from kDownList
   int* first;       // [3 * kJobSlots]: each list's warp prefix sums from 0, at the same offsets
   static constexpr int kDownList = 2 * kJobSlots;  // fixed, so graph launches can point at it
   int64_t* counts;  // [4]: gate/up jobs, gate/up warps, down jobs, down warps
   uint64_t* step;   // this GPU's layer step counter (zero at start)
 
-  IntArg gate_up_jobs(int max_jobs) const { return IntArg::at(counts + 0, 2 * max_jobs + 2); }
-  IntArg down_jobs(int max_jobs) const { return IntArg::at(counts + 2, max_jobs + 1); }
-  /** Warps are bounded by the jobs' shapes: `routed_warps` per routed job, `shared_warps` for the shared one. */
-  IntArg gate_up_warps(int max_jobs, int routed_warps, int shared_warps) const {
-    return IntArg::at(counts + 1, 2 * (max_jobs * static_cast<int64_t>(routed_warps) + shared_warps));
-  }
-  IntArg down_warps(int max_jobs, int routed_warps, int shared_warps) const {
-    return IntArg::at(counts + 3, max_jobs * static_cast<int64_t>(routed_warps) + shared_warps);
-  }
+  IntArg gate_up_jobs(int max_jobs) const { return IntArg::at(counts + 0, 2 * max_jobs); }
+  IntArg down_jobs(int max_jobs) const { return IntArg::at(counts + 2, max_jobs); }
+  /** Warps are bounded by the routed jobs' shapes: `warps` per gate/up or down job. */
+  IntArg gate_up_warps(int max_jobs, int warps) const { return IntArg::at(counts + 1, 2 * max_jobs * static_cast<int64_t>(warps)); }
+  IntArg down_warps(int max_jobs, int warps) const { return IntArg::at(counts + 3, max_jobs * static_cast<int64_t>(warps)); }
 };
 
 /** The routed Halves' shape (Expert store parts, MXFP4 tiles). */
@@ -58,11 +54,10 @@ struct RoutedShape {
 };
 
 /**
- * Resolve layer `layer`'s plan: `shared_jobs` are the shared Expert's gate,
- * up and down jobs; routed jobs write into `buf`'s slots 0..jobs-1 and read
- * their activations from `act_xf` (gate/up) and `buf`'s hidden fragments (down).
+ * Resolve layer `layer`'s plan: routed jobs write into `buf`'s slots 0..jobs-1 and read their
+ * activations from `act_xf` (gate/up) and `buf`'s hidden fragments (down).
  */
 void resolve_experts(const moe::Plan* plan, int layer, ExpertDirectory dir, RoutedShape shape, MoeBuffers buf,
-                     ActFragments act_xf, const GemvJob* shared_jobs, ResolvedMoe out, cudaStream_t stream);
+                     ActFragments act_xf, ResolvedMoe out, cudaStream_t stream);
 
 }  // namespace ds4n::cuda
