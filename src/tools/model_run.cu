@@ -215,7 +215,7 @@ int main(int argc, char** argv) {
         raw.insert(raw.end(), r.value().begin(), r.value().end());
       }
       decoder.begin_token(p, emb.value(), raw);
-      for (int l = 0; l < model::kLayers; l++) decoder.decode_layer(l, false);
+      decoder.decode_token();
       std::vector<float> logits;
       if (want_logits) logits = decoder.logits();
       else decoder.sync();

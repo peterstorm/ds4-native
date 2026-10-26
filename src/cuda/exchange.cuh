@@ -16,6 +16,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "cuda/mx_gemv.cuh"
+
 namespace ds4n::cuda {
 
 constexpr int kExchangeChunk = 1024;   // floats per block
@@ -34,5 +36,8 @@ struct ExchangeLink {
 
 /** out[i] = bf16(partial_gpu0[i] + partial_gpu1[i]) for i < n on this GPU; both GPUs must call it in step. */
 void exchange_add(const ExchangeLink& link, const float* mine, size_t n, __nv_bfloat16* out, cudaStream_t stream);
+
+/** The same for one token whose partial is split-K planes (summed in split order, FP32, as sum_planes_f32). */
+void exchange_add(const ExchangeLink& link, Planes mine, __nv_bfloat16* out, cudaStream_t stream);
 
 }  // namespace ds4n::cuda

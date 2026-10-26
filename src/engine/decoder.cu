@@ -11,6 +11,7 @@
 #include "cuda/compressor.cuh"
 #include "cuda/engram.cuh"
 #include "cuda/exchange.cuh"
+#include "cuda/fused.cuh"
 #include "cuda/glue.cuh"
 #include "cuda/indexer.cuh"
 #include "cuda/int_arg.cuh"
@@ -122,6 +123,7 @@ struct Decoder::Gpu {
   std::map<int, LayerLaunches> launches;
   // Captured layer steps by (layer, whether a ratio-2 KV source completes a group).
   std::map<std::pair<int, int>, cudaGraphExec_t> graphs;
+  std::array<cudaGraphExec_t, 2> token_graphs{};  // all layers, by whether ratio-2 sources complete a group
   cuda::ExpertDirectory experts{};  // this GPU's view of the Expert cache
   cuda::ResolvedMoe resolved{};
   // The stream between layers: h in, h_next after Engram, h_mid after attention, back to h after the FFN.
@@ -137,9 +139,10 @@ struct Decoder::Gpu {
   uint8_t* candidates = nullptr;
   cuda::IndexSelectScratch select{};
   // Per-token scratch.
-  bf16 *x0, *xa, *qlora, *qr, *kv_raw, *kv, *q, *latent, *latent_c, *k_raw, *k_idx, *q_idx, *scores, *o, *lora,
-      *attn_out, *xf, *moe_out, *kv_engram;
-  float *xa_f, *xf_f, *latent_f, *hc_scratch, *partial, *y, *packed;
+  // RMSNorm rows (the reduction is one block; its quantize and copy stay wide, in their own kernels).
+  bf16 *x0, *xa, *xf, *qlora, *qr;
+  bf16 *q, *latent, *latent_c, *k_raw, *k_idx, *q_idx, *scores, *o, *attn_out, *moe_out, *kv_engram;
+  float *xa_f, *xf_f, *latent_f, *hc_scratch, *y;
   float *planes_qa, *planes_kv, *planes_qb, *planes_iq, *planes_oa, *planes_ob, *planes_bf, *planes_proj, *planes_eg,
       *logits;
   cuda::ActFragments act_x, act_qr, act_o[kLocalGroups], act_lora, act_xf, act_engram;
@@ -207,11 +210,9 @@ Decoder::Decoder(std::array<int, 2> devices, std::array<cuda::ExpertDirectory, 2
                 a.alloc<int32_t>(cuda::kCandidateBlocks)};
 
     s.x0 = a.alloc<bf16>(kDim);
-    s.xa = a.alloc<bf16>(kDim);
     s.qlora = a.alloc<bf16>(kQLora);
     s.qr = a.alloc<bf16>(kQLora);
-    s.kv_raw = a.alloc<bf16>(kHeadDim);
-    s.kv = a.alloc<bf16>(kHeadDim);
+    s.xa = a.alloc<bf16>(kDim);
     s.q = a.alloc<bf16>(kLocalHeads * kHeadDim);
     s.latent = a.alloc<bf16>(kHeadDim);
     s.latent_c = a.alloc<bf16>(kHeadDim);
@@ -220,7 +221,6 @@ Decoder::Decoder(std::array<int, 2> devices, std::array<cuda::ExpertDirectory, 2
     s.q_idx = a.alloc<bf16>(cuda::kIndexHeads * cuda::kIndexDim);
     s.scores = a.alloc<bf16>(kMaxCompressed);
     s.o = a.alloc<bf16>(kLocalHeads * kHeadDim);
-    s.lora = a.alloc<bf16>(kLocalGroups * kOLora);
     s.attn_out = a.alloc<bf16>(kDim);
     s.xf = a.alloc<bf16>(kDim);
     s.moe_out = a.alloc<bf16>(kDim);
@@ -229,9 +229,7 @@ Decoder::Decoder(std::array<int, 2> devices, std::array<cuda::ExpertDirectory, 2
     s.xf_f = a.alloc<float>(kDim);
     s.latent_f = a.alloc<float>(kHeadDim);
     s.hc_scratch = a.alloc<float>(cuda::kHcPartials * 25);
-    s.partial = a.alloc<float>(kDim);
     s.y = a.alloc<float>(kDim);
-    s.packed = a.alloc<float>(cuda::kEngramKvRows);
     s.planes_qa = a.alloc<float>(static_cast<size_t>(kSplitsWqA) * kQLora * 8);
     s.planes_kv = a.alloc<float>(static_cast<size_t>(kSplitsWkv) * kHeadDim * 8);
     s.planes_qb = a.alloc<float>(static_cast<size_t>(kSplitsWqB) * kLocalHeads * kHeadDim * 8);
@@ -248,6 +246,11 @@ Decoder::Decoder(std::array<int, 2> devices, std::array<cuda::ExpertDirectory, 2
     s.act_lora = fragments(a, kLocalGroups * kOLora / 32);
     s.act_xf = fragments(a, kDimBlocks);
     s.act_engram = fragments(a, cuda::kEngramBlocks / kGpus);
+    // Fused kernels write token column 0 only; the rest stay empty (zero codes, scale 2^0).
+    for (const cuda::ActFragments* act : {&s.act_x, &s.act_qr, &s.act_o[0], &s.act_o[1], &s.act_o[2], &s.act_o[3], &s.act_lora,
+                                         &s.act_xf})
+      cuda::clear_fragments(*act, s.stream);
+    check(cudaStreamSynchronize(s.stream), "clear fragments");
     s.iq = {a.alloc<uint8_t>(16 * 256), a.alloc<uint8_t>(16 * 8), a.alloc<float>(32)};
     s.idx = a.alloc<int32_t>(kWindow + kTopK);
     s.produced = a.alloc<int>(1);
@@ -284,6 +287,8 @@ Decoder::~Decoder() {
       cudaSetDevice(g->device);
       cudaStreamSynchronize(g->stream);
       for (auto& [key, exec] : g->graphs) cudaGraphExecDestroy(exec);
+      for (cudaGraphExec_t exec : g->token_graphs)
+        if (exec) cudaGraphExecDestroy(exec);
       for (cudaEvent_t ev : {g->staged_token, g->staged_rows[0], g->staged_rows[1]}) cudaEventDestroy(ev);
       cudaStreamDestroy(g->stream);
       cudaFreeHost(g->staging);
@@ -388,14 +393,14 @@ void Decoder::Gpu::enqueue_layer(int layer, bool produced_now) {
     check(cudaMemcpyAsync(engram_rows, staging->engram_rows[table], kEngramTableBytes, cudaMemcpyHostToDevice, st), "rows");
     cuda::engram_quantize_rows(engram_rows, 1, rank * (cuda::kEngramBlocks / kGpus), act_engram, st);
     run(l.engram, st);
-    cuda::sum_planes_f32(planes_eg, 1, cuda::kEngramKvRows, 1, packed, st);
-    cuda::exchange_add(link, packed, cuda::kEngramKvRows, kv_engram, st);
+    cuda::exchange_add(link, cuda::Planes{planes_eg, 1, cuda::kEngramKvRows}, kv_engram, st);
     cuda::engram_gate(h, kv_engram, d.engram_q, d.engram_k, kNormEps, 1, h_next, st);
     h_in = h_next;
   }
 
   // Attention input and projections.
   const cuda::HcParams attn_params{d.hc_attn_fn, d.hc_attn_scale, d.hc_attn_base, kNormEps, kHcEps, kSinkhornIters};
+  // Fused glue where the work stays wide (cuda/fused.cuh): same arithmetic as the standalone kernels.
   cuda::hc_mixes(h_in, attn_params, kDim, 1, hc_scratch, mix_attn, st);
   cuda::hc_pre(h_in, mix_ffn, kDim, 1, x0, st);
   cuda::rmsnorm(x0, d.attn_norm, kDim, 1, kNormEps, xa, st);
@@ -405,14 +410,11 @@ void Decoder::Gpu::enqueue_layer(int layer, bool produced_now) {
   cuda::sum_planes_bf16(planes_qa, kSplitsWqA, kQLora, 1, qlora, st);
   cuda::rmsnorm(qlora, d.q_norm, kQLora, 1, kNormEps, qr, st);
   cuda::quantize_activations(qr, 1, act_qr, st);
-  cuda::sum_planes_bf16(planes_kv, kSplitsWkv, kHeadDim, 1, kv_raw, st);
-  cuda::rmsnorm(kv_raw, d.kv_norm, kHeadDim, 1, kNormEps, kv, st);
-  cuda::rope(kv, 1, 1, kHeadDim, kRopeDim, d.rope_freqs, pos, false, st);
-  cuda::fp8_quant_dequant(kv, 1, kHeadDim, st);
-  cuda::store_row(kv, kHeadDim, window.at(layer), IntArg::at(&step->ring_slot, kWindow - 1), st);
+  cuda::kv_to_cache({planes_kv, kSplitsWkv, kHeadDim}, d.kv_norm, kNormEps, d.rope_freqs, kRopeDim, pos, window.at(layer),
+                    IntArg::at(&step->ring_slot, kWindow - 1), st);
   run(l.qb, st);
-  cuda::sum_planes_bf16(planes_qb, kSplitsWqB, kLocalHeads * kHeadDim, 1, q, st);
-  cuda::rope(q, 1, kLocalHeads, kHeadDim, kRopeDim, d.rope_freqs, pos, false, st);
+  cuda::planes_rope({planes_qb, kSplitsWqB, kLocalHeads * kHeadDim}, kLocalHeads, kHeadDim, kRopeDim, d.rope_freqs, pos, q,
+                    st);
 
   if (ratio) {
     if (kind.kv_source) {
@@ -432,8 +434,8 @@ void Decoder::Gpu::enqueue_layer(int layer, bool produced_now) {
         cuda::rope(k_idx, 1, 1, cuda::kIndexDim, kRopeDim, d.rope_freqs, latent_pos, false, st);
         cuda::append_index_keys(k_idx, compress_row, 1, index_cache.at(layer), st);
       }
-      cuda::sum_planes_bf16(planes_iq, kSplitsIndexQ, cuda::kIndexHeads * cuda::kIndexDim, 1, q_idx, st);
-      cuda::rope(q_idx, 1, cuda::kIndexHeads, cuda::kIndexDim, kRopeDim, d.rope_freqs, pos, false, st);
+      cuda::planes_rope({planes_iq, kSplitsIndexQ, cuda::kIndexHeads * cuda::kIndexDim}, cuda::kIndexHeads, cuda::kIndexDim,
+                        kRopeDim, d.rope_freqs, pos, q_idx, st);
       cuda::bf16_gemv(d.index_weights_proj, xa_f, cuda::kIndexHeads, kDim, 1, kSplitsBf16, planes_proj, st);
       cuda::prepare_index_query(q_idx, planes_proj, kSplitsBf16, 0, iq, st);
       cuda::index_scores(index_cache.at(kind.cache_owner), compress_len, iq, kind.uses_candidates ? candidates : nullptr,
@@ -453,17 +455,12 @@ void Decoder::Gpu::enqueue_layer(int layer, bool produced_now) {
   // Attention, its output projections and the exchange.
   const cuda::KvSources kv_sources{window.at(layer), ratio ? compressed.at(kind.cache_owner) : nullptr};
   check(cuda::sparse_attn(q, kv_sources, idx, n_idx, d.sink, 1, kSoftmaxScale, attn, o, st), "sparse_attn");
-  cuda::rope(o, 1, kLocalHeads, kHeadDim, kRopeDim, d.rope_freqs, pos, true, st);
-  for (int gl = 0; gl < kLocalGroups; gl++)
-    cuda::quantize_activations(o + static_cast<size_t>(gl) * kGroupWidth, 1, act_o[gl], st);
+  cuda::unrope_quantize(o, kLocalHeads, kHeadDim, kRopeDim, d.rope_freqs, pos, kLocalHeads / kLocalGroups,
+                        {{act_o[0], act_o[1], act_o[2], act_o[3]}}, st);
   run(l.oa, st);
-  for (int gl = 0; gl < kLocalGroups; gl++)
-    cuda::sum_planes_bf16(planes_oa + static_cast<size_t>(gl) * kSplitsWoA * kOLora * 8, kSplitsWoA, kOLora, 1,
-                          lora + static_cast<size_t>(gl) * kOLora, st);
-  cuda::quantize_activations(lora, 1, act_lora, st);
+  cuda::group_planes_quantize(planes_oa, kLocalGroups, kSplitsWoA, kOLora, act_lora, st);
   run(l.ob, st);
-  cuda::sum_planes_f32(planes_ob, kSplitsWoB, kDim, 1, partial, st);
-  cuda::exchange_add(link, partial, kDim, attn_out, st);
+  cuda::exchange_add(link, cuda::Planes{planes_ob, kSplitsWoB, kDim}, attn_out, st);
   cuda::hc_post(attn_out, h_in, mix_attn, kDim, 1, h_mid, st);
 
   // FFN input and routing.
@@ -548,6 +545,35 @@ StepTrace Decoder::decode_layer(int layer, bool trace_step) {
   trace.idx.resize(n_idx);
   check(cudaMemcpy(trace.idx.data(), lead.idx, n_idx * 4, cudaMemcpyDeviceToHost), "idx");
   return trace;
+}
+
+void Decoder::decode_token() {
+  if (!in_token_) throw CudaError("decode_token before begin_token");
+  const bool any_engram = gpus_[0]->layers.contains(kEngramLayers[0]) || gpus_[0]->layers.contains(kEngramLayers[1]);
+  if (any_engram && !engram_staged_) throw CudaError("an Engram layer needs the token's Engram rows (begin_token)");
+  // Ratio-1 KV sources complete a group every step; ratio-2 sources every other one (the variant).
+  const int variant = step_.produced[2] != 0;
+  auto produced_for = [&](int layer) {
+    const LayerKind k = model::kind(layer);
+    return k.kv_source && step_.produced[k.compress_ratio] != 0;
+  };
+  for (auto& gp : gpus_) {
+    Gpu& s = *gp;
+    check(cudaSetDevice(s.device), "cudaSetDevice");
+    if (launches_ == Launches::Graphs && !s.token_graphs[variant])
+      s.token_graphs[variant] = capture(s.stream, [&] {
+        for (const auto& [layer, d] : s.layers) s.enqueue_layer(layer, produced_for(layer));
+      });
+  }
+  for (auto& gp : gpus_) {
+    Gpu& s = *gp;
+    check(cudaSetDevice(s.device), "cudaSetDevice");
+    if (launches_ == Launches::Graphs) check(cudaGraphLaunch(s.token_graphs[variant], s.stream), "cudaGraphLaunch");
+    else
+      for (const auto& [layer, d] : s.layers) s.enqueue_layer(layer, produced_for(layer));
+    for (int t = 0; t < 2; t++)
+      if (s.layers.contains(kEngramLayers[t])) check(cudaEventRecord(s.staged_rows[t], s.stream), "cudaEventRecord");
+  }
 }
 
 void Decoder::add_head(const std::vector<float>& norm, const std::vector<float>& head) {

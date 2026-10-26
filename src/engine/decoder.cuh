@@ -88,6 +88,12 @@ class Decoder {
    */
   StepTrace decode_layer(int layer, bool trace = true);
 
+  /**
+   * Every added layer, in order, for the current token: one graph per GPU (per whether the
+   * token completes a ratio-2 group), returning as soon as it is launched.
+   */
+  void decode_token();
+
   /** Wait until both GPUs finished everything launched so far. */
   void sync();
 

@@ -6,10 +6,11 @@
 // table rows are random (identical on both sides) unless real tables are given.
 //   ds4n-layer-check --backbone SAFETENSORS --store STORE [--first L] [--layers N] [--steps S]
 //                    [--expert-layers M] [--gguf-meta GGUF --engram-shards A,B,...] [--head 1]
-//                    [--timing N] [--launches graphs|eager] [--slots N --ram-records R]
+//                    [--timing N] [--launches graphs|eager] [--per-layer 1] [--slots N --ram-records R]
 // --head 1 also compares the full logits after the last layer of every step. --timing N then
 // times N more steps on the GPUs alone (pseudo-random tokens) under the same Expert cache. --launches
-// picks how the decoder issues kernels: replayed CUDA graphs (the default) or eager launches.
+// picks how the decoder issues kernels: replayed CUDA graphs (the default) or eager launches. Timing
+// launches one graph per token (decode_token) unless --per-layer 1 launches one per layer.
 // With --gguf-meta (a GGUF carrying deepseek41.engram.*) and --engram-shards (the files holding
 // the Engram tables), Engram layers hash the tokens and read real table rows.
 // --expert-layers M reads layer L's Experts from store layer L % M (a store holding only the
@@ -111,6 +112,7 @@ int main(int argc, char** argv) {
   int timing_steps = 0;
   uint32_t slot_count = 0, ram_records = 0;
   engine::Launches launches = engine::Launches::Graphs;
+  bool per_layer = false;  // timing: one launch per layer instead of one per token
   for (int i = 1; i < argc; i++) {
     const std::string s = argv[i];
     if (i + 1 >= argc) die("missing value for " + s);
@@ -126,6 +128,7 @@ int main(int argc, char** argv) {
     else if (s == "--timing") timing_steps = std::stoi(argv[++i]);
     else if (s == "--slots") slot_count = static_cast<uint32_t>(std::stoul(argv[++i]));
     else if (s == "--ram-records") ram_records = static_cast<uint32_t>(std::stoul(argv[++i]));
+    else if (s == "--per-layer") per_layer = std::string(argv[++i]) == "1";
     else if (s == "--launches") {
       const std::string v = argv[++i];
       if (v == "graphs") launches = engine::Launches::Graphs;
@@ -325,7 +328,8 @@ int main(int argc, char** argv) {
       if (!emb) die(emb.error().what);
       const auto t0 = std::chrono::steady_clock::now();
       decoder.begin_token(step, emb.value(), raw);
-      for (int l = first; l < first + layers; l++) decoder.decode_layer(l, false);
+      if (per_layer) for (int l = first; l < first + layers; l++) decoder.decode_layer(l, false);
+      else decoder.decode_token();
       if (with_head) decoder.logits();
       decoder.sync();
       step_ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());

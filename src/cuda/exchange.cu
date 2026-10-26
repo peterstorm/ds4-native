@@ -14,13 +14,28 @@ __device__ __forceinline__ uint64_t globaltimer() {
   return t;
 }
 
-__global__ void __launch_bounds__(kThreads) exchange_kernel(ExchangeLink link, const float* __restrict__ mine, size_t n,
+/** This GPU's partial, read element by element: a contiguous [n] FP32 array, or split-K planes summed in split order. */
+struct Contiguous {
+  const float* p;
+  __device__ __forceinline__ float operator()(size_t i) const { return p[i]; }
+};
+struct PlaneSum {
+  Planes in;
+  __device__ __forceinline__ float operator()(size_t i) const {
+    float v = in.data[i * kMaxTokens];
+    for (int s = 1; s < in.splits; s++) v = __fadd_rn(v, in.data[(static_cast<size_t>(s) * in.rows + i) * kMaxTokens]);
+    return v;
+  }
+};
+
+template <class Source>
+__global__ void __launch_bounds__(kThreads) exchange_kernel(ExchangeLink link, Source mine, size_t n,
                                                            __nv_bfloat16* __restrict__ out) {
   const size_t begin = static_cast<size_t>(blockIdx.x) * kExchangeChunk;
   const size_t end = begin + kExchangeChunk < n ? begin + kExchangeChunk : n;
   const uint32_t count = link.sent[blockIdx.x] + 1;  // same on both GPUs: they exchange in step
   const size_t parity = static_cast<size_t>(count & 1) * kExchangeMaxBlocks * kExchangeChunk;
-  for (size_t i = begin + threadIdx.x; i < end; i += kThreads) link.peer_inbox[parity + i] = mine[i];
+  for (size_t i = begin + threadIdx.x; i < end; i += kThreads) link.peer_inbox[parity + i] = mine(i);
   __syncthreads();  // every store of the block precedes thread 0's release below, and all threads read `sent`
   if (threadIdx.x == 0) {
     link.sent[blockIdx.x] = count;
@@ -35,7 +50,7 @@ __global__ void __launch_bounds__(kThreads) exchange_kernel(ExchangeLink link, c
   }
   __syncthreads();  // the acquire above covers the block's reads of the inbox
   for (size_t i = begin + threadIdx.x; i < end; i += kThreads) {
-    const float a = mine[i], b = __ldcg(link.inbox + parity + i);
+    const float a = mine(i), b = __ldcg(link.inbox + parity + i);
     out[i] = __float2bfloat16_rn(link.rank == 0 ? __fadd_rn(a, b) : __fadd_rn(b, a));
   }
 }
@@ -44,7 +59,13 @@ __global__ void __launch_bounds__(kThreads) exchange_kernel(ExchangeLink link, c
 
 void exchange_add(const ExchangeLink& link, const float* mine, size_t n, __nv_bfloat16* out, cudaStream_t stream) {
   const unsigned blocks = static_cast<unsigned>((n + kExchangeChunk - 1) / kExchangeChunk);
-  exchange_kernel<<<blocks, kThreads, 0, stream>>>(link, mine, n, out);
+  exchange_kernel<<<blocks, kThreads, 0, stream>>>(link, Contiguous{mine}, n, out);
+}
+
+void exchange_add(const ExchangeLink& link, Planes mine, __nv_bfloat16* out, cudaStream_t stream) {
+  const size_t n = static_cast<size_t>(mine.rows);
+  const unsigned blocks = static_cast<unsigned>((n + kExchangeChunk - 1) / kExchangeChunk);
+  exchange_kernel<<<blocks, kThreads, 0, stream>>>(link, PlaneSum{mine}, n, out);
 }
 
 }  // namespace ds4n::cuda

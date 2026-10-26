@@ -1,4 +1,5 @@
 #include "core/det_math.hpp"
+#include "cuda/device_ops.cuh"
 #include "cuda/glue.cuh"
 
 namespace ds4n::cuda {
@@ -6,20 +7,7 @@ namespace {
 
 constexpr int kMaxGemvTokens = 8;
 
-/** Fixed-order block sum over blockDim.x threads (power of two). */
-template <int Threads>
-__device__ __forceinline__ float block_sum(float v, float* shared) {
-  shared[threadIdx.x] = v;
-  __syncthreads();
-#pragma unroll
-  for (int s = Threads / 2; s > 0; s >>= 1) {
-    if (threadIdx.x < s) shared[threadIdx.x] += shared[threadIdx.x + s];
-    __syncthreads();
-  }
-  const float total = shared[0];
-  __syncthreads();
-  return total;
-}
+using ops::block_sum;
 
 template <int Threads>
 __global__ void rmsnorm_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w, int dim,
@@ -71,53 +59,10 @@ __global__ void hc_partial_kernel(const __nv_bfloat16* __restrict__ h, const flo
   }
 }
 
-__device__ float sigmoidf_rn(float v) { return __fdiv_rn(1.0f, __fadd_rn(1.0f, det::exp(-v))); }
-
-/** Sum, in index order 0..3, of the values held by lanes base + i*stride. */
-__device__ __forceinline__ float ordered_sum4(float v, int base, int stride) {
-  float s = 0.0f;
-#pragma unroll
-  for (int i = 0; i < kHcCopies; i++) s = __fadd_rn(s, __shfl_sync(0xFFFFFFFFu, v, base + i * stride));
-  return s;
-}
-
-/**
- * One warp per token. Lane r (< 25) sums value r's partials in part order. Then
- * every lane l reads raw mix m[l % 24]; lanes 0..3 finish pre, 4..7 post, and
- * lanes 0..15 hold comb[l/4][l%4] = mix 8 + l through the reference row softmax
- * and Sinkhorn, every row/column sum taken in index order (as the oracle).
- */
+/** One warp per token: ops::hc_finalize_warp. */
 __global__ void hc_finalize_kernel(const float* __restrict__ scratch, HcParams p, int width,
                                    HcMixes* __restrict__ out) {
-  constexpr int n = kHcCopies;
-  const int token = blockIdx.x, lane = threadIdx.x;
-  float acc = 0.0f;
-  if (lane < 1 + kHcMix)
-    for (int part = 0; part < kHcPartials; part++)
-      acc = __fadd_rn(acc, scratch[(static_cast<size_t>(token) * kHcPartials + part) * (1 + kHcMix) + lane]);
-  const float sumsq = __shfl_sync(0xFFFFFFFFu, acc, 0);
-  const float rs = det::rsqrt(__fadd_rn(__fdiv_rn(sumsq, static_cast<float>(width)), p.norm_eps));
-  HcMixes& o = out[token];
-
-  const float m = __fmul_rn(__shfl_sync(0xFFFFFFFFu, acc, lane % kHcMix + 1), rs);  // raw mix m[lane % 24]
-  if (lane < n) o.pre[lane] = __fadd_rn(sigmoidf_rn(__fadd_rn(__fmul_rn(m, p.scale[0]), p.base[lane])), p.hc_eps);
-  else if (lane < 2 * n)
-    o.post[lane - n] = __fmul_rn(2.0f, sigmoidf_rn(__fadd_rn(__fmul_rn(m, p.scale[1]), p.base[lane])));
-
-  const int l = lane & 15, j = l >> 2, k = l & 3;
-  const float mc = __fmul_rn(__shfl_sync(0xFFFFFFFFu, acc, 2 * n + l + 1), rs);
-  float c = __fadd_rn(__fmul_rn(mc, p.scale[2]), p.base[2 * n + l]);
-  float mx = __shfl_sync(0xFFFFFFFFu, c, 4 * j);
-#pragma unroll
-  for (int i = 1; i < n; i++) mx = fmaxf(mx, __shfl_sync(0xFFFFFFFFu, c, 4 * j + i));
-  c = det::exp(__fsub_rn(c, mx));
-  c = __fadd_rn(__fdiv_rn(c, ordered_sum4(c, 4 * j, 1)), p.hc_eps);
-  c = __fdiv_rn(c, __fadd_rn(ordered_sum4(c, k, 4), p.hc_eps));  // columns
-  for (int it = 0; it < p.sinkhorn_iters - 1; it++) {
-    c = __fdiv_rn(c, __fadd_rn(ordered_sum4(c, 4 * j, 1), p.hc_eps));  // rows
-    c = __fdiv_rn(c, __fadd_rn(ordered_sum4(c, k, 4), p.hc_eps));      // columns
-  }
-  if (lane < 16) o.comb[j][k] = c;
+  ops::hc_finalize_warp(scratch, p, width, blockIdx.x, out);
 }
 
 __global__ void hc_pre_kernel(const __nv_bfloat16* __restrict__ h, const HcMixes* __restrict__ mixes, int dim,

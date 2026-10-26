@@ -52,6 +52,13 @@ struct GemvJob {
 
 using gemv::split_blocks_for;
 
+/** Split-K GEMV output for one token: `splits` FP32 planes [split][rows][8], read at token column 0. */
+struct Planes {
+  const float* data;
+  int splits;
+  int rows;
+};
+
 /** Warps a job occupies: one per (16-row tile, split). */
 constexpr int job_warps(const GemvJob& j) { return j.rows / 16 * j.splits; }
 

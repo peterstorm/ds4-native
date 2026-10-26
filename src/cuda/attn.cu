@@ -1,5 +1,6 @@
 #include "core/det_math.hpp"
 #include "cuda/attn.cuh"
+#include "cuda/device_ops.cuh"
 #include "cuda/quant.cuh"
 
 namespace ds4n::cuda {
@@ -22,18 +23,19 @@ __global__ void qdq_kernel(__nv_bfloat16* __restrict__ x, int groups_total, int 
   const bool active = lane < group;
   const float v = active ? __bfloat162float(p[lane]) : 0.0f;
   const float amax = warp_max(fabsf(v));
-  float s, q;
   if constexpr (Kind == Qdq::Fp8E8m0) {
-    s = __uint_as_float(static_cast<uint32_t>(quant::log2_ceil_bits(__fmul_rn(fmaxf(amax, 1e-4f), 1.0f / 448.0f)) + 127) << 23);
-    q = quant::e4m3_round(fminf(fmaxf(__fdiv_rn(v, s), -448.0f), 448.0f));
-  } else if constexpr (Kind == Qdq::Fp4E8m0) {
-    s = __uint_as_float(static_cast<uint32_t>(quant::fp4_e8m0_exponent(amax) + 127) << 23);
-    q = quant::e2m1_round(fminf(fmaxf(__fdiv_rn(v, s), -6.0f), 6.0f));
+    if (active) p[lane] = __float2bfloat16_rn(ops::fp8_qdq(v, amax));
   } else {
-    s = quant::e4m3_round(__fdiv_rn(fmaxf(amax, 6.0f * 0x1p-9f), 6.0f));
-    q = quant::e2m1_round(fminf(fmaxf(__fdiv_rn(v, s), -6.0f), 6.0f));
+    float s, q;
+    if constexpr (Kind == Qdq::Fp4E8m0) {
+      s = __uint_as_float(static_cast<uint32_t>(quant::fp4_e8m0_exponent(amax) + 127) << 23);
+      q = quant::e2m1_round(fminf(fmaxf(__fdiv_rn(v, s), -6.0f), 6.0f));
+    } else {
+      s = quant::e4m3_round(__fdiv_rn(fmaxf(amax, 6.0f * 0x1p-9f), 6.0f));
+      q = quant::e2m1_round(fminf(fmaxf(__fdiv_rn(v, s), -6.0f), 6.0f));
+    }
+    if (active) p[lane] = __float2bfloat16_rn(__fmul_rn(q, s));
   }
-  if (active) p[lane] = __float2bfloat16_rn(__fmul_rn(q, s));
 }
 
 __global__ void rope_kernel(__nv_bfloat16* __restrict__ x, int heads, int head_dim, int rope_dim,
@@ -41,11 +43,10 @@ __global__ void rope_kernel(__nv_bfloat16* __restrict__ x, int heads, int head_d
   const int row = blockIdx.y, h = blockIdx.x, i = threadIdx.x;  // i: pair index
   if (i >= rope_dim / 2) return;
   __nv_bfloat16* tail = x + (static_cast<size_t>(row) * heads + h) * head_dim + head_dim - rope_dim;
-  const float angle = __fmul_rn(static_cast<float>(positions[row]), freqs[i]);
-  const float c = det::cos(angle), s = inverse ? -det::sin(angle) : det::sin(angle);
-  const float a = __bfloat162float(tail[2 * i]), b = __bfloat162float(tail[2 * i + 1]);
-  tail[2 * i] = __float2bfloat16_rn(__fsub_rn(__fmul_rn(a, c), __fmul_rn(b, s)));
-  tail[2 * i + 1] = __float2bfloat16_rn(__fadd_rn(__fmul_rn(a, s), __fmul_rn(b, c)));
+  float a = __bfloat162float(tail[2 * i]), b = __bfloat162float(tail[2 * i + 1]);
+  ops::rope_pair(a, b, positions[row], freqs[i], inverse);
+  tail[2 * i] = __float2bfloat16_rn(a);  // exact: rope_pair rounds to BF16
+  tail[2 * i + 1] = __float2bfloat16_rn(b);
 }
 
 constexpr int kSplitThreads = 512;          // 16 warps: one QK tile each

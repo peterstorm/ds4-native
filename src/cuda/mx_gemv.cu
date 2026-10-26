@@ -1,4 +1,5 @@
 #include "cuda/act_quant.cuh"
+#include "cuda/device_ops.cuh"
 #include "cuda/mma.cuh"
 #include "cuda/mx_gemv.cuh"
 
@@ -13,13 +14,14 @@ __global__ void quantize_kernel(const __nv_bfloat16* __restrict__ x, int tokens,
   const int lane = threadIdx.x & 31;
   if (warp >= blocks * kMaxTokens) return;
   const int b = warp / kMaxTokens, n = warp % kMaxTokens;
-  const float v = n < tokens ? __bfloat162float(x[static_cast<size_t>(n) * blocks * 32 + b * 32 + lane]) : 0.0f;
-  float amax = fabsf(v);
-  for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, o));
-  const int exp = n < tokens ? act::scale_exponent(amax) : 0;
+  if (n < tokens) {
+    ops::act_quantize_lane(__bfloat162float(x[static_cast<size_t>(n) * blocks * 32 + b * 32 + lane]), b, n, codes, scales);
+    return;
+  }
+  // Columns past `tokens`: zero codes, scale 2^0 (what a fragment holds before any token is written).
   const int q = (lane & 15) >> 2, j = lane & 3, hi = lane >> 4;
-  codes[b * 256 + (4 * n + q) * 8 + hi * 4 + j] = act::code(v, act::scale_value(exp));
-  if (lane == 0) scales[b * kMaxTokens + n] = static_cast<uint8_t>(exp + 127);
+  codes[b * 256 + (4 * n + q) * 8 + hi * 4 + j] = 0;
+  if (lane == 0) scales[b * kMaxTokens + n] = 127;
 }
 
 /** The last job whose first warp is <= `warp` (jobs are laid out back to back). */
