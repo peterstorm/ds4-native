@@ -132,7 +132,9 @@ the step in two phases per layer -- A: Engram, attention, routing, launched on b
 anything waits; the host reads the plan and places both GPUs' Expert Halves; B: Experts, MoE
 exchange, hc_post. `core/layer_reference` is the same step on the CPU, composed from the
 component oracles. `ds4n-layer-check` (real Backbone layers 0-3, real Experts from the store):
-**4 decode steps x 4 layers bit-identical** -- slots, plan, attention and MoE outputs, stream.
+**4 decode steps x 4 layers bit-identical** -- slots, plan, attention and MoE outputs, stream --
+and layers 20-24 (ratio-1 KV source and candidate source, candidate-masked indexer, reuse)
+likewise, with Experts mapped from the store's first layers (`--expert-layers 4`).
 
 Deadlock rules the decoder states and enforces: no host call that can wait on a GPU while its
 peer's side of an exchange is unlaunched -- per-step uploads through pinned staging, Expert

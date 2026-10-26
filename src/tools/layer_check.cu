@@ -4,7 +4,10 @@
 // Every layer of every step compares the attention slots, the routing plan,
 // the attention and MoE outputs after their exchanges, and the stream. Engram
 // table rows are random (identical on both sides) until the tables are converted.
-//   ds4n-layer-check --backbone SAFETENSORS --store STORE [--layers N] [--steps S]
+//   ds4n-layer-check --backbone SAFETENSORS --store STORE [--first L] [--layers N] [--steps S]
+//                    [--expert-layers M]
+// --expert-layers M reads layer L's Experts from store layer L % M (a store holding only the
+// first M layers can still exercise later layers: exactness needs the same Experts on both sides).
 #include <cuda_runtime.h>
 
 #include <cstdio>
@@ -85,7 +88,7 @@ int main(int argc, char** argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);  // progress shows even if a step hangs
   setenv("CUDA_MODULE_LOADING", "EAGER", 1);  // before any CUDA call: see engine/decoder.cuh
   std::string backbone_path, store_path;
-  int layers = 4, steps = 3;
+  int first = 0, layers = 4, steps = 3, expert_layers = model::kLayers;
   for (int i = 1; i < argc; i++) {
     const std::string s = argv[i];
     if (i + 1 >= argc) die("missing value for " + s);
@@ -93,16 +96,20 @@ int main(int argc, char** argv) {
     else if (s == "--store") store_path = argv[++i];
     else if (s == "--layers") layers = std::stoi(argv[++i]);
     else if (s == "--steps") steps = std::stoi(argv[++i]);
+    else if (s == "--first") first = std::stoi(argv[++i]);
+    else if (s == "--expert-layers") expert_layers = std::stoi(argv[++i]);
     else die("unknown argument " + s);
   }
-  if (backbone_path.empty() || store_path.empty() || layers < 1 || layers > model::kLayers) die("bad arguments");
+  if (backbone_path.empty() || store_path.empty() || layers < 1 || first < 0 || first + layers > model::kLayers ||
+      expert_layers < 1)
+    die("bad arguments");
 
   auto backbone = engine::open_backbone(backbone_path);
   if (!backbone) die(backbone.error().what);
   StoreReader store(store_path);
   std::vector<HostLayer> host;
   engine::Decoder decoder({0, 1});
-  for (int l = 0; l < layers; l++) {
+  for (int l = first; l < first + layers; l++) {
     auto w = engine::load_layer(backbone.value(), l);
     if (!w) die(w.error().what);
     decoder.add_layer(w.value());
@@ -119,7 +126,7 @@ int main(int argc, char** argv) {
       const auto key = std::make_tuple(rank, layer, plan.expert[j]);
       auto it = device_halves.find(key);
       if (it == device_halves.end()) {
-        const auto bytes = store.payload(layer, plan.expert[j], rank);
+        const auto bytes = store.payload(layer % expert_layers, plan.expert[j], rank);
         uint8_t* d = nullptr;
         engine::check(cudaMalloc(&d, bytes.size()), "cudaMalloc");
         engine::check(cudaMemcpy(d, bytes.data(), bytes.size(), cudaMemcpyHostToDevice), "expert upload");
@@ -134,7 +141,7 @@ int main(int argc, char** argv) {
     const auto key = std::make_tuple(current_layer, expert, half);
     auto it = ggml_halves.find(key);
     if (it == ggml_halves.end()) {
-      const auto bytes = store.payload(current_layer, expert, half);
+      const auto bytes = store.payload(current_layer % expert_layers, expert, half);
       auto part = [&](int i, int rows, int blocks) {
         auto g = mx::untile_matrix(bytes.subspan(i * store::kHalfPartBytes, store::kHalfPartBytes), rows, blocks);
         if (!g) die(g.error().what);
@@ -155,7 +162,7 @@ int main(int argc, char** argv) {
     if (!emb) die(emb.error().what);
     layer_ref::Stream stream = layer_ref::embed(emb.value());
     decoder.begin_token(emb.value());
-    for (int l = 0; l < layers; l++) {
+    for (int l = first; l < first + layers; l++) {
       std::vector<uint8_t> raw;
       std::vector<float> decoded;
       if (model::kind(l).engram) {
@@ -178,7 +185,7 @@ int main(int argc, char** argv) {
       std::printf("  oracle...\n");
       current_layer = l;
       layer_ref::Trace want;
-      stream = layer_ref::decode_layer(host[l], halves, state, stream, p, decoded, &want);
+      stream = layer_ref::decode_layer(host[l - first], halves, state, stream, p, decoded, &want);
 
       Compare idx, attn, moe_c, h;
       const bool idx_ok = idx.add(got.idx, want.idx);
