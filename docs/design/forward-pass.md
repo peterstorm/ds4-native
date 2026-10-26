@@ -114,7 +114,7 @@ with the routing round trip.
 | Head | BF16 [129280, 5120] | 1.32 GB | vocab split | **done** (BF16 GEMV), 415 us at 1,595 GB/s |
 | RMSNorm, hc_mixes + Sinkhorn, hc_pre/hc_post | F32 small | ~0.3 GB | replicated | **done**, all bit-identical (oracles emulate the kernels' FMA chains and warp/block trees, core/reduce.hpp) |
 | RoPE (YaRN for compressed layers) | — | — | local | **done**, bit-identical |
-| Compressor (ratio 2 pooling / ratio 1 proj) | F32 / BF16 | small | replicated | todo |
+| Compressor (ratio 2 pooling / ratio 1 proj) | BF16 weights, FP32 math | 10.5 MB (ratio 2) | replicated | **done**: one split-K BF16 GEMV over stacked wkv/wgate + a 256-thread pool/RMSNorm kernel (position read on the device); bit-identical to `core/compressor` on real layer-2 and layer-20 weights |
 | Indexer scores + two-level top-k | FP8 + BF16 | 68 B per position | replicated (no score exchange) | **done**: keys in an MXFP4 tile cache, scores on the block-scaled MMA, multi-block radix top-k (ties to the lower position); bit-identical to `core/indexer` at every stage; scores 19.6 us at 1M positions, top-512 15-24 us (plain launches) |
 | sparse_attn (window + 512 selected, sinks) | — | KV gather ~0.65 MB/layer | heads split | **done**: flash decoding on the BF16 MMA (one CTA per 64 slots, 16 warps, Q and KV staged in shared memory, ordered combine); 100 % bit-identical to the split-form oracle; 11.6 us/layer (was 173) |
 | Engram rows + wkv + gate | FP8 rows (disk) + FP8 wkv | 48 rows + 0.32 GB | rows replicated, wkv split | hashing + row decode done (CPU); GPU todo |
