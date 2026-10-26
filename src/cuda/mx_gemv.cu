@@ -6,6 +6,7 @@ namespace ds4n::cuda {
 namespace {
 
 constexpr float kE4M3Max = 448.0f;
+constexpr int kDepth = 4;  // weight pairs in flight per lane: 2 -> 1418 GB/s, 4 -> 1525, 8 -> 1323 (registers)
 
 /** UE8M0 exponent of the reference act_quant: ceil(log2(max(amax, 1e-4) / 448)) from FP32 bits. */
 __device__ __forceinline__ int act_scale_exponent(float amax) {
@@ -65,22 +66,29 @@ __global__ void __launch_bounds__(128) gemv_kernel(const GemvJob* __restrict__ j
   const unsigned scale_row = (lane >> 2) + 8 * (lane & 1);
 
   float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-  uint32_t s4 = 0;
   const int pairs = job.blocks / 2;
-  uint4 next = __ldcs(reinterpret_cast<const uint4*>(w + lane * 16));
-  for (int p = 0; p < pairs; p++) {
-    const uint4 c = next;
-    if (p + 1 < pairs) next = __ldcs(reinterpret_cast<const uint4*>(w + (p + 1) * 512 + lane * 16));
-    if ((p & 1) == 0) s4 = *reinterpret_cast<const uint32_t*>(wscale + (p >> 1) * 64 + scale_row * 4);
+  // Issue kDepth pairs' weight loads back to back, then consume them in K order:
+  // more bytes in flight per warp without changing the accumulation order.
+  for (int p0 = 0; p0 < pairs; p0 += kDepth) {
+    uint4 c[kDepth];
 #pragma unroll
-    for (int h = 0; h < 2; h++) {
-      const int blk = 2 * p + h;
-      const uint32_t x = h ? c.z : c.x, y = h ? c.w : c.y;
-      const uint32_t a[4] = {low_codes(x), low_codes(y), high_codes(x), high_codes(y)};
-      const uint2 bfrag = *reinterpret_cast<const uint2*>(job.act_codes + blk * 256 + lane * 8);
-      const uint32_t sfa = (s4 >> (8 * (blk & 3))) & 0xFFu;
-      const uint32_t sfb = job.act_scales[blk * kMaxTokens + (lane >> 2)];
-      mma_mx(d, a, bfrag.x, bfrag.y, sfa, sfb);
+    for (int i = 0; i < kDepth; i++)
+      if (p0 + i < pairs) c[i] = __ldcs(reinterpret_cast<const uint4*>(w + (p0 + i) * 512 + lane * 16));
+#pragma unroll
+    for (int i = 0; i < kDepth; i++) {
+      const int p = p0 + i;
+      if (p >= pairs) break;
+      const uint32_t s4 = *reinterpret_cast<const uint32_t*>(wscale + (p >> 1) * 64 + scale_row * 4);
+#pragma unroll
+      for (int h = 0; h < 2; h++) {
+        const int blk = 2 * p + h;
+        const uint32_t x = h ? c[i].z : c[i].x, y = h ? c[i].w : c[i].y;
+        const uint32_t a[4] = {low_codes(x), low_codes(y), high_codes(x), high_codes(y)};
+        const uint2 bfrag = *reinterpret_cast<const uint2*>(job.act_codes + blk * 256 + lane * 8);
+        const uint32_t sfa = (s4 >> (8 * (blk & 3))) & 0xFFu;
+        const uint32_t sfb = job.act_scales[blk * kMaxTokens + (lane >> 2)];
+        mma_mx(d, a, bfrag.x, bfrag.y, sfa, sfb);
+      }
     }
   }
   const int row = tile * 16 + static_cast<int>(lane >> 2);
