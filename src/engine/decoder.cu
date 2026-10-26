@@ -117,6 +117,16 @@ struct Decoder::Gpu {
   std::array<cudaEvent_t, 2> staged_rows{};
   int rank = 0, device = 0;
   cudaStream_t stream = nullptr;
+  // A layer step's parallel branches: work only a later stage needs runs on `side`, forked from and
+  // joined back into `stream` with events (captured into the graphs as branches).
+  cudaStream_t side = nullptr;
+  std::array<cudaEvent_t, 6> branch{};  // fork, join per branch
+  void fork(int b) {
+    check(cudaEventRecord(branch[2 * b], stream), "cudaEventRecord");
+    check(cudaStreamWaitEvent(side, branch[2 * b], 0), "cudaStreamWaitEvent");
+  }
+  void branch_done(int b) { check(cudaEventRecord(branch[2 * b + 1], side), "cudaEventRecord"); }
+  void join(int b) { check(cudaStreamWaitEvent(stream, branch[2 * b + 1], 0), "cudaStreamWaitEvent"); }
   DeviceArena arena;
   cuda::ExchangeLink link{};
   std::map<int, DeviceLayer> layers;
@@ -182,6 +192,8 @@ Decoder::Decoder(std::array<int, 2> devices, std::array<cuda::ExpertDirectory, 2
     s.rank = g;
     s.device = devices[g];
     check(cudaStreamCreateWithFlags(&s.stream, cudaStreamNonBlocking), "cudaStreamCreate");
+    check(cudaStreamCreateWithFlags(&s.side, cudaStreamNonBlocking), "cudaStreamCreate");
+    for (cudaEvent_t& ev : s.branch) check(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "cudaEventCreate");
     check(cudaMallocHost(&s.staging, sizeof(Staging)), "cudaMallocHost");
     s.experts = experts[g];
     for (cudaEvent_t* ev : {&s.staged_token, &s.staged_rows[0], &s.staged_rows[1]})
@@ -291,6 +303,9 @@ Decoder::~Decoder() {
         if (exec) cudaGraphExecDestroy(exec);
       for (cudaEvent_t ev : {g->staged_token, g->staged_rows[0], g->staged_rows[1]}) cudaEventDestroy(ev);
       cudaStreamDestroy(g->stream);
+      cudaStreamSynchronize(g->side);
+      for (cudaEvent_t ev : g->branch) cudaEventDestroy(ev);
+      cudaStreamDestroy(g->side);
       cudaFreeHost(g->staging);
     }
 }
@@ -401,7 +416,10 @@ void Decoder::Gpu::enqueue_layer(int layer, bool produced_now) {
   // Attention input and projections.
   const cuda::HcParams attn_params{d.hc_attn_fn, d.hc_attn_scale, d.hc_attn_base, kNormEps, kHcEps, kSinkhornIters};
   // Fused glue where the work stays wide (cuda/fused.cuh): same arithmetic as the standalone kernels.
-  cuda::hc_mixes(h_in, attn_params, kDim, 1, hc_scratch, mix_attn, st);
+  // Branch 0: this sub-block's mixes, which only its hc_post needs, beside the attention path.
+  fork(0);
+  cuda::hc_mixes(h_in, attn_params, kDim, 1, hc_scratch, mix_attn, side);
+  branch_done(0);
   cuda::hc_pre(h_in, mix_ffn, kDim, 1, x0, st);
   cuda::rmsnorm(x0, d.attn_norm, kDim, 1, kNormEps, xa, st);
   cuda::quantize_activations(xa, 1, act_x, st);
@@ -410,8 +428,11 @@ void Decoder::Gpu::enqueue_layer(int layer, bool produced_now) {
   cuda::sum_planes_bf16(planes_qa, kSplitsWqA, kQLora, 1, qlora, st);
   cuda::rmsnorm(qlora, d.q_norm, kQLora, 1, kNormEps, qr, st);
   cuda::quantize_activations(qr, 1, act_qr, st);
+  // Branch 1: the KV row into the window ring (only attention reads it) beside the q path.
+  fork(1);
   cuda::kv_to_cache({planes_kv, kSplitsWkv, kHeadDim}, d.kv_norm, kNormEps, d.rope_freqs, kRopeDim, pos, window.at(layer),
-                    IntArg::at(&step->ring_slot, kWindow - 1), st);
+                    IntArg::at(&step->ring_slot, kWindow - 1), side);
+  branch_done(1);
   run(l.qb, st);
   cuda::planes_rope({planes_qb, kSplitsWqB, kLocalHeads * kHeadDim}, kLocalHeads, kHeadDim, kRopeDim, d.rope_freqs, pos, q,
                     st);
@@ -453,6 +474,7 @@ void Decoder::Gpu::enqueue_layer(int layer, bool produced_now) {
   }
 
   // Attention, its output projections and the exchange.
+  join(1);
   const cuda::KvSources kv_sources{window.at(layer), ratio ? compressed.at(kind.cache_owner) : nullptr};
   check(cuda::sparse_attn(q, kv_sources, idx, n_idx, d.sink, 1, kSoftmaxScale, attn, o, st), "sparse_attn");
   cuda::unrope_quantize(o, kLocalHeads, kHeadDim, kRopeDim, d.rope_freqs, pos, kLocalHeads / kLocalGroups,
@@ -461,11 +483,15 @@ void Decoder::Gpu::enqueue_layer(int layer, bool produced_now) {
   cuda::group_planes_quantize(planes_oa, kLocalGroups, kSplitsWoA, kOLora, act_lora, st);
   run(l.ob, st);
   cuda::exchange_add(link, cuda::Planes{planes_ob, kSplitsWoB, kDim}, attn_out, st);
+  join(0);
   cuda::hc_post(attn_out, h_in, mix_attn, kDim, 1, h_mid, st);
 
   // FFN input and routing.
   const cuda::HcParams ffn_params{d.hc_ffn_fn, d.hc_ffn_scale, d.hc_ffn_base, kNormEps, kHcEps, kSinkhornIters};
-  cuda::hc_mixes(h_mid, ffn_params, kDim, 1, hc_scratch, mix_ffn, st);
+  // Branch 2: the FFN's mixes (its hc_post, the next layer's hc_pre) beside routing and the Experts.
+  fork(2);
+  cuda::hc_mixes(h_mid, ffn_params, kDim, 1, hc_scratch, mix_ffn, side);
+  branch_done(2);
   cuda::hc_pre(h_mid, mix_attn, kDim, 1, x0, st);
   cuda::rmsnorm(x0, d.ffn_norm, kDim, 1, kNormEps, xf, st);
   cuda::quantize_activations(xf, 1, act_xf, st);
@@ -486,6 +512,7 @@ void Decoder::Gpu::enqueue_layer(int layer, bool produced_now) {
              resolved.down_jobs(kStepJobs), resolved.down_warps(kStepJobs, kDownWarps, kDownWarps), st);
   cuda::combine(plan, moe, y, st);
   cuda::exchange_add(link, y, kDim, moe_out, st);
+  join(2);
   cuda::hc_post(moe_out, h_mid, mix_ffn, kDim, 1, h, st);
   check(cudaGetLastError(), "layer step launches");
 }
