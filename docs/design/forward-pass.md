@@ -119,7 +119,7 @@ with the routing round trip.
 | sparse_attn (window + 512 selected, sinks) | — | KV gather ~1.3 MB/layer | heads split | correctness version (99.96 %), 173 us/layer: tensor-core rewrite todo |
 | Engram rows + wkv + gate | FP8 rows (disk) + FP8 wkv | 48 rows + 0.32 GB | rows replicated, wkv split | hashing + row decode done (CPU); GPU todo |
 | Router top-6, Routing plan, SwiGLU, combine | — | — | replicated routing (bit-identical on both GPUs) | **done**, 100 % bit-identical end to end; MoE layer 109 us, perf todo |
-| All-reduce (attention out, MoE out) | — | 81 per token | custom P2P one-shot | todo (needs both GPUs) |
+| All-reduce (attention out, MoE out) | — | 80 per token | custom P2P one-shot (push + per-block release/acquire flags, parity double-buffered inbox) | **done**: 3.2 us at 1 token, 8.8 us at 8 (graphs); 0 mismatches over 20k rounds + 12.8k back-to-back; P2P flag latency 0.63 us |
 | Sampling (exact top-p normalizer in double) | — | — | on GPU | todo |
 | DSpark draft (3 blocks) + verify | MXFP4 + FP8 | ~8 GB resident | lead GPU | todo |
 
