@@ -6,6 +6,13 @@ namespace ds4n::cuda {
 namespace {
 
 constexpr int kThreads = 256;
+constexpr uint64_t kExchangeTimeoutNs = 10'000'000'000;  // 10 s
+
+__device__ __forceinline__ uint64_t globaltimer() {
+  uint64_t t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  return t;
+}
 
 __global__ void __launch_bounds__(kThreads) exchange_kernel(ExchangeLink link, const float* __restrict__ mine, size_t n,
                                                            __nv_bfloat16* __restrict__ out) {
@@ -20,8 +27,11 @@ __global__ void __launch_bounds__(kThreads) exchange_kernel(ExchangeLink link, c
     ::cuda::atomic_ref<uint32_t, ::cuda::thread_scope_system> out_flag(link.peer_flags[blockIdx.x]);
     out_flag.store(count, ::cuda::memory_order_release);
     ::cuda::atomic_ref<uint32_t, ::cuda::thread_scope_system> in_flag(link.flags[blockIdx.x]);
-    while (static_cast<int32_t>(in_flag.load(::cuda::memory_order_acquire) - count) < 0) {
-    }
+    // Watchdog: a peer that never arrives (it failed, or the host never launched its side) traps
+    // this kernel after kExchangeTimeoutNs, so the process fails loudly instead of hanging.
+    const uint64_t start = globaltimer();
+    while (static_cast<int32_t>(in_flag.load(::cuda::memory_order_acquire) - count) < 0)
+      if (globaltimer() - start > kExchangeTimeoutNs) __trap();
   }
   __syncthreads();  // the acquire above covers the block's reads of the inbox
   for (size_t i = begin + threadIdx.x; i < end; i += kThreads) {

@@ -21,6 +21,8 @@ add_library(ds4n_core STATIC
   src/core/safetensors.cpp
   src/core/indexer.cpp
   src/core/compressor.cpp
+  src/core/layer_reference.cpp
+  src/core/layer_weights.cpp
 )
 target_include_directories(ds4n_core PUBLIC src)
 target_compile_options(ds4n_core PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -33,6 +35,11 @@ add_library(ds4n_io STATIC
 )
 target_link_libraries(ds4n_io PUBLIC ds4n_core ${URING_LIB})
 target_compile_options(ds4n_io PRIVATE -Wall -Wextra -Wpedantic -Werror)
+
+# Engine shell (host side): loading Backbone layers.
+add_library(ds4n_engine STATIC src/engine/host_layer.cpp)
+target_link_libraries(ds4n_engine PUBLIC ds4n_io)
+target_compile_options(ds4n_engine PRIVATE -Wall -Wextra -Wpedantic -Werror)
 
 add_executable(ds4n-store-build src/tools/store_build.cpp)
 target_link_libraries(ds4n-store-build PRIVATE ds4n_io)
@@ -47,7 +54,7 @@ if(DS4N_CUDA)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
   set(CMAKE_CUDA_ARCHITECTURES OFF)
   set(DS4N_CUDA_FLAGS -gencode=arch=compute_120a,code=sm_120a -lineinfo -Xcompiler=-Wall)
-  add_library(ds4n_cuda STATIC src/cuda/mx_gemv.cu src/cuda/glue.cu src/cuda/attn.cu src/cuda/moe.cu src/cuda/exchange.cu src/cuda/indexer.cu src/cuda/select.cu src/cuda/compressor.cu src/cuda/engram.cu)
+  add_library(ds4n_cuda STATIC src/cuda/mx_gemv.cu src/cuda/glue.cu src/cuda/attn.cu src/cuda/moe.cu src/cuda/exchange.cu src/cuda/indexer.cu src/cuda/select.cu src/cuda/compressor.cu src/cuda/engram.cu src/cuda/planes.cu)
   target_compile_options(ds4n_cuda PRIVATE ${DS4N_CUDA_FLAGS})
   target_link_libraries(ds4n_cuda PUBLIC ds4n_core)
   add_executable(ds4n-mx-check src/tools/mx_check.cu)
@@ -75,6 +82,12 @@ if(DS4N_CUDA)
   add_executable(ds4n-engram-check src/tools/engram_check.cu)
   target_compile_options(ds4n-engram-check PRIVATE ${DS4N_CUDA_FLAGS})
   target_link_libraries(ds4n-engram-check PRIVATE ds4n_cuda ds4n_io)
+  add_library(ds4n_engine_cuda STATIC src/engine/device_layer.cu src/engine/decoder.cu)
+  target_compile_options(ds4n_engine_cuda PRIVATE ${DS4N_CUDA_FLAGS})
+  target_link_libraries(ds4n_engine_cuda PUBLIC ds4n_cuda ds4n_engine)
+  add_executable(ds4n-layer-check src/tools/layer_check.cu)
+  target_compile_options(ds4n-layer-check PRIVATE ${DS4N_CUDA_FLAGS})
+  target_link_libraries(ds4n-layer-check PRIVATE ds4n_engine_cuda)
   add_executable(ds4n-exchange-check src/tools/exchange_check.cu)
   target_compile_options(ds4n-exchange-check PRIVATE ${DS4N_CUDA_FLAGS})
   target_link_libraries(ds4n-exchange-check PRIVATE ds4n_cuda)

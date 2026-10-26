@@ -123,6 +123,23 @@ with the routing round trip.
 | Sampling (exact top-p normalizer in double) | — | — | on GPU | todo |
 | DSpark draft (3 blocks) + verify | MXFP4 + FP8 | ~8 GB resident | lead GPU | todo |
 
+## Layer assembly
+
+`engine::Decoder` runs decode steps through layers on both GPUs: one layer's weights per GPU
+from `engine/host_layer` + `engine/device_layer` (tensor-parallel slices tiled for the kernels),
+caches per GPU (window rings, compressed and index-key caches per KV source, pool states), and
+the step in two phases per layer -- A: Engram, attention, routing, launched on both GPUs before
+anything waits; the host reads the plan and places both GPUs' Expert Halves; B: Experts, MoE
+exchange, hc_post. `core/layer_reference` is the same step on the CPU, composed from the
+component oracles. `ds4n-layer-check` (real Backbone layers 0-3, real Experts from the store):
+**4 decode steps x 4 layers bit-identical** -- slots, plan, attention and MoE outputs, stream.
+
+Deadlock rules the decoder states and enforces: no host call that can wait on a GPU while its
+peer's side of an exchange is unlaunched -- per-step uploads through pinned staging, Expert
+Halves for both GPUs placed before phase B, eager module loading (`CUDA_MODULE_LOADING=EAGER`:
+a lazy first launch can wait on the device), and a 10 s watchdog in the exchange that traps
+instead of hanging.
+
 ## Validation path
 
 1. Per-kernel CPU oracles from `model.py` (as for act_quant / fp4_gemm / fp8_gemm).

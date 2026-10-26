@@ -5,7 +5,8 @@
 // writes, the fast direction on PCIe), raises a per-block flag with release
 // semantics, waits for the peer's flag on the matching block and writes
 // bf16(GPU 0 + GPU 1). Both GPUs add the same two FP32 values, so their outputs
-// are bit-identical. Flags count exchanges per block on the device, so the
+// are bit-identical. A side that waits 10 s for its peer traps (a dead or never-launched
+// peer fails loudly instead of hanging). Flags count exchanges per block on the device, so the
 // kernel needs no host-side epoch and replays inside CUDA graphs. The inbox is
 // double-buffered by exchange parity: a GPU can push exchange k+2 only after the
 // peer signalled k+1, which it does after it finished reading exchange k.

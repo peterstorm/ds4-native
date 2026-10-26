@@ -110,6 +110,7 @@ int main() {
   const int cache_rows = 4096, max_idx = 640, qrows = 4;
   const auto kv = attn::fp8_quant_dequant(bf16_random(static_cast<size_t>(cache_rows) * d, 1.0f));
   auto dkv = upload(to_bf16(kv));
+  const cuda::KvSources kvs{dkv, dkv + static_cast<size_t>(cuda::kAttnWindow) * d};  // one buffer: slot i is row i
   std::vector<float> sink(heads);
   for (auto& s : sink) s = n(rng);
   auto dsink = upload(sink);
@@ -127,7 +128,7 @@ int main() {
     for (size_t i = 0; i < idx.size(); i++) idx[i] = (i % 97 == 5) ? -1 : pick(rng);
     idx[0] = 3;  // row 0 always has a valid first slot
     auto didx = upload(idx);
-    ck(cuda::sparse_attn(dqs, dkv, didx, n_idx, dsink, qrows, scale, scratch, dout, nullptr), "sparse_attn");
+    ck(cuda::sparse_attn(dqs, kvs, didx, n_idx, dsink, qrows, scale, scratch, dout, nullptr), "sparse_attn");
     const auto got = download_bf16(dout, static_cast<size_t>(qrows) * heads * d);
     size_t same_attn = 0, total = 0;
     for (int r = 0; r < qrows; r++) {
@@ -152,7 +153,7 @@ int main() {
     cudaFree(didx);
   }
 
-  if (cuda::sparse_attn(dqs, dkv, nullptr, 641, dsink, 1, scale, scratch, dout, nullptr) != cudaErrorInvalidValue)
+  if (cuda::sparse_attn(dqs, kvs, nullptr, 641, dsink, 1, scale, scratch, dout, nullptr) != cudaErrorInvalidValue)
     die("sparse_attn accepted 641 slots");
   // Decode timing: one query row, 640 slots.
   std::vector<int32_t> idx(max_idx);
@@ -168,7 +169,7 @@ int main() {
     cudaGraph_t graph;
     cudaGraphExec_t exec;
     ck(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal), "capture");
-    for (int i = 0; i < 200; i++) ck(cuda::sparse_attn(dqs, dkv, didx, max_idx, dsink, rows_timed, scale, scratch, dout, st), "sparse_attn");
+    for (int i = 0; i < 200; i++) ck(cuda::sparse_attn(dqs, kvs, didx, max_idx, dsink, rows_timed, scale, scratch, dout, st), "sparse_attn");
     ck(cudaStreamEndCapture(st, &graph), "end capture");
     ck(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
     ck(cudaGraphLaunch(exec, st), "warm");

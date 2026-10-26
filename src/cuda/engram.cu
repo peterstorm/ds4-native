@@ -36,17 +36,6 @@ __global__ void quantize_rows_kernel(const uint8_t* __restrict__ rows, int token
   if (lane == 0) scales[b * kMaxTokens + n] = static_cast<uint8_t>(exp + 127);
 }
 
-__global__ void pack_kernel(const float* __restrict__ planes, int splits, int rows, int tokens,
-                            float* __restrict__ packed) {
-  const int r = blockIdx.x * blockDim.x + threadIdx.x;
-  if (r >= rows) return;
-  for (int t = 0; t < tokens; t++) {
-    float v = planes[static_cast<size_t>(r) * kMaxTokens + t];
-    for (int s = 1; s < splits; s++) v = __fadd_rn(v, planes[(static_cast<size_t>(s) * rows + r) * kMaxTokens + t]);
-    packed[static_cast<size_t>(t) * rows + r] = v;
-  }
-}
-
 /** The halving tree over the block (cuda::rmsnorm's), leaving the sum in red[0]. */
 __device__ float block_tree(float v, float* red) {
   red[threadIdx.x] = v;
@@ -99,10 +88,6 @@ void engram_quantize_rows(const uint8_t* rows, int tokens, int first_block, ActF
   const int warps = out.blocks * kMaxTokens;
   quantize_rows_kernel<<<(warps * 32 + 127) / 128, 128, 0, stream>>>(rows, tokens, first_block, out.blocks, out.codes,
                                                                       out.scales);
-}
-
-void engram_pack(const float* planes, int splits, int rows, int tokens, float* packed, cudaStream_t stream) {
-  pack_kernel<<<(rows + 255) / 256, 256, 0, stream>>>(planes, splits, rows, tokens, packed);
 }
 
 void engram_gate(const __nv_bfloat16* h, const __nv_bfloat16* kv, const __nv_bfloat16* q_weight,

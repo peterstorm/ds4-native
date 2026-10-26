@@ -19,6 +19,7 @@
 #include "core/mx_tiles.hpp"
 #include "core/safetensors.hpp"
 #include "cuda/engram.cuh"
+#include "cuda/planes.cuh"
 #include "cuda/moe.cuh"
 #include "cuda/mx_gemv.cuh"
 #include "io/file.hpp"
@@ -176,7 +177,7 @@ int main(int argc, char** argv) {
     auto* d_first = upload(&first, 1);
     cuda::gemv(d_job, d_first, 1, cuda::job_warps(job), nullptr);
     d_packed[half] = device_alloc<float>(static_cast<size_t>(tokens) * kRows);
-    cuda::engram_pack(d_planes, 1, kRows, tokens, d_packed[half], nullptr);
+    cuda::sum_planes_f32(d_planes, 1, kRows, tokens, d_packed[half], nullptr);
   }
   auto* d_kv = device_alloc<__nv_bfloat16>(static_cast<size_t>(tokens) * kRows);
   cuda::add_round_bf16(d_packed[0], d_packed[1], static_cast<size_t>(tokens) * kRows, d_kv, nullptr);

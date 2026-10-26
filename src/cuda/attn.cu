@@ -75,8 +75,7 @@ __device__ __forceinline__ uint32_t pack_bf16(__nv_bfloat16 lo, __nv_bfloat16 hi
  * -1), scores S = Q K^T on the BF16 MMA, per-head max and probabilities in row
  * order, then P.V on the BF16 MMA into the split's FP32 partial.
  */
-__global__ void __launch_bounds__(kSplitThreads) split_kernel(const __nv_bfloat16* __restrict__ q,
-                                                             const __nv_bfloat16* __restrict__ kv,
+__global__ void __launch_bounds__(kSplitThreads) split_kernel(const __nv_bfloat16* __restrict__ q, KvSources kv,
                                                              const int32_t* __restrict__ idx, int n_idx, float scale,
                                                              AttnScratch scratch) {
   extern __shared__ __align__(16) unsigned char smem[];
@@ -106,8 +105,9 @@ __global__ void __launch_bounds__(kSplitThreads) split_kernel(const __nv_bfloat1
     for (int j = 0; j < kBatch; j++) {
       const int c = threadIdx.x + (base + j) * kSplitThreads, r = c / (kAttnDim / 8), part = c % (kAttnDim / 8);
       const int id = slot_row[r];
-      v[j] = id >= 0 ? __ldg(reinterpret_cast<const uint4*>(kv + static_cast<size_t>(id) * kAttnDim) + part)
-                     : make_uint4(0, 0, 0, 0);
+      const __nv_bfloat16* row = id < kAttnWindow ? kv.window + static_cast<size_t>(id) * kAttnDim
+                                                  : kv.compressed + static_cast<size_t>(id - kAttnWindow) * kAttnDim;
+      v[j] = id >= 0 ? __ldg(reinterpret_cast<const uint4*>(row) + part) : make_uint4(0, 0, 0, 0);
     }
 #pragma unroll
     for (int j = 0; j < kBatch; j++) {
@@ -258,15 +258,20 @@ void rope(__nv_bfloat16* x, int rows, int heads, int head_dim, int rope_dim, con
   rope_kernel<<<dim3(heads, rows), rope_dim / 2, 0, stream>>>(x, heads, head_dim, rope_dim, freqs, positions, inverse);
 }
 
-cudaError_t sparse_attn(const __nv_bfloat16* q, const __nv_bfloat16* kv, const int32_t* idx, int n_idx, const float* sink,
-                        int rows, float scale, AttnScratch scratch, __nv_bfloat16* o, cudaStream_t stream) {
+cudaError_t sparse_attn(const __nv_bfloat16* q, KvSources kv, const int32_t* idx, int n_idx, const float* sink, int rows,
+                        float scale, AttnScratch scratch, __nv_bfloat16* o, cudaStream_t stream) {
   const int splits = attn_splits(n_idx);
   if (n_idx < 1 || splits > kMaxSplits) return cudaErrorInvalidValue;  // more slots than the window plus top-k
-  static const bool configured = [] {
-    cudaFuncSetAttribute(split_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kSplitSmem));
-    return true;
-  }();
-  (void)configured;
+  // The shared-memory opt-in is per device: configure each device on its first launch.
+  static bool configured[64] = {};
+  int device = 0;
+  if (cudaGetDevice(&device) != cudaSuccess || device >= 64) return cudaErrorInvalidDevice;
+  if (!configured[device]) {
+    const cudaError_t e =
+        cudaFuncSetAttribute(split_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kSplitSmem));
+    if (e != cudaSuccess) return e;
+    configured[device] = true;
+  }
   split_kernel<<<dim3(splits, rows), kSplitThreads, kSplitSmem, stream>>>(q, kv, idx, n_idx, scale, scratch);
   combine_kernel<<<dim3(kAttnHeads, rows), kAttnDim, 0, stream>>>(sink, splits, scratch, o);
   return cudaGetLastError();
