@@ -1,4 +1,5 @@
 #include "cuda/act_quant.cuh"
+#include "cuda/mma.cuh"
 #include "cuda/mx_gemv.cuh"
 
 namespace ds4n::cuda {
@@ -19,32 +20,6 @@ __global__ void quantize_kernel(const __nv_bfloat16* __restrict__ x, int tokens,
   const int q = (lane & 15) >> 2, j = lane & 3, hi = lane >> 4;
   codes[b * 256 + (4 * n + q) * 8 + hi * 4 + j] = act::code(v, act::scale_value(exp));
   if (lane == 0) scales[b * kMaxTokens + n] = static_cast<uint8_t>(exp + 127);
-}
-
-__device__ __forceinline__ void mma_mx(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1, uint32_t sfa,
-                                       uint32_t sfb) {
-  const uint16_t zero = 0;
-  asm volatile(
-      "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e2m1.e4m3.f32.ue8m0 "
-      "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
-      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(sfa), "h"(zero), "h"(zero), "r"(sfb),
-        "h"(zero), "h"(zero));
-}
-
-/** Packed MXFP4 bytes -> E2M1 codes in the middle of 8-bit containers (low or high nibbles). */
-__device__ __forceinline__ uint32_t low_codes(uint32_t w) { return (w & 0x0F0F0F0Fu) << 2; }
-__device__ __forceinline__ uint32_t high_codes(uint32_t w) { return ((w >> 4) & 0x0F0F0F0Fu) << 2; }
-
-__device__ __forceinline__ void mma_fp8(float (&d)[4], const uint4& a, uint32_t b0, uint32_t b1, uint32_t sfa,
-                                        uint32_t sfb) {
-  const uint16_t zero = 0;
-  asm volatile(
-      "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
-      "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
-      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-      : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), "r"(b0), "r"(b1), "r"(sfa), "h"(zero), "h"(zero), "r"(sfb),
-        "h"(zero), "h"(zero));
 }
 
 /** The last job whose first warp is <= `warp` (jobs are laid out back to back). */

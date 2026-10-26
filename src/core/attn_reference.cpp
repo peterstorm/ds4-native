@@ -58,10 +58,32 @@ std::vector<float> fp8_quant_dequant(std::span<const float> x) {
   return y;
 }
 
+std::vector<Fp4Block> fp4_quantize_e8m0(std::span<const float> x) {
+  std::vector<Fp4Block> out(x.size() / 32);
+  for (size_t g = 0; g < out.size(); g++) {
+    float amax = 0.0f;
+    for (size_t i = 0; i < 32; i++) amax = std::max(amax, std::fabs(x[g * 32 + i]));
+    const int exp = log2_ceil_bits(std::max(amax, 6.0f * std::ldexp(1.0f, -126)) * (1.0f / 6.0f));
+    const float s = std::ldexp(1.0f, exp);
+    out[g].scale = static_cast<uint8_t>(exp + 127);
+    for (size_t i = 0; i < 32; i++) out[g].codes[i] = e2m1_from_float(std::clamp(x[g * 32 + i] / s, -6.0f, 6.0f));
+  }
+  return out;
+}
+
+std::array<float, 32> fp4_dequantize(const Fp4Block& b) {
+  std::array<float, 32> y{};
+  const float s = mx::e8m0_value(b.scale);
+  for (size_t i = 0; i < 32; i++) y[i] = mx::round_bf16(mx::e2m1_value(b.codes[i]) * s);
+  return y;
+}
+
 std::vector<float> fp4_quant_dequant_e8m0(std::span<const float> x) {
-  return fp4_quant_dequant(x, 32, [](float amax) {
-    return std::ldexp(1.0f, log2_ceil_bits(std::max(amax, 6.0f * std::ldexp(1.0f, -126)) * (1.0f / 6.0f)));
-  });
+  std::vector<float> y;
+  y.reserve(x.size());
+  for (const auto& b : fp4_quantize_e8m0(x))
+    for (float v : fp4_dequantize(b)) y.push_back(v);
+  return y;
 }
 
 std::vector<float> fp4_quant_dequant_e4m3(std::span<const float> x) {

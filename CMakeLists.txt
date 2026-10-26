@@ -19,6 +19,7 @@ add_library(ds4n_core STATIC
   src/core/engram.cpp
   src/core/moe_reference.cpp
   src/core/safetensors.cpp
+  src/core/indexer.cpp
 )
 target_include_directories(ds4n_core PUBLIC src)
 target_compile_options(ds4n_core PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -45,7 +46,7 @@ if(DS4N_CUDA)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
   set(CMAKE_CUDA_ARCHITECTURES OFF)
   set(DS4N_CUDA_FLAGS -gencode=arch=compute_120a,code=sm_120a -lineinfo -Xcompiler=-Wall)
-  add_library(ds4n_cuda STATIC src/cuda/mx_gemv.cu src/cuda/glue.cu src/cuda/attn.cu src/cuda/moe.cu src/cuda/exchange.cu)
+  add_library(ds4n_cuda STATIC src/cuda/mx_gemv.cu src/cuda/glue.cu src/cuda/attn.cu src/cuda/moe.cu src/cuda/exchange.cu src/cuda/indexer.cu src/cuda/select.cu)
   target_compile_options(ds4n_cuda PRIVATE ${DS4N_CUDA_FLAGS})
   target_link_libraries(ds4n_cuda PUBLIC ds4n_core)
   add_executable(ds4n-mx-check src/tools/mx_check.cu)
@@ -64,6 +65,9 @@ if(DS4N_CUDA)
   add_executable(ds4n-miss-bench src/tools/miss_bench.cu)
   target_compile_options(ds4n-miss-bench PRIVATE ${DS4N_CUDA_FLAGS})
   target_link_libraries(ds4n-miss-bench PRIVATE ds4n_io CUDA::cudart)
+  add_executable(ds4n-indexer-check src/tools/indexer_check.cu)
+  target_compile_options(ds4n-indexer-check PRIVATE ${DS4N_CUDA_FLAGS})
+  target_link_libraries(ds4n-indexer-check PRIVATE ds4n_cuda)
   add_executable(ds4n-exchange-check src/tools/exchange_check.cu)
   target_compile_options(ds4n-exchange-check PRIVATE ${DS4N_CUDA_FLAGS})
   target_link_libraries(ds4n-exchange-check PRIVATE ds4n_cuda)
@@ -92,6 +96,7 @@ add_executable(ds4n_tests
   tests/core/test_moe_reference.cpp
   tests/core/test_det_math.cpp
   tests/core/test_safetensors.cpp
+  tests/core/test_indexer.cpp
 )
 target_link_libraries(ds4n_tests PRIVATE ds4n_core doctest::doctest)
 target_compile_options(ds4n_tests PRIVATE -Wall -Wextra)

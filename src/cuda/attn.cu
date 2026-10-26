@@ -1,8 +1,6 @@
-#include <cuda_fp4.h>
-#include <cuda_fp8.h>
-
 #include "core/det_math.hpp"
 #include "cuda/attn.cuh"
+#include "cuda/quant.cuh"
 
 namespace ds4n::cuda {
 namespace {
@@ -10,21 +8,6 @@ namespace {
 __device__ __forceinline__ float warp_max(float v) {
   for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xFFFFFFFFu, v, o));
   return v;
-}
-
-__device__ __forceinline__ int log2_ceil_bits(float v) {
-  const uint32_t bits = __float_as_uint(v);
-  return static_cast<int>((bits >> 23) & 0xFF) - 127 + ((bits & 0x7FFFFF) != 0 ? 1 : 0);
-}
-
-__device__ __forceinline__ float e2m1_round(float q) {
-  const __nv_fp4_storage_t c = __nv_cvt_float_to_fp4(q, __NV_E2M1, cudaRoundNearest);
-  return __half2float(__half(__nv_cvt_fp4_to_halfraw(c, __NV_E2M1)));
-}
-
-__device__ __forceinline__ float e4m3_round(float v) {
-  const __nv_fp8_storage_t c = __nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3);
-  return __half2float(__half(__nv_cvt_fp8_to_halfraw(c, __NV_E4M3)));
 }
 
 /** Kinds of in-place quant-dequant; one warp per group (lanes beyond the group idle). */
@@ -41,14 +24,14 @@ __global__ void qdq_kernel(__nv_bfloat16* __restrict__ x, int groups_total, int 
   const float amax = warp_max(fabsf(v));
   float s, q;
   if constexpr (Kind == Qdq::Fp8E8m0) {
-    s = __uint_as_float(static_cast<uint32_t>(log2_ceil_bits(__fmul_rn(fmaxf(amax, 1e-4f), 1.0f / 448.0f)) + 127) << 23);
-    q = e4m3_round(fminf(fmaxf(__fdiv_rn(v, s), -448.0f), 448.0f));
+    s = __uint_as_float(static_cast<uint32_t>(quant::log2_ceil_bits(__fmul_rn(fmaxf(amax, 1e-4f), 1.0f / 448.0f)) + 127) << 23);
+    q = quant::e4m3_round(fminf(fmaxf(__fdiv_rn(v, s), -448.0f), 448.0f));
   } else if constexpr (Kind == Qdq::Fp4E8m0) {
-    s = __uint_as_float(static_cast<uint32_t>(log2_ceil_bits(__fmul_rn(fmaxf(amax, 6.0f * 0x1p-126f), 1.0f / 6.0f)) + 127) << 23);
-    q = e2m1_round(fminf(fmaxf(__fdiv_rn(v, s), -6.0f), 6.0f));
+    s = __uint_as_float(static_cast<uint32_t>(quant::fp4_e8m0_exponent(amax) + 127) << 23);
+    q = quant::e2m1_round(fminf(fmaxf(__fdiv_rn(v, s), -6.0f), 6.0f));
   } else {
-    s = e4m3_round(__fdiv_rn(fmaxf(amax, 6.0f * 0x1p-9f), 6.0f));
-    q = e2m1_round(fminf(fmaxf(__fdiv_rn(v, s), -6.0f), 6.0f));
+    s = quant::e4m3_round(__fdiv_rn(fmaxf(amax, 6.0f * 0x1p-9f), 6.0f));
+    q = quant::e2m1_round(fminf(fmaxf(__fdiv_rn(v, s), -6.0f), 6.0f));
   }
   if (active) p[lane] = __float2bfloat16_rn(__fmul_rn(q, s));
 }

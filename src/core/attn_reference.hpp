@@ -2,6 +2,7 @@
 // CPU oracle for the attention building blocks of DeepSeek V4.1 (reference
 // model.py precompute_freqs_cis / apply_rotary_emb, kernel.py act_quant
 // in-place, fp4_act_quant, sparse_attn). Values are BF16-representable floats.
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -14,6 +15,18 @@ uint8_t e2m1_from_float(float x);
 
 /** act_quant(inplace): FP8 E4M3 with UE8M0 scale per 32, dequantized back to BF16 values. */
 std::vector<float> fp8_quant_dequant(std::span<const float> x);
+
+/** One block of fp4_act_quant(block 32, E8M0): E2M1 codes (sign in bit 3) and the scale byte. */
+struct Fp4Block {
+  uint8_t scale;                 // E8M0: 2^(scale - 127)
+  std::array<uint8_t, 32> codes;  // E2M1
+};
+
+/** fp4_act_quant(block 32, E8M0 scales) of a length that is a multiple of 32. */
+std::vector<Fp4Block> fp4_quantize_e8m0(std::span<const float> x);
+
+/** The BF16 values a quantized block stands for (exact). */
+std::array<float, 32> fp4_dequantize(const Fp4Block& b);
 
 /** fp4_act_quant(block 32, E8M0 scales, inplace): the indexer's queries and keys. */
 std::vector<float> fp4_quant_dequant_e8m0(std::span<const float> x);

@@ -115,7 +115,7 @@ with the routing round trip.
 | RMSNorm, hc_mixes + Sinkhorn, hc_pre/hc_post | F32 small | ~0.3 GB | replicated | **done**; hc_pre/post bit-identical, RMSNorm 99.96 % and hc_mixes to 1.5e-5 (oracle sums sequentially) |
 | RoPE (YaRN for compressed layers) | — | — | local | **done**, bit-identical |
 | Compressor (ratio 2 pooling / ratio 1 proj) | F32 / BF16 | small | replicated | todo |
-| Indexer scores + two-level top-k | FP8 + BF16 | small, grows with context | heads split, all-reduce scores | todo |
+| Indexer scores + two-level top-k | FP8 + BF16 | 68 B per position | replicated (no score exchange) | **done**: keys in an MXFP4 tile cache, scores on the block-scaled MMA, multi-block radix top-k (ties to the lower position); bit-identical to `core/indexer` at every stage; scores 19.6 us at 1M positions, top-512 15-24 us (plain launches) |
 | sparse_attn (window + 512 selected, sinks) | — | KV gather ~1.3 MB/layer | heads split | correctness version (99.96 %), 173 us/layer: tensor-core rewrite todo |
 | Engram rows + wkv + gate | FP8 rows (disk) + FP8 wkv | 48 rows + 0.32 GB | rows replicated, wkv split | hashing + row decode done (CPU); GPU todo |
 | Router top-6, Routing plan, SwiGLU, combine | — | — | replicated routing (bit-identical on both GPUs) | **done**, 100 % bit-identical end to end; MoE layer 109 us, perf todo |
