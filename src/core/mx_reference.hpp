@@ -10,9 +10,8 @@
 //   GGML MXFP4 block: 1 E8M0 byte, then 16 bytes; byte j holds element j in the
 //   low nibble and element j+16 in the high nibble.
 //
-// Summation order is this oracle's own definition: each 32-wide block's dot
-// product is formed exactly and rounded once to FP32, scaled by both
-// power-of-two scales, and accumulated over blocks in K order in FP32.
+// Accumulation follows the sm_120 block-scaled MMA bit for bit (mma_step_*),
+// over K blocks in order: the GPU GEMVs match these dot products exactly.
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -49,6 +48,19 @@ std::vector<ActBlock> act_quant(std::span<const float> x);
 float ggml_block_element(std::span<const std::byte, kGgmlBlockBytes> block, size_t i);
 
 /**
+ * One k32 step of the sm_120 block-scaled MMA (mma.sync kind::mxf8f6f4) for
+ * one output: activation block `a` times 32 weight codes (E2M1 in the low
+ * nibble, or E4M3) under E8M0 scale `w_scale`, added to `acc`. Measured on the
+ * hardware (bit-identical across shapes, splits and token counts): each
+ * product is aligned by its unnormalized exponent (the operands' exponents
+ * summed, subnormals at the minimum exponent), the products and the incoming
+ * accumulator are truncated toward zero 25 bits below the largest of those
+ * exponents, summed exactly, and rounded toward zero to FP32.
+ */
+float mma_step_e2m1(float acc, const ActBlock& a, std::span<const uint8_t, kBlock> w_codes, uint8_t w_scale);
+float mma_step_e4m3(float acc, const ActBlock& a, std::span<const uint8_t, kBlock> w_codes, uint8_t w_scale);
+
+/**
  * FP32 dot product of quantized activations with one weight row over blocks
  * [first, first + count) (the whole row when count spans it). Not rounded to BF16.
  */
@@ -60,6 +72,14 @@ float fp4_row_dot(std::span<const ActBlock> act, std::span<const std::byte> row,
  * this row's 32x32 weight tile in K block b. Not rounded to BF16.
  */
 float fp8_row_dot(std::span<const ActBlock> act, std::span<const uint8_t> codes, std::span<const uint8_t> scales);
+
+/**
+ * One SwiGLU activation as the reference Expert computes it: gate and up are
+ * the BF16 outputs of their GEMMs; up is clamped to +-limit and gate from
+ * above (training's limits), silu(gate) * up in FP32, times the routing
+ * weight, rounded to BF16.
+ */
+float swiglu(float gate, float up, float weight, float limit);
 
 /** Reference linear: every output row's FP32 dot product, rounded to BF16. */
 std::vector<float> fp4_linear(std::span<const ActBlock> act, std::span<const std::byte> matrix, size_t rows);

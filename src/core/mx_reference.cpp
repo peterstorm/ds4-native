@@ -4,6 +4,9 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <limits>
+
+#include "core/det_math.hpp"
 
 namespace ds4n::mx {
 namespace {
@@ -29,6 +32,36 @@ int log2_ceil_bits(float v) {
   const uint32_t bits = std::bit_cast<uint32_t>(v);
   const int exp = static_cast<int>((bits >> 23) & 0xFF) - 127;
   return exp + ((bits & 0x7FFFFF) != 0 ? 1 : 0);
+}
+
+/** Exponent of a code's significand as the hardware aligns it (subnormals at the minimum exponent). */
+int e4m3_exponent(uint8_t code) { return std::max((code >> 3) & 0xF, 1) - 7; }
+int e2m1_exponent(uint8_t code) { return std::max((code >> 1) & 0x3, 1) - 1; }
+
+/** One product of a k32 MMA step: its exact value and its unnormalized exponent (the operands' exponents summed). */
+struct Product {
+  double value;
+  int exp;
+};
+
+/** `v` rounded toward zero to FP32. */
+float to_float_rz(double v) {
+  float f = static_cast<float>(v);
+  if (std::fabs(double(f)) > std::fabs(v)) f = std::nextafter(f, 0.0f);
+  return f;
+}
+
+/** The MMA step of mma_step_e2m1 / mma_step_e4m3 over prepared products. */
+constexpr int kMmaAlignBits = 25;
+float mma_step(float acc, std::span<const Product, kBlock> products) {
+  int top = acc != 0.0f ? std::ilogb(acc) : std::numeric_limits<int>::min();
+  for (const auto& p : products)
+    if (p.value != 0.0) top = std::max(top, p.exp);
+  if (top == std::numeric_limits<int>::min()) return acc;
+  const double grid = std::ldexp(1.0, top - kMmaAlignBits);
+  double sum = std::trunc(double(acc) / grid) * grid;  // every term < 2^(top+2): the sum is exact in double
+  for (const auto& p : products) sum += std::trunc(p.value / grid) * grid;
+  return to_float_rz(sum);
 }
 
 }  // namespace
@@ -89,26 +122,57 @@ float ggml_block_element(std::span<const std::byte, kGgmlBlockBytes> block, size
   return e2m1_value(i < 16 ? (byte & 0x0F) : (byte >> 4));
 }
 
+namespace {
+
+/** One activation block times 32 weight codes of a format given by its value and exponent decoders. */
+template <class Value, class Exponent>
+float mma_step_codes(float acc, const ActBlock& a, std::span<const uint8_t, kBlock> w, uint8_t w_scale, Value value_of,
+                     Exponent exponent_of) {
+  const double scale = double(e8m0_value(a.scale)) * e8m0_value(w_scale);
+  const int scale_exp = int{a.scale} + int{w_scale} - 254;
+  std::array<Product, kBlock> products;
+  for (size_t i = 0; i < kBlock; i++)
+    products[i] = {double(e4m3_value(a.codes[i])) * value_of(w[i]) * scale,
+                   e4m3_exponent(a.codes[i]) + exponent_of(w[i]) + scale_exp};
+  return mma_step(acc, products);
+}
+
+}  // namespace
+
+float mma_step_e2m1(float acc, const ActBlock& a, std::span<const uint8_t, kBlock> w_codes, uint8_t w_scale) {
+  return mma_step_codes(acc, a, w_codes, w_scale, e2m1_value, e2m1_exponent);
+}
+
+float mma_step_e4m3(float acc, const ActBlock& a, std::span<const uint8_t, kBlock> w_codes, uint8_t w_scale) {
+  return mma_step_codes(acc, a, w_codes, w_scale, e4m3_value, e4m3_exponent);
+}
+
 float fp4_row_dot(std::span<const ActBlock> act, std::span<const std::byte> row, size_t first, size_t count) {
   float acc = 0.0f;
+  std::array<uint8_t, kBlock> w;
   for (size_t b = first; b < first + count; b++) {
     const auto block = row.subspan(b * kGgmlBlockBytes).first<kGgmlBlockBytes>();
-    double exact = 0.0;  // 32 products of <=5 significant bits: exact in double
-    for (size_t i = 0; i < kBlock; i++) exact += double(e4m3_value(act[b].codes[i])) * ggml_block_element(block, i);
-    const float partial = static_cast<float>(exact);
-    acc += partial * e8m0_value(act[b].scale) * e8m0_value(std::to_integer<uint8_t>(block[0]));
+    for (size_t i = 0; i < kBlock; i++) {
+      const auto byte = std::to_integer<uint8_t>(block[1 + (i & 15)]);
+      w[i] = i < 16 ? (byte & 0x0F) : (byte >> 4);
+    }
+    acc = mma_step_e2m1(acc, act[b], w, std::to_integer<uint8_t>(block[0]));
   }
   return acc;
 }
 
 float fp8_row_dot(std::span<const ActBlock> act, std::span<const uint8_t> codes, std::span<const uint8_t> scales) {
   float acc = 0.0f;
-  for (size_t b = 0; b < act.size(); b++) {
-    double exact = 0.0;  // E4M3 x E4M3 products have <= 8 significant bits: exact in double
-    for (size_t i = 0; i < kBlock; i++) exact += double(e4m3_value(act[b].codes[i])) * e4m3_value(codes[b * kBlock + i]);
-    acc += static_cast<float>(exact) * e8m0_value(act[b].scale) * e8m0_value(scales[b]);
-  }
+  for (size_t b = 0; b < act.size(); b++)
+    acc = mma_step_e4m3(acc, act[b], codes.subspan(b * kBlock).first<kBlock>(), scales[b]);
   return acc;
+}
+
+float swiglu(float gate, float up, float weight, float limit) {
+  const float g = std::min(gate, limit);
+  const float u = std::clamp(up, -limit, limit);
+  const float silu = g / (1.0f + det::exp(-g));
+  return round_bf16(weight * (silu * u));  // weights * x, then .to(bf16)
 }
 
 std::vector<float> fp4_linear(std::span<const ActBlock> act, std::span<const std::byte> matrix, size_t rows) {
@@ -126,12 +190,7 @@ std::vector<float> expert_forward(std::span<const float> x, float routing_weight
   const auto g = fp4_linear(ax, gate, inter);  // BF16, read back as FP32 (the reference's .float())
   const auto u = fp4_linear(ax, up, inter);
   std::vector<float> h(inter);
-  for (size_t i = 0; i < inter; i++) {
-    const float gi = std::min(g[i], swiglu_limit);
-    const float ui = std::clamp(u[i], -swiglu_limit, swiglu_limit);
-    const float silu = gi / (1.0f + std::exp(-gi));
-    h[i] = round_bf16(routing_weight * (silu * ui));  // weights * x, then .to(bf16)
-  }
+  for (size_t i = 0; i < inter; i++) h[i] = swiglu(g[i], u[i], routing_weight, swiglu_limit);
   return fp4_linear(act_quant(h), down, x.size());
 }
 

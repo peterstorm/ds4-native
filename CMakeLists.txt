@@ -17,6 +17,7 @@ add_library(ds4n_core STATIC
   src/core/hc_reference.cpp
   src/core/attn_reference.cpp
   src/core/engram.cpp
+  src/core/moe_reference.cpp
 )
 target_include_directories(ds4n_core PUBLIC src)
 target_compile_options(ds4n_core PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -43,7 +44,7 @@ if(DS4N_CUDA)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
   set(CMAKE_CUDA_ARCHITECTURES OFF)
   set(DS4N_CUDA_FLAGS -gencode=arch=compute_120a,code=sm_120a -lineinfo -Xcompiler=-Wall)
-  add_library(ds4n_cuda STATIC src/cuda/mx_gemv.cu src/cuda/glue.cu src/cuda/attn.cu)
+  add_library(ds4n_cuda STATIC src/cuda/mx_gemv.cu src/cuda/glue.cu src/cuda/attn.cu src/cuda/moe.cu)
   target_compile_options(ds4n_cuda PRIVATE ${DS4N_CUDA_FLAGS})
   target_link_libraries(ds4n_cuda PUBLIC ds4n_core)
   add_executable(ds4n-mx-check src/tools/mx_check.cu)
@@ -62,6 +63,12 @@ if(DS4N_CUDA)
   add_executable(ds4n-miss-bench src/tools/miss_bench.cu)
   target_compile_options(ds4n-miss-bench PRIVATE ${DS4N_CUDA_FLAGS})
   target_link_libraries(ds4n-miss-bench PRIVATE ds4n_io CUDA::cudart)
+  add_executable(ds4n-det-check src/tools/det_check.cu)
+  target_compile_options(ds4n-det-check PRIVATE ${DS4N_CUDA_FLAGS})
+  target_include_directories(ds4n-det-check PRIVATE src)
+  add_executable(ds4n-moe-check src/tools/moe_check.cu)
+  target_compile_options(ds4n-moe-check PRIVATE ${DS4N_CUDA_FLAGS})
+  target_link_libraries(ds4n-moe-check PRIVATE ds4n_cuda ds4n_io)
 endif()
 
 enable_testing()
@@ -78,6 +85,8 @@ add_executable(ds4n_tests
   tests/core/test_hc_reference.cpp
   tests/core/test_attn_reference.cpp
   tests/core/test_engram.cpp
+  tests/core/test_moe_reference.cpp
+  tests/core/test_det_math.cpp
 )
 target_link_libraries(ds4n_tests PRIVATE ds4n_core doctest::doctest)
 target_compile_options(ds4n_tests PRIVATE -Wall -Wextra)

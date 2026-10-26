@@ -1,0 +1,456 @@
+// ds4n-moe-check: one MoE layer on the GPU versus the CPU oracle
+// (core/moe_reference). Routed Experts are real (both Halves from the store);
+// the router and the FP8 shared Expert are random until the Backbone is
+// converted. Both Halves run on this GPU in turn, standing in for the two
+// GPUs, and are combined as the exchange will. Then one GPU's decode-layer MoE
+// work is timed per stage, with weights rotated over copies so L2 cannot serve them.
+//
+//   ds4n-moe-check --store STORE --layer L [--tokens T] [--splits S] [--iters I] [--seed N]
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <random>
+#include <string>
+#include <vector>
+
+#include "core/moe_reference.hpp"
+#include "core/mx_reference.hpp"
+#include "core/mx_tiles.hpp"
+#include "core/store_layout.hpp"
+#include "cuda/glue.cuh"
+#include "cuda/moe.cuh"
+#include "cuda/mx_gemv.cuh"
+#include "io/file.hpp"
+
+using namespace ds4n;
+
+namespace {
+
+[[noreturn]] void die(const std::string& msg) {
+  std::fprintf(stderr, "ds4n-moe-check: %s\n", msg.c_str());
+  std::exit(1);
+}
+
+void ck(cudaError_t e, const char* what) {
+  if (e != cudaSuccess) die(std::string(what) + ": " + cudaGetErrorString(e));
+}
+
+template <class T>
+T* device_alloc(size_t n) {
+  T* p = nullptr;
+  ck(cudaMalloc(&p, n * sizeof(T)), "cudaMalloc");
+  return p;
+}
+
+template <class T>
+T* upload(const T* data, size_t n) {
+  T* d = device_alloc<T>(n);
+  ck(cudaMemcpy(d, data, n * sizeof(T), cudaMemcpyHostToDevice), "upload");
+  return d;
+}
+
+template <class T>
+std::vector<T> download(const T* d, size_t n) {
+  std::vector<T> v(n);
+  ck(cudaMemcpy(v.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost), "download");
+  return v;
+}
+
+constexpr int kDim = static_cast<int>(store::kHidden);
+constexpr int kRows = static_cast<int>(store::kHalfRows);
+constexpr int kGateBlocks = static_cast<int>(store::kGateBlocks);
+constexpr int kDownBlocks = static_cast<int>(store::kHalfDownBlocks);
+constexpr float kRouteScale = 1.5f;
+
+/** A batched GEMV launch living on the device. */
+struct Launch {
+  cuda::GemvJob* jobs;
+  int* first;
+  int n, warps;
+};
+
+Launch make_launch(const std::vector<cuda::GemvJob>& jobs) {
+  std::vector<int> first;
+  int warps = 0;
+  for (const auto& j : jobs) {
+    first.push_back(warps);
+    warps += cuda::job_warps(j);
+  }
+  return {upload(jobs.data(), jobs.size()), upload(first.data(), first.size()), static_cast<int>(jobs.size()), warps};
+}
+
+/** A random FP8 matrix (E4M3 codes, 32x32 E8M0 tile scales), host form and device tiles. */
+struct Fp8Matrix {
+  std::vector<uint8_t> codes, scales;
+  int rows, blocks;
+  std::vector<std::byte> tiles;
+};
+
+Fp8Matrix random_fp8(std::mt19937& rng, int rows, int blocks) {
+  Fp8Matrix m{std::vector<uint8_t>(static_cast<size_t>(rows) * blocks * 32),
+              std::vector<uint8_t>(static_cast<size_t>(rows + 31) / 32 * blocks), rows, blocks, {}};
+  for (auto& c : m.codes) {
+    c = static_cast<uint8_t>(rng());
+    if ((c & 0x7F) == 0x7F) c = 0x10;  // no NaN codes
+  }
+  for (auto& s : m.scales) s = static_cast<uint8_t>(113 + rng() % 2);  // 2^-14 or 2^-13
+  auto tiled = mx::tile_fp8_matrix(m.codes, m.scales, rows, blocks);
+  if (!tiled) die(tiled.error().what);
+  m.tiles = std::move(tiled.value());
+  return m;
+}
+
+moe::RowDot fp8_dot(const Fp8Matrix& m) {
+  return [&m](std::span<const mx::ActBlock> act, size_t row, size_t first, size_t count) {
+    const size_t k = static_cast<size_t>(m.blocks) * 32;
+    return mx::fp8_row_dot(act.subspan(first, count), std::span(m.codes).subspan(row * k + first * 32, count * 32),
+                           std::span(m.scales).subspan(row / 32 * m.blocks + first, count));
+  };
+}
+
+moe::RowDot fp4_dot(const std::vector<std::byte>& ggml, int blocks) {
+  const size_t row_bytes = static_cast<size_t>(blocks) * mx::kGgmlBlockBytes;
+  return [&ggml, row_bytes](std::span<const mx::ActBlock> act, size_t row, size_t first, size_t count) {
+    return mx::fp4_row_dot(act, std::span(ggml).subspan(row * row_bytes, row_bytes), first, count);
+  };
+}
+
+/** One Half of a routed Expert: the tiled payload on the device and GGML matrices for the oracle. */
+struct RoutedHalf {
+  uint8_t* device;
+  std::vector<std::byte> gate, up, down;
+};
+
+/** One Half of the shared Expert. */
+struct SharedHalf {
+  Fp8Matrix gate, up, down;
+  uint8_t *d_gate, *d_up, *d_down;
+};
+
+/** Fraction of equal floats and the largest difference relative to the largest reference magnitude. */
+struct Agreement {
+  size_t same = 0, total = 0;
+  double max_err = 0, scale = 0;
+  void add(std::span<const float> got, std::span<const float> want) {
+    for (size_t i = 0; i < want.size(); i++) {
+      same += got[i] == want[i];
+      total++;
+      max_err = std::max(max_err, std::fabs(double(got[i]) - want[i]));
+      scale = std::max(scale, std::fabs(double(want[i])));
+    }
+  }
+  double relative() const { return scale > 0 ? max_err / scale : max_err; }
+  double percent() const { return 100.0 * same / std::max<size_t>(total, 1); }
+};
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  std::string store_path;
+  uint32_t layer = 3;
+  int tokens = 1, splits = 1, iters = 200, sets = 8;
+  unsigned seed = 7;
+  for (int i = 1; i < argc; i++) {
+    const std::string s = argv[i];
+    if (i + 1 >= argc) die("missing value for " + s);
+    if (s == "--store") store_path = argv[++i];
+    else if (s == "--layer") layer = static_cast<uint32_t>(std::stoul(argv[++i]));
+    else if (s == "--tokens") tokens = std::stoi(argv[++i]);
+    else if (s == "--splits") splits = std::stoi(argv[++i]);
+    else if (s == "--iters") iters = std::stoi(argv[++i]);
+    else if (s == "--seed") seed = static_cast<unsigned>(std::stoul(argv[++i]));
+    else die("unknown argument " + s);
+  }
+  if (store_path.empty() || tokens < 1 || tokens > cuda::kMaxTokens || splits < 1) die("bad arguments");
+  std::mt19937 rng(seed);
+  std::normal_distribution<float> normal(0.0f, 1.0f);
+
+  // Router and input (random, BF16 values).
+  std::vector<__nv_bfloat16> router(static_cast<size_t>(moe::kExperts) * kDim);
+  for (auto& w : router) w = __float2bfloat16(0.02f * normal(rng));
+  std::vector<float> bias(moe::kExperts);
+  for (auto& b : bias) b = 0.05f * normal(rng);
+  std::vector<float> xf(static_cast<size_t>(tokens) * kDim);
+  std::vector<__nv_bfloat16> xb(xf.size());
+  for (size_t i = 0; i < xf.size(); i++) {
+    xf[i] = mx::round_bf16(normal(rng));
+    xb[i] = __float2bfloat16(xf[i]);
+  }
+  auto* d_router = upload(router.data(), router.size());
+  auto* d_bias = upload(bias.data(), bias.size());
+  auto* d_xf = upload(xf.data(), xf.size());
+  auto* d_xb = upload(xb.data(), xb.size());
+  auto* d_logits = device_alloc<float>(static_cast<size_t>(moe::kExperts) * cuda::kMaxTokens);
+  auto* d_experts = device_alloc<int32_t>(static_cast<size_t>(tokens) * moe::kTopK);
+  auto* d_weights = device_alloc<float>(static_cast<size_t>(tokens) * moe::kTopK);
+  auto* d_plan = device_alloc<moe::Plan>(1);
+  const cuda::RouterParams router_params{d_bias, nullptr, kRouteScale};
+  cuda::bf16_gemv(d_router, d_xf, moe::kExperts, kDim, tokens, d_logits, nullptr);
+  cuda::route(d_logits, tokens, nullptr, router_params, d_experts, d_weights, d_plan, nullptr);
+  ck(cudaDeviceSynchronize(), "route");
+
+  // Routing versus the oracle on the same logits.
+  const auto logits = download(d_logits, static_cast<size_t>(moe::kExperts) * cuda::kMaxTokens);
+  const auto gpu_experts = download(d_experts, static_cast<size_t>(tokens) * moe::kTopK);
+  const auto gpu_weights = download(d_weights, static_cast<size_t>(tokens) * moe::kTopK);
+  const moe::Plan plan = download(d_plan, 1)[0];
+  std::vector<moe::Route> routes;
+  size_t id_mismatch = 0;
+  Agreement weight_agreement;
+  for (int n = 0; n < tokens; n++) {
+    std::vector<float> token_logits(moe::kExperts);
+    for (int e = 0; e < moe::kExperts; e++) token_logits[e] = logits[static_cast<size_t>(e) * cuda::kMaxTokens + n];
+    auto r = moe::route(token_logits, bias, kRouteScale);
+    if (!r) die(r.error().what);
+    for (int k = 0; k < moe::kTopK; k++) id_mismatch += r.value().expert[k] != gpu_experts[n * moe::kTopK + k];
+    weight_agreement.add(std::span(gpu_weights).subspan(n * moe::kTopK, moe::kTopK), r.value().weight);
+    routes.push_back(r.value());
+  }
+  const auto oracle_plan = moe::plan(routes);
+  if (!oracle_plan) die(oracle_plan.error().what);
+  const moe::Plan& want_plan = oracle_plan.value();
+  bool plan_same = plan.tokens == want_plan.tokens && plan.jobs == want_plan.jobs;
+  for (int j = 0; plan_same && j < moe::kMaxJobs; j++) {
+    plan_same = plan.expert[j] == want_plan.expert[j] && plan.token_mask[j] == want_plan.token_mask[j];
+    for (int n = 0; n < cuda::kMaxTokens; n++) plan_same = plan_same && plan.weight[j][n] == want_plan.weight[j][n];
+  }
+  std::printf("route %d token%s: Expert ids %s, weights %.2f%% bit-identical (max error %.3g), plan %s, %d jobs\n",
+              tokens, tokens > 1 ? "s" : "", id_mismatch ? "DIFFER" : "identical", weight_agreement.percent(),
+              weight_agreement.relative(), plan_same ? "identical" : "DIFFERS", plan.jobs);
+  if (id_mismatch || plan.jobs < 1) die("routing disagrees with the oracle");
+
+  // Weights: both Halves of each routed Expert from the store; a random FP8 shared Expert.
+  auto fd = io::open_file(store_path, io::Access::ReadDirect);
+  if (!fd) die(fd.error().what);
+  io::AlignedBuffer header(store::kHeaderBytes);
+  if (auto r = io::pread_exact(fd.value(), header.span(), 0); !r) die(r.error().what);
+  if (auto h = store::decode_header(header.span()); !h) die(h.error().what);
+  io::AlignedBuffer staging(store::kHalfStride);
+  std::vector<std::array<RoutedHalf, 2>> routed(plan.jobs);
+  for (int j = 0; j < plan.jobs; j++)
+    for (uint32_t h = 0; h < 2; h++) {
+      const auto at = store::half_offset({layer, static_cast<uint32_t>(plan.expert[j])}, h);
+      if (auto r = io::pread_exact(fd.value(), staging.span(), at); !r) die(r.error().what);
+      const auto payload = staging.span().first(store::kHalfPayloadBytes);
+      RoutedHalf& half = routed[j][h];
+      half.device = upload(reinterpret_cast<const uint8_t*>(payload.data()), payload.size());
+      auto part = [&](int i, int rows, int blocks) {
+        auto g = mx::untile_matrix(payload.subspan(i * store::kHalfPartBytes, store::kHalfPartBytes), rows, blocks);
+        if (!g) die(g.error().what);
+        return std::move(g.value());
+      };
+      half.gate = part(0, kRows, kGateBlocks);
+      half.up = part(1, kRows, kGateBlocks);
+      half.down = part(2, kDim, kDownBlocks);
+    }
+  std::array<std::unique_ptr<SharedHalf>, 2> shared;
+  for (auto& s : shared) {
+    s = std::make_unique<SharedHalf>(SharedHalf{random_fp8(rng, kRows, kGateBlocks), random_fp8(rng, kRows, kGateBlocks),
+                                                random_fp8(rng, kDim, kDownBlocks), nullptr, nullptr, nullptr});
+    s->d_gate = upload(reinterpret_cast<const uint8_t*>(s->gate.tiles.data()), s->gate.tiles.size());
+    s->d_up = upload(reinterpret_cast<const uint8_t*>(s->up.tiles.data()), s->up.tiles.size());
+    s->d_down = upload(reinterpret_cast<const uint8_t*>(s->down.tiles.data()), s->down.tiles.size());
+  }
+
+  // One GPU's MoE work for Half h, as launches.
+  const cuda::ActFragments x_act{device_alloc<uint8_t>(kGateBlocks * 256), device_alloc<uint8_t>(kGateBlocks * 8),
+                                 kGateBlocks};
+  const int sb = cuda::split_blocks_for(kGateBlocks, splits);
+  auto make_buffers = [&] {
+    const size_t plane = static_cast<size_t>(splits) * kRows * cuda::kMaxTokens;
+    return cuda::MoeBuffers{device_alloc<float>(cuda::kJobSlots * plane),
+                            device_alloc<float>(cuda::kJobSlots * plane),
+                            device_alloc<uint8_t>(static_cast<size_t>(cuda::kJobSlots) * kDownBlocks * 256),
+                            device_alloc<uint8_t>(static_cast<size_t>(cuda::kJobSlots) * kDownBlocks * 8),
+                            device_alloc<float>(static_cast<size_t>(cuda::kJobSlots) * kDim * cuda::kMaxTokens),
+                            kRows,
+                            splits,
+                            kDim};
+  };
+  struct HalfLaunches {
+    Launch gate_up, shared_gate_up, down, shared_down;
+  };
+  auto make_launches = [&](const cuda::MoeBuffers& buf, const std::vector<const uint8_t*>& payloads,
+                           const uint8_t* s_gate, const uint8_t* s_up, const uint8_t* s_down) {
+    std::vector<cuda::GemvJob> gate_up, down;
+    for (int j = 0; j < plan.jobs; j++) {
+      const auto hid = buf.hidden_of(j);
+      gate_up.push_back({payloads[j], x_act.codes, x_act.scales, buf.gate_of(j), kRows, kGateBlocks, splits, sb});
+      gate_up.push_back({payloads[j] + store::kHalfPartBytes, x_act.codes, x_act.scales, buf.up_of(j), kRows,
+                         kGateBlocks, splits, sb});
+      down.push_back({payloads[j] + 2 * store::kHalfPartBytes, hid.codes, hid.scales, buf.down_of(j), kDim, kDownBlocks,
+                      1, kDownBlocks});
+    }
+    const auto shid = buf.hidden_of(cuda::kSharedJob);
+    return HalfLaunches{
+        make_launch(gate_up),
+        make_launch({{s_gate, x_act.codes, x_act.scales, buf.gate_of(cuda::kSharedJob), kRows, kGateBlocks, splits, sb},
+                     {s_up, x_act.codes, x_act.scales, buf.up_of(cuda::kSharedJob), kRows, kGateBlocks, splits, sb}}),
+        make_launch(down),
+        make_launch({{s_down, shid.codes, shid.scales, buf.down_of(cuda::kSharedJob), kDim, kDownBlocks, 1, kDownBlocks}})};
+  };
+  auto run_moe = [&](const HalfLaunches& l, const cuda::MoeBuffers& buf, float* y, cudaStream_t st) {
+    cuda::mx_gemv(l.gate_up.jobs, l.gate_up.first, l.gate_up.n, l.gate_up.warps, st);
+    cuda::fp8_gemv(l.shared_gate_up.jobs, l.shared_gate_up.first, l.shared_gate_up.n, l.shared_gate_up.warps, st);
+    cuda::swiglu_quantize(d_plan, buf, moe::kSwigluLimit, st);
+    cuda::mx_gemv(l.down.jobs, l.down.first, l.down.n, l.down.warps, st);
+    cuda::fp8_gemv(l.shared_down.jobs, l.shared_down.first, l.shared_down.n, l.shared_down.warps, st);
+    cuda::combine(d_plan, buf, y, st);
+  };
+
+  cuda::quantize_activations(d_xb, tokens, x_act, nullptr);
+  std::array<cuda::MoeBuffers, 2> bufs{make_buffers(), make_buffers()};
+  std::array<float*, 2> y{device_alloc<float>(static_cast<size_t>(tokens) * kDim),
+                          device_alloc<float>(static_cast<size_t>(tokens) * kDim)};
+  auto* d_out = device_alloc<__nv_bfloat16>(static_cast<size_t>(tokens) * kDim);
+  for (int h = 0; h < 2; h++) {
+    std::vector<const uint8_t*> payloads;
+    for (int j = 0; j < plan.jobs; j++) payloads.push_back(routed[j][h].device);
+    run_moe(make_launches(bufs[h], payloads, shared[h]->d_gate, shared[h]->d_up, shared[h]->d_down), bufs[h], y[h],
+            nullptr);
+  }
+  cuda::add_round_bf16(y[0], y[1], static_cast<size_t>(tokens) * kDim, d_out, nullptr);
+  ck(cudaDeviceSynchronize(), "moe");
+
+  // Oracle, token by token: Halves, per-GPU partials, final output.
+  std::array<std::vector<float>, 2> gpu_y{download(y[0], static_cast<size_t>(tokens) * kDim),
+                                          download(y[1], static_cast<size_t>(tokens) * kDim)};
+  std::vector<float> gpu_out;
+  for (const auto& v : download(d_out, static_cast<size_t>(tokens) * kDim)) gpu_out.push_back(__bfloat162float(v));
+  size_t code_same = 0, code_total = 0;
+  Agreement partial_agreement, out_agreement;
+  auto check_hidden = [&](const cuda::MoeBuffers& buf, int slot, int n, std::span<const float> hidden) {
+    const auto act = buf.hidden_of(slot);
+    const auto codes = download(act.codes, static_cast<size_t>(kDownBlocks) * 256);
+    const auto scales = download(act.scales, static_cast<size_t>(kDownBlocks) * 8);
+    const auto want = mx::act_quant(hidden);
+    for (int b = 0; b < kDownBlocks; b++) {
+      code_same += scales[b * 8 + n] == want[b].scale;
+      code_total++;
+      for (int i = 0; i < 32; i++) {
+        const int q = (i & 15) >> 2, jj = i & 3, hi = i >> 4;
+        code_same += codes[b * 256 + (4 * n + q) * 8 + hi * 4 + jj] == want[b].codes[i];
+        code_total++;
+      }
+    }
+  };
+  for (int n = 0; n < tokens; n++) {
+    const auto x_blocks = mx::act_quant(std::span(xf).subspan(static_cast<size_t>(n) * kDim, kDim));
+    std::array<std::vector<float>, 2> partial;
+    for (int h = 0; h < 2; h++) {
+      std::vector<std::vector<float>> outs;
+      for (int j = 0; j < plan.jobs; j++) {
+        if (!((plan.token_mask[j] >> n) & 1)) continue;
+        const RoutedHalf& rh = routed[j][h];
+        const moe::HalfWeights w{fp4_dot(rh.gate, kGateBlocks), fp4_dot(rh.up, kGateBlocks),
+                                 fp4_dot(rh.down, kDownBlocks), kRows, kGateBlocks, kDim};
+        const auto hidden = moe::half_hidden(x_blocks, plan.weight[j][n], w, splits);
+        check_hidden(bufs[h], j, n, hidden);
+        outs.push_back(moe::half_down(hidden, w));
+      }
+      const SharedHalf& sh = *shared[h];
+      const moe::HalfWeights sw{fp8_dot(sh.gate), fp8_dot(sh.up), fp8_dot(sh.down), kRows, kGateBlocks, kDim};
+      const auto shidden = moe::half_hidden(x_blocks, 1.0f, sw, splits);
+      check_hidden(bufs[h], cuda::kSharedJob, n, shidden);
+      auto p = moe::combine(outs, moe::half_down(shidden, sw));
+      if (!p) die(p.error().what);
+      partial[h] = std::move(p.value());
+      partial_agreement.add(std::span(gpu_y[h]).subspan(static_cast<size_t>(n) * kDim, kDim), partial[h]);
+    }
+    const auto want = moe::finalize(partial[0], partial[1]);
+    if (!want) die(want.error().what);
+    out_agreement.add(std::span(gpu_out).subspan(static_cast<size_t>(n) * kDim, kDim), want.value());
+  }
+  std::printf("hidden fragments (swiglu + act_quant): %.4f%% of %zu bytes identical\n",
+              100.0 * code_same / std::max<size_t>(code_total, 1), code_total);
+  std::printf("per-GPU partials: %.4f%% bit-identical, max error %.3g of the largest\n", partial_agreement.percent(),
+              partial_agreement.relative());
+  std::printf("MoE output (BF16): %.4f%% bit-identical, max error %.3g of the largest\n", out_agreement.percent(),
+              out_agreement.relative());
+  if (out_agreement.relative() > 1e-2) die("MoE output disagrees with the oracle");
+
+  // Timing: one GPU's decode-layer MoE work (Half 0), weights rotated over `sets` copies.
+  std::vector<HalfLaunches> set_launches;
+  for (int s = 0; s < sets; s++) {
+    std::vector<const uint8_t*> payloads;
+    for (int j = 0; j < plan.jobs; j++) {
+      auto* copy = device_alloc<uint8_t>(store::kHalfPayloadBytes);
+      ck(cudaMemcpy(copy, routed[j][0].device, store::kHalfPayloadBytes, cudaMemcpyDeviceToDevice), "copy");
+      payloads.push_back(copy);
+    }
+    const SharedHalf& sh = *shared[0];
+    auto copy_of = [](const uint8_t* src, size_t n) {
+      auto* d = device_alloc<uint8_t>(n);
+      ck(cudaMemcpy(d, src, n, cudaMemcpyDeviceToDevice), "copy");
+      return d;
+    };
+    set_launches.push_back(make_launches(bufs[0], payloads, copy_of(sh.d_gate, sh.gate.tiles.size()),
+                                         copy_of(sh.d_up, sh.up.tiles.size()), copy_of(sh.d_down, sh.down.tiles.size())));
+  }
+  const char* names[] = {"quantize x", "router GEMV", "route", "routed gate/up", "shared gate/up",
+                         "swiglu+quantize", "routed down", "shared down", "combine"};
+  constexpr int kStages = 9;
+  cudaEvent_t ev[kStages + 1];
+  for (auto& e : ev) ck(cudaEventCreate(&e), "event");
+  std::vector<double> stage_ms(kStages, 0.0);
+  auto decode_layer = [&](int s, bool timed) {
+    const HalfLaunches& l = set_launches[s];
+    int k = 0;
+    auto mark = [&] {
+      if (timed) ck(cudaEventRecord(ev[k]), "record");
+      k++;
+    };
+    mark();
+    cuda::quantize_activations(d_xb, tokens, x_act, nullptr);
+    mark();
+    cuda::bf16_gemv(d_router, d_xf, moe::kExperts, kDim, tokens, d_logits, nullptr);
+    mark();
+    cuda::route(d_logits, tokens, nullptr, router_params, d_experts, d_weights, d_plan, nullptr);
+    mark();
+    cuda::mx_gemv(l.gate_up.jobs, l.gate_up.first, l.gate_up.n, l.gate_up.warps, nullptr);
+    mark();
+    cuda::fp8_gemv(l.shared_gate_up.jobs, l.shared_gate_up.first, l.shared_gate_up.n, l.shared_gate_up.warps, nullptr);
+    mark();
+    cuda::swiglu_quantize(d_plan, bufs[0], moe::kSwigluLimit, nullptr);
+    mark();
+    cuda::mx_gemv(l.down.jobs, l.down.first, l.down.n, l.down.warps, nullptr);
+    mark();
+    cuda::fp8_gemv(l.shared_down.jobs, l.shared_down.first, l.shared_down.n, l.shared_down.warps, nullptr);
+    mark();
+    cuda::combine(d_plan, bufs[0], y[0], nullptr);
+    mark();
+  };
+  for (int i = 0; i < iters; i++) {
+    decode_layer(i % sets, true);
+    ck(cudaEventSynchronize(ev[kStages]), "sync");
+    for (int k = 0; k < kStages; k++) {
+      float ms = 0;
+      ck(cudaEventElapsedTime(&ms, ev[k], ev[k + 1]), "elapsed");
+      stage_ms[k] += ms;
+    }
+  }
+  cudaEvent_t a, b;
+  ck(cudaEventCreate(&a), "event");
+  ck(cudaEventCreate(&b), "event");
+  ck(cudaEventRecord(a), "record");
+  for (int i = 0; i < iters; i++) decode_layer(i % sets, false);
+  ck(cudaEventRecord(b), "record");
+  ck(cudaEventSynchronize(b), "sync");
+  float total_ms = 0;
+  ck(cudaEventElapsedTime(&total_ms, a, b), "elapsed");
+  const double per_layer_us = total_ms / iters * 1000.0;
+  const double bytes = plan.jobs * double(store::kHalfPayloadBytes) + shared[0]->gate.tiles.size() * 2.0 +
+                       shared[0]->down.tiles.size() + router.size() * 2.0;
+  std::printf("one GPU's decode-layer MoE (%d token%s, %d routed Halves + shared, splits %d):\n", tokens,
+              tokens > 1 ? "s" : "", plan.jobs, splits);
+  for (int k = 0; k < kStages; k++) std::printf("  %-16s %7.1f us\n", names[k], stage_ms[k] / iters * 1000.0);
+  std::printf("  back to back: %.1f us per layer, %.0f GB/s; x40 layers = %.2f ms/token\n", per_layer_us,
+              bytes / (per_layer_us * 1e-6) / 1e9, per_layer_us * 40 / 1000.0);
+  return 0;
+}

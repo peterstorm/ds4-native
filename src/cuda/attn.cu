@@ -1,6 +1,7 @@
 #include <cuda_fp4.h>
 #include <cuda_fp8.h>
 
+#include "core/det_math.hpp"
 #include "cuda/attn.cuh"
 
 namespace ds4n::cuda {
@@ -58,7 +59,7 @@ __global__ void rope_kernel(__nv_bfloat16* __restrict__ x, int heads, int head_d
   if (i >= rope_dim / 2) return;
   __nv_bfloat16* tail = x + (static_cast<size_t>(row) * heads + h) * head_dim + head_dim - rope_dim;
   const float angle = __fmul_rn(static_cast<float>(positions[row]), freqs[i]);
-  const float c = cosf(angle), s = inverse ? -sinf(angle) : sinf(angle);
+  const float c = det::cos(angle), s = inverse ? -det::sin(angle) : det::sin(angle);
   const float a = __bfloat162float(tail[2 * i]), b = __bfloat162float(tail[2 * i + 1]);
   tail[2 * i] = __float2bfloat16_rn(__fsub_rn(__fmul_rn(a, c), __fmul_rn(b, s)));
   tail[2 * i + 1] = __float2bfloat16_rn(__fadd_rn(__fmul_rn(a, s), __fmul_rn(b, c)));
@@ -111,10 +112,10 @@ __global__ void __launch_bounds__(kAttnThreads) sparse_attn_kernel(const __nv_bf
     if (threadIdx.x == 0) {
       float bmax = run_max;
       for (int r = 0; r < bn; r++) bmax = fmaxf(bmax, score[r]);
-      const float rescale = expf(__fsub_rn(run_max, bmax));
+      const float rescale = det::exp(__fsub_rn(run_max, bmax));
       float bsum = 0.0f;
       for (int r = 0; r < bn; r++) {
-        const float e = expf(__fsub_rn(score[r], bmax));
+        const float e = det::exp(__fsub_rn(score[r], bmax));
         bsum = __fadd_rn(bsum, e);
         prob[r] = __bfloat162float(__float2bfloat16_rn(e));
       }
@@ -139,7 +140,7 @@ __global__ void __launch_bounds__(kAttnThreads) sparse_attn_kernel(const __nv_bf
     __syncthreads();
   }
   if (threadIdx.x == 0) {
-    sum_exp = __fadd_rn(sum_exp, expf(__fsub_rn(sink[h], run_max)));
+    sum_exp = __fadd_rn(sum_exp, det::exp(__fsub_rn(sink[h], run_max)));
     shared_max = sum_exp;
   }
   __syncthreads();

@@ -80,6 +80,10 @@ One conversation's KV state plus its token history.
 **KV checkpoint**:
 A persisted Session state that can be restored instead of re-prefilled.
 
+**Routing plan**:
+One Step's routing: the distinct routed Experts in ascending id, the tokens each serves and their weights; its order is the combine order (`moe::Plan`).
+_Avoid_: dispatch table, job list
+
 **Cache-conditional routing**:
 Adding a bonus λ to resident Experts' router scores before top-6 selection (approximation, opt-in).
 _Avoid_: CCR in prose (acronym fine in tables), routing bias (ambiguous with model's own bias terms)

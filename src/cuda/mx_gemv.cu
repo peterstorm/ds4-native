@@ -1,19 +1,10 @@
-#include <cuda_fp8.h>
-
+#include "cuda/act_quant.cuh"
 #include "cuda/mx_gemv.cuh"
 
 namespace ds4n::cuda {
 namespace {
 
-constexpr float kE4M3Max = 448.0f;
 constexpr int kDepth = 4;  // weight pairs in flight per lane: 2 -> 1418 GB/s, 4 -> 1525, 8 -> 1323 (registers)
-
-/** UE8M0 exponent of the reference act_quant: ceil(log2(max(amax, 1e-4) / 448)) from FP32 bits. */
-__device__ __forceinline__ int act_scale_exponent(float amax) {
-  const float v = __fmul_rn(fmaxf(amax, 1e-4f), 1.0f / kE4M3Max);
-  const uint32_t bits = __float_as_uint(v);
-  return static_cast<int>((bits >> 23) & 0xFF) - 127 + ((bits & 0x7FFFFF) != 0 ? 1 : 0);
-}
 
 __global__ void quantize_kernel(const __nv_bfloat16* __restrict__ x, int tokens, int blocks,
                                 uint8_t* __restrict__ codes, uint8_t* __restrict__ scales) {
@@ -24,12 +15,9 @@ __global__ void quantize_kernel(const __nv_bfloat16* __restrict__ x, int tokens,
   const float v = n < tokens ? __bfloat162float(x[static_cast<size_t>(n) * blocks * 32 + b * 32 + lane]) : 0.0f;
   float amax = fabsf(v);
   for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, o));
-  const int exp = n < tokens ? act_scale_exponent(amax) : 0;
-  const float s = __uint_as_float(static_cast<uint32_t>(exp + 127) << 23);
-  const float y = fminf(fmaxf(__fdiv_rn(v, s), -kE4M3Max), kE4M3Max);
-  const uint8_t code = static_cast<uint8_t>(__nv_cvt_float_to_fp8(y, __NV_SATFINITE, __NV_E4M3));
+  const int exp = n < tokens ? act::scale_exponent(amax) : 0;
   const int q = (lane & 15) >> 2, j = lane & 3, hi = lane >> 4;
-  codes[b * 256 + (4 * n + q) * 8 + hi * 4 + j] = code;
+  codes[b * 256 + (4 * n + q) * 8 + hi * 4 + j] = act::code(v, act::scale_value(exp));
   if (lane == 0) scales[b * kMaxTokens + n] = static_cast<uint8_t>(exp + 127);
 }
 

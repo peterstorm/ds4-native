@@ -7,6 +7,8 @@
 
 #include <cstdint>
 
+#include "core/split_k.hpp"
+
 namespace ds4n::cuda {
 
 constexpr int kMaxTokens = 8;
@@ -43,8 +45,7 @@ struct GemvJob {
   int split_blocks;  // K blocks per split, multiple of 4; splits * split_blocks >= blocks
 };
 
-/** K blocks per split for `splits` ways over `blocks` (a multiple of 4, so FP4 pairs and scale groups align). */
-constexpr int split_blocks_for(int blocks, int splits) { return ((blocks + splits - 1) / splits + 3) / 4 * 4; }
+using gemv::split_blocks_for;
 
 /** Warps a job occupies: one per (16-row tile, split). */
 constexpr int job_warps(const GemvJob& j) { return j.rows / 16 * j.splits; }

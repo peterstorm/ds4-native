@@ -1,3 +1,4 @@
+#include "core/det_math.hpp"
 #include "cuda/glue.cuh"
 
 namespace ds4n::cuda {
@@ -30,7 +31,7 @@ __global__ void rmsnorm_kernel(const __nv_bfloat16* __restrict__ x, const __nv_b
     const float v = __bfloat162float(row[i]);
     sq = __fmaf_rn(v, v, sq);
   }
-  const float r = rsqrtf(__fadd_rn(__fdiv_rn(block_sum<Threads>(sq, red), static_cast<float>(dim)), eps));
+  const float r = det::rsqrt(__fadd_rn(__fdiv_rn(block_sum<Threads>(sq, red), static_cast<float>(dim)), eps));
   for (int i = threadIdx.x; i < dim; i += Threads)
     out[static_cast<size_t>(blockIdx.x) * dim + i] =
         __float2bfloat16_rn(__fmul_rn(__bfloat162float(w[i]), __fmul_rn(__bfloat162float(row[i]), r)));
@@ -70,7 +71,7 @@ __global__ void hc_partial_kernel(const __nv_bfloat16* __restrict__ h, const flo
   }
 }
 
-__device__ float sigmoidf_rn(float v) { return __fdiv_rn(1.0f, __fadd_rn(1.0f, expf(-v))); }
+__device__ float sigmoidf_rn(float v) { return __fdiv_rn(1.0f, __fadd_rn(1.0f, det::exp(-v))); }
 
 /** Sum, in index order 0..3, of the values held by lanes base + i*stride. */
 __device__ __forceinline__ float ordered_sum4(float v, int base, int stride) {
@@ -95,7 +96,7 @@ __global__ void hc_finalize_kernel(const float* __restrict__ scratch, HcParams p
     for (int part = 0; part < kHcPartials; part++)
       acc = __fadd_rn(acc, scratch[(static_cast<size_t>(token) * kHcPartials + part) * (1 + kHcMix) + lane]);
   const float sumsq = __shfl_sync(0xFFFFFFFFu, acc, 0);
-  const float rs = rsqrtf(__fadd_rn(__fdiv_rn(sumsq, static_cast<float>(width)), p.norm_eps));
+  const float rs = det::rsqrt(__fadd_rn(__fdiv_rn(sumsq, static_cast<float>(width)), p.norm_eps));
   HcMixes& o = out[token];
 
   const float m = __fmul_rn(__shfl_sync(0xFFFFFFFFu, acc, lane % kHcMix + 1), rs);  // raw mix m[lane % 24]
@@ -109,7 +110,7 @@ __global__ void hc_finalize_kernel(const float* __restrict__ scratch, HcParams p
   float mx = __shfl_sync(0xFFFFFFFFu, c, 4 * j);
 #pragma unroll
   for (int i = 1; i < n; i++) mx = fmaxf(mx, __shfl_sync(0xFFFFFFFFu, c, 4 * j + i));
-  c = expf(__fsub_rn(c, mx));
+  c = det::exp(__fsub_rn(c, mx));
   c = __fadd_rn(__fdiv_rn(c, ordered_sum4(c, 4 * j, 1)), p.hc_eps);
   c = __fdiv_rn(c, __fadd_rn(ordered_sum4(c, k, 4), p.hc_eps));  // columns
   for (int it = 0; it < p.sinkhorn_iters - 1; it++) {

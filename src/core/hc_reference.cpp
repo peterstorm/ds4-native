@@ -3,11 +3,12 @@
 #include <algorithm>
 #include <cmath>
 
+#include "core/det_math.hpp"
 #include "core/mx_reference.hpp"
 
 namespace ds4n::hc {
 namespace {
-float sigmoid(float v) { return 1.0f / (1.0f + std::exp(-v)); }
+float sigmoid(float v) { return 1.0f / (1.0f + det::exp(-v)); }
 }  // namespace
 
 std::vector<float> rmsnorm(std::span<const float> x, std::span<const float> weight, float eps) {
@@ -34,7 +35,7 @@ Mixes split_sinkhorn(std::span<const float, kMix> mixes, std::span<const float, 
   for (size_t j = 0; j < n; j++) {
     const float mx = *std::max_element(c[j].begin(), c[j].end());
     float s = 0.0f;
-    for (size_t k = 0; k < n; k++) s += (c[j][k] = std::exp(c[j][k] - mx));
+    for (size_t k = 0; k < n; k++) s += (c[j][k] = det::exp(c[j][k] - mx));
     for (size_t k = 0; k < n; k++) c[j][k] = c[j][k] / s + eps;
   }
   auto normalize_cols = [&] {

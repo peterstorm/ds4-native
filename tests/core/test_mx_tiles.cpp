@@ -19,20 +19,20 @@ std::vector<std::byte> random_ggml(std::mt19937& rng, size_t rows, size_t blocks
   return m;
 }
 
-/** E2M1 code in an MMA byte container (value in bits 5..2), back to its value. */
-float container_e2m1(uint8_t byte) { return e2m1_value((byte >> 2) & 0xF); }
+/** E2M1 code in an MMA byte container (code in bits 5..2). */
+uint8_t container_e2m1(uint8_t byte) { return (byte >> 2) & 0xF; }
 
 /**
  * CPU emulation of what one warp computes for one 16-row tile: every lane
  * gathers its A fragments (shifted E2M1 containers) and scale from the tiled
- * layout exactly as the kernel will, and the products are summed per output
- * row and block in the same order as the oracle.
+ * layout exactly as the kernel will; each row's 32 codes then go through the
+ * oracle's MMA step, so only the gathering is under test.
  */
 std::vector<float> emulate_tile(std::span<const std::byte> tiled, size_t blocks, size_t tile,
                                 std::span<const ActBlock> act) {
   std::vector<float> out(kTileRows, 0.0f);
   for (size_t b = 0; b < blocks; b++) {
-    double exact[kTileRows] = {};
+    uint8_t row_codes[kTileRows][kBlock] = {};
     uint8_t row_scale[kTileRows] = {};
     for (unsigned lane = 0; lane < 32; lane++) {
       const unsigned g = lane >> 2, q = lane & 3;
@@ -47,14 +47,12 @@ std::vector<float> emulate_tile(std::span<const std::byte> tiled, size_t blocks,
         for (unsigned j = 0; j < 4; j++) {
           const unsigned row = g + 8 * (reg & 1);
           const unsigned k = 4 * q + j + 16 * (reg >> 1);
-          const uint8_t byte = static_cast<uint8_t>(a[reg] >> (8 * j));
-          exact[row] += double(container_e2m1(byte)) * e4m3_value(act[b].codes[k]);
+          row_codes[row][k] = container_e2m1(static_cast<uint8_t>(a[reg] >> (8 * j)));
         }
       const uint32_t s = lane_scales(tiled, blocks, tile, b / 4, lane);
       row_scale[g + 8 * (lane & 1)] = static_cast<uint8_t>(s >> (8 * (b % 4)));
     }
-    for (size_t r = 0; r < kTileRows; r++)
-      out[r] += static_cast<float>(exact[r]) * e8m0_value(act[b].scale) * e8m0_value(row_scale[r]);
+    for (size_t r = 0; r < kTileRows; r++) out[r] = mma_step_e2m1(out[r], act[b], row_codes[r], row_scale[r]);
   }
   return out;
 }
@@ -95,19 +93,17 @@ TEST_CASE("FP8 tiles: lane fragments emulate to the fp8 oracle exactly") {
   const auto act = act_quant(x);
   for (size_t tile = 0; tile < rows / kTileRows; tile++) {
     const std::byte* t = tiled.data() + tile * fp8_tile_bytes(blocks);
-    double exact[kTileRows];
     float out[kTileRows] = {};
     for (size_t b = 0; b < blocks; b++) {
-      std::fill(std::begin(exact), std::end(exact), 0.0);
+      uint8_t row_codes[kTileRows][kBlock] = {};
       for (unsigned lane = 0; lane < 32; lane++)
         for (unsigned reg = 0; reg < 4; reg++)
           for (unsigned j = 0; j < 4; j++) {
             const unsigned row = (lane >> 2) + 8 * (reg & 1), kk = 4 * (lane & 3) + j + 16 * (reg >> 1);
-            const auto code = std::to_integer<uint8_t>(t[b * 512 + lane * 16 + reg * 4 + j]);
-            exact[row] += double(e4m3_value(code)) * e4m3_value(act[b].codes[kk]);
+            row_codes[row][kk] = std::to_integer<uint8_t>(t[b * 512 + lane * 16 + reg * 4 + j]);
           }
-      const float sw = e8m0_value(std::to_integer<uint8_t>(t[blocks * 512 + b]));
-      for (size_t r = 0; r < kTileRows; r++) out[r] += static_cast<float>(exact[r]) * e8m0_value(act[b].scale) * sw;
+      const auto sw = std::to_integer<uint8_t>(t[blocks * 512 + b]);
+      for (size_t r = 0; r < kTileRows; r++) out[r] = mma_step_e4m3(out[r], act[b], row_codes[r], sw);
     }
     for (size_t r = 0; r < kTileRows; r++) {
       const size_t row = tile * kTileRows + r;

@@ -5,6 +5,7 @@
 #include <cmath>
 #include <numbers>
 
+#include "core/det_math.hpp"
 #include "core/mx_reference.hpp"
 
 namespace ds4n::attn {
@@ -93,7 +94,7 @@ void apply_rope(std::span<float> x, const Rope& r, std::span<const float> freqs,
   float* tail = x.data() + x.size() - r.dim;
   for (int i = 0; i < r.dim / 2; i++) {
     const float angle = static_cast<float>(pos) * freqs[i];
-    const float c = std::cos(angle), s = inverse ? -std::sin(angle) : std::sin(angle);
+    const float c = det::cos(angle), s = inverse ? -det::sin(angle) : det::sin(angle);
     const float a = tail[2 * i], b = tail[2 * i + 1];
     tail[2 * i] = mx::round_bf16(a * c - b * s);
     tail[2 * i + 1] = mx::round_bf16(a * s + b * c);
@@ -123,10 +124,10 @@ std::vector<float> sparse_attn(std::span<const float> q, std::span<const float> 
         s[i] = dot * scale;
         bmax = std::max(bmax, s[i]);
       }
-      const float rescale = std::exp(run_max - bmax);
+      const float rescale = det::exp(run_max - bmax);
       float bsum = 0.0f;
       for (size_t i = 0; i < bn; i++) {
-        s[i] = std::exp(s[i] - bmax);
+        s[i] = det::exp(s[i] - bmax);
         bsum += s[i];
       }
       sum_exp = sum_exp * rescale + bsum;
@@ -138,7 +139,7 @@ std::vector<float> sparse_attn(std::span<const float> q, std::span<const float> 
       }
       run_max = bmax;
     }
-    sum_exp += std::exp(sink[h] - run_max);
+    sum_exp += det::exp(sink[h] - run_max);
     for (int k = 0; k < d; k++) out[static_cast<size_t>(h) * d + k] = mx::round_bf16(acc[k] / sum_exp);
   }
   return out;
