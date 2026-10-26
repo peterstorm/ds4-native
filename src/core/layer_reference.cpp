@@ -261,3 +261,15 @@ Stream decode_layer(const HostLayer& w, const ExpertHalf& experts, State& state,
 }
 
 }  // namespace ds4n::layer_ref
+
+namespace ds4n::layer_ref {
+
+std::vector<float> logits(const Stream& s, std::span<const float> norm, std::span<const float> head) {
+  const auto x = hc::rmsnorm(hc::hc_pre(s.h, s.pre_mix), norm, model::kNormEps);
+  const size_t vocab = head.size() / x.size();
+  std::vector<float> out(vocab);
+  for (size_t r = 0; r < vocab; r++) out[r] = reduce::bf16_gemv(head.subspan(r * x.size(), x.size()), x, 1);
+  return out;
+}
+
+}  // namespace ds4n::layer_ref

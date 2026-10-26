@@ -25,3 +25,13 @@ Result<HostLayer, io::IoError> load_layer(const Backbone& b, int layer);
 Result<std::vector<float>, io::IoError> load_bf16_row(const Backbone& b, const std::string& name, int64_t row);
 
 }  // namespace ds4n::engine
+
+namespace ds4n::engine {
+
+/** The final norm [5120] and the head [129280][5120], as BF16 values. */
+struct HostHead {
+  std::vector<float> norm, head;
+};
+Result<HostHead, io::IoError> load_head(const Backbone& b);
+
+}  // namespace ds4n::engine

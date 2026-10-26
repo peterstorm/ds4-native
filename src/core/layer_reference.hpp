@@ -58,3 +58,14 @@ Stream decode_layer(const HostLayer& w, const ExpertHalf& experts, State& state,
                     std::span<const float> engram_rows, Trace* trace = nullptr);
 
 }  // namespace ds4n::layer_ref
+
+namespace ds4n::layer_ref {
+
+/**
+ * The model's output after the last layer: head(rmsnorm(hc_pre(h, pre_mix), norm))
+ * in FP32 (reference ParallelHead: F.linear(x.float(), weight)), `head` being
+ * [vocab][5120] BF16 values. Rows follow cuda::bf16_gemv's order (one split).
+ */
+std::vector<float> logits(const Stream& s, std::span<const float> norm, std::span<const float> head);
+
+}  // namespace ds4n::layer_ref

@@ -112,6 +112,9 @@ struct Decoder::Gpu {
   cuda::MoeBuffers moe{};
   cuda::GemvJob* moe_jobs = nullptr;
   int* moe_first = nullptr;
+  // The head: this GPU's half of the vocabulary.
+  bf16 *norm = nullptr, *head = nullptr;
+  float *head_planes = nullptr, *head_out = nullptr;
 };
 
 Decoder::Decoder(std::array<int, 2> devices) {
@@ -492,6 +495,44 @@ StepTrace Decoder::decode_layer(int layer, int64_t p, std::span<const uint8_t> e
   trace.idx.resize(n_idx);
   check(cudaMemcpy(trace.idx.data(), lead.idx, n_idx * 4, cudaMemcpyDeviceToHost), "idx");
   return trace;
+}
+
+void Decoder::add_head(const std::vector<float>& norm, const std::vector<float>& head) {
+  constexpr size_t half = kVocab / kGpus;
+  if (norm.size() != static_cast<size_t>(kDim) || head.size() != static_cast<size_t>(kVocab) * kDim)
+    throw CudaError("add_head: the norm or head has the wrong shape");
+  for (auto& gp : gpus_) {
+    Gpu& s = *gp;
+    check(cudaSetDevice(s.device), "cudaSetDevice");
+    s.norm = s.arena.upload_bf16(norm);
+    std::vector<bf16> rows(half * kDim);
+    const size_t first = static_cast<size_t>(s.rank) * half * kDim;
+    for (size_t i = 0; i < rows.size(); i++) rows[i] = __float2bfloat16(head[first + i]);
+    s.head = s.arena.upload(rows.data(), rows.size());
+    s.head_planes = s.arena.alloc<float>(half * 8);
+    s.head_out = s.arena.alloc<float>(half);
+  }
+}
+
+std::vector<float> Decoder::logits() {
+  constexpr int half = kVocab / kGpus;
+  std::vector<float> out(kVocab);
+  for (auto& gp : gpus_) {
+    Gpu& s = *gp;
+    if (s.head == nullptr) throw CudaError("logits() before add_head()");
+    check(cudaSetDevice(s.device), "cudaSetDevice");
+    const cudaStream_t st = s.stream;
+    cuda::hc_pre(s.h, s.prev_mix, kDim, 1, s.x0, st);
+    cuda::rmsnorm(s.x0, s.norm, kDim, 1, kNormEps, s.xf, st);
+    cuda::bf16_to_f32(s.xf, kDim, s.xf_f, st);
+    cuda::bf16_gemv(s.head, s.xf_f, half, kDim, 1, 1, s.head_planes, st);
+    cuda::sum_planes_f32(s.head_planes, 1, half, 1, s.head_out, st);
+    check(cudaMemcpyAsync(out.data() + static_cast<size_t>(s.rank) * half, s.head_out, half * sizeof(float),
+                          cudaMemcpyDeviceToHost, st),
+          "logits");
+    check(cudaStreamSynchronize(st), "logits");
+  }
+  return out;
 }
 
 }  // namespace ds4n::engine

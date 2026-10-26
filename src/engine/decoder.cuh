@@ -69,6 +69,12 @@ class Decoder {
    */
   StepTrace decode_layer(int layer, int64_t p, std::span<const uint8_t> engram_rows, const ExpertSlots& experts);
 
+  /** Upload the final norm and the head (BF16 values [129280][5120]); each GPU keeps its half of the vocabulary. */
+  void add_head(const std::vector<float>& norm, const std::vector<float>& head);
+
+  /** FP32 logits [129280] of the current token after the last layer (rank 0's half, then rank 1's). */
+  std::vector<float> logits();
+
  private:
   struct Gpu;
   std::array<std::unique_ptr<Gpu>, 2> gpus_;

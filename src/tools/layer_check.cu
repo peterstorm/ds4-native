@@ -5,13 +5,15 @@
 // the attention and MoE outputs after their exchanges, and the stream. Engram
 // table rows are random (identical on both sides) unless real tables are given.
 //   ds4n-layer-check --backbone SAFETENSORS --store STORE [--first L] [--layers N] [--steps S]
-//                    [--expert-layers M] [--gguf-meta GGUF --engram-shards A,B,...]
+//                    [--expert-layers M] [--gguf-meta GGUF --engram-shards A,B,...] [--head 1]
+// --head 1 also compares the full logits after the last layer of every step.
 // With --gguf-meta (a GGUF carrying deepseek41.engram.*) and --engram-shards (the files holding
 // the Engram tables), Engram layers hash the tokens and read real table rows.
 // --expert-layers M reads layer L's Experts from store layer L % M (a store holding only the
 // first M layers can still exercise later layers: exactness needs the same Experts on both sides).
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -94,6 +96,7 @@ int main(int argc, char** argv) {
   std::string backbone_path, store_path;
   int first = 0, layers = 4, steps = 3, expert_layers = model::kLayers;
   std::string gguf_meta, engram_shards;
+  bool with_head = false;
   for (int i = 1; i < argc; i++) {
     const std::string s = argv[i];
     if (i + 1 >= argc) die("missing value for " + s);
@@ -105,6 +108,7 @@ int main(int argc, char** argv) {
     else if (s == "--expert-layers") expert_layers = std::stoi(argv[++i]);
     else if (s == "--gguf-meta") gguf_meta = argv[++i];
     else if (s == "--engram-shards") engram_shards = argv[++i];
+    else if (s == "--head" && argv[++i] == std::string("1")) with_head = true;
     else die("unknown argument " + s);
   }
   if (backbone_path.empty() || store_path.empty() || layers < 1 || first < 0 || first + layers > model::kLayers ||
@@ -122,6 +126,14 @@ int main(int argc, char** argv) {
     decoder.add_layer(w.value());
     host.push_back(std::move(w).value());
     std::printf("layer %d loaded\n", l);
+  }
+  std::optional<engine::HostHead> head;
+  if (with_head) {
+    auto h = engine::load_head(backbone.value());
+    if (!h) die(h.error().what);
+    decoder.add_head(h.value().norm, h.value().head);
+    head = std::move(h).value();
+    std::printf("head loaded\n");
   }
 
   // Experts: device payloads per (rank, layer, expert) for the decoder, GGML Halves for the oracle.
@@ -237,6 +249,18 @@ int main(int argc, char** argv) {
                   step, token, l, idx_ok ? "identical" : "DIFFER", plan_ok ? "identical" : "DIFFERS", got.plan.jobs,
                   attn.same, attn.total, moe_c.same, moe_c.total, h.same, h.total);
       if (!(idx_ok && plan_ok && attn_ok && moe_ok && h_ok)) die("the GPUs and the oracle disagree");
+    }
+    if (with_head) {
+      const auto got = decoder.logits();
+      const auto want = layer_ref::logits(stream, head->norm, head->head);
+      Compare logit;
+      const bool ok = logit.add(got, want);
+      std::vector<int> order(got.size());
+      for (size_t i = 0; i < order.size(); i++) order[i] = static_cast<int>(i);
+      std::partial_sort(order.begin(), order.begin() + 5, order.end(), [&](int a, int b) { return got[a] > got[b]; });
+      std::printf("step %d logits: %zu/%zu identical; top-5 ids %d %d %d %d %d\n", step, logit.same, logit.total, order[0],
+                  order[1], order[2], order[3], order[4]);
+      if (!ok) die("the logits differ");
     }
   }
   std::printf("%d steps x %d layers: GPUs and oracle bit-identical\n", steps, layers);

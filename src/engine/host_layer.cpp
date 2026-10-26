@@ -152,3 +152,29 @@ Result<std::vector<float>, io::IoError> load_bf16_row(const Backbone& b, const s
 }
 
 }  // namespace ds4n::engine
+
+namespace ds4n::engine {
+
+Result<HostHead, io::IoError> load_head(const Backbone& b) {
+  using R = Result<HostHead, io::IoError>;
+  auto bf16 = [&](const std::string& name, std::initializer_list<uint64_t> shape) -> Result<std::vector<float>, io::IoError> {
+    const auto t = safetensors::expect(b.header, name, safetensors::Dtype::BF16, std::span(shape.begin(), shape.size()));
+    if (!t) return Result<std::vector<float>, io::IoError>::err({t.error().what});
+    auto bytes = io::read_tensor(b.fd, *t.value());
+    if (!bytes) return Result<std::vector<float>, io::IoError>::err(bytes.error());
+    std::vector<float> out(bytes.value().size() / 2);
+    for (size_t i = 0; i < out.size(); i++) {
+      uint16_t bits;
+      std::memcpy(&bits, bytes.value().data() + 2 * i, 2);
+      out[i] = mx::bf16_value(bits);
+    }
+    return Result<std::vector<float>, io::IoError>::ok(std::move(out));
+  };
+  auto norm = bf16("norm.weight", {model::kDim});
+  if (!norm) return R::err(norm.error());
+  auto head = bf16("head.weight", {model::kVocab, model::kDim});
+  if (!head) return R::err(head.error());
+  return R::ok({std::move(norm).value(), std::move(head).value()});
+}
+
+}  // namespace ds4n::engine
