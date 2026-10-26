@@ -13,6 +13,7 @@
 
 #include "core/hc_reference.hpp"
 #include "core/mx_reference.hpp"
+#include "core/reduce.hpp"
 #include "cuda/glue.cuh"
 
 using namespace ds4n;
@@ -48,9 +49,9 @@ std::vector<float> from_bf16(const std::vector<__nv_bfloat16>& b) {
   for (size_t i = 0; i < b.size(); i++) f[i] = __bfloat162float(b[i]);
   return f;
 }
-void report(const char* what, size_t n, size_t exact, double max_rel, double limit) {
+void report(const char* what, size_t n, size_t exact, double max_rel) {
   std::printf("%-10s %8zu values, %.4f%% bit-identical, max relative error %.3g\n", what, n, 100.0 * exact / n, max_rel);
-  if (max_rel > limit) die(std::string(what) + " exceeds tolerance");
+  if (exact != n) die(std::string(what) + " differs from the oracle");
 }
 }  // namespace
 
@@ -83,7 +84,7 @@ int main(int argc, char** argv) {
       max_rel = std::max(max_rel, std::fabs(double(y[t * dim + i]) - want[i]) / (std::fabs(double(want[i])) + 1e-3));
     }
   }
-  report("rmsnorm", x.size(), exact, max_rel, 1e-2);  // a BF16 ulp is 2^-8 relative
+  report("rmsnorm", x.size(), exact, max_rel);
 
   // hc_mixes.
   const auto h = bf16_random(static_cast<size_t>(tokens) * width, 1.0f);
@@ -117,7 +118,7 @@ int main(int argc, char** argv) {
       for (int k = 0; k < 4; k++) cmp(gmix[t].comb[j][k], want.comb[j][k]);
     }
   }
-  report("hc_mixes", count, exact, max_rel, 1e-4);
+  report("hc_mixes", count, exact, max_rel);
 
   // hc_pre / hc_post with the GPU's own mixes: same op order as the oracle, so bit-identical.
   __nv_bfloat16 *dpre, *dpost;
@@ -141,10 +142,10 @@ int main(int argc, char** argv) {
     for (int i = 0; i < dim; i++) pre_exact += pre[t * dim + i] == wp[i];
     for (int i = 0; i < width; i++) post_exact += post[static_cast<size_t>(t) * width + i] == wq[i];
   }
-  report("hc_pre", static_cast<size_t>(tokens) * dim, pre_exact, pre_exact == size_t(tokens) * dim ? 0 : 1, 0.5);
-  report("hc_post", h.size(), post_exact, post_exact == h.size() ? 0 : 1, 0.5);
+  report("hc_pre", static_cast<size_t>(tokens) * dim, pre_exact, 0);
+  report("hc_post", h.size(), post_exact, 0);
 
-  // BF16 GEMV at head scale: one GPU's vocabulary half.
+  // BF16 GEMV at head scale (one GPU's vocabulary half) and router scale with split-K.
   const int rows = 64640;
   std::vector<__nv_bfloat16> hw(static_cast<size_t>(rows) * dim);
   for (auto& v : hw) v = __float2bfloat16(n(rng) * 0.02f);
@@ -153,22 +154,24 @@ int main(int argc, char** argv) {
   auto dhw = upload(hw);
   auto dxf = upload(xf);
   float* dlog;
-  ck(cudaMalloc(&dlog, static_cast<size_t>(rows) * 8 * 4), "malloc");
-  cuda::bf16_gemv(dhw, dxf, rows, dim, tokens, 1, dlog, nullptr);
-  const auto logits = download(dlog, static_cast<size_t>(rows) * 8);
-  max_rel = 0;
-  for (int r = 0; r < rows; r += 997)
-    for (int t = 0; t < tokens; t++) {
-      double want = 0, mag = 0;
-      for (int i = 0; i < dim; i++) {
-        const double p = double(__bfloat162float(hw[static_cast<size_t>(r) * dim + i])) * xf[static_cast<size_t>(t) * dim + i];
-        want += p;
-        mag += std::fabs(p);
+  ck(cudaMalloc(&dlog, static_cast<size_t>(rows) * 8 * 4 * 5), "malloc");  // room for 5 split planes
+  for (int splits : {1, 5}) {
+    const int checked_rows = splits == 1 ? rows : 384;
+    cuda::bf16_gemv(dhw, dxf, checked_rows, dim, tokens, splits, dlog, nullptr);
+    const auto planes = download(dlog, static_cast<size_t>(checked_rows) * 8 * splits);
+    size_t same = 0, total = 0;
+    for (int r = 0; r < checked_rows; r += (splits == 1 ? 97 : 1))
+      for (int t = 0; t < tokens; t++) {
+        std::vector<float> wr(dim);
+        for (int i = 0; i < dim; i++) wr[i] = __bfloat162float(hw[static_cast<size_t>(r) * dim + i]);
+        const float want = reduce::bf16_gemv(wr, std::span(xf).subspan(static_cast<size_t>(t) * dim, dim), splits);
+        float got = planes[static_cast<size_t>(r) * 8 + t];
+        for (int s = 1; s < splits; s++) got += planes[(static_cast<size_t>(s) * checked_rows + r) * 8 + t];
+        same += got == want;
+        total++;
       }
-      max_rel = std::max(max_rel, std::fabs(logits[static_cast<size_t>(r) * 8 + t] - want) / mag);
-    }
-  std::printf("bf16_gemv  %d x %d: max error %.3g of the row's absolute sum\n", rows, dim, max_rel);
-  if (max_rel > 1e-6) die("bf16_gemv exceeds tolerance");
+    report(splits == 1 ? "bf16_gemv" : "bf16_gemv/5", total, same, 0);
+  }
 
   cudaEvent_t a, b;
   ck(cudaEventCreate(&a), "ev");

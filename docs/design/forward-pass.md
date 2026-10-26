@@ -25,9 +25,9 @@ configuration fixes its own K split and reduction orders, which the CPU oracles 
   and GPU agree bit for bit (`ds4n-det-check`: 16.7 M inputs per function); cos/sin round
   a double result. CUDA's `expf`/`log1pf`/`rsqrtf` and libm differ in the last ulp, so no
   kernel or oracle calls them.
-- **Reductions**: split-K partial planes are added in split order starting from split 0;
-  oracles that still sum sequentially where the kernel uses a tree (RMSNorm, hc_mixes,
-  sparse_attn dot products) agree to 99.96 % / tolerance, not bit for bit (see inventory).
+- **Reductions** (`core/reduce.hpp`): split-K partial planes add in split order from split 0;
+  the oracles reproduce each kernel's FMA chains, warp xor trees and shared-memory halving
+  trees, so RMSNorm, hc_mixes and the BF16 GEMV are bit-identical too.
 ## Per-token dataflow
 
 ```
@@ -112,7 +112,7 @@ with the routing round trip.
 | wq_b, wo_a, wo_b | FP8 | 3.3 GB | heads / groups / K split | FP8 done |
 | Shared Expert | FP8 | 1.42 GB | Halves, like routed | FP8 done |
 | Head | BF16 [129280, 5120] | 1.32 GB | vocab split | **done** (BF16 GEMV), 415 us at 1,595 GB/s |
-| RMSNorm, hc_mixes + Sinkhorn, hc_pre/hc_post | F32 small | ~0.3 GB | replicated | **done**; hc_pre/post bit-identical, RMSNorm 99.96 % and hc_mixes to 1.5e-5 (oracle sums sequentially) |
+| RMSNorm, hc_mixes + Sinkhorn, hc_pre/hc_post | F32 small | ~0.3 GB | replicated | **done**, all bit-identical (oracles emulate the kernels' FMA chains and warp/block trees, core/reduce.hpp) |
 | RoPE (YaRN for compressed layers) | — | — | local | **done**, bit-identical |
 | Compressor (ratio 2 pooling / ratio 1 proj) | F32 / BF16 | small | replicated | todo |
 | Indexer scores + two-level top-k | FP8 + BF16 | 68 B per position | replicated (no score exchange) | **done**: keys in an MXFP4 tile cache, scores on the block-scaled MMA, multi-block radix top-k (ties to the lower position); bit-identical to `core/indexer` at every stage; scores 19.6 us at 1M positions, top-512 15-24 us (plain launches) |

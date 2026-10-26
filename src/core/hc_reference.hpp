@@ -1,9 +1,8 @@
 #pragma once
 // CPU oracle for the per-sub-block glue of DeepSeek V4.1 (reference model.py
 // RMSNorm and Block.hc_mixes/hc_pre/hc_post; kernel.py hc_split_sinkhorn).
-// Values are BF16-representable floats in and out; internal math is FP32 with
-// the summation orders written down here (index ascending), which the GPU
-// kernels reproduce.
+// Values are BF16-representable floats in and out; internal math is FP32 in
+// the GPU kernels' own reduction orders (core/reduce.hpp), bit for bit.
 #include <array>
 #include <cstddef>
 #include <span>

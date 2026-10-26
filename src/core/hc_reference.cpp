@@ -5,16 +5,29 @@
 
 #include "core/det_math.hpp"
 #include "core/mx_reference.hpp"
+#include "core/reduce.hpp"
 
 namespace ds4n::hc {
 namespace {
+
+constexpr size_t kNormThreads = 256;  // cuda::rmsnorm block
+constexpr size_t kHcThreads = 256;    // cuda::hc_mix_partials block
+constexpr size_t kHcPartials = 64;    // slices per token
+
 float sigmoid(float v) { return 1.0f / (1.0f + det::exp(-v)); }
+
+/** cuda::rmsnorm's sum of squares: per thread an FMA chain over a 256-stride, then the halving tree. */
+float kernel_sum_squares(std::span<const float> x) {
+  std::array<float, kNormThreads> part{};
+  for (size_t t = 0; t < kNormThreads; t++)
+    for (size_t i = t; i < x.size(); i += kNormThreads) part[t] = std::fma(x[i], x[i], part[t]);
+  return reduce::halving_tree_sum(part);
+}
+
 }  // namespace
 
 std::vector<float> rmsnorm(std::span<const float> x, std::span<const float> weight, float eps) {
-  float sq = 0.0f;
-  for (float v : x) sq += v * v;
-  const float r = 1.0f / std::sqrt(sq / static_cast<float>(x.size()) + eps);
+  const float r = det::rsqrt(kernel_sum_squares(x) / static_cast<float>(x.size()) + eps);
   std::vector<float> y(x.size());
   for (size_t i = 0; i < x.size(); i++) y[i] = mx::round_bf16(weight[i] * (x[i] * r));
   return y;
@@ -62,15 +75,34 @@ Mixes split_sinkhorn(std::span<const float, kMix> mixes, std::span<const float, 
 
 Mixes hc_mixes(std::span<const float> h, std::span<const float> fn, std::span<const float, 3> scale,
                std::span<const float, kMix> base, float norm_eps, float hc_eps, int iters) {
-  float sq = 0.0f;
-  for (float v : h) sq += v * v;
-  const float rsqrt = 1.0f / std::sqrt(sq / static_cast<float>(h.size()) + norm_eps);
-  std::array<float, kMix> raw{};
-  for (size_t r = 0; r < kMix; r++) {
-    float dot = 0.0f;
-    for (size_t i = 0; i < h.size(); i++) dot += h[i] * fn[r * h.size() + i];
-    raw[r] = dot * rsqrt;
+  // cuda::hc_mix_partials / hc_mix_finalize: 64 contiguous slices; in each, thread t FMA-accumulates
+  // elements begin + t + 256 i, warps reduce by the xor tree, the 8 warp sums add in order; then the
+  // slices add in order. Value 0 is the sum of squares, 1 + r the dot with fn row r.
+  constexpr size_t kValues = 1 + kMix;
+  const size_t width = h.size(), per = (width + kHcPartials - 1) / kHcPartials;
+  std::array<float, kValues> total{};
+  for (size_t p = 0; p < kHcPartials; p++) {
+    const size_t begin = p * per, end = std::min(width, begin + per);
+    std::array<std::array<float, kValues>, kHcThreads> acc{};
+    for (size_t t = 0; t < kHcThreads; t++)
+      for (size_t i = begin + t; i < end; i += kHcThreads) {
+        const float v = h[i];
+        acc[t][0] = std::fma(v, v, acc[t][0]);
+        for (size_t r = 0; r < kMix; r++) acc[t][1 + r] = std::fma(v, fn[r * width + i], acc[t][1 + r]);
+      }
+    for (size_t r = 0; r < kValues; r++) {
+      float slice = 0.0f;
+      for (size_t w = 0; w < kHcThreads / 32; w++) {
+        std::array<float, 32> lanes{};
+        for (size_t l = 0; l < 32; l++) lanes[l] = acc[w * 32 + l][r];
+        slice += reduce::warp_xor_sum(lanes);
+      }
+      total[r] += slice;
+    }
   }
+  const float rs = det::rsqrt(total[0] / static_cast<float>(width) + norm_eps);
+  std::array<float, kMix> raw{};
+  for (size_t r = 0; r < kMix; r++) raw[r] = total[1 + r] * rs;
   return split_sinkhorn(raw, scale, base, hc_eps, iters);
 }
 

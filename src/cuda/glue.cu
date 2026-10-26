@@ -151,10 +151,11 @@ __global__ void hc_post_kernel(const __nv_bfloat16* __restrict__ x, const __nv_b
   }
 }
 
+/** kLoads: uint4 weight loads in flight per lane (narrow launches need them; wide ones prefer occupancy). */
+template <int kLoads>
 __global__ void __launch_bounds__(256) bf16_gemv_kernel(const __nv_bfloat16* __restrict__ w,
                                                         const float* __restrict__ x, int rows, int k, int tokens,
                                                         int splits, float* __restrict__ out) {
-  constexpr int kLoads = 4;  // uint4 weight loads in flight per lane
   const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
   const int lane = threadIdx.x & 31;
   if (warp >= rows * splits) return;
@@ -225,7 +226,9 @@ void hc_post(const __nv_bfloat16* x, const __nv_bfloat16* residual, const HcMixe
 
 void bf16_gemv(const __nv_bfloat16* w, const float* x, int rows, int k, int tokens, int splits, float* out,
                cudaStream_t stream) {
-  bf16_gemv_kernel<<<(rows * splits * 32 + 255) / 256, 256, 0, stream>>>(w, x, rows, k, tokens, splits, out);
+  const int warps = rows * splits, blocks = (warps * 32 + 255) / 256;
+  if (warps < 16384) bf16_gemv_kernel<4><<<blocks, 256, 0, stream>>>(w, x, rows, k, tokens, splits, out);
+  else bf16_gemv_kernel<1><<<blocks, 256, 0, stream>>>(w, x, rows, k, tokens, splits, out);
 }
 
 }  // namespace ds4n::cuda
