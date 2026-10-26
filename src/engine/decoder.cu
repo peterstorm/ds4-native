@@ -153,7 +153,7 @@ struct Decoder::Gpu {
   // RMSNorm rows (the reduction is one block; its quantize and copy stay wide, in their own kernels).
   bf16 *x0, *xa, *xf, *qlora, *qr;
   bf16 *q, *latent, *latent_c, *k_raw, *k_idx, *q_idx, *scores, *o, *attn_out, *moe_out, *kv_engram;
-  float *xa_f, *xf_f, *latent_f, *hc_scratch, *y;
+  float *xa_f, *xf_f, *latent_f, *hc_scratch, *partial, *packed, *y;
   float *planes_qa, *planes_kv, *planes_qb, *planes_iq, *planes_oa, *planes_ob, *planes_bf, *planes_proj, *planes_eg,
       *logits;
   cuda::ActFragments act_x, act_qr, act_o[kLocalGroups], act_lora, act_xf, act_engram;
@@ -243,6 +243,8 @@ Decoder::Decoder(std::array<int, 2> devices, std::array<cuda::ExpertDirectory, 2
     s.latent_f = a.alloc<float>(kHeadDim);
     s.hc_scratch = a.alloc<float>(cuda::kHcPartials * 25);
     s.y = a.alloc<float>(kDim);
+    s.partial = a.alloc<float>(kDim);
+    s.packed = a.alloc<float>(cuda::kEngramKvRows);
     s.planes_qa = a.alloc<float>(static_cast<size_t>(kSplitsWqA) * kQLora * 8);
     s.planes_kv = a.alloc<float>(static_cast<size_t>(kSplitsWkv) * kHeadDim * 8);
     s.planes_qb = a.alloc<float>(static_cast<size_t>(kSplitsWqB) * kLocalHeads * kHeadDim * 8);
@@ -409,7 +411,8 @@ void Decoder::Gpu::enqueue_layer(int layer, bool produced_now) {
     check(cudaMemcpyAsync(engram_rows, staging->engram_rows[table], kEngramTableBytes, cudaMemcpyHostToDevice, st), "rows");
     cuda::engram_quantize_rows(engram_rows, 1, rank * (cuda::kEngramBlocks / kGpus), act_engram, st);
     run(l.engram, st);
-    cuda::exchange_add(link, cuda::Planes{planes_eg, 1, cuda::kEngramKvRows}, kv_engram, st);
+    cuda::sum_planes_f32(planes_eg, 1, cuda::kEngramKvRows, 1, packed, st);
+    cuda::exchange_add(link, packed, cuda::kEngramKvRows, kv_engram, st);
     cuda::engram_gate(h, kv_engram, d.engram_q, d.engram_k, kNormEps, 1, h_next, st);
     h_in = h_next;
   }
@@ -483,7 +486,8 @@ void Decoder::Gpu::enqueue_layer(int layer, bool produced_now) {
   run(l.oa, st);
   cuda::group_planes_quantize(planes_oa, kLocalGroups, kSplitsWoA, kOLora, act_lora, st);
   run(l.ob, st);
-  cuda::exchange_add(link, cuda::Planes{planes_ob, kSplitsWoB, kDim}, attn_out, st);
+  cuda::sum_planes_f32(planes_ob, kSplitsWoB, kDim, 1, partial, st);  // wide; summing inside the exchange's 5 blocks was slower
+  cuda::exchange_add(link, partial, kDim, attn_out, st);
   join(0);
   cuda::hc_post(attn_out, h_in, mix_attn, kDim, 1, h_mid, st);
 
