@@ -1,8 +1,12 @@
 #include "core/engram.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <limits>
 
+#include "core/det_math.hpp"
 #include "core/mx_reference.hpp"
+#include "core/reduce.hpp"
 
 namespace ds4n::engram {
 
@@ -71,6 +75,43 @@ std::array<float, kRowValues> decode_row(std::span<const std::byte, kRowBytes> r
     const float v = mx::e4m3_value(std::to_integer<uint8_t>(row[i]));
     const float s = mx::e8m0_value(std::to_integer<uint8_t>(row[kRowValues + i / 32]));
     out[i] = mx::round_bf16(v * s);
+  }
+  return out;
+}
+
+namespace {
+
+constexpr size_t kThreads = 256;  // cuda::engram_gate block
+
+/** cuda::engram_gate's sum: thread t FMA-accumulates a(i) * b(i) for i = t, t + 256, ..., then the halving tree. */
+template <class A, class B>
+float kernel_dot(size_t n, A a, B b) {
+  std::array<float, kThreads> part{};
+  for (size_t t = 0; t < kThreads; t++)
+    for (size_t i = t; i < n; i += kThreads) part[t] = std::fma(a(i), b(i), part[t]);
+  return reduce::halving_tree_sum(part);
+}
+
+float sigmoid(float v) { return 1.0f / (1.0f + det::exp(-v)); }
+
+}  // namespace
+
+std::vector<float> apply(std::span<const float> h, std::span<const float> kv, std::span<const float> q_weight,
+                         std::span<const float> k_weight, float eps) {
+  constexpr float kDimScale = 0.013975424859373685f;  // 5120^-0.5, the reference's Python float rounded to FP32
+  const std::span<const float> value = kv.subspan(static_cast<size_t>(kCopies) * kDim, kDim);
+  std::vector<float> out(h.size());
+  for (size_t j = 0; j < kCopies; j++) {
+    const auto hj = h.subspan(j * kDim, kDim), key = kv.subspan(j * kDim, kDim);
+    const auto qw = q_weight.subspan(j * kDim, kDim), kw = k_weight.subspan(j * kDim, kDim);
+    const float hh = kernel_dot(kDim, [&](size_t i) { return hj[i]; }, [&](size_t i) { return hj[i]; });
+    const float kk = kernel_dot(kDim, [&](size_t i) { return key[i]; }, [&](size_t i) { return key[i]; });
+    const float hwk =
+        kernel_dot(kDim, [&](size_t i) { return hj[i] * (qw[i] * kw[i]); }, [&](size_t i) { return key[i]; });
+    const float rstd = det::rsqrt(hh / static_cast<float>(kDim) + eps) * det::rsqrt(kk / static_cast<float>(kDim) + eps);
+    const float dot = hwk * rstd * kDimScale;
+    const float gate = sigmoid(std::copysign(det::sqrt(std::max(std::fabs(dot), kClamp)), dot));
+    for (size_t i = 0; i < kDim; i++) out[j * kDim + i] = mx::round_bf16(hj[i] + gate * value[i]);
   }
   return out;
 }

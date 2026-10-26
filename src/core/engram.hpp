@@ -59,4 +59,22 @@ Result<Step, LayoutError> hash_token(const Layout& l, const History& h, uint32_t
 /** One table row: 256 E4M3 values times their E8M0 scale per 32, rounded to BF16 (as floats). */
 std::array<float, kRowValues> decode_row(std::span<const std::byte, kRowBytes> row);
 
+constexpr int kDim = 5120;    // model dimension
+constexpr int kCopies = 4;    // hc_mult
+constexpr int kKvRows = kDim * (kCopies + 1);  // wkv output: one key per copy, then the value
+constexpr float kClamp = 1e-6f;
+
+/**
+ * The Engram residual update for one token (reference model.py Engram.forward):
+ * h is the [4][5120] stream, kv = bf16(wkv(rows)) [25600] (keys for the four
+ * copies, then the value), q_weight / k_weight [4][5120], all BF16 values. Per
+ * copy j: rstd = rsqrt(mean(h_j^2) + eps) * rsqrt(mean(key_j^2) + eps),
+ * dot = sum(h_j * w_j * key_j) * rstd * 5120^-0.5 with w = q_weight * k_weight,
+ * gate = sigmoid(copysign(sqrt(max(|dot|, 1e-6)), dot)), out_j = bf16(h_j + gate *
+ * value). The three sums follow cuda::engram_gate (FMA chains over a
+ * 256-stride, halving tree). Returns the [4][5120] stream.
+ */
+std::vector<float> apply(std::span<const float> h, std::span<const float> kv, std::span<const float> q_weight,
+                         std::span<const float> k_weight, float eps);
+
 }  // namespace ds4n::engram
