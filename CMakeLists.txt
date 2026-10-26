@@ -23,6 +23,7 @@ add_library(ds4n_core STATIC
   src/core/compressor.cpp
   src/core/layer_reference.cpp
   src/core/layer_weights.cpp
+  src/core/compare.cpp
 )
 target_include_directories(ds4n_core PUBLIC src)
 target_compile_options(ds4n_core PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -88,6 +89,9 @@ if(DS4N_CUDA)
   add_executable(ds4n-layer-check src/tools/layer_check.cu)
   target_compile_options(ds4n-layer-check PRIVATE ${DS4N_CUDA_FLAGS})
   target_link_libraries(ds4n-layer-check PRIVATE ds4n_engine_cuda)
+  add_executable(ds4n-model-run src/tools/model_run.cu)
+  target_compile_options(ds4n-model-run PRIVATE ${DS4N_CUDA_FLAGS})
+  target_link_libraries(ds4n-model-run PRIVATE ds4n_engine_cuda)
   add_executable(ds4n-exchange-check src/tools/exchange_check.cu)
   target_compile_options(ds4n-exchange-check PRIVATE ${DS4N_CUDA_FLAGS})
   target_link_libraries(ds4n-exchange-check PRIVATE ds4n_cuda)
@@ -118,6 +122,7 @@ add_executable(ds4n_tests
   tests/core/test_safetensors.cpp
   tests/core/test_indexer.cpp
   tests/core/test_compressor.cpp
+  tests/core/test_compare.cpp
 )
 target_link_libraries(ds4n_tests PRIVATE ds4n_core doctest::doctest)
 target_compile_options(ds4n_tests PRIVATE -Wall -Wextra)

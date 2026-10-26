@@ -77,7 +77,10 @@ class Decoder {
 
   /**
    * Start the token at position p: its embedding (BF16 values) in all four
-   * copies, pre mix one-hot on copy 0, and the step's positions.
+   * copies, pre mix one-hot on copy 0, and the step's positions. p = 0 starts a new Session:
+   * every cache read is bounded by p (window slots past p, compressed and index rows
+   * below its compressed length, a ratio-2 pool slot written before it is read), so a
+   * previous Session's rows are never read.
    */
   void begin_token(int64_t p, std::span<const float> embedding_row);
 

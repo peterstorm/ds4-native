@@ -155,6 +155,10 @@ output is the layer's stream input (`h_next`), never a host-side pointer swap, s
 graph's buffers are right on every replay. `ds4n-layer-check --steps 6` (both variants
 replayed, real Engram rows, logits): bit-identical to the oracle.
 
+**Full depth**: `ds4n-layer-check --first 0 --layers 40 --steps 2 --head 1 --expert-layers 4`: all 40
+layers and the head bit-identical to the oracle (logits 129280/129280 at both steps); Base step
+**9.67 ms per token** (~103 tok/s, every Half resident, graphs).
+
 Measured (layers 0-3, Experts resident, `--timing 40`): graphs 0.27 ms per layer, eager 0.31;
 the head on both GPUs at once 0.35 ms. Profile per layer step (graph nodes, GPU 0): busy
 ~220 us -- GEMVs 116 (MoE gate/up 34 us at 1.48 TB/s, down 17, wo_b 15, wq_b 14, wo_a 15 at

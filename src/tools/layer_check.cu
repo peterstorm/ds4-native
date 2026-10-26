@@ -161,7 +161,7 @@ int main(int argc, char** argv) {
   }
 
   // Experts for the decoder: through the Expert cache with --slots, else every Half the steps
-  // touch uploaded once and kept (per rank, layer, expert). GGML Halves for the oracle.
+  // touch uploaded once and kept (per rank, store layer, expert). GGML Halves for the oracle.
   std::unique_ptr<engine::ExpertResidency> residency;
   if (slot_count > 0) {
     residency = engine::ExpertResidency::open({store_path, {0, 1}, slot_count, ram_records, {}});
@@ -176,7 +176,7 @@ int main(int argc, char** argv) {
     for (int rank = 0; rank < 2; rank++) {
       engine::check(cudaSetDevice(rank), "cudaSetDevice");
       for (int j = 0; j < plan.jobs; j++) {
-        const auto key = std::make_tuple(rank, layer, plan.expert[j]);
+        const auto key = std::make_tuple(rank, layer % expert_layers, plan.expert[j]);  // mapped layers share bytes
         auto it = device_halves.find(key);
         if (it == device_halves.end()) {
           const auto bytes = store.payload(layer % expert_layers, plan.expert[j], rank);
