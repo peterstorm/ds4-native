@@ -16,6 +16,7 @@ add_library(ds4n_core STATIC
   src/core/mx_tiles.cpp
   src/core/hc_reference.cpp
   src/core/attn_reference.cpp
+  src/core/engram.cpp
 )
 target_include_directories(ds4n_core PUBLIC src)
 target_compile_options(ds4n_core PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -76,6 +77,7 @@ add_executable(ds4n_tests
   tests/core/test_mx_tiles.cpp
   tests/core/test_hc_reference.cpp
   tests/core/test_attn_reference.cpp
+  tests/core/test_engram.cpp
 )
 target_link_libraries(ds4n_tests PRIVATE ds4n_core doctest::doctest)
 target_compile_options(ds4n_tests PRIVATE -Wall -Wextra)
