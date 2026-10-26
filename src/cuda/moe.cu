@@ -25,11 +25,33 @@ __device__ __forceinline__ unsigned ordered_key(float v) {
 }
 
 /**
+ * One round of a warp's tournament over `row` ([384] selection scores): each lane offers its best
+ * untaken Expert (lane L holds L + 32 i), the warp takes the highest key and, among equal keys, the
+ * lowest Expert id, and marks it taken.
+ */
+__device__ __forceinline__ int take_best(const float* row, int lane, unsigned& taken) {
+  float bv = -INFINITY;
+  int be = INT_MAX;
+#pragma unroll
+  for (int i = 0; i < kPerLane; i++) {
+    const float v = row[lane + 32 * i];
+    if (!((taken >> i) & 1) && v > bv) {  // ascending i: ties keep the lower id
+      bv = v;
+      be = lane + 32 * i;
+    }
+  }
+  const unsigned key = ordered_key(bv);
+  const unsigned top = __reduce_max_sync(0xFFFFFFFFu, key);
+  const int winner = static_cast<int>(__reduce_min_sync(0xFFFFFFFFu, key == top ? static_cast<unsigned>(be) : ~0u));
+  if ((winner & 31) == lane) taken |= 1u << (winner >> 5);
+  return winner;
+}
+
+/**
  * Thread e computes Expert e's scores for every token (independent exp/log1p
  * chains, unrolled over the token slots so they overlap). Warp n then picks
- * token n's top 6: per round each lane offers its best untaken Expert (lane L
- * holds L + 32 i), the warp takes the highest key and, among equal keys, the
- * lowest Expert id. Warp 0 finally builds the Plan, lane L owning Experts
+ * token n's top 6 in take_best rounds (and, when asked, its near-misses in
+ * further rounds). Warp 0 finally builds the Plan, lane L owning Experts
  * [12 L, 12 L + 12) so a prefix sum over lanes keeps jobs in ascending id.
  */
 __global__ void __launch_bounds__(moe::kExperts) route_kernel(const float* __restrict__ logits, int logit_splits,
@@ -77,22 +99,8 @@ __global__ void __launch_bounds__(moe::kExperts) route_kernel(const float* __res
     float w[moe::kTopK];
 #pragma unroll
     for (int k = 0; k < moe::kTopK; k++) {
-      float bv = -INFINITY;
-      int be = INT_MAX;
-#pragma unroll
-      for (int i = 0; i < kPerLane; i++) {
-        const float v = biased[n][lane + 32 * i];
-        if (!((taken >> i) & 1) && v > bv) {  // ascending i: ties keep the lower id
-          bv = v;
-          be = lane + 32 * i;
-        }
-      }
-      const unsigned key = ordered_key(bv);
-      const unsigned top = __reduce_max_sync(0xFFFFFFFFu, key);
-      const int winner = static_cast<int>(__reduce_min_sync(0xFFFFFFFFu, key == top ? static_cast<unsigned>(be) : ~0u));
-      if ((winner & 31) == lane) taken |= 1u << (winner >> 5);
-      sel[k] = winner;
-      w[k] = scores[n][winner];
+      sel[k] = take_best(biased[n], lane, taken);
+      w[k] = scores[n][sel[k]];
     }
     float sum = 0.0f;
     for (int k = 0; k < moe::kTopK; k++) sum = __fadd_rn(sum, w[k]);
@@ -104,6 +112,12 @@ __global__ void __launch_bounds__(moe::kExperts) route_kernel(const float* __res
         weights[n * moe::kTopK + k] = w[k];
         atomicOr(&mask[sel[k]], 1u << n);
         routed_weight[sel[k]][n] = w[k];
+      }
+    // Near-misses: the same tournament, continued past the top 6 (routing is already fixed).
+    if (p.near != nullptr)
+      for (int k = 0; k < moe::kNear; k++) {
+        const int winner = take_best(biased[n], lane, taken);
+        if (lane == 0) p.near[n * moe::kNear + k] = winner;
       }
   }
   __syncthreads();

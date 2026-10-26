@@ -11,6 +11,9 @@ constexpr int kExperts = 384;
 constexpr int kTopK = 6;
 constexpr int kMaxTokens = 8;                 // decode and verify rows per step
 constexpr int kMaxJobs = kTopK * kMaxTokens;  // distinct routed Experts in one step, at most
+// Near-misses: each token's Experts ranked just below its top 6 (ranks 7 .. 6 + kNear by selection
+// score). Never routed; the Expert cache may use them as hints of what the next tokens need.
+constexpr int kNear = 10;
 
 struct Plan {
   int32_t tokens;

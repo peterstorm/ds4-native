@@ -165,6 +165,7 @@ struct Decoder::Gpu {
   uint8_t* engram_rows = nullptr;
   cuda::AttnScratch attn{};
   int32_t* route_experts = nullptr;
+  int32_t* route_near = nullptr;  // [row][moe::kNear], when the residency wants near-misses
   float* route_weights = nullptr;
   moe::Plan* plan = nullptr;
   cuda::MoeBuffers moe{};
@@ -278,6 +279,7 @@ Decoder::Decoder(std::array<int, 2> devices, std::array<cuda::ExpertDirectory, 2
               a.alloc<float>(R * max_splits * kLocalHeads * kHeadDim)};
     s.route_experts = a.alloc<int32_t>(R * moe::kTopK);
     s.route_weights = a.alloc<float>(R * moe::kTopK);
+    if (s.experts.post_near && s.rank == 0) s.route_near = a.alloc<int32_t>(R * moe::kNear);  // GPU 0 posts
     s.plan = a.alloc<moe::Plan>(1);
     const size_t plane = static_cast<size_t>(kSplitsExpert) * kExpertRows * 8;
     s.moe = {a.alloc<float>(cuda::kJobSlots * plane),
@@ -542,7 +544,8 @@ void Decoder::Gpu::enqueue_layer(int layer, int rows, int parity) {
   branch_done(3);
   cuda::bf16_gemv(d.router, xf_f, moe::kExperts, kDim, rows, kSplitsBf16, logits, st);
   cuda::route(logits, kSplitsBf16, rows, nullptr,
-              {d.router_bias, nullptr, kRouteScale, experts.slot_of, layer % experts.key_layers, experts.route_bonus},
+              {d.router_bias, nullptr, kRouteScale, experts.slot_of, layer % experts.key_layers, experts.route_bonus,
+               route_near},
               route_experts, route_weights, plan, st);
 
   // The routed Experts: resolved on the device (a Miss waits for the Expert cache's service), then
@@ -550,7 +553,7 @@ void Decoder::Gpu::enqueue_layer(int layer, int rows, int parity) {
   const int max_jobs = moe::kTopK * rows;
   const cuda::RoutedShape shape{kExpertRows, kDimBlocks, kSplitsExpert, cuda::split_blocks_for(kDimBlocks, kSplitsExpert),
                                 kDim,        kExpertDownBlocks, kExpertPartBytes};
-  cuda::resolve_experts(plan, layer, experts, shape, moe, act_xf, resolved, st);
+  cuda::resolve_experts(plan, route_near, layer, experts, shape, moe, act_xf, resolved, st);
   cuda::gemv(resolved.jobs, resolved.first, resolved.gate_up_jobs(max_jobs), resolved.gate_up_warps(max_jobs, kGateUpWarps),
              st);
   cuda::swiglu_quantize_routed(plan, moe, moe::kSwigluLimit, st);

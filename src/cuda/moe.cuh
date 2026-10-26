@@ -36,6 +36,9 @@ struct RouterParams {
   const int32_t* resident = nullptr;
   int resident_layer = 0;
   float resident_bonus = 0.0f;
+  // Each token's near-misses ([tokens][moe::kNear], best first), or null for none. Only written: they
+  // never change routing.
+  int32_t* near = nullptr;
 };
 
 /**

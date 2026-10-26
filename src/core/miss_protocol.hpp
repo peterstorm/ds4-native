@@ -31,6 +31,8 @@ struct PostedStep {
   int32_t layer;
   int32_t jobs;  // the plan's job count (-1: routing failed; nothing to place)
   int32_t expert[kMaxJobs];
+  int32_t near_count;                   // 0 when the decoder posts no near-misses
+  int32_t near[kMaxTokens * kNear];     // per token, its near-misses (may repeat across tokens and jobs)
 };
 
 /** Written by the GPUs: GPU 0 posts each step's needs; GPU 1 posts only how far it has routed. */

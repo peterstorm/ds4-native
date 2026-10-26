@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <iterator>
 #include <chrono>
 #include <map>
 #include <mutex>
@@ -67,6 +68,7 @@ struct ExpertResidency::State {
   std::atomic<bool> stop{false};
   mutable std::mutex mutex;  // guards stats and failure
   ResidencyStats stats;
+  std::vector<cache::Access> accesses;  // with config.record_accesses
   std::string failure;
 
   State(ResidencyConfig c, io::Fd fd, io::UringReader r, cache::ExpertCache v, cache::ExpertCache m)
@@ -97,7 +99,7 @@ struct ExpertResidency::State {
   /** Drain posted steps in order until stopped. */
   void serve();
   /** Posted step `s` through the cache; Loads land, and GPU 1 has routed the step, before the table changes. */
-  void serve_step(const moe::PostedStep& step, uint64_t s, ResidencyStats& counts);
+  void serve_step(const moe::PostedStep& step, uint64_t s, ResidencyStats& counts, std::vector<cache::Access>& seen);
 };
 
 ExpertResidency::State::~State() {
@@ -185,14 +187,24 @@ void ExpertResidency::State::read_records(std::span<const RecordRead> records_in
   }
 }
 
-void ExpertResidency::State::serve_step(const moe::PostedStep& step, uint64_t s, ResidencyStats& counts) {
+void ExpertResidency::State::serve_step(const moe::PostedStep& step, uint64_t s, ResidencyStats& counts,
+                                        std::vector<cache::Access>& seen) {
   counts.layer_steps++;
   if (step.jobs <= 0) return;  // failed routing: nothing to place (the GPUs run the shared Expert only)
   if (step.jobs > moe::kMaxJobs || step.layer < 0 || step.layer >= static_cast<int32_t>(store::kLayers))
     fail("posted step out of range (layer " + std::to_string(step.layer) + ", " + std::to_string(step.jobs) + " jobs)");
   std::vector<cache::ExpertKey> keys;
   for (int j = 0; j < step.jobs; j++) keys.push_back(key_of(step.layer, step.expert[j]));
-  auto placed = vram.plan(keys);
+  if (step.near_count < 0 || step.near_count > moe::kMaxTokens * moe::kNear) fail("posted step with a bad near-miss count");
+  std::vector<cache::ExpertKey> near;  // distinct, none needed
+  for (int i = 0; i < step.near_count; i++) {
+    if (step.near[i] < 0 || step.near[i] >= static_cast<int32_t>(store::kExperts)) fail("posted near-miss out of range");
+    const cache::ExpertKey k = key_of(step.layer, step.near[i]);
+    if (std::find(keys.begin(), keys.end(), k) == keys.end() && std::find(near.begin(), near.end(), k) == near.end())
+      near.push_back(k);
+  }
+  if (config.record_accesses) seen.push_back({keys, near});
+  auto placed = vram.plan(keys, config.hints ? std::span<const cache::ExpertKey>(near) : std::span<const cache::ExpertKey>{});
   if (!placed) fail("Expert cache: " + placed.error().what);
   counts.hits += placed.value().hits.size();
   if (placed.value().loads.empty()) return;
@@ -224,9 +236,10 @@ void ExpertResidency::State::serve() {
         continue;
       }
       ResidencyStats counts;
+      std::vector<cache::Access> seen;
       for (uint64_t s = done + 1; s <= posted; s++) {
         const moe::PostedStep step = mailbox->ring[(s - 1) % moe::kMissRing];
-        serve_step(step, s, counts);
+        serve_step(step, s, counts, seen);
         std::atomic_ref<uint64_t>(board->served).store(s, std::memory_order_release);
         done = s;
       }
@@ -237,6 +250,7 @@ void ExpertResidency::State::serve() {
       stats.ram_hits += counts.ram_hits;
       stats.store_reads += counts.store_reads;
       stats.exposed_ms += counts.exposed_ms;
+      accesses.insert(accesses.end(), std::make_move_iterator(seen.begin()), std::make_move_iterator(seen.end()));
     }
   } catch (const std::exception& e) {
     {
@@ -272,7 +286,7 @@ std::unique_ptr<ExpertResidency> ExpertResidency::open(const ResidencyConfig& co
     prior.assign(cache::kKeys, 0);
     std::fill(prior.begin(), prior.begin() + config.key_layers * store::kExperts, 1u);
   }
-  auto vram = cache::ExpertCache::create(config.slots, prior, cache::Policy{});
+  auto vram = cache::ExpertCache::create(config.slots, prior, config.vram_policy);
   if (!vram) fail("Expert cache: " + vram.error().what);
   // The RAM tier: Recent ranks by last load and starts empty; Popular ranks by decayed load count
   // and, with a prior, starts with the profile's next-hottest Experts after the VRAM set.
@@ -346,6 +360,7 @@ std::unique_ptr<ExpertResidency> ExpertResidency::open(const ResidencyConfig& co
     d.pool = s->pool[g];
     d.slot_bytes = store::kHalfPayloadBytes;
     d.key_layers = static_cast<int>(config.key_layers);
+    d.post_near = config.record_accesses || config.hints;
   }
   State* raw = s.get();
   s->service = std::thread([raw] { raw->serve(); });
@@ -357,6 +372,11 @@ cuda::ExpertDirectory ExpertResidency::directory(int rank) const { return s_->di
 ResidencyStats ExpertResidency::stats() const {
   std::lock_guard lock(s_->mutex);
   return s_->stats;
+}
+
+std::vector<cache::Access> ExpertResidency::accesses() const {
+  std::lock_guard lock(s_->mutex);
+  return s_->accesses;
 }
 
 void ExpertResidency::check() const {

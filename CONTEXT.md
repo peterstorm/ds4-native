@@ -54,6 +54,13 @@ A routed Expert not in a Slot, served from the RAM tier or the Expert store.
 **Exposed miss**:
 The part of a Miss the GPU waits for; overlapped load time is not exposed.
 
+**Near-miss**:
+An Expert the router ranked just below a token's top 6 (ranks 7-16 by selection score). Never routed; the Expert cache counts it as a use, a hint of what the next tokens need.
+_Avoid_: candidate (the indexer's candidate blocks), runner-up
+
+**Access record**:
+The sequence of every layer step's needed Experts and Near-misses as the Expert cache saw them, saved for replaying policies offline against Belady's optimal eviction (`core/cache_replay`).
+
 **Ledger**:
 Byte arithmetic that fixes Slot counts per GPU and phase from mandatory state, never from free-memory readings.
 

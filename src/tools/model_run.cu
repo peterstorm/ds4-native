@@ -4,6 +4,7 @@
 //   ds4n-model-run --backbone SAFETENSORS --store STORE --gguf MERGED_GGUF --tokens DIR --names a,b
 //                  --out DIR [--oracle DIR] [--force 1] [--steps N] [--slots N] [--ram-records R] [--prior PROFILE]
 //                  [--prior-weight W] [--ram-policy recent|popular] [--ccr LAMBDA] [--prefill R]
+//                  [--access-log FILE] [--vram-policy lru|picks] [--hints 0|1]
 //
 // For each name, DIR/<name>.tokens is antirez's --dump-tokens output (ids on the first line). The
 // prompt runs from position 0 in Rounds of R rows (--prefill, 1 to 8, default 8: the same logits as
@@ -19,7 +20,11 @@
 // cache::ExpertCache::prior_from_profile). --ram-policy popular ranks the RAM tier by load count and
 // warms it with the profile's next-hottest Experts (default recent: last loaded, empty at first).
 // --ccr LAMBDA turns on Cache-conditional routing: resident Experts' selection scores gain LAMBDA (not
-// Exact; 0, the default, keeps routing exact).
+// Exact; 0, the default, keeps routing exact). --access-log FILE writes every layer step's Expert
+// keys, in order, as an access record for ds4n-cache-study (core/cache_replay).
+// --vram-policy lru|picks (default lru: least recently used; picks: decayed pick counts) ranks the
+// VRAM Slots; --hints 0 stops them ranking the router's near-misses as just used (on by default).
+// Placement only: outputs never change.
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -128,12 +133,15 @@ double median(std::vector<double> v) {
 int main(int argc, char** argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   setenv("CUDA_MODULE_LOADING", "EAGER", 1);  // before any CUDA call: see engine/decoder.cuh
-  std::string backbone_path, store_path, gguf_path, tokens_dir, names_arg, out_dir, oracle_dir, prior_path;
+  std::string backbone_path, store_path, gguf_path, tokens_dir, names_arg, out_dir, oracle_dir, prior_path, access_log;
   bool force = false;
   int max_steps = 64, prefill_rows = model::kMaxRows;
   uint32_t slots = 8000, ram_records = 512, prior_weight = 1;
   float ccr = 0.0f;
   engine::RamPolicy ram_policy = engine::RamPolicy::Recent;
+  engine::ResidencyConfig defaults;
+  cache::Policy vram_policy = defaults.vram_policy;
+  bool hints = defaults.hints;
   for (int i = 1; i < argc; i++) {
     const std::string s = argv[i];
     if (i + 1 >= argc) die("missing value for " + s);
@@ -152,6 +160,14 @@ int main(int argc, char** argv) {
     else if (s == "--prior") prior_path = argv[++i];
     else if (s == "--prior-weight") prior_weight = static_cast<uint32_t>(std::stoul(argv[++i]));
     else if (s == "--ccr") ccr = std::stof(argv[++i]);
+    else if (s == "--access-log") access_log = argv[++i];
+    else if (s == "--hints") hints = std::string(argv[++i]) == "1";
+    else if (s == "--vram-policy") {
+      const std::string v = argv[++i];
+      if (v == "picks") vram_policy = cache::Policy{};
+      else if (v == "lru") vram_policy = cache::Policy{4096, false};
+      else die("--vram-policy takes picks or lru");
+    }
     else if (s == "--ram-policy") {
       const std::string v = argv[++i];
       if (v == "recent") ram_policy = engine::RamPolicy::Recent;
@@ -181,7 +197,8 @@ int main(int argc, char** argv) {
     if (!p) die(prior_path + ": " + p.error().what);
     prior = std::move(p).value();
   }
-  auto residency = engine::ExpertResidency::open({store_path, {0, 1}, slots, ram_records, prior, 40, ram_policy, ccr});
+  auto residency = engine::ExpertResidency::open(
+      {store_path, {0, 1}, slots, ram_records, prior, 40, ram_policy, ccr, !access_log.empty(), vram_policy, hints});
   std::printf("Expert cache: %u Slots warm in %.1f s, RAM tier %u records\n", slots, residency->stats().warm_ms / 1e3,
               ram_records);
   const auto t_load = Clock::now();
@@ -350,5 +367,14 @@ int main(int argc, char** argv) {
                   n_dlp ? sum_dlp / static_cast<double>(n_dlp) : 0.0, max_dlp);
   }
   decoder.sync();  // nothing in flight reads the Expert cache once it closes
+  if (!access_log.empty()) {
+    residency->check();
+    const auto steps = residency->accesses();
+    const auto bytes = cache::encode_accesses(steps);
+    std::ofstream f(access_log, std::ios::binary);
+    if (!f || !f.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size())))
+      die("cannot write " + access_log);
+    std::printf("access record: %zu layer steps to %s\n", steps.size(), access_log.c_str());
+  }
   return 0;
 }

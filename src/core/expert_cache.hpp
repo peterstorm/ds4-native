@@ -33,6 +33,7 @@ constexpr uint32_t kKeys = 40 * 384;
 struct Policy {
   uint32_t decay_period = 4096;  // calls between score halvings
   bool frequency = true;         // rank by pick count first; false: recency only
+  uint32_t hint_score = 0;       // score a hinted Expert gains under `frequency` (a pick gains 1)
 };
 
 struct Hit {
@@ -83,8 +84,12 @@ class ExpertCache {
   /** Experts placed at construction, in Slot order, for the shell to preload. */
   std::vector<Load> warm_start() const;
 
-  /** Plan one layer's needs (distinct keys). Fails if they exceed the Slot count. */
-  Result<Plan, CacheError> plan(std::span<const ExpertKey> needed);
+  /**
+   * Plan one layer's needs (distinct keys). Fails if they exceed the Slot count. `hinted` (distinct
+   * keys, none of them needed) are Experts expected soon, such as the router's near-misses: after
+   * the Loads are placed, each is ranked as just used (and gains `hint_score`), never loaded.
+   */
+  Result<Plan, CacheError> plan(std::span<const ExpertKey> needed, std::span<const ExpertKey> hinted = {});
 
   uint32_t slots() const { return static_cast<uint32_t>(slot_key_.size()); }
   std::optional<uint32_t> slot_of(ExpertKey key) const;
@@ -95,7 +100,7 @@ class ExpertCache {
   ExpertCache(uint32_t slots, Policy policy);
   static std::optional<CacheError> invalid(uint32_t slots, Policy policy);
   Rank rank(ExpertKey k) const { return {score_[k], last_use_[k], k}; }
-  void touch(ExpertKey k);
+  void touch(ExpertKey k, uint32_t score);
   void decay();
 
   Policy policy_;

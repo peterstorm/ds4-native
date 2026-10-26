@@ -8,8 +8,8 @@
 // access, Hits included.
 //
 // Placement is core/expert_cache twice: the VRAM Slots (warm from construction,
-// ranked by decayed pick count) and the RAM tier's pinned record buffers (empty
-// at first, least recently used). A Slot index means the same Expert on both
+// least recently used by default, the router's near-misses counting as uses) and
+// the RAM tier's pinned record buffers (empty at first, least recently used). A Slot index means the same Expert on both
 // GPUs, GPU r holding Half r. A Load comes from its RAM tier record when there,
 // otherwise from the store in 1 MiB O_DIRECT chunks into a RAM tier buffer, each
 // chunk copied to its GPU as it lands. Only after both GPUs' copies landed does
@@ -30,6 +30,7 @@
 #include <string>
 #include <vector>
 
+#include "core/cache_replay.hpp"
 #include "cuda/resolve.cuh"
 
 namespace ds4n::engine {
@@ -60,6 +61,14 @@ struct ResidencyConfig {
   // Cache-conditional routing: a bonus added to resident Experts' router selection scores. Not Exact:
   // outputs then depend on what is resident. 0 (the default) keeps routing exact.
   float route_bonus = 0.0f;
+  // Keep every served layer step's Expert keys, in order, for accesses() (offline cache studies).
+  bool record_accesses = false;
+  // The VRAM Slots' policy, and whether it takes the router's near-misses as hints
+  // (cache::ExpertCache::plan). Placement only: outputs never change. The default, least recently
+  // used with hints, read 8-10 % less from the store than decayed pick counts on long generations
+  // (docs/design/forward-pass.md, Expert residency).
+  cache::Policy vram_policy{4096, false};
+  bool hints = true;
 };
 
 /** Counters since open(); a Hit is a needed Expert found in a VRAM Slot. */
@@ -82,6 +91,9 @@ class ExpertResidency {
 
   /** A snapshot of the counters. */
   ResidencyStats stats() const;
+
+  /** Every served layer step's Expert keys in order; empty unless ResidencyConfig::record_accesses. */
+  std::vector<cache::Access> accesses() const;
 
   /** Throws the service's failure, if it failed (the GPUs then trap at their next Miss). */
   void check() const;

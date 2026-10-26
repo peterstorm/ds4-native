@@ -250,8 +250,31 @@ KL against exact: code 0.001-0.007, prose and math 0.11-0.46 (routing-sensitive 
 profile prior at weight 16 hurt (29.5 tok/s: the profile outranked this traffic's recent picks);
 weight 1 helps the cold start. Per Miss ~1.6-1.8 ms (one NVMe, ~13 GB/s).
 
-Next: prefetch from a predicted next-layer routing; the warm start from a profile of the
-engine's own traffic.
+**Placement study** (`ds4n-model-run --access-log`, then `ds4n-cache-study`: the recorded sequence
+of every layer step's Experts replayed offline through policies, `core/cache_replay`). Three long
+free-running generations (code, history, guide; 5,063 tokens, 203,400 layer steps), 8,500 Slots,
+the first 4,000 steps warming:
+
+| Policy | Hits | Misses per token |
+|---|---|---|
+| decayed picks, period 1024 / 4096 (old default) / 16384 | 97.75 / 97.72 / 97.25 % | 5.45 / 5.53 / 6.66 |
+| least recently used | 97.75 % | 5.45 |
+| LRU, near-misses as uses (default) | 97.86 % | 5.18 |
+| Belady (optimal; the same with bypass) | 99.05 % | 2.31 |
+
+The replay reproduces the engine's own counts (93.66 % against 92.3-94.4 % on the short prompts).
+Online policies saturate at LRU; Belady's 2.4x fewer Misses is knowledge of the future that
+neither pick counts nor the router's near-misses (ranks 7-16, posted by GPU 0 beside each step)
+carry. Near-misses as hints still read 8-10 % less from the store in the engine (code / history /
+guide store reads 6,794 / 8,335 / 13,763 -> 6,128 / 7,591 / 12,713; 84.6 / 71.9 / 47.8 -> 87.4 /
+73.7 / 51.0 tok/s, outputs byte-identical), so LRU with hints is the default. At tiny caches hints
+hurt (64 Slots: 4.9 -> 1.8 % Hits): they protect Experts that real reuse would need the Slot for.
+
+Exact decode on these long generations: code 87 tok/s median (steady ~100: 99.5 % Hits, ~1.2
+store reads per token), history 74, guide 51 -- locality grows with a single long context.
+
+Next: prefetch from a predicted routing (the remaining gap to Belady is foresight); the warm start
+from a profile of the engine's own traffic.
 
 ## Validation path
 

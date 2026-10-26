@@ -47,7 +47,8 @@ __device__ void wait_for_host(const moe::Board* board, Ready ready) {
 
 __device__ __forceinline__ int warps_of(const GemvJob& j) { return j.rows / 16 * j.splits; }
 
-__global__ void __launch_bounds__(kThreads) resolve_kernel(const moe::Plan* __restrict__ plan, int layer,
+__global__ void __launch_bounds__(kThreads) resolve_kernel(const moe::Plan* __restrict__ plan, const int32_t* __restrict__ near,
+                                                           int layer,
                                                            ExpertDirectory dir, RoutedShape shape, MoeBuffers buf,
                                                            ActFragments act, ResolvedMoe out) {
   __shared__ int any_miss;
@@ -74,9 +75,12 @@ __global__ void __launch_bounds__(kThreads) resolve_kernel(const moe::Plan* __re
     __syncthreads();
     moe::PostedStep& e = dir.mailbox->ring[(s - 1) % moe::kMissRing];
     if (t < moe::kMaxJobs) e.expert[t] = mine ? plan->expert[t] : 0;
+    const int near_count = near != nullptr && raw_jobs >= 0 ? plan->tokens * moe::kNear : 0;
+    for (int i = t; i < near_count; i += kThreads) e.near[i] = near[i];
     if (t == 0) {
       e.layer = layer;
       e.jobs = raw_jobs;
+      e.near_count = near_count;
     }
     __threadfence_system();
     __syncthreads();
@@ -134,9 +138,9 @@ __global__ void __launch_bounds__(kThreads) resolve_kernel(const moe::Plan* __re
 
 }  // namespace
 
-void resolve_experts(const moe::Plan* plan, int layer, ExpertDirectory dir, RoutedShape shape, MoeBuffers buf,
-                     ActFragments act_xf, ResolvedMoe out, cudaStream_t stream) {
-  resolve_kernel<<<1, kThreads, 0, stream>>>(plan, layer, dir, shape, buf, act_xf, out);
+void resolve_experts(const moe::Plan* plan, const int32_t* near, int layer, ExpertDirectory dir, RoutedShape shape,
+                     MoeBuffers buf, ActFragments act_xf, ResolvedMoe out, cudaStream_t stream) {
+  resolve_kernel<<<1, kThreads, 0, stream>>>(plan, near, layer, dir, shape, buf, act_xf, out);
 }
 
 }  // namespace ds4n::cuda

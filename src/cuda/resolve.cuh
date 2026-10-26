@@ -27,6 +27,7 @@ struct ExpertDirectory {
   float route_bonus = 0.0f;          // Cache-conditional routing: added to resident Experts' selection scores (0: exact)
   const moe::Board* board = nullptr; // host-mapped
   int key_layers = 40;               // layer L's Experts are keyed as layer L % key_layers (a test store's few layers)
+  bool post_near = false;            // GPU 0 posts each step's near-misses (the residency uses them)
 };
 
 /** Where resolve leaves the job lists and their launch counts (device memory). */
@@ -57,9 +58,10 @@ struct RoutedShape {
 
 /**
  * Resolve layer `layer`'s plan: routed jobs write into `buf`'s slots 0..jobs-1 and read their
- * activations from `act_xf` (gate/up) and `buf`'s hidden fragments (down).
+ * activations from `act_xf` (gate/up) and `buf`'s hidden fragments (down). GPU 0 posts the step
+ * with the tokens' near-misses (`near`, [tokens][moe::kNear] from route) when not null.
  */
-void resolve_experts(const moe::Plan* plan, int layer, ExpertDirectory dir, RoutedShape shape, MoeBuffers buf,
-                     ActFragments act_xf, ResolvedMoe out, cudaStream_t stream);
+void resolve_experts(const moe::Plan* plan, const int32_t* near, int layer, ExpertDirectory dir, RoutedShape shape,
+                     MoeBuffers buf, ActFragments act_xf, ResolvedMoe out, cudaStream_t stream);
 
 }  // namespace ds4n::cuda

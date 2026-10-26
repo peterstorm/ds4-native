@@ -24,6 +24,7 @@ add_library(ds4n_core STATIC
   src/core/layer_reference.cpp
   src/core/layer_weights.cpp
   src/core/compare.cpp
+  src/core/cache_replay.cpp
 )
 target_include_directories(ds4n_core PUBLIC src)
 target_compile_options(ds4n_core PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -46,6 +47,8 @@ add_executable(ds4n-store-build src/tools/store_build.cpp)
 target_link_libraries(ds4n-store-build PRIVATE ds4n_io)
 add_executable(ds4n-readbench src/tools/read_bench.cpp)
 target_link_libraries(ds4n-readbench PRIVATE ds4n_io)
+add_executable(ds4n-cache-study src/tools/cache_study.cpp)
+target_link_libraries(ds4n-cache-study PRIVATE ds4n_core)
 
 # GPU kernels (sm_120a: block-scaled MMA needs the arch-specific target).
 option(DS4N_CUDA "Build CUDA kernels and GPU tools" ON)
@@ -124,6 +127,7 @@ add_executable(ds4n_tests
   tests/core/test_compressor.cpp
   tests/core/test_compare.cpp
   tests/core/test_round.cpp
+  tests/core/test_cache_replay.cpp
 )
 target_link_libraries(ds4n_tests PRIVATE ds4n_core doctest::doctest)
 target_compile_options(ds4n_tests PRIVATE -Wall -Wextra)

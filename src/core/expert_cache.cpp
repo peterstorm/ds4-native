@@ -57,10 +57,10 @@ std::optional<uint32_t> ExpertCache::slot_of(ExpertKey key) const {
   return static_cast<uint32_t>(key_slot_[key]);
 }
 
-void ExpertCache::touch(ExpertKey k) {
+void ExpertCache::touch(ExpertKey k, uint32_t score) {
   const bool resident = key_slot_[k] >= 0;
   if (resident) resident_.erase(rank(k));
-  if (policy_.frequency) score_[k] += 1;
+  if (policy_.frequency) score_[k] += score;
   last_use_[k] = clock_;
   if (resident) resident_.insert(rank(k));
 }
@@ -72,13 +72,19 @@ void ExpertCache::decay() {
     if (key_slot_[k] >= 0) resident_.insert(rank(k));
 }
 
-Result<Plan, CacheError> ExpertCache::plan(std::span<const ExpertKey> needed) {
+Result<Plan, CacheError> ExpertCache::plan(std::span<const ExpertKey> needed, std::span<const ExpertKey> hinted) {
   using R = Result<Plan, CacheError>;
   if (needed.size() > slot_key_.size()) return R::err({"a layer needs more Experts than there are Slots"});
   std::vector<ExpertKey> want(needed.begin(), needed.end());
   std::sort(want.begin(), want.end());
   if (std::adjacent_find(want.begin(), want.end()) != want.end()) return R::err({"needed Experts must be distinct"});
   if (!want.empty() && want.back() >= kKeys) return R::err({"Expert key out of range"});
+  std::vector<ExpertKey> hints(hinted.begin(), hinted.end());
+  std::sort(hints.begin(), hints.end());
+  if (std::adjacent_find(hints.begin(), hints.end()) != hints.end()) return R::err({"hinted Experts must be distinct"});
+  if (!hints.empty() && hints.back() >= kKeys) return R::err({"hinted Expert key out of range"});
+  for (ExpertKey h : hints)
+    if (std::binary_search(want.begin(), want.end(), h)) return R::err({"a hinted Expert is also needed"});
 
   clock_ += 1;
   if (policy_.frequency && clock_ % policy_.decay_period == 0) decay();
@@ -86,7 +92,7 @@ Result<Plan, CacheError> ExpertCache::plan(std::span<const ExpertKey> needed) {
   Plan plan;
   std::vector<ExpertKey> missing;
   for (ExpertKey k : needed) {
-    touch(k);
+    touch(k, 1);
     if (key_slot_[k] >= 0) plan.hits.push_back({k, static_cast<uint32_t>(key_slot_[k])});
     else missing.push_back(k);
   }
@@ -114,6 +120,8 @@ Result<Plan, CacheError> ExpertCache::plan(std::span<const ExpertKey> needed) {
     resident_.insert(rank(k));
     plan.loads.push_back({k, slot, evicted});
   }
+  // Hints rank after the Loads were placed, so they never keep a Slot from being evicted this call.
+  for (ExpertKey h : hinted) touch(h, policy_.hint_score);
   return R::ok(std::move(plan));
 }
 

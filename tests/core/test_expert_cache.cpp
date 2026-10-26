@@ -201,3 +201,48 @@ TEST_CASE("prior_from_profile rejects malformed profiles") {
   CHECK_FALSE(ExpertCache::prior_from_profile(encode_profile(empty_layer), {}, 1).is_ok());
   CHECK_FALSE(ExpertCache::prior_from_profile(encode_profile(std::vector<uint32_t>(40 * 384, 1)), {}, 0).is_ok());
 }
+
+TEST_CASE("a hint ranks a resident Expert as just used, changing which one is evicted") {
+  auto victim_after = [](bool hint) {
+    auto c = ExpertCache::empty(2, Policy{4096, false}).value();
+    REQUIRE(c.plan(std::vector<ExpertKey>{2}));  // 2 used first
+    REQUIRE(c.plan(std::vector<ExpertKey>{1}));  // then 1
+    if (hint) REQUIRE(c.plan(std::vector<ExpertKey>{1}, std::vector<ExpertKey>{2}));
+    const auto p = c.plan(std::vector<ExpertKey>{3}).value();
+    REQUIRE(p.loads.size() == 1);
+    return *p.loads[0].evicted;
+  };
+  CHECK(victim_after(false) == 2);  // least recently used
+  CHECK(victim_after(true) == 1);   // 2 was hinted as recently as 1 was used; ties go by key
+}
+
+TEST_CASE("a hint never keeps a Slot from being evicted in its own call") {
+  auto c = ExpertCache::empty(1, Policy{4096, false}).value();
+  REQUIRE(c.plan(std::vector<ExpertKey>{1}));
+  const auto p = c.plan(std::vector<ExpertKey>{2}, std::vector<ExpertKey>{1});
+  REQUIRE(p);
+  REQUIRE(p.value().loads.size() == 1);
+  CHECK(p.value().loads[0].evicted == std::optional<ExpertKey>{1});
+  CHECK_FALSE(c.slot_of(1));  // hinted, not loaded
+}
+
+TEST_CASE("under a frequency policy a hint gains hint_score") {
+  // Two Slots holding 1 and 2, each picked once; 2 is hinted repeatedly, so when 3 arrives 1 goes.
+  for (const uint32_t hint_score : {0u, 4u}) {
+    auto c = ExpertCache::empty(2, Policy{4096, true, hint_score}).value();
+    REQUIRE(c.plan(std::vector<ExpertKey>{1}));
+    REQUIRE(c.plan(std::vector<ExpertKey>{2}));
+    REQUIRE(c.plan(std::vector<ExpertKey>{1}));  // 1: two picks, 2: one
+    for (int i = 0; i < 3; i++) REQUIRE(c.plan(std::vector<ExpertKey>{1}, std::vector<ExpertKey>{2}));
+    const auto p = c.plan(std::vector<ExpertKey>{3}).value();
+    CHECK(*p.loads[0].evicted == (hint_score == 0 ? 2u : 1u));
+  }
+}
+
+TEST_CASE("malformed hints are rejected") {
+  auto c = ExpertCache::empty(4, Policy{}).value();
+  CHECK_FALSE(c.plan(std::vector<ExpertKey>{1}, std::vector<ExpertKey>{2, 2}));
+  CHECK_FALSE(c.plan(std::vector<ExpertKey>{1}, std::vector<ExpertKey>{1}));
+  CHECK_FALSE(c.plan(std::vector<ExpertKey>{1}, std::vector<ExpertKey>{kKeys}));
+  CHECK(c.plan(std::vector<ExpertKey>{1}, std::vector<ExpertKey>{2, 3}));
+}
