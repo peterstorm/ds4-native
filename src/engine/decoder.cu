@@ -2,6 +2,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 #include "core/model.hpp"
 #include "core/moe_reference.hpp"
@@ -12,6 +13,7 @@
 #include "cuda/exchange.cuh"
 #include "cuda/glue.cuh"
 #include "cuda/indexer.cuh"
+#include "cuda/int_arg.cuh"
 #include "cuda/moe.cuh"
 #include "cuda/mx_gemv.cuh"
 #include "cuda/planes.cuh"
@@ -22,6 +24,7 @@ namespace {
 
 using namespace ds4n::model;
 using bf16 = __nv_bfloat16;
+using cuda::IntArg;
 
 constexpr float kSoftmaxScale = 0.044194173824159216f;  // head_dim^-0.5, as core/layer_reference
 constexpr int kExpertRows = 1152, kExpertDownBlocks = 36, kDimBlocks = kDim / 32;
@@ -63,29 +66,75 @@ struct LayerLaunches {
   Launch qa_kv, qb, oa, ob, engram;
 };
 
+/** Phase B's launch shape: the job lists' lengths and warps, fixed by the plan's job count. */
+struct MoeShape {
+  int n_gate_up = 0, warps_gate_up = 0, n_down = 0, warps_down = 0;
+  bool operator==(const MoeShape&) const = default;
+};
+
+/** A captured phase B and the shape it was captured for. */
+struct CapturedMoe {
+  cudaGraphExec_t exec = nullptr;
+  MoeShape shape;
+};
+
+/** What `enqueue` puts on `stream`, captured as an executable graph (nothing runs). */
+template <class Enqueue>
+cudaGraphExec_t capture(cudaStream_t stream, Enqueue&& enqueue) {
+  check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "cudaStreamBeginCapture");
+  try {
+    enqueue();
+  } catch (...) {
+    cudaGraph_t broken = nullptr;
+    cudaStreamEndCapture(stream, &broken);
+    if (broken) cudaGraphDestroy(broken);
+    throw;
+  }
+  cudaGraph_t graph = nullptr;
+  check(cudaStreamEndCapture(stream, &graph), "cudaStreamEndCapture");
+  cudaGraphExec_t exec = nullptr;
+  const cudaError_t e = cudaGraphInstantiate(&exec, graph, 0);
+  cudaGraphDestroy(graph);
+  check(e, "cudaGraphInstantiate");
+  return exec;
+}
+
 }  // namespace
 
-/** Pinned host staging for one GPU's per-step uploads (copies from it are truly asynchronous). */
+/**
+ * Pinned host staging for one GPU's per-step uploads (copies from it are truly
+ * asynchronous, and graph copy nodes read these fixed addresses when they run).
+ * The host rewrites a field only after the copy that read it last finished.
+ */
 struct Staging {
-  int64_t positions[2];
+  model::StepIndex step;
   int32_t window_idx[kWindow];
+  bf16 h[kHcCopies * kDim];
   uint8_t engram_rows[cuda::kEngramCols * cuda::kEngramRowBytes];
   cuda::GemvJob jobs[3 * cuda::kJobSlots];
   int first[3 * cuda::kJobSlots];
+  moe::Plan plan;
+  float logits[kVocab / kGpus];  // this GPU's half of the vocabulary
 };
 
 struct Decoder::Gpu {
   Staging* staging = nullptr;  // pinned
+  // Recorded after the copies out of each staging field.
+  cudaEvent_t staged_token = nullptr, staged_rows = nullptr, staged_jobs = nullptr;
   int rank = 0, device = 0;
   cudaStream_t stream = nullptr;
   DeviceArena arena;
   cuda::ExchangeLink link{};
   std::map<int, DeviceLayer> layers;
   std::map<int, LayerLaunches> launches;
-  // The stream between layers.
+  // Captured phases: A by (layer, produced), B by (layer, plan jobs).
+  std::map<std::pair<int, int>, cudaGraphExec_t> phase_a;
+  std::map<std::pair<int, int>, CapturedMoe> phase_b;
+  // The stream between layers: h in, h_next after Engram, h_mid after attention, back to h after the FFN.
   bf16 *h = nullptr, *h_next = nullptr, *h_mid = nullptr;
+  // The mixes; mix_ffn starts each token as `identity` (pre mix one-hot on copy 0).
   cuda::HcMixes *identity = nullptr, *mix_attn = nullptr, *mix_ffn = nullptr;
-  const cuda::HcMixes* prev_mix = nullptr;
+  model::StepIndex* step = nullptr;  // this token's, uploaded by begin_token
   // Caches.
   std::map<int, bf16*> window, compressed;
   std::map<int, uint8_t*> index_cache;
@@ -101,8 +150,7 @@ struct Decoder::Gpu {
       *logits;
   cuda::ActFragments act_x, act_qr, act_o[kLocalGroups], act_lora, act_xf, act_engram;
   cuda::IndexQuery iq{};
-  int32_t* idx = nullptr;
-  int64_t* positions = nullptr;  // [p, latent position]
+  int32_t* idx = nullptr;  // [window slots | top-k]; the window part is set per token
   int* produced = nullptr;
   uint8_t* engram_rows = nullptr;
   cuda::AttnScratch attn{};
@@ -115,9 +163,13 @@ struct Decoder::Gpu {
   // The head: this GPU's half of the vocabulary.
   bf16 *norm = nullptr, *head = nullptr;
   float *head_planes = nullptr, *head_out = nullptr;
+
+  void enqueue_phase_a(int layer, bool produced_now);
+  void enqueue_phase_b(const MoeShape& shape);
+  MoeShape stage_moe(int layer, const moe::Plan& routes, const std::vector<const uint8_t*>& halves);
 };
 
-Decoder::Decoder(std::array<int, 2> devices) {
+Decoder::Decoder(std::array<int, 2> devices, Launches launches) : launches_(launches) {
   const char* loading = std::getenv("CUDA_MODULE_LOADING");
   if (loading == nullptr || std::string(loading) != "EAGER")
     throw CudaError("the two-GPU decoder needs CUDA_MODULE_LOADING=EAGER set before CUDA initializes");
@@ -136,6 +188,8 @@ Decoder::Decoder(std::array<int, 2> devices) {
     s.device = devices[g];
     check(cudaStreamCreateWithFlags(&s.stream, cudaStreamNonBlocking), "cudaStreamCreate");
     check(cudaMallocHost(&s.staging, sizeof(Staging)), "cudaMallocHost");
+    for (cudaEvent_t* ev : {&s.staged_token, &s.staged_rows, &s.staged_jobs})
+      check(cudaEventCreateWithFlags(ev, cudaEventDisableTiming), "cudaEventCreate");
     DeviceArena& a = s.arena;
     s.link.rank = g;
     s.link.inbox = a.alloc<float>(cuda::kExchangeInboxFloats);
@@ -153,6 +207,7 @@ Decoder::Decoder(std::array<int, 2> devices) {
     s.identity = a.upload(&identity, 1);
     s.mix_attn = a.alloc<cuda::HcMixes>(1);
     s.mix_ffn = a.alloc<cuda::HcMixes>(1);
+    s.step = a.alloc<model::StepIndex>(1);
     s.topk = a.alloc<int32_t>(kTopK);
     s.candidates = a.alloc<uint8_t>(kMaxCompressed / 8);
     s.select = {{a.alloc<unsigned>(cuda::select_scratch_words())}, a.alloc<bf16>(kMaxCompressed / 8),
@@ -202,7 +257,6 @@ Decoder::Decoder(std::array<int, 2> devices) {
     s.act_engram = fragments(a, cuda::kEngramBlocks / kGpus);
     s.iq = {a.alloc<uint8_t>(16 * 256), a.alloc<uint8_t>(16 * 8), a.alloc<float>(32)};
     s.idx = a.alloc<int32_t>(kWindow + kTopK);
-    s.positions = a.alloc<int64_t>(2);
     s.produced = a.alloc<int>(1);
     s.engram_rows = a.alloc<uint8_t>(static_cast<size_t>(cuda::kEngramCols) * cuda::kEngramRowBytes);
     const int max_splits = cuda::attn_splits(kWindow + kTopK);
@@ -220,7 +274,7 @@ Decoder::Decoder(std::array<int, 2> devices) {
              kExpertRows,
              kSplitsExpert,
              kDim};
-    s.moe_jobs = a.alloc<cuda::GemvJob>(2 * cuda::kJobSlots + cuda::kJobSlots);
+    s.moe_jobs = a.alloc<cuda::GemvJob>(3 * cuda::kJobSlots);
     s.moe_first = a.alloc<int>(3 * cuda::kJobSlots);
     gpus_[g] = std::move(gpu);
   }
@@ -235,6 +289,9 @@ Decoder::~Decoder() {
     if (g) {
       cudaSetDevice(g->device);
       cudaStreamSynchronize(g->stream);
+      for (auto& [key, exec] : g->phase_a) cudaGraphExecDestroy(exec);
+      for (auto& [key, captured] : g->phase_b) cudaGraphExecDestroy(captured.exec);
+      for (cudaEvent_t ev : {g->staged_token, g->staged_rows, g->staged_jobs}) cudaEventDestroy(ev);
       cudaStreamDestroy(g->stream);
       cudaFreeHost(g->staging);
     }
@@ -275,202 +332,260 @@ void Decoder::add_layer(const HostLayer& w) {
   }
 }
 
-void Decoder::begin_token(std::span<const float> embedding_row) {
-  std::vector<bf16> h(static_cast<size_t>(kHcCopies) * kDim);
-  for (int c = 0; c < kHcCopies; c++)
-    for (int i = 0; i < kDim; i++) h[static_cast<size_t>(c) * kDim + i] = __float2bfloat16(embedding_row[i]);
+void Decoder::begin_token(int64_t p, std::span<const float> embedding_row) {
+  if (p < 0 || p >= kMaxCompressed) throw CudaError("position outside this executor's compressed capacity");
+  if (embedding_row.size() != static_cast<size_t>(kDim)) throw CudaError("begin_token: the embedding row has the wrong size");
+  step_ = model::step_index(p);
+  in_token_ = true;
   for (auto& gp : gpus_) {
-    check(cudaSetDevice(gp->device), "cudaSetDevice");
-    check(cudaMemcpy(gp->h, h.data(), h.size() * 2, cudaMemcpyHostToDevice), "begin_token");
-    gp->prev_mix = gp->identity;
+    Gpu& s = *gp;
+    const cudaStream_t st = s.stream;
+    check(cudaSetDevice(s.device), "cudaSetDevice");
+    check(cudaEventSynchronize(s.staged_token), "staging");
+    Staging& sg = *s.staging;
+    sg.step = step_;
+    for (int i = 0; i < kWindow; i++) sg.window_idx[i] = window_slot(p, i);
+    for (int c = 0; c < kHcCopies; c++)
+      for (int i = 0; i < kDim; i++) sg.h[c * kDim + i] = __float2bfloat16(embedding_row[i]);
+    check(cudaMemcpyAsync(s.step, &sg.step, sizeof(sg.step), cudaMemcpyHostToDevice, st), "step");
+    check(cudaMemcpyAsync(s.idx, sg.window_idx, sizeof(sg.window_idx), cudaMemcpyHostToDevice, st), "window idx");
+    check(cudaMemcpyAsync(s.h, sg.h, sizeof(sg.h), cudaMemcpyHostToDevice, st), "embedding");
+    check(cudaMemcpyAsync(s.mix_ffn, s.identity, sizeof(cuda::HcMixes), cudaMemcpyDeviceToDevice, st), "identity");
+    check(cudaEventRecord(s.staged_token, st), "cudaEventRecord");
   }
 }
 
-StepTrace Decoder::decode_layer(int layer, int64_t p, std::span<const uint8_t> engram_rows, const ExpertSlots& experts) {
+void Decoder::sync() {
+  for (auto& gp : gpus_) {
+    check(cudaSetDevice(gp->device), "cudaSetDevice");
+    check(cudaStreamSynchronize(gp->stream), "sync");
+  }
+}
+
+void Decoder::Gpu::enqueue_phase_a(int layer, bool produced_now) {
   const LayerKind kind = model::kind(layer);
   const int ratio = kind.compress_ratio;
-  const bool produced = kind.kv_source && (ratio == 1 || (ratio == 2 && p % 2 == 1));
-  const int64_t compress_len = ratio ? (p + 1) / ratio : 0;
-  if (compress_len > kMaxCompressed) throw CudaError("position beyond this executor's compressed capacity");
-  if (kind.engram && engram_rows.size() != static_cast<size_t>(cuda::kEngramCols) * cuda::kEngramRowBytes)
-    throw CudaError("an Engram layer needs 24 raw table rows");
-  const int64_t positions[2] = {p, p + 1 - ratio};
+  const DeviceLayer& d = layers.at(layer);
+  const LayerLaunches& l = launches.at(layer);
+  const cudaStream_t st = stream;
+  const int64_t* pos = &step->pos;
+  const int64_t* latent_pos = &step->latent_pos[ratio];
+  const IntArg compress_len = IntArg::at(&step->compress_len[ratio], kMaxCompressed);
+  const IntArg compress_row = IntArg::at(&step->compress_row[ratio], kMaxCompressed - 1);
   const int n_idx = ratio ? kWindow + kTopK : kWindow;
 
-  // Phase A on both GPUs: Engram, attention, the FFN input and routing.
+  // Engram adds its memory into the stream this layer reads.
+  bf16* h_in = h;
+  if (kind.engram) {
+    check(cudaMemcpyAsync(engram_rows, staging->engram_rows, sizeof(staging->engram_rows), cudaMemcpyHostToDevice, st),
+          "rows");
+    cuda::engram_quantize_rows(engram_rows, 1, rank * (cuda::kEngramBlocks / kGpus), act_engram, st);
+    run(l.engram, st);
+    cuda::sum_planes_f32(planes_eg, 1, cuda::kEngramKvRows, 1, packed, st);
+    cuda::exchange_add(link, packed, cuda::kEngramKvRows, kv_engram, st);
+    cuda::engram_gate(h, kv_engram, d.engram_q, d.engram_k, kNormEps, 1, h_next, st);
+    h_in = h_next;
+  }
+
+  // Attention input and projections.
+  const cuda::HcParams attn_params{d.hc_attn_fn, d.hc_attn_scale, d.hc_attn_base, kNormEps, kHcEps, kSinkhornIters};
+  cuda::hc_mixes(h_in, attn_params, kDim, 1, hc_scratch, mix_attn, st);
+  cuda::hc_pre(h_in, mix_ffn, kDim, 1, x0, st);
+  cuda::rmsnorm(x0, d.attn_norm, kDim, 1, kNormEps, xa, st);
+  cuda::quantize_activations(xa, 1, act_x, st);
+  cuda::bf16_to_f32(xa, kDim, xa_f, st);
+  run(l.qa_kv, st);
+  cuda::sum_planes_bf16(planes_qa, kSplitsWqA, kQLora, 1, qlora, st);
+  cuda::rmsnorm(qlora, d.q_norm, kQLora, 1, kNormEps, qr, st);
+  cuda::quantize_activations(qr, 1, act_qr, st);
+  cuda::sum_planes_bf16(planes_kv, kSplitsWkv, kHeadDim, 1, kv_raw, st);
+  cuda::rmsnorm(kv_raw, d.kv_norm, kHeadDim, 1, kNormEps, kv, st);
+  cuda::rope(kv, 1, 1, kHeadDim, kRopeDim, d.rope_freqs, pos, false, st);
+  cuda::fp8_quant_dequant(kv, 1, kHeadDim, st);
+  cuda::store_row(kv, kHeadDim, window.at(layer), IntArg::at(&step->ring_slot, kWindow - 1), st);
+  run(l.qb, st);
+  cuda::sum_planes_bf16(planes_qb, kSplitsWqB, kLocalHeads * kHeadDim, 1, q, st);
+  cuda::rope(q, 1, kLocalHeads, kHeadDim, kRopeDim, d.rope_freqs, pos, false, st);
+
+  if (ratio) {
+    if (kind.kv_source) {
+      cuda::bf16_gemv(d.compress_w, xa_f, d.compress_rows, kDim, 1, kSplitsBf16, planes_bf, st);
+      if (ratio == 2)
+        cuda::compress_pool(planes_bf, kSplitsBf16, 0, pos, pools.at(layer), d.compress_norm, kNormEps, latent, produced,
+                            st);
+      else
+        cuda::compress_project(planes_bf, kSplitsBf16, 0, d.compress_norm, kNormEps, latent, st);
+    }
+    if (kind.index_source) {
+      if (kind.kv_source && produced_now) {
+        cuda::bf16_to_f32(latent, kHeadDim, latent_f, st);
+        cuda::bf16_gemv(d.index_wk, latent_f, cuda::kIndexDim, kHeadDim, 1, kSplitsWk, planes_bf, st);
+        cuda::sum_planes_bf16(planes_bf, kSplitsWk, cuda::kIndexDim, 1, k_raw, st);
+        cuda::rmsnorm(k_raw, d.index_k_norm, cuda::kIndexDim, 1, kNormEps, k_idx, st);
+        cuda::rope(k_idx, 1, 1, cuda::kIndexDim, kRopeDim, d.rope_freqs, latent_pos, false, st);
+        cuda::append_index_keys(k_idx, compress_row, 1, index_cache.at(layer), st);
+      }
+      cuda::sum_planes_bf16(planes_iq, kSplitsIndexQ, cuda::kIndexHeads * cuda::kIndexDim, 1, q_idx, st);
+      cuda::rope(q_idx, 1, cuda::kIndexHeads, cuda::kIndexDim, kRopeDim, d.rope_freqs, pos, false, st);
+      cuda::bf16_gemv(d.index_weights_proj, xa_f, cuda::kIndexHeads, kDim, 1, kSplitsBf16, planes_proj, st);
+      cuda::prepare_index_query(q_idx, planes_proj, kSplitsBf16, 0, iq, st);
+      cuda::index_scores(index_cache.at(kind.cache_owner), compress_len, iq, kind.uses_candidates ? candidates : nullptr,
+                         scores, st);
+      if (kind.candidate_source) cuda::candidate_blocks(scores, compress_len, candidates, select, st);
+      cuda::top_positions(scores, compress_len, kWindow, topk, select.select, st);
+    }
+    if (kind.kv_source && produced_now) {
+      check(cudaMemcpyAsync(latent_c, latent, kHeadDim * 2, cudaMemcpyDeviceToDevice, st), "latent");
+      cuda::rope(latent_c, 1, 1, kHeadDim, kRopeDim, d.rope_freqs, latent_pos, false, st);
+      cuda::fp4_quant_dequant_e4m3(latent_c, 1, kHeadDim, st);
+      cuda::store_row(latent_c, kHeadDim, compressed.at(layer), compress_row, st);
+    }
+    check(cudaMemcpyAsync(idx + kWindow, topk, kTopK * 4, cudaMemcpyDeviceToDevice, st), "topk");
+  }
+
+  // Attention, its output projections and the exchange.
+  const cuda::KvSources kv_sources{window.at(layer), ratio ? compressed.at(kind.cache_owner) : nullptr};
+  check(cuda::sparse_attn(q, kv_sources, idx, n_idx, d.sink, 1, kSoftmaxScale, attn, o, st), "sparse_attn");
+  cuda::rope(o, 1, kLocalHeads, kHeadDim, kRopeDim, d.rope_freqs, pos, true, st);
+  for (int gl = 0; gl < kLocalGroups; gl++)
+    cuda::quantize_activations(o + static_cast<size_t>(gl) * kGroupWidth, 1, act_o[gl], st);
+  run(l.oa, st);
+  for (int gl = 0; gl < kLocalGroups; gl++)
+    cuda::sum_planes_bf16(planes_oa + static_cast<size_t>(gl) * kSplitsWoA * kOLora * 8, kSplitsWoA, kOLora, 1,
+                          lora + static_cast<size_t>(gl) * kOLora, st);
+  cuda::quantize_activations(lora, 1, act_lora, st);
+  run(l.ob, st);
+  cuda::sum_planes_f32(planes_ob, kSplitsWoB, kDim, 1, partial, st);
+  cuda::exchange_add(link, partial, kDim, attn_out, st);
+  cuda::hc_post(attn_out, h_in, mix_attn, kDim, 1, h_mid, st);
+
+  // FFN input and routing.
+  const cuda::HcParams ffn_params{d.hc_ffn_fn, d.hc_ffn_scale, d.hc_ffn_base, kNormEps, kHcEps, kSinkhornIters};
+  cuda::hc_mixes(h_mid, ffn_params, kDim, 1, hc_scratch, mix_ffn, st);
+  cuda::hc_pre(h_mid, mix_attn, kDim, 1, x0, st);
+  cuda::rmsnorm(x0, d.ffn_norm, kDim, 1, kNormEps, xf, st);
+  cuda::quantize_activations(xf, 1, act_xf, st);
+  cuda::bf16_to_f32(xf, kDim, xf_f, st);
+  cuda::bf16_gemv(d.router, xf_f, moe::kExperts, kDim, 1, kSplitsBf16, logits, st);
+  cuda::route(logits, kSplitsBf16, 1, nullptr, {d.router_bias, nullptr, kRouteScale}, route_experts, route_weights, plan,
+              st);
+  check(cudaGetLastError(), "phase A launches");
+}
+
+MoeShape Decoder::Gpu::stage_moe(int layer, const moe::Plan& routes, const std::vector<const uint8_t*>& halves) {
+  if (halves.size() != static_cast<size_t>(routes.jobs)) throw CudaError("ExpertSlots gave the wrong number of Halves");
+  const DeviceLayer& d = layers.at(layer);
+  const int sb = cuda::split_blocks_for(kDimBlocks, kSplitsExpert);
+  std::vector<cuda::GemvJob> gate_up, down;
+  for (int j = 0; j < routes.jobs; j++) {
+    const auto hid = moe.hidden_of(j);
+    gate_up.push_back({cuda::WeightFormat::Mxfp4, halves[j], act_xf.codes, act_xf.scales, moe.gate_of(j), kExpertRows,
+                       kDimBlocks, kSplitsExpert, sb});
+    gate_up.push_back({cuda::WeightFormat::Mxfp4, halves[j] + kExpertPartBytes, act_xf.codes, act_xf.scales, moe.up_of(j),
+                       kExpertRows, kDimBlocks, kSplitsExpert, sb});
+    down.push_back({cuda::WeightFormat::Mxfp4, halves[j] + 2 * kExpertPartBytes, hid.codes, hid.scales, moe.down_of(j), kDim,
+                    kExpertDownBlocks, 1, kExpertDownBlocks});
+  }
+  const int shared = cuda::kSharedJob;
+  const auto shid = moe.hidden_of(shared);
+  gate_up.push_back(fp8_job(d.shared_gate, 0, act_xf, moe.gate_of(shared), kExpertRows, kSplitsExpert));
+  gate_up.push_back(fp8_job(d.shared_up, 0, act_xf, moe.up_of(shared), kExpertRows, kSplitsExpert));
+  down.push_back(fp8_job(d.shared_down, 0, shid, moe.down_of(shared), kDim, 1));
+
+  // Both job lists back to back, each with its own warp prefix sums.
+  MoeShape shape{static_cast<int>(gate_up.size()), 0, static_cast<int>(down.size()), 0};
+  check(cudaEventSynchronize(staged_jobs), "staging");
+  int at = 0;
+  for (const auto& j : gate_up) {
+    staging->jobs[at] = j;
+    staging->first[at++] = shape.warps_gate_up;
+    shape.warps_gate_up += cuda::job_warps(j);
+  }
+  for (const auto& j : down) {
+    staging->jobs[at] = j;
+    staging->first[at++] = shape.warps_down;
+    shape.warps_down += cuda::job_warps(j);
+  }
+  return shape;
+}
+
+void Decoder::Gpu::enqueue_phase_b(const MoeShape& shape) {
+  const cudaStream_t st = stream;
+  const int n = shape.n_gate_up + shape.n_down;
+  check(cudaMemcpyAsync(moe_jobs, staging->jobs, n * sizeof(cuda::GemvJob), cudaMemcpyHostToDevice, st), "jobs");
+  check(cudaMemcpyAsync(moe_first, staging->first, n * sizeof(int), cudaMemcpyHostToDevice, st), "first");
+  cuda::gemv(moe_jobs, moe_first, shape.n_gate_up, shape.warps_gate_up, st);
+  cuda::swiglu_quantize(plan, moe, moe::kSwigluLimit, st);
+  cuda::gemv(moe_jobs + shape.n_gate_up, moe_first + shape.n_gate_up, shape.n_down, shape.warps_down, st);
+  cuda::combine(plan, moe, y, st);
+  cuda::exchange_add(link, y, kDim, moe_out, st);
+  cuda::hc_post(moe_out, h_mid, mix_ffn, kDim, 1, h, st);
+  check(cudaGetLastError(), "phase B launches");
+}
+
+StepTrace Decoder::decode_layer(int layer, std::span<const uint8_t> engram_rows, const ExpertSlots& experts,
+                                bool trace_step) {
+  if (!in_token_) throw CudaError("decode_layer before begin_token");
+  const LayerKind kind = model::kind(layer);
+  const bool produced = kind.kv_source && step_.produced[kind.compress_ratio] != 0;
+  if (kind.engram && engram_rows.size() != sizeof(Staging::engram_rows))
+    throw CudaError("an Engram layer needs 24 raw table rows");
+  const bool graphs = launches_ == Launches::Graphs;
+  const std::pair<int, int> key_a{layer, produced};
+
+  // Phase A: stage and capture on both GPUs, then launch on both.
   for (auto& gp : gpus_) {
     Gpu& s = *gp;
-    const DeviceLayer& d = s.layers.at(layer);
-    const LayerLaunches& l = s.launches.at(layer);
-    const cudaStream_t st = s.stream;
     check(cudaSetDevice(s.device), "cudaSetDevice");
-    std::memcpy(s.staging->positions, positions, sizeof(positions));
-    for (int i = 0; i < kWindow; i++) s.staging->window_idx[i] = window_slot(p, i);
-    if (kind.engram) std::memcpy(s.staging->engram_rows, engram_rows.data(), engram_rows.size());
-    check(cudaMemcpyAsync(s.positions, s.staging->positions, sizeof(positions), cudaMemcpyHostToDevice, st), "positions");
-
     if (kind.engram) {
-      check(cudaMemcpyAsync(s.engram_rows, s.staging->engram_rows, engram_rows.size(), cudaMemcpyHostToDevice, st), "rows");
-      cuda::engram_quantize_rows(s.engram_rows, 1, s.rank * (cuda::kEngramBlocks / kGpus), s.act_engram, st);
-      run(l.engram, st);
-      cuda::sum_planes_f32(s.planes_eg, 1, cuda::kEngramKvRows, 1, s.packed, st);
-      cuda::exchange_add(s.link, s.packed, cuda::kEngramKvRows, s.kv_engram, st);
-      cuda::engram_gate(s.h, s.kv_engram, d.engram_q, d.engram_k, kNormEps, 1, s.h_next, st);
-      std::swap(s.h, s.h_next);
+      check(cudaEventSynchronize(s.staged_rows), "staging");
+      std::memcpy(s.staging->engram_rows, engram_rows.data(), engram_rows.size());
     }
-
-    // Attention input and projections.
-    const cuda::HcParams attn_params{d.hc_attn_fn, d.hc_attn_scale, d.hc_attn_base, kNormEps, kHcEps, kSinkhornIters};
-    cuda::hc_mixes(s.h, attn_params, kDim, 1, s.hc_scratch, s.mix_attn, st);
-    cuda::hc_pre(s.h, s.prev_mix, kDim, 1, s.x0, st);
-    cuda::rmsnorm(s.x0, d.attn_norm, kDim, 1, kNormEps, s.xa, st);
-    cuda::quantize_activations(s.xa, 1, s.act_x, st);
-    cuda::bf16_to_f32(s.xa, kDim, s.xa_f, st);
-    run(l.qa_kv, st);
-    cuda::sum_planes_bf16(s.planes_qa, kSplitsWqA, kQLora, 1, s.qlora, st);
-    cuda::rmsnorm(s.qlora, d.q_norm, kQLora, 1, kNormEps, s.qr, st);
-    cuda::quantize_activations(s.qr, 1, s.act_qr, st);
-    cuda::sum_planes_bf16(s.planes_kv, kSplitsWkv, kHeadDim, 1, s.kv_raw, st);
-    cuda::rmsnorm(s.kv_raw, d.kv_norm, kHeadDim, 1, kNormEps, s.kv, st);
-    cuda::rope(s.kv, 1, 1, kHeadDim, kRopeDim, d.rope_freqs, s.positions, false, st);
-    cuda::fp8_quant_dequant(s.kv, 1, kHeadDim, st);
-    check(cudaMemcpyAsync(s.window[layer] + (p % kWindow) * kHeadDim, s.kv, kHeadDim * 2, cudaMemcpyDeviceToDevice, st),
-          "window");
-    run(l.qb, st);
-    cuda::sum_planes_bf16(s.planes_qb, kSplitsWqB, kLocalHeads * kHeadDim, 1, s.q, st);
-    cuda::rope(s.q, 1, kLocalHeads, kHeadDim, kRopeDim, d.rope_freqs, s.positions, false, st);
-
-    check(cudaMemcpyAsync(s.idx, s.staging->window_idx, sizeof(s.staging->window_idx), cudaMemcpyHostToDevice, st), "idx");
-    if (ratio) {
-      if (kind.kv_source) {
-        cuda::bf16_gemv(d.compress_w, s.xa_f, d.compress_rows, kDim, 1, kSplitsBf16, s.planes_bf, st);
-        if (ratio == 2)
-          cuda::compress_pool(s.planes_bf, kSplitsBf16, 0, s.positions, s.pools.at(layer), d.compress_norm, kNormEps,
-                              s.latent, s.produced, st);
-        else
-          cuda::compress_project(s.planes_bf, kSplitsBf16, 0, d.compress_norm, kNormEps, s.latent, st);
-      }
-      if (kind.index_source) {
-        if (kind.kv_source && produced) {
-          cuda::bf16_to_f32(s.latent, kHeadDim, s.latent_f, st);
-          cuda::bf16_gemv(d.index_wk, s.latent_f, cuda::kIndexDim, kHeadDim, 1, kSplitsWk, s.planes_bf, st);
-          cuda::sum_planes_bf16(s.planes_bf, kSplitsWk, cuda::kIndexDim, 1, s.k_raw, st);
-          cuda::rmsnorm(s.k_raw, d.index_k_norm, cuda::kIndexDim, 1, kNormEps, s.k_idx, st);
-          cuda::rope(s.k_idx, 1, 1, cuda::kIndexDim, kRopeDim, d.rope_freqs, s.positions + 1, false, st);
-          cuda::append_index_keys(s.k_idx, p / ratio, 1, s.index_cache.at(layer), st);
-        }
-        cuda::sum_planes_bf16(s.planes_iq, kSplitsIndexQ, cuda::kIndexHeads * cuda::kIndexDim, 1, s.q_idx, st);
-        cuda::rope(s.q_idx, 1, cuda::kIndexHeads, cuda::kIndexDim, kRopeDim, d.rope_freqs, s.positions, false, st);
-        cuda::bf16_gemv(d.index_weights_proj, s.xa_f, cuda::kIndexHeads, kDim, 1, kSplitsBf16, s.planes_proj, st);
-        cuda::prepare_index_query(s.q_idx, s.planes_proj, kSplitsBf16, 0, s.iq, st);
-        cuda::index_scores(s.index_cache.at(kind.cache_owner), compress_len, s.iq, kind.uses_candidates ? s.candidates : nullptr,
-                           s.scores, st);
-        if (kind.candidate_source) cuda::candidate_blocks(s.scores, compress_len, s.candidates, s.select, st);
-        cuda::top_positions(s.scores, compress_len, kWindow, s.topk, s.select.select, st);
-      }
-      if (kind.kv_source && produced) {
-        check(cudaMemcpyAsync(s.latent_c, s.latent, kHeadDim * 2, cudaMemcpyDeviceToDevice, st), "latent");
-        cuda::rope(s.latent_c, 1, 1, kHeadDim, kRopeDim, d.rope_freqs, s.positions + 1, false, st);
-        cuda::fp4_quant_dequant_e4m3(s.latent_c, 1, kHeadDim, st);
-        check(cudaMemcpyAsync(s.compressed.at(layer) + (p / ratio) * kHeadDim, s.latent_c, kHeadDim * 2,
-                              cudaMemcpyDeviceToDevice, st),
-              "compressed");
-      }
-      check(cudaMemcpyAsync(s.idx + kWindow, s.topk, kTopK * 4, cudaMemcpyDeviceToDevice, st), "topk");
-    }
-
-    // Attention, its output projections and the exchange.
-    const cuda::KvSources kv{s.window.at(layer), ratio ? s.compressed.at(kind.cache_owner) : nullptr};
-    check(cuda::sparse_attn(s.q, kv, s.idx, n_idx, d.sink, 1, kSoftmaxScale, s.attn, s.o, st), "sparse_attn");
-    cuda::rope(s.o, 1, kLocalHeads, kHeadDim, kRopeDim, d.rope_freqs, s.positions, true, st);
-    for (int gl = 0; gl < kLocalGroups; gl++)
-      cuda::quantize_activations(s.o + static_cast<size_t>(gl) * kGroupWidth, 1, s.act_o[gl], st);
-    run(l.oa, st);
-    for (int gl = 0; gl < kLocalGroups; gl++)
-      cuda::sum_planes_bf16(s.planes_oa + static_cast<size_t>(gl) * kSplitsWoA * kOLora * 8, kSplitsWoA, kOLora, 1,
-                            s.lora + static_cast<size_t>(gl) * kOLora, st);
-    cuda::quantize_activations(s.lora, 1, s.act_lora, st);
-    run(l.ob, st);
-    cuda::sum_planes_f32(s.planes_ob, kSplitsWoB, kDim, 1, s.partial, st);
-    cuda::exchange_add(s.link, s.partial, kDim, s.attn_out, st);
-    cuda::hc_post(s.attn_out, s.h, s.mix_attn, kDim, 1, s.h_mid, st);
-
-    // FFN input and routing.
-    const cuda::HcParams ffn_params{d.hc_ffn_fn, d.hc_ffn_scale, d.hc_ffn_base, kNormEps, kHcEps, kSinkhornIters};
-    cuda::hc_mixes(s.h_mid, ffn_params, kDim, 1, s.hc_scratch, s.mix_ffn, st);
-    cuda::hc_pre(s.h_mid, s.mix_attn, kDim, 1, s.x0, st);
-    cuda::rmsnorm(s.x0, d.ffn_norm, kDim, 1, kNormEps, s.xf, st);
-    cuda::quantize_activations(s.xf, 1, s.act_xf, st);
-    cuda::bf16_to_f32(s.xf, kDim, s.xf_f, st);
-    cuda::bf16_gemv(d.router, s.xf_f, moe::kExperts, kDim, 1, kSplitsBf16, s.logits, st);
-    cuda::route(s.logits, kSplitsBf16, 1, nullptr, {d.router_bias, nullptr, kRouteScale}, s.route_experts,
-                s.route_weights, s.plan, st);
+    if (graphs && !s.phase_a.contains(key_a))
+      s.phase_a[key_a] = capture(s.stream, [&] { s.enqueue_phase_a(layer, produced); });
+  }
+  for (auto& gp : gpus_) {
+    Gpu& s = *gp;
+    check(cudaSetDevice(s.device), "cudaSetDevice");
+    if (graphs) check(cudaGraphLaunch(s.phase_a.at(key_a), s.stream), "cudaGraphLaunch");
+    else s.enqueue_phase_a(layer, produced);
+    if (kind.engram) check(cudaEventRecord(s.staged_rows, s.stream), "cudaEventRecord");
   }
 
   // The plan (identical on both GPUs) decides which Halves this step needs.
   StepTrace trace;
   Gpu& lead = *gpus_[0];
   check(cudaSetDevice(lead.device), "cudaSetDevice");
-  check(cudaMemcpyAsync(&trace.plan, lead.plan, sizeof(moe::Plan), cudaMemcpyDeviceToHost, lead.stream), "plan");
+  check(cudaMemcpyAsync(&lead.staging->plan, lead.plan, sizeof(moe::Plan), cudaMemcpyDeviceToHost, lead.stream), "plan");
   check(cudaStreamSynchronize(lead.stream), "phase A");
+  trace.plan = lead.staging->plan;
   if (trace.plan.jobs < 1) throw CudaError("routing failed (non-finite router logits)");
 
-  // Both GPUs' Halves in place before either launches phase B (loading may allocate or synchronize).
-  std::array<std::vector<const uint8_t*>, 2> placed;
-  for (auto& gp : gpus_) {
-    check(cudaSetDevice(gp->device), "cudaSetDevice");
-    placed[gp->rank] = experts(gp->rank, layer, trace.plan);
-  }
-
-  // Phase B on both GPUs: the Experts, the MoE exchange, hc_post.
+  // Both GPUs' Halves in place, job lists staged and graphs captured before either launches phase B
+  // (loading and instantiation may allocate or synchronize).
+  const std::pair<int, int> key_b{layer, trace.plan.jobs};
+  std::array<MoeShape, 2> shapes;
   for (auto& gp : gpus_) {
     Gpu& s = *gp;
-    const DeviceLayer& d = s.layers.at(layer);
-    const cudaStream_t st = s.stream;
     check(cudaSetDevice(s.device), "cudaSetDevice");
-    const auto& halves = placed[s.rank];
-    const int sb = cuda::split_blocks_for(kDimBlocks, kSplitsExpert);
-    std::vector<cuda::GemvJob> gate_up, down;
-    for (int j = 0; j < trace.plan.jobs; j++) {
-      const auto hid = s.moe.hidden_of(j);
-      gate_up.push_back({cuda::WeightFormat::Mxfp4, halves[j], s.act_xf.codes, s.act_xf.scales, s.moe.gate_of(j), kExpertRows,
-                         kDimBlocks, kSplitsExpert, sb});
-      gate_up.push_back({cuda::WeightFormat::Mxfp4, halves[j] + kExpertPartBytes, s.act_xf.codes, s.act_xf.scales,
-                         s.moe.up_of(j), kExpertRows, kDimBlocks, kSplitsExpert, sb});
-      down.push_back({cuda::WeightFormat::Mxfp4, halves[j] + 2 * kExpertPartBytes, hid.codes, hid.scales, s.moe.down_of(j),
-                      kDim, kExpertDownBlocks, 1, kExpertDownBlocks});
+    shapes[s.rank] = s.stage_moe(layer, trace.plan, experts(s.rank, layer, trace.plan));
+    if (!graphs) continue;
+    auto it = s.phase_b.find(key_b);
+    if (it == s.phase_b.end()) {
+      const MoeShape shape = shapes[s.rank];
+      it = s.phase_b.emplace(key_b, CapturedMoe{capture(s.stream, [&] { s.enqueue_phase_b(shape); }), shape}).first;
     }
-    const int shared = cuda::kSharedJob;
-    const auto shid = s.moe.hidden_of(shared);
-    gate_up.push_back(fp8_job(d.shared_gate, 0, s.act_xf, s.moe.gate_of(shared), kExpertRows, kSplitsExpert));
-    gate_up.push_back(fp8_job(d.shared_up, 0, s.act_xf, s.moe.up_of(shared), kExpertRows, kSplitsExpert));
-    down.push_back(fp8_job(d.shared_down, 0, shid, s.moe.down_of(shared), kDim, 1));
-    // Upload both job lists back to back, then launch.
-    std::vector<cuda::GemvJob> all = gate_up;
-    all.insert(all.end(), down.begin(), down.end());
-    std::vector<int> first;
-    int warps_gu = 0, warps_dn = 0;
-    for (const auto& j : gate_up) {
-      first.push_back(warps_gu);
-      warps_gu += cuda::job_warps(j);
-    }
-    for (const auto& j : down) {
-      first.push_back(warps_dn);
-      warps_dn += cuda::job_warps(j);
-    }
-    std::memcpy(s.staging->jobs, all.data(), all.size() * sizeof(cuda::GemvJob));
-    std::memcpy(s.staging->first, first.data(), first.size() * sizeof(int));
-    check(cudaMemcpyAsync(s.moe_jobs, s.staging->jobs, all.size() * sizeof(cuda::GemvJob), cudaMemcpyHostToDevice, st), "jobs");
-    check(cudaMemcpyAsync(s.moe_first, s.staging->first, first.size() * sizeof(int), cudaMemcpyHostToDevice, st), "first");
-    const int n_gu = static_cast<int>(gate_up.size());
-    cuda::gemv(s.moe_jobs, s.moe_first, n_gu, warps_gu, st);
-    cuda::swiglu_quantize(s.plan, s.moe, moe::kSwigluLimit, st);
-    cuda::gemv(s.moe_jobs + n_gu, s.moe_first + n_gu, static_cast<int>(down.size()), warps_dn, st);
-    cuda::combine(s.plan, s.moe, s.y, st);
-    cuda::exchange_add(s.link, s.y, kDim, s.moe_out, st);
-    cuda::hc_post(s.moe_out, s.h_mid, s.mix_ffn, kDim, 1, s.h, st);
-    s.prev_mix = s.mix_ffn;
+    if (it->second.shape != shapes[s.rank]) throw CudaError("phase B's launch shape changed for the same job count");
   }
+  for (auto& gp : gpus_) {
+    Gpu& s = *gp;
+    check(cudaSetDevice(s.device), "cudaSetDevice");
+    if (graphs) check(cudaGraphLaunch(s.phase_b.at(key_b).exec, s.stream), "cudaGraphLaunch");
+    else s.enqueue_phase_b(shapes[s.rank]);
+    check(cudaEventRecord(s.staged_jobs, s.stream), "cudaEventRecord");
+  }
+
+  if (!trace_step) return trace;
 
   // Rank 0's trace; both ranks' streams must agree.
   auto download_bf16 = [](const bf16* d, size_t n, cudaStream_t st) {
@@ -492,6 +607,7 @@ StepTrace Decoder::decode_layer(int layer, int64_t p, std::span<const uint8_t> e
   trace.stream = std::move(streams[0]);
   trace.attn_out = download_bf16(lead.attn_out, kDim, lead.stream);
   trace.moe_out = download_bf16(lead.moe_out, kDim, lead.stream);
+  const int n_idx = kind.compress_ratio ? kWindow + kTopK : kWindow;
   trace.idx.resize(n_idx);
   check(cudaMemcpy(trace.idx.data(), lead.idx, n_idx * 4, cudaMemcpyDeviceToHost), "idx");
   return trace;
@@ -516,21 +632,24 @@ void Decoder::add_head(const std::vector<float>& norm, const std::vector<float>&
 
 std::vector<float> Decoder::logits() {
   constexpr int half = kVocab / kGpus;
-  std::vector<float> out(kVocab);
+  // Both halves run at once: enqueue on both GPUs, then wait for both.
   for (auto& gp : gpus_) {
     Gpu& s = *gp;
     if (s.head == nullptr) throw CudaError("logits() before add_head()");
     check(cudaSetDevice(s.device), "cudaSetDevice");
     const cudaStream_t st = s.stream;
-    cuda::hc_pre(s.h, s.prev_mix, kDim, 1, s.x0, st);
+    cuda::hc_pre(s.h, s.mix_ffn, kDim, 1, s.x0, st);
     cuda::rmsnorm(s.x0, s.norm, kDim, 1, kNormEps, s.xf, st);
     cuda::bf16_to_f32(s.xf, kDim, s.xf_f, st);
     cuda::bf16_gemv(s.head, s.xf_f, half, kDim, 1, 1, s.head_planes, st);
     cuda::sum_planes_f32(s.head_planes, 1, half, 1, s.head_out, st);
-    check(cudaMemcpyAsync(out.data() + static_cast<size_t>(s.rank) * half, s.head_out, half * sizeof(float),
-                          cudaMemcpyDeviceToHost, st),
-          "logits");
-    check(cudaStreamSynchronize(st), "logits");
+    check(cudaMemcpyAsync(s.staging->logits, s.head_out, half * sizeof(float), cudaMemcpyDeviceToHost, st), "logits");
+  }
+  std::vector<float> out(kVocab);
+  for (auto& gp : gpus_) {
+    check(cudaSetDevice(gp->device), "cudaSetDevice");
+    check(cudaStreamSynchronize(gp->stream), "logits");
+    std::memcpy(out.data() + static_cast<size_t>(gp->rank) * half, gp->staging->logits, half * sizeof(float));
   }
   return out;
 }

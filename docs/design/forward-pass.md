@@ -111,7 +111,7 @@ with the routing round trip.
 | wq_a, wkv, router, indexer wq_b | FP8 / BF16 | 0.5 GB | replicated (avoid syncs) | FP8 and BF16 GEMV done (router GEMV 13 us: too narrow) |
 | wq_b, wo_a, wo_b | FP8 | 3.3 GB | heads / groups / K split | FP8 done |
 | Shared Expert | FP8 | 1.42 GB | Halves, like routed | FP8 done |
-| Head | BF16 [129280, 5120] | 1.32 GB | vocab split | **done** (BF16 GEMV), 415 us at 1,595 GB/s |
+| Head | BF16 [129280, 5120] | 1.32 GB | vocab split | **done** (BF16 GEMV), 415 us per half at 1,595 GB/s; both halves at once in the decoder, 0.35 ms per token |
 | RMSNorm, hc_mixes + Sinkhorn, hc_pre/hc_post | F32 small | ~0.3 GB | replicated | **done**, all bit-identical (oracles emulate the kernels' FMA chains and warp/block trees, core/reduce.hpp) |
 | RoPE (YaRN for compressed layers) | — | — | local | **done**, bit-identical |
 | Compressor (ratio 2 pooling / ratio 1 proj) | BF16 weights, FP32 math | 10.5 MB (ratio 2) | replicated | **done**: one split-K BF16 GEMV over stacked wkv/wgate + a 256-thread pool/RMSNorm kernel (position read on the device); bit-identical to `core/compressor` on real layer-2 and layer-20 weights |
@@ -138,9 +138,33 @@ likewise, with Experts mapped from the store's first layers (`--expert-layers 4`
 
 Deadlock rules the decoder states and enforces: no host call that can wait on a GPU while its
 peer's side of an exchange is unlaunched -- per-step uploads through pinned staging, Expert
-Halves for both GPUs placed before phase B, eager module loading (`CUDA_MODULE_LOADING=EAGER`:
-a lazy first launch can wait on the device), and a 10 s watchdog in the exchange that traps
-instead of hanging.
+Halves for both GPUs placed (and both GPUs' graphs captured) before a phase launches on either,
+eager module loading (`CUDA_MODULE_LOADING=EAGER`: a lazy first launch can wait on the device),
+and a 10 s watchdog in the exchange that traps instead of hanging.
+
+**Graph replay.** Each phase replays as a CUDA graph captured on first use: phase A per
+(layer, whether a ratio-2 KV source completes a group), phase B per (layer, plan job count).
+No captured launch takes a per-step host value: `begin_token(p)` uploads the token's
+`model::StepIndex` (position, latent positions, ring slot, compressed lengths and rows per
+ratio), and kernels read it as `cuda::IntArg` device arguments -- launches are sized for the
+argument's bound and give the same bytes for any grid that covers it (`ds4n-indexer-check`:
+device lengths with capacity-sized launches identical to host lengths, 0 to 40000 positions).
+Engram rows and Expert job lists are copies from fixed pinned staging inside the graph; the
+host rewrites a staging field only after the event recorded behind its last reader. The Engram
+output is the layer's stream input (`h_next`), never a host-side pointer swap, so a captured
+graph's buffers are right on every replay. `ds4n-layer-check --steps 6` (both variants
+replayed, real Engram rows, logits): bit-identical to the oracle.
+
+Measured (layers 0-3, Experts resident, `--timing 40`): graphs 0.27 ms per layer, eager 0.31;
+the head on both GPUs at once 0.35 ms. Profile per layer step (graph nodes, GPU 0): busy
+~220 us -- GEMVs 116 (MoE gate/up 34 us at 1.48 TB/s, down 17, wo_b 15, wq_b 14, wo_a 15 at
+1.18 TB/s with 512 warps, wq_a+wkv 10 at 0.96 TB/s with 448 warps), exchange waits 25 (GPU 1
+launches later), ~45 small kernels ~80; kernel-to-kernel gaps inside a graph 0.2 us; the plan
+round trip (readback to phase B's first copy) 9 us. Next levers, in size order: fuse the small
+kernels (norm + quantize + plane sums, rope + quant + cache store), more warps for the narrow
+GEMVs (split ways are Reference configuration constants, so the oracles follow), and the whole
+token as one graph per GPU with device-side Expert resolution (no per-layer host round trip,
+no launch skew between the GPUs).
 
 ## Validation path
 

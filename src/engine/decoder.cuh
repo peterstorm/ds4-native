@@ -6,15 +6,25 @@
 // host reads the routing plan, has this step's Expert Halves put in place, and
 // launches B (the Experts, the MoE exchange, hc_post) on both.
 //
+// Phases replay as CUDA graphs: each (layer, phase, variant) is captured on its
+// first use and replayed after that. Phase A's variant is whether a ratio-2 KV
+// source completes a group this step; phase B's is the plan's job count. Nothing a
+// graph launches takes a per-step host value. begin_token uploads the token's
+// model::StepIndex (positions, ring slot, cache lengths and rows), which kernels
+// read when they run. Engram rows and Expert job lists come in as copies from
+// fixed pinned staging, recorded as nodes in the graph.
+//
 // The rule that keeps the exchanges from deadlocking: once one GPU may be
 // spinning in an exchange, the host must not make a call that can wait on that
 // GPU before the peer's side is launched -- no allocations (with peer access,
-// cudaMalloc may synchronize the peer) and no copies from pageable memory
-// (they can block until earlier work on the stream ran). Per-step uploads go
-// through pinned staging, and Expert Halves for both GPUs are put in place
-// before either GPU's phase B is launched. Lazy module loading breaks the same rule (a
-// kernel's first launch can load its module and wait on the device), so the
-// decoder requires CUDA_MODULE_LOADING=EAGER, set before CUDA initializes.
+// cudaMalloc may synchronize the peer), no graph instantiation (it may
+// allocate), and no copies from pageable memory (they can block until earlier
+// work on the stream ran). Per-step uploads go through pinned staging; both
+// GPUs' graphs for a phase are captured, and Expert Halves for both GPUs put in
+// place, before either GPU's phase is launched. Lazy module loading breaks the
+// same rule (a kernel's first launch can load its module and wait on the
+// device), so the decoder requires CUDA_MODULE_LOADING=EAGER, set before CUDA
+// initializes.
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -27,12 +37,13 @@
 #include <vector>
 
 #include "core/layer_weights.hpp"
+#include "core/model.hpp"
 #include "core/moe_plan.hpp"
 #include "engine/device_layer.cuh"
 
 namespace ds4n::engine {
 
-/** Compressed positions each KV source can hold in this executor. */
+/** Compressed positions each KV source can hold in this executor (positions p < kMaxCompressed). */
 constexpr int64_t kMaxCompressed = 65536;
 
 /**
@@ -48,10 +59,13 @@ struct StepTrace {
   moe::Plan plan;
 };
 
+/** How the decoder issues a layer step's kernels. */
+enum class Launches { Graphs, Eager };
+
 class Decoder {
  public:
   /** Two devices with peer access to each other. */
-  explicit Decoder(std::array<int, 2> devices);
+  explicit Decoder(std::array<int, 2> devices, Launches launches = Launches::Graphs);
   ~Decoder();
   Decoder(const Decoder&) = delete;
   Decoder& operator=(const Decoder&) = delete;
@@ -59,15 +73,22 @@ class Decoder {
   /** Upload a layer to both GPUs and prepare its launches. */
   void add_layer(const HostLayer& w);
 
-  /** Start a token: its embedding (BF16 values) in all four copies, pre mix one-hot on copy 0. */
-  void begin_token(std::span<const float> embedding_row);
+  /**
+   * Start the token at position p: its embedding (BF16 values) in all four
+   * copies, pre mix one-hot on copy 0, and the step's positions.
+   */
+  void begin_token(int64_t p, std::span<const float> embedding_row);
 
   /**
-   * One decode step of `layer` at position p. `engram_rows` is the 24 raw table
-   * rows (24 x 264 bytes) on Engram layers, else empty. Returns rank 0's trace;
-   * the two ranks' streams must match, else this throws.
+   * One decode step of `layer` for the current token. `engram_rows` is the 24
+   * raw table rows (24 x 264 bytes) on Engram layers, else empty. With `trace`,
+   * waits for the step and returns rank 0's trace, throwing unless both ranks'
+   * streams match; without, returns as soon as the step is launched (the plan only).
    */
-  StepTrace decode_layer(int layer, int64_t p, std::span<const uint8_t> engram_rows, const ExpertSlots& experts);
+  StepTrace decode_layer(int layer, std::span<const uint8_t> engram_rows, const ExpertSlots& experts, bool trace = true);
+
+  /** Wait until both GPUs finished everything launched so far. */
+  void sync();
 
   /** Upload the final norm and the head (BF16 values [129280][5120]); each GPU keeps its half of the vocabulary. */
   void add_head(const std::vector<float>& norm, const std::vector<float>& head);
@@ -78,6 +99,9 @@ class Decoder {
  private:
   struct Gpu;
   std::array<std::unique_ptr<Gpu>, 2> gpus_;
+  Launches launches_;
+  model::StepIndex step_{};
+  bool in_token_ = false;
 };
 
 }  // namespace ds4n::engine

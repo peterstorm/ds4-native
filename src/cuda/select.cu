@@ -44,8 +44,10 @@ __device__ void find_bin(const unsigned* hist, unsigned above, unsigned k, unsig
 }
 
 template <bool kHighPass>
-__global__ void __launch_bounds__(kThreads) histogram_kernel(const __nv_bfloat16* __restrict__ v, int64_t n, int k,
+__global__ void __launch_bounds__(kThreads) histogram_kernel(const __nv_bfloat16* __restrict__ v, IntArg count, int k_max,
                                                             unsigned* __restrict__ words) {
+  const int64_t n = count.get();
+  const int k = static_cast<int>(n < k_max ? n : k_max);
   __shared__ unsigned hist[256];
   for (int i = threadIdx.x; i < 256; i += kThreads) hist[i] = 0;
   __syncthreads();
@@ -107,8 +109,9 @@ __device__ unsigned block_exclusive_scan(unsigned v) {
 }
 
 /** Per block: keys above the threshold and keys equal to it; the last block turns them into output offsets. */
-__global__ void __launch_bounds__(kThreads) count_kernel(const __nv_bfloat16* __restrict__ v, int64_t n,
+__global__ void __launch_bounds__(kThreads) count_kernel(const __nv_bfloat16* __restrict__ v, IntArg count,
                                                         unsigned* __restrict__ words) {
+  const int64_t n = count.get();
   __shared__ unsigned counts_a[kSelectMaxBlocks], counts_b[kSelectMaxBlocks];
   const unsigned threshold = __ldcg(words + kState + kThreshold);
   const Range r = block_range(n);
@@ -144,8 +147,9 @@ __global__ void __launch_bounds__(kThreads) count_kernel(const __nv_bfloat16* __
 }
 
 /** Ordered emission: threads own contiguous sub-ranges of the block's range. */
-__global__ void __launch_bounds__(kThreads) emit_kernel(const __nv_bfloat16* __restrict__ v, int64_t n, int32_t offset,
+__global__ void __launch_bounds__(kThreads) emit_kernel(const __nv_bfloat16* __restrict__ v, IntArg count, int32_t offset,
                                                        const unsigned* __restrict__ words, int32_t* __restrict__ out) {
+  const int64_t n = count.get();
   const unsigned threshold = words[kState + kThreshold], take_equal = words[kState + kTakeEqual];
   const Range r = block_range(n);
   const int64_t per = (r.hi - r.lo + kThreads - 1) / kThreads;
@@ -169,14 +173,14 @@ __global__ void __launch_bounds__(kThreads) emit_kernel(const __nv_bfloat16* __r
 
 }  // namespace
 
-void select_top(const __nv_bfloat16* values, int64_t n, int k, int32_t offset, int32_t* out, SelectScratch scratch,
+void select_top(const __nv_bfloat16* values, IntArg n, int k_max, int32_t offset, int32_t* out, SelectScratch scratch,
                 cudaStream_t stream) {
-  if (k <= 0 || n <= 0) return;
-  const int64_t want = (n + 4095) / 4096;
-  const unsigned blocks = static_cast<unsigned>(want < 1 ? 1 : (want > kSelectMaxBlocks ? kSelectMaxBlocks : want));
+  if (n.bound() <= 0 || k_max <= 0) return;
+  const int64_t want = (n.bound() + 4095) / 4096;
+  const unsigned blocks = static_cast<unsigned>(want > kSelectMaxBlocks ? kSelectMaxBlocks : want);  // want >= 1 here
   cudaMemsetAsync(scratch.words, 0, select_scratch_words() * sizeof(unsigned), stream);
-  histogram_kernel<true><<<blocks, kThreads, 0, stream>>>(values, n, k, scratch.words);
-  histogram_kernel<false><<<blocks, kThreads, 0, stream>>>(values, n, k, scratch.words);
+  histogram_kernel<true><<<blocks, kThreads, 0, stream>>>(values, n, k_max, scratch.words);
+  histogram_kernel<false><<<blocks, kThreads, 0, stream>>>(values, n, k_max, scratch.words);
   count_kernel<<<blocks, kThreads, 0, stream>>>(values, n, scratch.words);
   emit_kernel<<<blocks, kThreads, 0, stream>>>(values, n, offset, scratch.words, out);
 }

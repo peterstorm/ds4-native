@@ -28,7 +28,7 @@ __device__ __forceinline__ uint8_t fp4_code(float v, float s) {
  * holds element j (low nibble) and j + 16 (high nibble): lanes with L%8 < 4
  * own elements below 16 and take the high nibbles from lane L + 4.
  */
-__global__ void append_kernel(const __nv_bfloat16* __restrict__ keys, int64_t first, int n, uint8_t* __restrict__ cache) {
+__global__ void append_kernel(const __nv_bfloat16* __restrict__ keys, IntArg first, int n, uint8_t* __restrict__ cache) {
   const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
   const int lane = threadIdx.x & 31;
   if (warp >= n) return;
@@ -48,7 +48,7 @@ __global__ void append_kernel(const __nv_bfloat16* __restrict__ keys, int64_t fi
 #pragma unroll
   for (int u = 0; u < 4; u++) mine |= static_cast<uint32_t>(fp4_code(v[u], s)) << (8 * u);
   const uint32_t high = __shfl_down_sync(0xFFFFFFFFu, mine, 4);
-  const int64_t pos = first + warp;
+  const int64_t pos = first.get() + warp;
   uint8_t* tile = cache + static_cast<size_t>(pos / 16) * kIndexTileBytes;
   const int r = static_cast<int>(pos % 16);
   if (sub < 4) *reinterpret_cast<uint32_t*>(tile + code_offset(r, b, sub)) = mine | (high << 4);
@@ -92,9 +92,10 @@ __global__ void prepare_kernel(const __nv_bfloat16* __restrict__ q, const float*
  * then per head relu(bf16(dot)) * weight in BF16, summed per lane in (group,
  * j) order and across the lane quad as (p0 + p1) + (p2 + p3) (indexer::head_sum).
  */
-__global__ void __launch_bounds__(128) score_kernel(const uint8_t* __restrict__ cache, int64_t len, IndexQuery q,
+__global__ void __launch_bounds__(128) score_kernel(const uint8_t* __restrict__ cache, IntArg length, IndexQuery q,
                                                     const uint8_t* __restrict__ block_mask,
                                                     __nv_bfloat16* __restrict__ scores) {
+  const int64_t len = length.get();
   const int64_t tile = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) >> 5;
   const int lane = threadIdx.x & 31;
   const int64_t p0 = tile * 16;
@@ -146,7 +147,8 @@ __global__ void __launch_bounds__(128) score_kernel(const uint8_t* __restrict__ 
 }
 
 /** Each 8-position block's best score; the newest block +inf (always kept). */
-__global__ void block_keys_kernel(const __nv_bfloat16* __restrict__ scores, int64_t len, __nv_bfloat16* __restrict__ keys) {
+__global__ void block_keys_kernel(const __nv_bfloat16* __restrict__ scores, IntArg length, __nv_bfloat16* __restrict__ keys) {
+  const int64_t len = length.get();
   const int64_t b = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const int64_t blocks = (len + kCandidateBlockSize - 1) / kCandidateBlockSize;
   if (b >= blocks) return;
@@ -161,15 +163,18 @@ __global__ void block_keys_kernel(const __nv_bfloat16* __restrict__ scores, int6
 }
 
 /** Mark the chosen blocks, except those with no reachable position (-inf). */
-__global__ void mark_blocks_kernel(const int32_t* __restrict__ chosen, int k, const __nv_bfloat16* __restrict__ keys,
+__global__ void mark_blocks_kernel(const int32_t* __restrict__ chosen, IntArg blocks, const __nv_bfloat16* __restrict__ keys,
                                    uint8_t* __restrict__ mask) {
+  const int64_t n = blocks.get();
+  const int k = static_cast<int>(n < kCandidateBlocks ? n : kCandidateBlocks);
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < k) mask[chosen[i]] = __bfloat16_as_ushort(keys[chosen[i]]) != kNegInfBits;
 }
 
 }  // namespace
 
-void append_index_keys(const __nv_bfloat16* keys, int64_t first, int n, uint8_t* cache, cudaStream_t stream) {
+void append_index_keys(const __nv_bfloat16* keys, IntArg first, int n, uint8_t* cache, cudaStream_t stream) {
+  if (n <= 0) return;
   append_kernel<<<(n * 32 + 127) / 128, 128, 0, stream>>>(keys, first, n, cache);
 }
 
@@ -178,30 +183,31 @@ void prepare_index_query(const __nv_bfloat16* q, const float* projection, int sp
   prepare_kernel<<<kIndexHeads * kIndexBlocks * 32 / 128, 128, 0, stream>>>(q, projection, splits, token, out);
 }
 
-void index_scores(const uint8_t* cache, int64_t compress_len, const IndexQuery& q, const uint8_t* block_mask,
+void index_scores(const uint8_t* cache, IntArg compress_len, const IndexQuery& q, const uint8_t* block_mask,
                   __nv_bfloat16* scores, cudaStream_t stream) {
-  const int64_t tiles = (compress_len + 15) / 16;
-  if (tiles == 0) return;
+  const int64_t tiles = (compress_len.bound() + 15) / 16;
+  if (tiles <= 0) return;
   score_kernel<<<static_cast<unsigned>((tiles * 32 + 127) / 128), 128, 0, stream>>>(cache, compress_len, q, block_mask,
                                                                                     scores);
 }
 
-void candidate_blocks(const __nv_bfloat16* scores, int64_t compress_len, uint8_t* block_mask,
+void candidate_blocks(const __nv_bfloat16* scores, IntArg compress_len, uint8_t* block_mask,
                       const IndexSelectScratch& scratch, cudaStream_t stream) {
-  if (compress_len <= 0) return;
-  const int64_t blocks = (compress_len + kCandidateBlockSize - 1) / kCandidateBlockSize;
-  block_keys_kernel<<<static_cast<unsigned>((blocks + 255) / 256), 256, 0, stream>>>(scores, compress_len, scratch.block_keys);
-  cudaMemsetAsync(block_mask, 0, static_cast<size_t>(blocks), stream);
-  const int k = blocks < kCandidateBlocks ? static_cast<int>(blocks) : kCandidateBlocks;
-  select_top(scratch.block_keys, blocks, k, 0, scratch.chosen_blocks, scratch.select, stream);
-  mark_blocks_kernel<<<(k + 255) / 256, 256, 0, stream>>>(scratch.chosen_blocks, k, scratch.block_keys, block_mask);
+  const IntArg blocks = compress_len.ceil_div(kCandidateBlockSize);
+  if (blocks.bound() <= 0) return;
+  block_keys_kernel<<<static_cast<unsigned>((blocks.bound() + 255) / 256), 256, 0, stream>>>(scores, compress_len,
+                                                                                            scratch.block_keys);
+  cudaMemsetAsync(block_mask, 0, static_cast<size_t>(blocks.bound()), stream);
+  select_top(scratch.block_keys, blocks, kCandidateBlocks, 0, scratch.chosen_blocks, scratch.select, stream);
+  const int64_t k_bound = blocks.bound() < kCandidateBlocks ? blocks.bound() : kCandidateBlocks;
+  mark_blocks_kernel<<<static_cast<unsigned>((k_bound + 255) / 256), 256, 0, stream>>>(scratch.chosen_blocks, blocks,
+                                                                                      scratch.block_keys, block_mask);
 }
 
-void top_positions(const __nv_bfloat16* scores, int64_t compress_len, int32_t offset, int32_t* idx,
+void top_positions(const __nv_bfloat16* scores, IntArg compress_len, int32_t offset, int32_t* idx,
                    SelectScratch scratch, cudaStream_t stream) {
   cudaMemsetAsync(idx, 0xFF, kIndexTopK * sizeof(int32_t), stream);  // -1 past the selection
-  const int k = compress_len < kIndexTopK ? static_cast<int>(compress_len) : kIndexTopK;
-  select_top(scores, compress_len, k, offset, idx, scratch, stream);
+  select_top(scores, compress_len, kIndexTopK, offset, idx, scratch, stream);
 }
 
 }  // namespace ds4n::cuda

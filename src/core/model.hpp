@@ -107,3 +107,38 @@ constexpr int32_t window_slot(int64_t p, int s) {
 }
 
 }  // namespace ds4n::model
+
+namespace ds4n::model {
+
+/**
+ * Everything a decode step at position p derives from p, computed once on the
+ * host and handed to the GPUs (CUDA graphs replay kernels whose sizes and
+ * addresses must not depend on host values). All int64 so kernels can take
+ * pointers to any field.
+ */
+struct StepIndex {
+  int64_t pos;            // p: RoPE position of q, kv and o
+  int64_t latent_pos[3];  // by ratio: the compressed latent's position p + 1 - ratio (index 0 unused)
+  int64_t ring_slot;      // p % 128: this step's window row
+  int64_t compress_len[3];  // by ratio: compressed positions visible, (p + 1) / ratio (index 0: 0)
+  int64_t compress_row[3];  // by ratio: the row a completed latent is written to, p / ratio
+  int64_t produced[3];      // by ratio: 1 when this step completes a group
+};
+
+constexpr StepIndex step_index(int64_t p) {
+  StepIndex s{};
+  s.pos = p;
+  s.ring_slot = p % kWindow;
+  for (int r = 1; r <= 2; r++) {
+    s.latent_pos[r] = p + 1 - r;
+    s.compress_len[r] = (p + 1) / r;
+    s.compress_row[r] = p / r;
+    s.produced[r] = (p + 1) % r == 0;
+  }
+  return s;
+}
+
+static_assert(step_index(5).compress_len[2] == 3 && step_index(5).produced[2] == 1 && step_index(4).produced[2] == 0);
+static_assert(step_index(130).ring_slot == 2 && step_index(7).compress_row[2] == 3 && step_index(7).latent_pos[2] == 6);
+
+}  // namespace ds4n::model

@@ -7,13 +7,15 @@
 // warp takes 16 positions straight to the block-scaled MMA as the A operand;
 // the query's 32 heads are the B operand, four groups of 8. Selection is a
 // deterministic radix select on the BF16 keys (cuda/select.cuh): ties go to
-// the lower block or position, and results come out in ascending order.
+// the lower block or position, and results come out in ascending order. Lengths
+// and the append position are IntArgs, so the launches replay in CUDA graphs.
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <cstddef>
 #include <cstdint>
 
+#include "cuda/int_arg.cuh"
 #include "cuda/select.cuh"
 
 namespace ds4n::cuda {
@@ -32,7 +34,7 @@ constexpr size_t index_cache_bytes(int64_t positions) {
 }
 
 /** fp4_act_quant (block 32, E8M0) of keys [n][128] (BF16, after RoPE) into positions first .. first + n - 1. */
-void append_index_keys(const __nv_bfloat16* keys, int64_t first, int n, uint8_t* cache, cudaStream_t stream);
+void append_index_keys(const __nv_bfloat16* keys, IntArg first, int n, uint8_t* cache, cudaStream_t stream);
 
 /** One query ready to score: per head group G, B fragments over 4 K blocks, and the head weights. */
 struct IndexQuery {
@@ -53,7 +55,7 @@ void prepare_index_query(const __nv_bfloat16* q, const float* projection, int sp
  * scores[t] (BF16) for t < compress_len. With `block_mask` (one byte per 8
  * positions), positions in unmasked blocks score -inf and skip the MMA.
  */
-void index_scores(const uint8_t* cache, int64_t compress_len, const IndexQuery& q, const uint8_t* block_mask,
+void index_scores(const uint8_t* cache, IntArg compress_len, const IndexQuery& q, const uint8_t* block_mask,
                   __nv_bfloat16* scores, cudaStream_t stream);
 
 /** Scratch for the selections: block keys for up to `max_positions` positions, the chosen blocks. */
@@ -63,12 +65,15 @@ struct IndexSelectScratch {
   int32_t* chosen_blocks;     // kCandidateBlocks
 };
 
-/** Level one: block_mask[b] for b < ceil(compress_len / 8), as indexer::candidates. */
-void candidate_blocks(const __nv_bfloat16* scores, int64_t compress_len, uint8_t* block_mask,
+/**
+ * Level one: block_mask[b] for b < ceil(compress_len / 8), as indexer::candidates;
+ * the mask is zeroed up to the bound of compress_len.
+ */
+void candidate_blocks(const __nv_bfloat16* scores, IntArg compress_len, uint8_t* block_mask,
                       const IndexSelectScratch& scratch, cudaStream_t stream);
 
 /** idx[0 .. k) = the top k = min(512, compress_len) positions ascending, plus offset; idx[k .. 512) = -1. */
-void top_positions(const __nv_bfloat16* scores, int64_t compress_len, int32_t offset, int32_t* idx,
+void top_positions(const __nv_bfloat16* scores, IntArg compress_len, int32_t offset, int32_t* idx,
                    SelectScratch scratch, cudaStream_t stream);
 
 }  // namespace ds4n::cuda

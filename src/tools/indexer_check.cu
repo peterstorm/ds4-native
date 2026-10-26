@@ -95,7 +95,7 @@ int main(int argc, char** argv) {
   auto* d_cache = device_alloc<uint8_t>(cache_bytes);
   ck(cudaMemset(d_cache, 0, cache_bytes), "memset");
   for (int64_t first = 0, step = 1; first < positions; first += step, step = step * 3 % 997 + 1)
-    cuda::append_index_keys(d_keys + first * indexer::kHeadDim, first, static_cast<int>(std::min(step, positions - first)),
+    cuda::append_index_keys(d_keys + first * indexer::kHeadDim, cuda::IntArg::of(first), static_cast<int>(std::min(step, positions - first)),
                             d_cache, nullptr);
 
   std::vector<indexer::Row> rows(positions);
@@ -153,7 +153,7 @@ int main(int argc, char** argv) {
 
   // Scores, then the two selection levels.
   auto* d_scores = device_alloc<__nv_bfloat16>(std::max(positions, timing_positions));
-  cuda::index_scores(d_cache, positions, dq, nullptr, d_scores, nullptr);
+  cuda::index_scores(d_cache, cuda::IntArg::of(positions), dq, nullptr, d_scores, nullptr);
   const auto gpu_scores = download(d_scores, positions);
   const auto want_scores = indexer::scores(query, rows, weights);
   Check score_check{"scores"};
@@ -169,7 +169,7 @@ int main(int argc, char** argv) {
   const cuda::IndexSelectScratch scratch{{device_alloc<unsigned>(cuda::select_scratch_words())},
                                          device_alloc<__nv_bfloat16>(max_blocks),
                                          device_alloc<int32_t>(cuda::kCandidateBlocks)};
-  cuda::candidate_blocks(d_scores, positions, d_mask, scratch, nullptr);
+  cuda::candidate_blocks(d_scores, cuda::IntArg::of(positions), d_mask, scratch, nullptr);
   const auto gpu_mask = download(d_mask, blocks);
   const auto want_mask = indexer::candidates(scores_f, positions);
   if (!want_mask) die(want_mask.error().what);
@@ -179,7 +179,7 @@ int main(int argc, char** argv) {
   auto* d_idx = device_alloc<int32_t>(cuda::kIndexTopK);
   Check top_check{"top positions (all)"}, masked_check{"top positions (candidates)"},
       masked_score_check{"scores inside candidates"};
-  cuda::top_positions(d_scores, positions, 128, d_idx, scratch.select, nullptr);
+  cuda::top_positions(d_scores, cuda::IntArg::of(positions), 128, d_idx, scratch.select, nullptr);
   const auto gpu_top = download(d_idx, cuda::kIndexTopK);
   const auto want_top = indexer::top_positions(scores_f, {}, positions, 128);
   if (!want_top) die(want_top.error().what);
@@ -187,14 +187,14 @@ int main(int argc, char** argv) {
     top_check.add(gpu_top[i] == (i < static_cast<int>(want_top.value().size()) ? want_top.value()[i] : -1));
 
   // A later index layer: score only inside the candidate blocks, then select.
-  cuda::index_scores(d_cache, positions, dq, d_mask, d_scores, nullptr);
+  cuda::index_scores(d_cache, cuda::IntArg::of(positions), dq, d_mask, d_scores, nullptr);
   const auto gpu_masked = download(d_scores, positions);
   std::vector<float> masked_f(positions);
   for (int64_t t = 0; t < positions; t++) {
     masked_f[t] = bf16_value(gpu_masked[t]);
     masked_score_check.add(masked_f[t] == (want_mask.value()[t] ? want_scores[t] : -INFINITY));
   }
-  cuda::top_positions(d_scores, positions, 128, d_idx, scratch.select, nullptr);
+  cuda::top_positions(d_scores, cuda::IntArg::of(positions), 128, d_idx, scratch.select, nullptr);
   const auto gpu_masked_top = download(d_idx, cuda::kIndexTopK);
   const auto want_masked_top = indexer::top_positions(want_scores, want_mask.value(), positions, 128);
   if (!want_masked_top) die(want_masked_top.error().what);
@@ -205,16 +205,45 @@ int main(int argc, char** argv) {
   // Short contexts select every position.
   Check short_check{"top positions (short contexts)"};
   for (int64_t len : {1, 7, 300, 511, 512, 513}) {
-    cuda::top_positions(d_scores, len, 128, d_idx, scratch.select, nullptr);
+    cuda::top_positions(d_scores, cuda::IntArg::of(len), 128, d_idx, scratch.select, nullptr);
     const auto got = download(d_idx, cuda::kIndexTopK);
     const auto want = indexer::top_positions(masked_f, {}, len, 128).value();
     for (int i = 0; i < cuda::kIndexTopK; i++)
       short_check.add(got[i] == (i < static_cast<int>(want.size()) ? want[i] : -1));
   }
 
+  // Lengths read from device memory with launches sized for the cache's capacity
+  // (as CUDA graphs replay them) give the same bytes as host lengths.
+  Check device_check{"device lengths, capacity launches"};
+  const int64_t capacity = std::max(positions, timing_positions);
+  auto* d_len = device_alloc<int64_t>(1);
+  auto pipeline = [&](cuda::IntArg len) {
+    cuda::index_scores(d_cache, len, dq, nullptr, d_scores, nullptr);
+    cuda::candidate_blocks(d_scores, len, d_mask, scratch, nullptr);
+    cuda::index_scores(d_cache, len, dq, d_mask, d_scores, nullptr);
+    cuda::top_positions(d_scores, len, 128, d_idx, scratch.select, nullptr);
+  };
+  for (int64_t len : {int64_t{0}, int64_t{1}, int64_t{9}, int64_t{300}, int64_t{513}, int64_t{4097}, positions}) {
+    const size_t n_blocks = static_cast<size_t>((len + 7) / 8);
+    pipeline(cuda::IntArg::of(len));
+    const auto want_s = download(d_scores, static_cast<size_t>(len));
+    const auto want_m = download(d_mask, n_blocks);
+    const auto want_i = download(d_idx, cuda::kIndexTopK);
+    ck(cudaMemcpy(d_len, &len, sizeof(len), cudaMemcpyHostToDevice), "upload");
+    pipeline(cuda::IntArg::at(d_len, capacity));
+    const auto got_s = download(d_scores, static_cast<size_t>(len));
+    const auto got_m = download(d_mask, n_blocks);
+    const auto got_i = download(d_idx, cuda::kIndexTopK);
+    for (int64_t t = 0; t < len; t++)
+      device_check.add(__bfloat16_as_ushort(got_s[t]) == __bfloat16_as_ushort(want_s[t]));
+    for (size_t b = 0; b < n_blocks; b++) device_check.add(got_m[b] == want_m[b]);
+    for (int i = 0; i < cuda::kIndexTopK; i++) device_check.add(got_i[i] == want_i[i]);
+  }
+  ck(cudaDeviceSynchronize(), "device lengths");
+
   std::printf("indexer, %lld positions:\n", static_cast<long long>(positions));
   for (const Check* c : {&cache_check, &fragment_check, &weight_check, &score_check, &candidate_check, &top_check,
-                         &masked_score_check, &masked_check, &short_check})
+                         &masked_score_check, &masked_check, &short_check, &device_check})
     c->report();
 
   // Timing at a longer context (cache bytes beyond `positions` are zeros: the arithmetic still runs).
@@ -232,10 +261,10 @@ int main(int argc, char** argv) {
     return ms / 50 * 1000.0;
   };
   const int64_t n = timing_positions;
-  const double score_us = time_us([&] { cuda::index_scores(d_cache, n, dq, nullptr, d_scores, nullptr); });
-  const double cand_us = time_us([&] { cuda::candidate_blocks(d_scores, n, d_mask, scratch, nullptr); });
-  const double masked_us = time_us([&] { cuda::index_scores(d_cache, n, dq, d_mask, d_scores, nullptr); });
-  const double top_us = time_us([&] { cuda::top_positions(d_scores, n, 128, d_idx, scratch.select, nullptr); });
+  const double score_us = time_us([&] { cuda::index_scores(d_cache, cuda::IntArg::of(n), dq, nullptr, d_scores, nullptr); });
+  const double cand_us = time_us([&] { cuda::candidate_blocks(d_scores, cuda::IntArg::of(n), d_mask, scratch, nullptr); });
+  const double masked_us = time_us([&] { cuda::index_scores(d_cache, cuda::IntArg::of(n), dq, d_mask, d_scores, nullptr); });
+  const double top_us = time_us([&] { cuda::top_positions(d_scores, cuda::IntArg::of(n), 128, d_idx, scratch.select, nullptr); });
   const double query_us = time_us([&] { cuda::prepare_index_query(d_q, d_proj, 1, 3, dq, nullptr); });
   std::printf("timing at %lld positions (%.1f MB of keys): prepare %.1f us, scores %.1f us (%.0f GB/s), "
               "candidates %.1f us, scores in candidates %.1f us, top-512 %.1f us\n",

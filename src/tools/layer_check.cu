@@ -6,7 +6,10 @@
 // table rows are random (identical on both sides) unless real tables are given.
 //   ds4n-layer-check --backbone SAFETENSORS --store STORE [--first L] [--layers N] [--steps S]
 //                    [--expert-layers M] [--gguf-meta GGUF --engram-shards A,B,...] [--head 1]
-// --head 1 also compares the full logits after the last layer of every step.
+//                    [--timing N] [--launches graphs|eager]
+// --head 1 also compares the full logits after the last layer of every step. --timing N then
+// times N more steps on the GPUs alone with every Half of the loaded layers resident. --launches
+// picks how the decoder issues kernels: replayed CUDA graphs (the default) or eager launches.
 // With --gguf-meta (a GGUF carrying deepseek41.engram.*) and --engram-shards (the files holding
 // the Engram tables), Engram layers hash the tokens and read real table rows.
 // --expert-layers M reads layer L's Experts from store layer L % M (a store holding only the
@@ -14,6 +17,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -97,6 +101,8 @@ int main(int argc, char** argv) {
   int first = 0, layers = 4, steps = 3, expert_layers = model::kLayers;
   std::string gguf_meta, engram_shards;
   bool with_head = false;
+  int timing_steps = 0;
+  engine::Launches launches = engine::Launches::Graphs;
   for (int i = 1; i < argc; i++) {
     const std::string s = argv[i];
     if (i + 1 >= argc) die("missing value for " + s);
@@ -109,6 +115,13 @@ int main(int argc, char** argv) {
     else if (s == "--gguf-meta") gguf_meta = argv[++i];
     else if (s == "--engram-shards") engram_shards = argv[++i];
     else if (s == "--head" && argv[++i] == std::string("1")) with_head = true;
+    else if (s == "--timing") timing_steps = std::stoi(argv[++i]);
+    else if (s == "--launches") {
+      const std::string v = argv[++i];
+      if (v == "graphs") launches = engine::Launches::Graphs;
+      else if (v == "eager") launches = engine::Launches::Eager;
+      else die("--launches takes graphs or eager");
+    }
     else die("unknown argument " + s);
   }
   if (backbone_path.empty() || store_path.empty() || layers < 1 || first < 0 || first + layers > model::kLayers ||
@@ -119,7 +132,7 @@ int main(int argc, char** argv) {
   if (!backbone) die(backbone.error().what);
   StoreReader store(store_path);
   std::vector<HostLayer> host;
-  engine::Decoder decoder({0, 1});
+  engine::Decoder decoder({0, 1}, launches);
   for (int l = first; l < first + layers; l++) {
     auto w = engine::load_layer(backbone.value(), l);
     if (!w) die(w.error().what);
@@ -199,7 +212,7 @@ int main(int argc, char** argv) {
     auto emb = engine::load_bf16_row(backbone.value(), "embed.weight", token);
     if (!emb) die(emb.error().what);
     layer_ref::Stream stream = layer_ref::embed(emb.value());
-    decoder.begin_token(emb.value());
+    decoder.begin_token(p, emb.value());
     std::optional<engram::Step> hashed;
     if (engram_layout) {
       auto h = engram::hash_token(*engram_layout, history, static_cast<uint32_t>(token), true);
@@ -233,7 +246,7 @@ int main(int argc, char** argv) {
         }
       }
       std::printf("step %d layer %d: GPUs...\n", step, l);
-      const engine::StepTrace got = decoder.decode_layer(l, p, raw, slots);
+      const engine::StepTrace got = decoder.decode_layer(l, raw, slots);
       std::printf("  oracle...\n");
       current_layer = l;
       layer_ref::Trace want;
@@ -264,5 +277,37 @@ int main(int argc, char** argv) {
     }
   }
   std::printf("%d steps x %d layers: GPUs and oracle bit-identical\n", steps, layers);
+
+  // Timing: every Half of the loaded layers resident, then decode steps on the GPUs alone.
+  if (timing_steps > 0) {
+    for (int rank = 0; rank < 2; rank++) {
+      engine::check(cudaSetDevice(rank), "cudaSetDevice");
+      moe::Plan all{};
+      all.jobs = moe::kMaxJobs;
+      for (int l = first; l < first + layers; l++)
+        for (int e0 = 0; e0 < moe::kExperts; e0 += moe::kMaxJobs) {
+          for (int j = 0; j < moe::kMaxJobs; j++) all.expert[j] = (e0 + j) % moe::kExperts;
+          slots(rank, l, all);
+        }
+    }
+    std::vector<double> step_ms;
+    for (int step = steps; step < steps + timing_steps; step++) {
+      const int token = tokens[step % 8];
+      auto emb = engine::load_bf16_row(backbone.value(), "embed.weight", token);
+      if (!emb) die(emb.error().what);
+      std::vector<uint8_t> raw(static_cast<size_t>(cuda::kEngramCols) * cuda::kEngramRowBytes, 0x38);
+      const auto t0 = std::chrono::steady_clock::now();
+      decoder.begin_token(step, emb.value());
+      for (int l = first; l < first + layers; l++) decoder.decode_layer(l, raw, slots, false);
+      if (with_head) decoder.logits();
+      decoder.sync();
+      step_ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    }
+    std::sort(step_ms.begin(), step_ms.end());
+    const double median = step_ms[step_ms.size() / 2];
+    std::printf("timing (%s): %d steps x %d layers%s, Experts resident: median %.2f ms per step, %.3f ms per layer\n",
+                launches == engine::Launches::Graphs ? "graphs" : "eager", timing_steps, layers,
+                with_head ? " + head" : "", median, median / layers);
+  }
   return 0;
 }
