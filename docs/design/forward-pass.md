@@ -166,6 +166,29 @@ GEMVs (split ways are Reference configuration constants, so the oracles follow),
 token as one graph per GPU with device-side Expert resolution (no per-layer host round trip,
 no launch skew between the GPUs).
 
+## Expert residency
+
+`engine::ExpertResidency` serves the decoder's Experts (the `ExpertSlots` seam, called once per
+layer step for both GPUs). Placement is `cache::ExpertCache` twice: the VRAM Slots (warm from
+construction, ranked by decayed pick count) and the RAM tier's pinned 18 MiB record buffers
+(empty at first, least recently used). A Load comes from its RAM tier record when there (two
+Half copies, one per GPU link, in parallel), otherwise from the store: 1 MiB O_DIRECT chunks
+into a RAM tier buffer, each chunk copied to its GPU as it lands, so only the last chunk's copy
+is exposed. Evicting is safe because place() runs after both GPUs finished the previous layer's
+Experts, and the cache never evicts what the same call needs.
+
+Measured (`ds4n-layer-check --slots N --ram-records R`, layers 0-3, real Experts):
+- **Slot-count invariance gate**: 48 and 200 Slots (31-68 % Hits) give logits and every layer
+  step bit-identical to the oracle, and to the all-resident run.
+- All Slots resident (1,536): 0.247 ms per layer, same as the plain resident path (0.246) --
+  the Hit path costs nothing; the warm start streams 29 GB at 10.1 GB/s.
+- Misses: 1.78 ms per Expert at ~3.4 Misses per layer step, 2.37 ms at ~1.9 (whole-record reads
+  with copies after each record: 1.94 and 2.55). Measured while a download wrote to the same
+  NVMe; the store dataset caches metadata only, so every Miss reads the drive.
+
+Next: Miss telemetry by Loads per call, prefetch from a predicted next-layer routing, a pick-count
+prior for the warm start, and Cache-conditional routing behind a flag (default off: not Exact).
+
 ## Validation path
 
 1. Per-kernel CPU oracles from `model.py` (as for act_quant / fp4_gemm / fp8_gemm).

@@ -11,8 +11,8 @@ using namespace ds4n::cache;
 
 namespace {
 
-// Invariants that must hold after any sequence of plans.
-void check_invariants(const ExpertCache& c) {
+// Invariants that must hold after any sequence of plans (`full`: every Slot occupied, as a warm cache).
+void check_invariants(const ExpertCache& c, bool full = true) {
   std::set<uint32_t> slots;
   uint32_t resident = 0;
   for (ExpertKey k = 0; k < kKeys; k++)
@@ -21,7 +21,8 @@ void check_invariants(const ExpertCache& c) {
       CHECK(*s < c.slots());
       CHECK(slots.insert(*s).second);  // one Expert per Slot
     }
-  CHECK(resident == c.slots());  // every Slot occupied
+  if (full) CHECK(resident == c.slots());  // every Slot occupied
+  else CHECK(resident <= c.slots());
 }
 
 std::vector<ExpertKey> random_needs(std::mt19937& rng, uint32_t layer, uint32_t n) {
@@ -112,4 +113,54 @@ TEST_CASE("plan rejects impossible requests") {
   CHECK_FALSE(c.plan(std::vector<ExpertKey>{1, 1}).is_ok());           // duplicates
   CHECK_FALSE(c.plan(std::vector<ExpertKey>{kKeys}).is_ok());          // out of range
   check_invariants(c);
+}
+
+TEST_CASE("an empty cache fills free Slots, lowest first, before it evicts") {
+  CHECK_FALSE(ExpertCache::empty(0, {}).is_ok());
+  auto c = ExpertCache::empty(3, {}).value();
+  CHECK(c.warm_start().empty());
+  CHECK_FALSE(c.slot_of(0).has_value());  // key 0 is not resident in a free Slot
+
+  const auto first = c.plan(std::vector<ExpertKey>{10, 20}).value();
+  CHECK(first.hits.empty());
+  REQUIRE(first.loads.size() == 2);
+  CHECK(first.loads[0] == Load{10, 0, std::nullopt});
+  CHECK(first.loads[1] == Load{20, 1, std::nullopt});
+
+  const auto second = c.plan(std::vector<ExpertKey>{20, 30, 40}).value();
+  REQUIRE(second.hits.size() == 1);
+  CHECK(second.hits[0] == Hit{20, 1});
+  REQUIRE(second.loads.size() == 2);
+  CHECK(second.loads[0] == Load{30, 2, std::nullopt});  // the last free Slot
+  CHECK(second.loads[1] == Load{40, 0, ExpertKey{10}});  // then the only Expert this call does not need
+  check_invariants(c);
+}
+
+TEST_CASE("recency ranking evicts the least recently used, whatever the pick counts") {
+  auto run = [](Policy policy) {
+    auto c = ExpertCache::empty(2, policy).value();
+    for (int i = 0; i < 5; i++) REQUIRE(c.plan(std::vector<ExpertKey>{1}).is_ok());  // 1: picked often, long ago
+    REQUIRE(c.plan(std::vector<ExpertKey>{2}).is_ok());                             // 2: picked once, recently
+    return c.plan(std::vector<ExpertKey>{3}).value().loads.at(0).evicted;
+  };
+  CHECK(run({4096, false}) == ExpertKey{1});
+  CHECK(run({4096, true}) == ExpertKey{2});
+}
+
+TEST_CASE("an empty cache returns every need once and evicts only when full") {
+  auto c = ExpertCache::empty(100, {4096, false}).value();
+  std::mt19937 rng(9);
+  uint32_t filled = 0;
+  for (int round = 0; round < 1000; round++) {
+    const auto need = random_needs(rng, round % 40, 6);
+    const auto p = c.plan(need).value();
+    REQUIRE(p.hits.size() + p.loads.size() == need.size());
+    for (const auto& l : p.loads) {
+      CHECK(l.evicted.has_value() == (filled == c.slots()));
+      if (!l.evicted) filled++;
+      else CHECK(std::find(need.begin(), need.end(), *l.evicted) == need.end());
+    }
+    check_invariants(c, filled == c.slots());
+  }
+  CHECK(filled == c.slots());
 }

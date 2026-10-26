@@ -47,10 +47,12 @@ namespace ds4n::engine {
 constexpr int64_t kMaxCompressed = 65536;
 
 /**
- * This GPU's Half of every plan job, as device pointers to Half payloads
- * (gate, up, down parts as in the Expert store), valid until the next call.
+ * Both GPUs' Halves of every plan job (GPU r holds Half r) as device pointers to
+ * Half payloads (gate, up, down parts as in the Expert store), in plan order and
+ * valid until the next call. Called once per layer step, after both GPUs finished
+ * the previous layer's Experts (engine::ExpertResidency::place is one).
  */
-using ExpertSlots = std::function<std::vector<const uint8_t*>(int rank, int layer, const moe::Plan& plan)>;
+using ExpertSlots = std::function<std::array<std::vector<const uint8_t*>, 2>(int layer, const moe::Plan& plan)>;
 
 /** What one layer step leaves on rank 0, for stage-by-stage checks. */
 struct StepTrace {

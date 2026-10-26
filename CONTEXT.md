@@ -42,8 +42,8 @@ The set of Slots and the policy that decides which Experts occupy them.
 _Avoid_: hotlist (that is antirez's preload table)
 
 **RAM tier**:
-Optional pinned host memory holding Experts evicted from the Expert cache.
-_Avoid_: CPU lane (Maya computes on CPU; we do not)
+Pinned host memory holding the most recently loaded Expert records: every store read lands in a RAM tier buffer on its way to the Slots, so an Expert evicted soon after it was loaded comes back over PCIe instead of from the store. Least recently used goes first.
+_Avoid_: CPU lane (Maya computes on CPU; we do not), victim cache (it holds loads, not evictions)
 
 **Hit**:
 A routed Expert found in a Slot when a layer needs it.

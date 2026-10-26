@@ -564,11 +564,12 @@ StepTrace Decoder::decode_layer(int layer, std::span<const uint8_t> engram_rows,
   // Both GPUs' Halves in place, job lists staged and graphs captured before either launches phase B
   // (loading and instantiation may allocate or synchronize).
   const std::pair<int, int> key_b{layer, trace.plan.jobs};
+  const auto halves = experts(layer, trace.plan);
   std::array<MoeShape, 2> shapes;
   for (auto& gp : gpus_) {
     Gpu& s = *gp;
     check(cudaSetDevice(s.device), "cudaSetDevice");
-    shapes[s.rank] = s.stage_moe(layer, trace.plan, experts(s.rank, layer, trace.plan));
+    shapes[s.rank] = s.stage_moe(layer, trace.plan, halves[s.rank]);
     if (!graphs) continue;
     auto it = s.phase_b.find(key_b);
     if (it == s.phase_b.end()) {

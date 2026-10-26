@@ -6,7 +6,7 @@
 // table rows are random (identical on both sides) unless real tables are given.
 //   ds4n-layer-check --backbone SAFETENSORS --store STORE [--first L] [--layers N] [--steps S]
 //                    [--expert-layers M] [--gguf-meta GGUF --engram-shards A,B,...] [--head 1]
-//                    [--timing N] [--launches graphs|eager]
+//                    [--timing N] [--launches graphs|eager] [--slots N --ram-records R]
 // --head 1 also compares the full logits after the last layer of every step. --timing N then
 // times N more steps on the GPUs alone with every Half of the loaded layers resident. --launches
 // picks how the decoder issues kernels: replayed CUDA graphs (the default) or eager launches.
@@ -14,6 +14,10 @@
 // the Engram tables), Engram layers hash the tokens and read real table rows.
 // --expert-layers M reads layer L's Experts from store layer L % M (a store holding only the
 // first M layers can still exercise later layers: exactness needs the same Experts on both sides).
+// --slots N --ram-records R serve the decoder's Experts through engine::ExpertResidency: N VRAM
+// Slots, R RAM tier records, Misses read from the store. Outputs must not change with N (the
+// Slot-count invariance gate); the Hit, RAM and store counts are reported. The timing steps then
+// run under the same cache instead of with every Half resident. Timing tokens are pseudo-random ids.
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -22,6 +26,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <memory>
+#include <numeric>
 #include <optional>
 #include <random>
 #include <string>
@@ -35,6 +41,7 @@
 #include "cuda/engram.cuh"
 #include "engine/decoder.cuh"
 #include "engine/engram_source.hpp"
+#include "engine/expert_residency.cuh"
 #include "engine/host_layer.hpp"
 #include "io/file.hpp"
 
@@ -102,6 +109,7 @@ int main(int argc, char** argv) {
   std::string gguf_meta, engram_shards;
   bool with_head = false;
   int timing_steps = 0;
+  uint32_t slot_count = 0, ram_records = 0;
   engine::Launches launches = engine::Launches::Graphs;
   for (int i = 1; i < argc; i++) {
     const std::string s = argv[i];
@@ -116,6 +124,8 @@ int main(int argc, char** argv) {
     else if (s == "--engram-shards") engram_shards = argv[++i];
     else if (s == "--head" && argv[++i] == std::string("1")) with_head = true;
     else if (s == "--timing") timing_steps = std::stoi(argv[++i]);
+    else if (s == "--slots") slot_count = static_cast<uint32_t>(std::stoul(argv[++i]));
+    else if (s == "--ram-records") ram_records = static_cast<uint32_t>(std::stoul(argv[++i]));
     else if (s == "--launches") {
       const std::string v = argv[++i];
       if (v == "graphs") launches = engine::Launches::Graphs;
@@ -127,6 +137,7 @@ int main(int argc, char** argv) {
   if (backbone_path.empty() || store_path.empty() || layers < 1 || first < 0 || first + layers > model::kLayers ||
       expert_layers < 1)
     die("bad arguments");
+  if (slot_count > 0 && expert_layers != model::kLayers) die("--slots reads the store's own layers: drop --expert-layers");
 
   auto backbone = engine::open_backbone(backbone_path);
   if (!backbone) die(backbone.error().what);
@@ -149,24 +160,46 @@ int main(int argc, char** argv) {
     std::printf("head loaded\n");
   }
 
-  // Experts: device payloads per (rank, layer, expert) for the decoder, GGML Halves for the oracle.
+  // Experts for the decoder: through the Expert cache with --slots, else every Half the steps
+  // touch uploaded once and kept (per rank, layer, expert). GGML Halves for the oracle.
+  std::unique_ptr<engine::ExpertResidency> residency;
+  if (slot_count > 0) {
+    residency = engine::ExpertResidency::open({store_path, {0, 1}, slot_count, ram_records, {}});
+    std::printf("Expert cache: %u Slots warm in %.0f ms, RAM tier %u records\n", slot_count, residency->stats().warm_ms,
+                ram_records);
+  }
   std::map<std::tuple<int, int, int>, uint8_t*> device_halves;
   std::map<std::tuple<int, int, int>, GgmlHalf> ggml_halves;
-  const engine::ExpertSlots slots = [&](int rank, int layer, const moe::Plan& plan) {
-    std::vector<const uint8_t*> out;
-    for (int j = 0; j < plan.jobs; j++) {
-      const auto key = std::make_tuple(rank, layer, plan.expert[j]);
-      auto it = device_halves.find(key);
-      if (it == device_halves.end()) {
-        const auto bytes = store.payload(layer % expert_layers, plan.expert[j], rank);
-        uint8_t* d = nullptr;
-        engine::check(cudaMalloc(&d, bytes.size()), "cudaMalloc");
-        engine::check(cudaMemcpy(d, bytes.data(), bytes.size(), cudaMemcpyHostToDevice), "expert upload");
-        it = device_halves.emplace(key, d).first;
+  const engine::ExpertSlots slots = [&](int layer, const moe::Plan& plan) {
+    if (residency) return residency->place(layer, plan);
+    std::array<std::vector<const uint8_t*>, 2> out;
+    for (int rank = 0; rank < 2; rank++) {
+      engine::check(cudaSetDevice(rank), "cudaSetDevice");
+      for (int j = 0; j < plan.jobs; j++) {
+        const auto key = std::make_tuple(rank, layer, plan.expert[j]);
+        auto it = device_halves.find(key);
+        if (it == device_halves.end()) {
+          const auto bytes = store.payload(layer % expert_layers, plan.expert[j], rank);
+          uint8_t* d = nullptr;
+          engine::check(cudaMalloc(&d, bytes.size()), "cudaMalloc");
+          engine::check(cudaMemcpy(d, bytes.data(), bytes.size(), cudaMemcpyHostToDevice), "expert upload");
+          it = device_halves.emplace(key, d).first;
+        }
+        out[rank].push_back(it->second);
       }
-      out.push_back(it->second);
     }
     return out;
+  };
+  auto report_cache = [&](const char* when) {
+    if (!residency) return;
+    const auto& st = residency->stats();
+    const uint64_t needed = st.hits + st.ram_hits + st.store_reads;
+    std::printf("Expert cache (%s): %llu layer steps, %llu Experts needed: %llu Hits (%.1f %%), %llu RAM tier, "
+                "%llu store reads; exposed %.1f ms (%.2f ms per Miss)\n",
+                when, static_cast<unsigned long long>(st.layer_steps), static_cast<unsigned long long>(needed),
+                static_cast<unsigned long long>(st.hits), needed ? 100.0 * st.hits / needed : 0.0,
+                static_cast<unsigned long long>(st.ram_hits), static_cast<unsigned long long>(st.store_reads),
+                st.exposed_ms, needed > st.hits ? st.exposed_ms / static_cast<double>(needed - st.hits) : 0.0);
   };
   int current_layer = 0;  // the oracle runs one layer at a time
   const layer_ref::ExpertHalf halves = [&](int expert, int half) -> moe::HalfWeights {
@@ -277,22 +310,25 @@ int main(int argc, char** argv) {
     }
   }
   std::printf("%d steps x %d layers: GPUs and oracle bit-identical\n", steps, layers);
+  report_cache("checked steps");
 
-  // Timing: every Half of the loaded layers resident, then decode steps on the GPUs alone.
+  // Timing: decode steps on the GPUs alone, under the Expert cache with --slots, else with every
+  // Half of the loaded layers resident.
   if (timing_steps > 0) {
-    for (int rank = 0; rank < 2; rank++) {
-      engine::check(cudaSetDevice(rank), "cudaSetDevice");
+    if (!residency) {
       moe::Plan all{};
       all.jobs = moe::kMaxJobs;
       for (int l = first; l < first + layers; l++)
         for (int e0 = 0; e0 < moe::kExperts; e0 += moe::kMaxJobs) {
-          for (int j = 0; j < moe::kMaxJobs; j++) all.expert[j] = (e0 + j) % moe::kExperts;
-          slots(rank, l, all);
+          for (int j = 0; j < moe::kMaxJobs; j++) all.expert[j] = e0 + j;
+          slots(l, all);
         }
     }
+    std::mt19937 token_rng(77);
+    std::uniform_int_distribution<int> token_id(0, model::kVocab - 1);
     std::vector<double> step_ms;
     for (int step = steps; step < steps + timing_steps; step++) {
-      const int token = tokens[step % 8];
+      const int token = token_id(token_rng);
       auto emb = engine::load_bf16_row(backbone.value(), "embed.weight", token);
       if (!emb) die(emb.error().what);
       std::vector<uint8_t> raw(static_cast<size_t>(cuda::kEngramCols) * cuda::kEngramRowBytes, 0x38);
@@ -305,9 +341,12 @@ int main(int argc, char** argv) {
     }
     std::sort(step_ms.begin(), step_ms.end());
     const double median = step_ms[step_ms.size() / 2];
-    std::printf("timing (%s): %d steps x %d layers%s, Experts resident: median %.2f ms per step, %.3f ms per layer\n",
+    const double mean = std::accumulate(step_ms.begin(), step_ms.end(), 0.0) / static_cast<double>(step_ms.size());
+    std::printf("timing (%s): %d steps x %d layers%s, %s: median %.2f ms per step (mean %.2f), %.3f ms per layer\n",
                 launches == engine::Launches::Graphs ? "graphs" : "eager", timing_steps, layers,
-                with_head ? " + head" : "", median, median / layers);
+                with_head ? " + head" : "", residency ? "Expert cache" : "Experts resident", median, mean,
+                median / layers);
+    report_cache("all steps");
   }
   return 0;
 }
