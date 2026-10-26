@@ -3,6 +3,7 @@
 #include <cstring>
 #include <vector>
 
+#include "core/mx_tiles.hpp"
 #include "core/store_layout.hpp"
 
 using namespace ds4n::store;
@@ -59,7 +60,16 @@ TEST_CASE("record and Half offsets are 1 MiB aligned and never overlap") {
   CHECK(record_offset({39, 383}) + kRecordStride == kStoreBytes);
 }
 
-TEST_CASE("build_record splits gate/up by rows and down by K blocks") {
+namespace {
+/** Part `p` (0 gate, 1 up, 2 down) of Half `h`, untiled back to GGML rows. */
+std::vector<std::byte> untiled_part(const std::vector<std::byte>& rec, uint32_t h, int p) {
+  const auto part = std::span(rec).subspan(h * kHalfStride + p * kHalfPartBytes, kHalfPartBytes);
+  return p < 2 ? ds4n::mx::untile_matrix(part, kHalfRows, kGateBlocks).value()
+               : ds4n::mx::untile_matrix(part, kHidden, kHalfDownBlocks).value();
+}
+}  // namespace
+
+TEST_CASE("build_record: each Half untiles to its gate/up rows and its down K slice") {
   const auto gate = pattern(1, kIntermediate, kGateRowBytes);
   const auto up = pattern(2, kIntermediate, kGateRowBytes);
   const auto down = pattern(3, kHidden, kDownRowBytes);
@@ -68,32 +78,14 @@ TEST_CASE("build_record splits gate/up by rows and down by K blocks") {
   const auto& rec = r.value();
   REQUIRE(rec.size() == kRecordStride);
   for (uint32_t h = 0; h < kHalves; h++) {
+    const auto g = untiled_part(rec, h, 0), u = untiled_part(rec, h, 1), d = untiled_part(rec, h, 2);
+    CHECK(std::memcmp(g.data(), gate.data() + h * kHalfPartBytes, kHalfPartBytes) == 0);
+    CHECK(std::memcmp(u.data(), up.data() + h * kHalfPartBytes, kHalfPartBytes) == 0);
+    for (uint64_t row = 0; row < kHidden; row++)
+      REQUIRE(std::memcmp(d.data() + row * kHalfDownRowBytes,
+                          down.data() + row * kDownRowBytes + h * kHalfDownRowBytes, kHalfDownRowBytes) == 0);
     const std::byte* half = rec.data() + h * kHalfStride;
-    for (uint64_t row : std::initializer_list<uint64_t>{0, 1, 577, kHalfRows - 1}) {
-      CHECK(std::memcmp(half + row * kGateRowBytes, gate.data() + (h * kHalfRows + row) * kGateRowBytes,
-                        kGateRowBytes) == 0);
-      CHECK(std::memcmp(half + kHalfPartBytes + row * kGateRowBytes,
-                        up.data() + (h * kHalfRows + row) * kGateRowBytes, kGateRowBytes) == 0);
-    }
-    for (uint64_t row : std::initializer_list<uint64_t>{0, 1, 2049, kHidden - 1}) {
-      CHECK(std::memcmp(half + 2 * kHalfPartBytes + row * kHalfDownRowBytes,
-                        down.data() + row * kDownRowBytes + h * kHalfDownRowBytes, kHalfDownRowBytes) == 0);
-    }
     for (uint64_t pad = kHalfPayloadBytes; pad < kHalfStride; pad += 4096) CHECK(half[pad] == std::byte{0});
-  }
-}
-
-TEST_CASE("the two down Halves of a row rejoin into the source row") {
-  const auto gate = pattern(4, kIntermediate, kGateRowBytes);
-  const auto up = pattern(5, kIntermediate, kGateRowBytes);
-  const auto down = pattern(6, kHidden, kDownRowBytes);
-  const auto rec = build_record(gate, up, down).value();
-  for (uint64_t row = 0; row < kHidden; row += 311) {
-    std::vector<std::byte> joined(kDownRowBytes);
-    for (uint32_t h = 0; h < kHalves; h++)
-      std::memcpy(joined.data() + h * kHalfDownRowBytes,
-                  rec.data() + h * kHalfStride + 2 * kHalfPartBytes + row * kHalfDownRowBytes, kHalfDownRowBytes);
-    CHECK(std::memcmp(joined.data(), down.data() + row * kDownRowBytes, kDownRowBytes) == 0);
   }
 }
 

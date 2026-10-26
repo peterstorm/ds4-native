@@ -2,6 +2,8 @@
 
 #include <cstring>
 
+#include "core/mx_tiles.hpp"
+
 namespace ds4n::store {
 namespace {
 
@@ -62,14 +64,21 @@ Result<std::vector<std::byte>, LayoutError> build_record(std::span<const std::by
   if (gate.size() != kMatrixBytes || up.size() != kMatrixBytes || down.size() != kMatrixBytes)
     return R::err({"source matrix size mismatch"});
   std::vector<std::byte> record(kRecordStride);  // zero-initialized padding
+  std::vector<std::byte> down_half(kHalfPartBytes);
   for (uint32_t h = 0; h < kHalves; h++) {
     std::byte* half = record.data() + h * kHalfStride;
-    std::memcpy(half, gate.data() + h * kHalfPartBytes, kHalfPartBytes);
-    std::memcpy(half + kHalfPartBytes, up.data() + h * kHalfPartBytes, kHalfPartBytes);
-    std::byte* d = half + 2 * kHalfPartBytes;
     for (uint64_t row = 0; row < kHidden; row++)
-      std::memcpy(d + row * kHalfDownRowBytes, down.data() + row * kDownRowBytes + h * kHalfDownRowBytes,
-                  kHalfDownRowBytes);
+      std::memcpy(down_half.data() + row * kHalfDownRowBytes,
+                  down.data() + row * kDownRowBytes + h * kHalfDownRowBytes, kHalfDownRowBytes);
+    const std::span<const std::byte> parts[3] = {gate.subspan(h * kHalfPartBytes, kHalfPartBytes),
+                                                 up.subspan(h * kHalfPartBytes, kHalfPartBytes), down_half};
+    const uint64_t rows[3] = {kHalfRows, kHalfRows, kHidden};
+    const uint64_t blocks[3] = {kGateBlocks, kGateBlocks, kHalfDownBlocks};
+    for (int p = 0; p < 3; p++) {
+      auto tiled = mx::tile_matrix(parts[p], rows[p], blocks[p]);
+      if (!tiled) return R::err({tiled.error().what});
+      std::memcpy(half + p * kHalfPartBytes, tiled.value().data(), kHalfPartBytes);
+    }
   }
   return R::ok(std::move(record));
 }

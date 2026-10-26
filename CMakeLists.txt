@@ -13,6 +13,7 @@ add_library(ds4n_core STATIC
   src/core/ledger.cpp
   src/core/expert_cache.cpp
   src/core/mx_reference.cpp
+  src/core/mx_tiles.cpp
 )
 target_include_directories(ds4n_core PUBLIC src)
 target_compile_options(ds4n_core PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -31,6 +32,22 @@ target_link_libraries(ds4n-store-build PRIVATE ds4n_io)
 add_executable(ds4n-readbench src/tools/read_bench.cpp)
 target_link_libraries(ds4n-readbench PRIVATE ds4n_io)
 
+# GPU kernels (sm_120a: block-scaled MMA needs the arch-specific target).
+option(DS4N_CUDA "Build CUDA kernels and GPU tools" ON)
+if(DS4N_CUDA)
+  enable_language(CUDA)
+  set(CMAKE_CUDA_STANDARD 20)
+  set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+  set(CMAKE_CUDA_ARCHITECTURES OFF)
+  set(DS4N_CUDA_FLAGS -gencode=arch=compute_120a,code=sm_120a -lineinfo -Xcompiler=-Wall)
+  add_library(ds4n_cuda STATIC src/cuda/mx_gemv.cu)
+  target_compile_options(ds4n_cuda PRIVATE ${DS4N_CUDA_FLAGS})
+  target_link_libraries(ds4n_cuda PUBLIC ds4n_core)
+  add_executable(ds4n-mx-check src/tools/mx_check.cu)
+  target_compile_options(ds4n-mx-check PRIVATE ${DS4N_CUDA_FLAGS})
+  target_link_libraries(ds4n-mx-check PRIVATE ds4n_cuda ds4n_io)
+endif()
+
 enable_testing()
 find_package(doctest REQUIRED)
 add_executable(ds4n_tests
@@ -41,6 +58,7 @@ add_executable(ds4n_tests
   tests/core/test_expert_cache.cpp
   tests/core/test_stats.cpp
   tests/core/test_mx_reference.cpp
+  tests/core/test_mx_tiles.cpp
 )
 target_link_libraries(ds4n_tests PRIVATE ds4n_core doctest::doctest)
 target_compile_options(ds4n_tests PRIVATE -Wall -Wextra)

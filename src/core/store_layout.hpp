@@ -1,8 +1,11 @@
 #pragma once
 // Expert store layout (pure). One record per Expert; each record is two Halves,
 // one per GPU under 2-way tensor parallelism, so a Miss is one aligned read per
-// GPU. Payload stays in GGML MXFP4 blocks (1 E8M0 scale byte + 16 bytes of
-// E2M1 pairs per 32 values) exactly as the source GGUF stores it.
+// GPU. A Half is three parts — gate rows, up rows (1152 x 160 blocks each) and
+// the matching K slice of down (5120 x 36 blocks) — each in the MMA
+// fragment-order tile layout of core/mx_tiles.hpp, so a Half copies into its
+// Slot unchanged and the kernels read it directly. Bytes per 32 weights stay
+// 17, as in the source GGUF's MXFP4 blocks.
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -27,6 +30,7 @@ constexpr uint64_t kGateRowBytes = kHidden / kBlockValues * kBlockBytes;        
 constexpr uint64_t kDownRowBytes = kIntermediate / kBlockValues * kBlockBytes;  // 1,224
 constexpr uint64_t kMatrixBytes = kIntermediate * kGateRowBytes;                // 6,266,880
 constexpr uint64_t kHalfRows = kIntermediate / kHalves;                          // 1,152
+constexpr uint64_t kGateBlocks = kHidden / kBlockValues;                         // 160 (K blocks of gate/up)
 constexpr uint64_t kHalfDownBlocks = kIntermediate / kBlockValues / kHalves;    // 36
 constexpr uint64_t kHalfDownRowBytes = kHalfDownBlocks * kBlockBytes;           // 612
 constexpr uint64_t kHalfPartBytes = kHalfRows * kGateRowBytes;                   // 3,133,440 (gate, up and down part alike)
@@ -71,9 +75,10 @@ struct LayoutError {
 Result<ExpertSource, LayoutError> expert_source(const gguf::TensorIndex& index, ExpertId id);
 
 /**
- * Build one store record from an Expert's three source matrices: Half h holds
- * gate rows and up rows [h*1152, (h+1)*1152) and, for every down row, MXFP4
- * blocks [h*36, h*36+36) (the matching K range). Padding is zero.
+ * Build one store record from an Expert's three source matrices (GGML MXFP4
+ * row-major): Half h holds gate rows and up rows [h*1152, (h+1)*1152) and, for
+ * every down row, MXFP4 blocks [h*36, h*36+36) (the matching K range), each
+ * part tiled for the kernels. Padding is zero.
  */
 Result<std::vector<std::byte>, LayoutError> build_record(std::span<const std::byte> gate,
                                                         std::span<const std::byte> up,
@@ -86,7 +91,7 @@ struct StoreHeader {
   uint64_t half_stride, record_stride, header_bytes;
   std::string source_revision;  // general.source.revision of the source GGUF
 };
-constexpr uint32_t kLayoutVersion = 1;
+constexpr uint32_t kLayoutVersion = 2;  // 2: parts in MMA fragment-order tiles
 
 StoreHeader current_header(std::string source_revision);
 std::vector<std::byte> encode_header(const StoreHeader& h);

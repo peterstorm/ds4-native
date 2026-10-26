@@ -38,7 +38,7 @@ case "${1:-}" in
     ;;
   test)
     sync
-    in_image "" "cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo >/dev/null && cmake --build build && ctest --test-dir build --output-on-failure"
+    in_image "" "cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc >/dev/null && cmake --build build && ctest --test-dir build --output-on-failure"
     ;;
   run)
     shift
