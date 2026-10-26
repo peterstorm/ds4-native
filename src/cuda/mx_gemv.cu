@@ -68,20 +68,11 @@ __device__ __forceinline__ void store_tile(float* out, int tile, unsigned lane, 
   out[(row + 8) * kMaxTokens + col + 1] = d[3];
 }
 
-__global__ void __launch_bounds__(128) gemv_kernel(const GemvJob* __restrict__ jobs,
-                                                   const int* __restrict__ first_warp, int n_jobs, int total_warps) {
-  const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
-  const unsigned lane = threadIdx.x & 31;
-  if (warp >= total_warps) return;
-  const int j = find_job(first_warp, n_jobs, warp);
-  const GemvJob job = jobs[j];
-  const int local = warp - first_warp[j];
-  const int tile = local / job.splits, split = local % job.splits;
+/** One warp's 16-row MXFP4 tile over its split's K range. */
+__device__ __forceinline__ void mxfp4_tile(const GemvJob& job, int tile, int split, unsigned lane, float (&d)[4]) {
   const uint8_t* w = job.weights + static_cast<size_t>(tile) * job.blocks * 272;
   const uint8_t* wscale = w + static_cast<size_t>(job.blocks) * 256;
   const unsigned scale_row = (lane >> 2) + 8 * (lane & 1);
-
-  float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
   const int first_pair = split * job.split_blocks / 2;
   const int pairs = min(job.blocks, (split + 1) * job.split_blocks) / 2;
   // Issue kDepth pairs' weight loads back to back, then consume them in K order:
@@ -108,32 +99,13 @@ __global__ void __launch_bounds__(128) gemv_kernel(const GemvJob* __restrict__ j
       }
     }
   }
-  store_tile(job.out + static_cast<size_t>(split) * job.rows * kMaxTokens, tile, lane, d);
 }
 
-__global__ void reduce_kernel(const float* __restrict__ partials, int splits, int n, float* __restrict__ out) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= n) return;
-  float acc = partials[i];
-  for (int s = 1; s < splits; s++) acc += partials[static_cast<size_t>(s) * n + i];
-  out[i] = acc;
-}
-
-__global__ void __launch_bounds__(128) fp8_gemv_kernel(const GemvJob* __restrict__ jobs,
-                                                       const int* __restrict__ first_warp, int n_jobs,
-                                                       int total_warps) {
-  const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
-  const unsigned lane = threadIdx.x & 31;
-  if (warp >= total_warps) return;
-  const int j = find_job(first_warp, n_jobs, warp);
-  const GemvJob job = jobs[j];
-  const int local = warp - first_warp[j];
-  const int tile = local / job.splits, split = local % job.splits;
+/** One warp's 16-row FP8 tile over its split's K range. */
+__device__ __forceinline__ void fp8_tile(const GemvJob& job, int tile, int split, unsigned lane, float (&d)[4]) {
   const size_t tile_bytes = static_cast<size_t>(job.blocks) * 512 + (job.blocks + 15) / 16 * 16;
   const uint8_t* w = job.weights + static_cast<size_t>(tile) * tile_bytes;
   const uint8_t* wscale = w + static_cast<size_t>(job.blocks) * 512;
-
-  float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
   const int end = min(job.blocks, (split + 1) * job.split_blocks);
   for (int b0 = split * job.split_blocks; b0 < end; b0 += kDepth) {
     uint4 c[kDepth];
@@ -150,7 +122,29 @@ __global__ void __launch_bounds__(128) fp8_gemv_kernel(const GemvJob* __restrict
       mma_fp8(d, c[i], bfrag.x, bfrag.y, sfa, sfb);
     }
   }
+}
+
+__global__ void __launch_bounds__(128) gemv_kernel(const GemvJob* __restrict__ jobs,
+                                                   const int* __restrict__ first_warp, int n_jobs, int total_warps) {
+  const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const unsigned lane = threadIdx.x & 31;
+  if (warp >= total_warps) return;
+  const int j = find_job(first_warp, n_jobs, warp);
+  const GemvJob job = jobs[j];
+  const int local = warp - first_warp[j];
+  const int tile = local / job.splits, split = local % job.splits;
+  float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  if (job.format == WeightFormat::Mxfp4) mxfp4_tile(job, tile, split, lane, d);
+  else fp8_tile(job, tile, split, lane, d);
   store_tile(job.out + static_cast<size_t>(split) * job.rows * kMaxTokens, tile, lane, d);
+}
+
+__global__ void reduce_kernel(const float* __restrict__ partials, int splits, int n, float* __restrict__ out) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  float acc = partials[i];
+  for (int s = 1; s < splits; s++) acc += partials[static_cast<size_t>(s) * n + i];
+  out[i] = acc;
 }
 
 }  // namespace
@@ -160,16 +154,12 @@ void reduce_splits(const float* partials, int splits, int rows, float* out, cuda
   reduce_kernel<<<(n + 255) / 256, 256, 0, stream>>>(partials, splits, n, out);
 }
 
-void fp8_gemv(const GemvJob* jobs, const int* first_warp, int n_jobs, int total_warps, cudaStream_t stream) {
-  fp8_gemv_kernel<<<(total_warps * 32 + 127) / 128, 128, 0, stream>>>(jobs, first_warp, n_jobs, total_warps);
-}
-
 void quantize_activations(const __nv_bfloat16* x, int tokens, ActFragments act, cudaStream_t stream) {
   const int warps = act.blocks * kMaxTokens;
   quantize_kernel<<<(warps * 32 + 127) / 128, 128, 0, stream>>>(x, tokens, act.blocks, act.codes, act.scales);
 }
 
-void mx_gemv(const GemvJob* jobs, const int* first_warp, int n_jobs, int total_warps, cudaStream_t stream) {
+void gemv(const GemvJob* jobs, const int* first_warp, int n_jobs, int total_warps, cudaStream_t stream) {
   gemv_kernel<<<(total_warps * 32 + 127) / 128, 128, 0, stream>>>(jobs, first_warp, n_jobs, total_warps);
 }
 

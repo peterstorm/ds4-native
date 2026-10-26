@@ -10,7 +10,7 @@
 set -euo pipefail
 
 HOST="${DS4N_HOST:-desktop}"
-IMAGE="ds4-native-dev:1"
+IMAGE="ds4-native-dev:2"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 if [ "$(hostname)" = "$HOST" ]; then

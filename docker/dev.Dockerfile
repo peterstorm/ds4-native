@@ -3,6 +3,6 @@
 # few dev packages it lacks. Reusing it avoids pulling another CUDA base.
 FROM ghcr.io/local-inference-lab/vllm:karmic-kraken-beta
 RUN apt-get update \
- && apt-get install -y --no-install-recommends doctest-dev liburing-dev \
+ && apt-get install -y --no-install-recommends doctest-dev liburing-dev nlohmann-json3-dev \
  && rm -rf /var/lib/apt/lists/*
 ENTRYPOINT []

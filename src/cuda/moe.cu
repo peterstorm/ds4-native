@@ -16,81 +16,85 @@ __device__ __forceinline__ float score(float logit) {
   return det::sqrt(logit > kSoftplusThreshold ? logit : det::log1p(det::exp(logit)));
 }
 
-/** (v, e) ranks above (bv, be): higher biased score, or equal and lower Expert id. */
-__device__ __forceinline__ bool ranks_above(float v, int e, float bv, int be) { return v > bv || (v == bv && e < be); }
+/** A key whose unsigned order is the float order of finite values. */
+__device__ __forceinline__ unsigned ordered_key(float v) {
+  const unsigned u = __float_as_uint(v);
+  return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
 
 /**
- * Warp n routes token n (lane L holds Experts L + 32 i); then warp 0 builds the
- * Plan, lane L owning Experts [12 L, 12 L + 12) so a prefix sum over lanes
- * keeps the jobs in ascending Expert id.
+ * Thread e computes Expert e's scores for every token (independent exp/log1p
+ * chains, unrolled over the token slots so they overlap). Warp n then picks
+ * token n's top 6: per round each lane offers its best untaken Expert (lane L
+ * holds L + 32 i), the warp takes the highest key and, among equal keys, the
+ * lowest Expert id. Warp 0 finally builds the Plan, lane L owning Experts
+ * [12 L, 12 L + 12) so a prefix sum over lanes keeps jobs in ascending id.
  */
-__global__ void __launch_bounds__(256) route_kernel(const float* __restrict__ logits, int tokens,
-                                                    const uint8_t* __restrict__ image, RouterParams p,
-                                                    int32_t* __restrict__ experts, float* __restrict__ weights,
-                                                    moe::Plan* __restrict__ plan) {
+__global__ void __launch_bounds__(moe::kExperts) route_kernel(const float* __restrict__ logits, int logit_splits,
+                                                              int tokens, const uint8_t* __restrict__ image,
+                                                              RouterParams p, int32_t* __restrict__ experts,
+                                                              float* __restrict__ weights, moe::Plan* __restrict__ plan) {
+  __shared__ float scores[kMaxTokens][moe::kExperts];
+  __shared__ float biased[kMaxTokens][moe::kExperts];
   __shared__ unsigned mask[moe::kExperts];
   __shared__ float routed_weight[moe::kExperts][kMaxTokens];
   __shared__ int failed;
-  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-  for (int e = threadIdx.x; e < moe::kExperts; e += blockDim.x) mask[e] = 0;
-  if (threadIdx.x == 0) failed = 0;
+  const int e = threadIdx.x, warp = e >> 5, lane = e & 31;
+  mask[e] = 0;
+  if (e == 0) failed = 0;
   __syncthreads();
 
-  if (warp < tokens) {
-    const int n = warp;
+  bool finite = true;
+#pragma unroll
+  for (int n = 0; n < kMaxTokens; n++) {
+    if (n >= tokens) break;
+    float l = logits[e * kMaxTokens + n];
+    for (int s = 1; s < logit_splits; s++)
+      l = __fadd_rn(l, logits[(static_cast<size_t>(s) * moe::kExperts + e) * kMaxTokens + n]);
+    finite = finite && isfinite(l);
     const float* bias = image != nullptr && image[n] != 0 && p.bias_vl != nullptr ? p.bias_vl : p.bias;
-    float s[kPerLane], biased[kPerLane];
-    bool finite = true;
-    for (int i = 0; i < kPerLane; i++) {
-      const int e = lane + 32 * i;
-      const float l = logits[e * kMaxTokens + n];
-      finite = finite && isfinite(l);
-      s[i] = score(l);
-      biased[i] = __fadd_rn(s[i], bias[e]);
-    }
-    if (!__all_sync(0xFFFFFFFFu, finite)) {
-      if (lane == 0) atomicOr(&failed, 1);
-    } else {
-      unsigned taken = 0;  // bit i: Expert lane + 32 i already selected
-      int sel[moe::kTopK];
-      float w[moe::kTopK];
-      for (int k = 0; k < moe::kTopK; k++) {
-        float bv = -INFINITY;
-        int be = INT_MAX;
-        for (int i = 0; i < kPerLane; i++)
-          if (!((taken >> i) & 1) && ranks_above(biased[i], lane + 32 * i, bv, be)) {
-            bv = biased[i];
-            be = lane + 32 * i;
-          }
-        for (int o = 16; o > 0; o >>= 1) {
-          const float ov = __shfl_xor_sync(0xFFFFFFFFu, bv, o);
-          const int oe = __shfl_xor_sync(0xFFFFFFFFu, be, o);
-          if (ranks_above(ov, oe, bv, be)) {
-            bv = ov;
-            be = oe;
-          }
+    const float sc = score(l);
+    scores[n][e] = sc;
+    biased[n][e] = __fadd_rn(sc, bias[e]);
+  }
+  if (!finite) atomicOr(&failed, 1);
+  __syncthreads();
+
+  if (!failed && warp < tokens) {
+    const int n = warp;
+    unsigned taken = 0;  // bit i: Expert lane + 32 i already selected
+    int sel[moe::kTopK];
+    float w[moe::kTopK];
+#pragma unroll
+    for (int k = 0; k < moe::kTopK; k++) {
+      float bv = -INFINITY;
+      int be = INT_MAX;
+#pragma unroll
+      for (int i = 0; i < kPerLane; i++) {
+        const float v = biased[n][lane + 32 * i];
+        if (!((taken >> i) & 1) && v > bv) {  // ascending i: ties keep the lower id
+          bv = v;
+          be = lane + 32 * i;
         }
-        float mine = 0.0f;
-        for (int i = 0; i < kPerLane; i++)
-          if (lane + 32 * i == be) {
-            mine = s[i];
-            taken |= 1u << i;
-          }
-        sel[k] = be;
-        w[k] = __shfl_sync(0xFFFFFFFFu, mine, be & 31);
       }
-      float sum = 0.0f;
-      for (int k = 0; k < moe::kTopK; k++) sum = __fadd_rn(sum, w[k]);
-      const float denom = __fadd_rn(sum, kWeightSumEps);
-      for (int k = 0; k < moe::kTopK; k++) w[k] = __fmul_rn(__fdiv_rn(w[k], denom), p.route_scale);
-      if (lane == 0)
-        for (int k = 0; k < moe::kTopK; k++) {
-          experts[n * moe::kTopK + k] = sel[k];
-          weights[n * moe::kTopK + k] = w[k];
-          atomicOr(&mask[sel[k]], 1u << n);
-          routed_weight[sel[k]][n] = w[k];
-        }
+      const unsigned key = ordered_key(bv);
+      const unsigned top = __reduce_max_sync(0xFFFFFFFFu, key);
+      const int winner = static_cast<int>(__reduce_min_sync(0xFFFFFFFFu, key == top ? static_cast<unsigned>(be) : ~0u));
+      if ((winner & 31) == lane) taken |= 1u << (winner >> 5);
+      sel[k] = winner;
+      w[k] = scores[n][winner];
     }
+    float sum = 0.0f;
+    for (int k = 0; k < moe::kTopK; k++) sum = __fadd_rn(sum, w[k]);
+    const float denom = __fadd_rn(sum, kWeightSumEps);
+    for (int k = 0; k < moe::kTopK; k++) w[k] = __fmul_rn(__fdiv_rn(w[k], denom), p.route_scale);
+    if (lane == 0)
+      for (int k = 0; k < moe::kTopK; k++) {
+        experts[n * moe::kTopK + k] = sel[k];
+        weights[n * moe::kTopK + k] = w[k];
+        atomicOr(&mask[sel[k]], 1u << n);
+        routed_weight[sel[k]][n] = w[k];
+      }
   }
   __syncthreads();
   if (warp != 0) return;
@@ -106,12 +110,12 @@ __global__ void __launch_bounds__(256) route_kernel(const float* __restrict__ lo
   if (!failed) {
     int j = inclusive - count;
     for (int i = 0; i < kPerLane; i++) {
-      const int e = lane * kPerLane + i;
-      const unsigned m = mask[e];
+      const int ex = lane * kPerLane + i;
+      const unsigned m = mask[ex];
       if (m == 0) continue;
-      plan->expert[j] = e;
+      plan->expert[j] = ex;
       plan->token_mask[j] = static_cast<uint8_t>(m);
-      for (int n = 0; n < kMaxTokens; n++) plan->weight[j][n] = (m >> n) & 1 ? routed_weight[e][n] : 0.0f;
+      for (int n = 0; n < kMaxTokens; n++) plan->weight[j][n] = (m >> n) & 1 ? routed_weight[ex][n] : 0.0f;
       j++;
     }
   }
@@ -216,9 +220,9 @@ __global__ void add_round_kernel(const float* __restrict__ a, const float* __res
 
 }  // namespace
 
-void route(const float* logits, int tokens, const uint8_t* image, RouterParams p, int32_t* experts, float* weights,
-           moe::Plan* plan, cudaStream_t stream) {
-  route_kernel<<<1, 32 * kMaxTokens, 0, stream>>>(logits, tokens, image, p, experts, weights, plan);
+void route(const float* logits, int logit_splits, int tokens, const uint8_t* image, RouterParams p, int32_t* experts,
+           float* weights, moe::Plan* plan, cudaStream_t stream) {
+  route_kernel<<<1, moe::kExperts, 0, stream>>>(logits, logit_splits, tokens, image, p, experts, weights, plan);
 }
 
 void swiglu_quantize(const moe::Plan* plan, MoeBuffers buf, float limit, cudaStream_t stream) {

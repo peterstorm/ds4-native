@@ -153,29 +153,42 @@ __global__ void hc_post_kernel(const __nv_bfloat16* __restrict__ x, const __nv_b
 
 __global__ void __launch_bounds__(256) bf16_gemv_kernel(const __nv_bfloat16* __restrict__ w,
                                                         const float* __restrict__ x, int rows, int k, int tokens,
-                                                        float* __restrict__ out) {
-  const int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+                                                        int splits, float* __restrict__ out) {
+  constexpr int kLoads = 4;  // uint4 weight loads in flight per lane
+  const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
   const int lane = threadIdx.x & 31;
-  if (row >= rows) return;
-  const __nv_bfloat16* wr = w + static_cast<size_t>(row) * k;
+  if (warp >= rows * splits) return;
+  const int row = warp / splits, split = warp % splits;
+  const int span = k / splits;
+  const __nv_bfloat16* wr = w + static_cast<size_t>(row) * k + static_cast<size_t>(split) * span;
+  const float* xs = x + static_cast<size_t>(split) * span;
   float acc[kMaxGemvTokens] = {};
-  for (int base = lane * 8; base < k; base += 256) {
-    const uint4 raw = __ldcs(reinterpret_cast<const uint4*>(wr + base));
-    const __nv_bfloat16* wv = reinterpret_cast<const __nv_bfloat16*>(&raw);
+  for (int base0 = lane * 8; base0 < span; base0 += 256 * kLoads) {
+    uint4 raw[kLoads];
 #pragma unroll
-    for (int t = 0; t < kMaxGemvTokens; t++) {
-      if (t >= tokens) break;
-      const float* xt = x + static_cast<size_t>(t) * k + base;
+    for (int i = 0; i < kLoads; i++)
+      if (base0 + i * 256 < span) raw[i] = __ldcs(reinterpret_cast<const uint4*>(wr + base0 + i * 256));
 #pragma unroll
-      for (int e = 0; e < 8; e++) acc[t] = __fmaf_rn(__bfloat162float(wv[e]), xt[e], acc[t]);
+    for (int i = 0; i < kLoads; i++) {
+      const int base = base0 + i * 256;
+      if (base >= span) break;
+      const __nv_bfloat16* wv = reinterpret_cast<const __nv_bfloat16*>(&raw[i]);
+#pragma unroll
+      for (int t = 0; t < kMaxGemvTokens; t++) {
+        if (t >= tokens) break;
+        const float* xt = xs + static_cast<size_t>(t) * k + base;
+#pragma unroll
+        for (int e = 0; e < 8; e++) acc[t] = __fmaf_rn(__bfloat162float(wv[e]), xt[e], acc[t]);
+      }
     }
   }
+  float* plane = out + static_cast<size_t>(split) * rows * kMaxGemvTokens;
 #pragma unroll
   for (int t = 0; t < kMaxGemvTokens; t++) {
     if (t >= tokens) break;
     float v = acc[t];
     for (int o = 16; o > 0; o >>= 1) v = __fadd_rn(v, __shfl_xor_sync(0xFFFFFFFFu, v, o));
-    if (lane == 0) out[static_cast<size_t>(row) * kMaxGemvTokens + t] = v;
+    if (lane == 0) plane[static_cast<size_t>(row) * kMaxGemvTokens + t] = v;
   }
 }
 
@@ -210,8 +223,9 @@ void hc_post(const __nv_bfloat16* x, const __nv_bfloat16* residual, const HcMixe
   hc_post_kernel<<<dim3((dim + 255) / 256, tokens), 256, 0, stream>>>(x, residual, mixes, dim, out);
 }
 
-void bf16_gemv(const __nv_bfloat16* w, const float* x, int rows, int k, int tokens, float* out, cudaStream_t stream) {
-  bf16_gemv_kernel<<<(rows * 32 + 255) / 256, 256, 0, stream>>>(w, x, rows, k, tokens, out);
+void bf16_gemv(const __nv_bfloat16* w, const float* x, int rows, int k, int tokens, int splits, float* out,
+               cudaStream_t stream) {
+  bf16_gemv_kernel<<<(rows * splits * 32 + 255) / 256, 256, 0, stream>>>(w, x, rows, k, tokens, splits, out);
 }
 
 }  // namespace ds4n::cuda

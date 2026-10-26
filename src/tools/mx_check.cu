@@ -157,8 +157,8 @@ int main(int argc, char** argv) {
       const int e = (s * 6 + j / 3) % n_experts;
       const auto& act = j % 3 == 2 ? act_h : act_x;
       const int sp = split_of(j % 3);
-      jobs.push_back({dw + static_cast<size_t>(e) * store::kHalfPayloadBytes + p.offset, act.codes, act.scales,
-                      partial[j], p.rows, p.blocks, sp, cuda::split_blocks_for(p.blocks, sp)});
+      jobs.push_back({cuda::WeightFormat::Mxfp4, dw + static_cast<size_t>(e) * store::kHalfPayloadBytes + p.offset,
+                      act.codes, act.scales, partial[j], p.rows, p.blocks, sp, cuda::split_blocks_for(p.blocks, sp)});
     }
     djobs[s] = device_alloc<cuda::GemvJob>(jobs.size());
     ck(cudaMemcpy(djobs[s], jobs.data(), jobs.size() * sizeof(cuda::GemvJob), cudaMemcpyHostToDevice), "jobs");
@@ -167,7 +167,7 @@ int main(int argc, char** argv) {
   ck(cudaMemcpy(dfirst, first.data(), first.size() * sizeof(int), cudaMemcpyHostToDevice), "first");
 
   auto run_layer = [&](int set) {
-    cuda::mx_gemv(djobs[set], dfirst, kJobs, total_warps, nullptr);
+    cuda::gemv(djobs[set], dfirst, kJobs, total_warps, nullptr);
     for (int j = 0; j < kJobs; j++)
       if (split_of(j % 3) > 1) cuda::reduce_splits(partial[j], split_of(j % 3), kParts[j % 3].rows, final_out[j], nullptr);
   };

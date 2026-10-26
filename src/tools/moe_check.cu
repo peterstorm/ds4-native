@@ -1,11 +1,11 @@
 // ds4n-moe-check: one MoE layer on the GPU versus the CPU oracle
 // (core/moe_reference). Routed Experts are real (both Halves from the store);
-// the router and the FP8 shared Expert are random until the Backbone is
-// converted. Both Halves run on this GPU in turn, standing in for the two
+// with --backbone the router, bias, FFN norm scale and FP8 shared Expert are the
+// layer's real ones (else random). Both Halves run on this GPU in turn, standing in for the two
 // GPUs, and are combined as the exchange will. Then one GPU's decode-layer MoE
 // work is timed per stage, with weights rotated over copies so L2 cannot serve them.
 //
-//   ds4n-moe-check --store STORE --layer L [--tokens T] [--splits S] [--iters I] [--seed N]
+//   ds4n-moe-check --store STORE --layer L [--backbone SAFETENSORS] [--tokens T] [--splits S] [--router-splits R] [--iters I] [--seed N]
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <random>
 #include <string>
 #include <vector>
@@ -106,6 +107,72 @@ Fp8Matrix random_fp8(std::mt19937& rng, int rows, int blocks) {
   return m;
 }
 
+/**
+ * Rows [r0, r0 + rows) and K blocks [b0, b0 + blocks) of a full FP8 matrix
+ * (codes row-major with `k_blocks` 32-wide K blocks, scales [rows/32][k_blocks]).
+ */
+Fp8Matrix fp8_slice(std::span<const std::byte> codes, std::span<const std::byte> scales, int k_blocks, int r0, int rows,
+                    int b0, int blocks) {
+  Fp8Matrix m{std::vector<uint8_t>(static_cast<size_t>(rows) * blocks * 32),
+              std::vector<uint8_t>(static_cast<size_t>(rows) / 32 * blocks), rows, blocks, {}};
+  const size_t k = static_cast<size_t>(k_blocks) * 32;
+  for (int r = 0; r < rows; r++)
+    std::memcpy(m.codes.data() + static_cast<size_t>(r) * blocks * 32, codes.data() + (r0 + r) * k + b0 * 32,
+                static_cast<size_t>(blocks) * 32);
+  for (int t = 0; t < rows / 32; t++)
+    std::memcpy(m.scales.data() + static_cast<size_t>(t) * blocks, scales.data() + (r0 / 32 + t) * k_blocks + b0, blocks);
+  auto tiled = mx::tile_fp8_matrix(m.codes, m.scales, rows, blocks);
+  if (!tiled) die(tiled.error().what);
+  m.tiles = std::move(tiled.value());
+  return m;
+}
+
+/** One layer's real router, FFN norm scale and shared Expert Halves from the Backbone. */
+struct BackboneLayer {
+  std::vector<__nv_bfloat16> router;
+  std::vector<float> bias, norm;
+  std::array<std::array<Fp8Matrix, 3>, 2> shared;  // [Half][gate, up, down]
+};
+
+BackboneLayer load_backbone(const std::string& path, uint32_t layer) {
+  const auto h = io::read_safetensors_header(path);
+  if (!h) die(h.error().what);
+  const auto fd = io::open_file(path, io::Access::ReadBuffered);
+  if (!fd) die(fd.error().what);
+  auto get = [&](const std::string& name, safetensors::Dtype dtype, std::initializer_list<uint64_t> shape) {
+    const auto t = safetensors::expect(h.value(), name, dtype, std::span(shape.begin(), shape.size()));
+    if (!t) die(t.error().what);
+    auto bytes = io::read_tensor(fd.value(), *t.value());
+    if (!bytes) die(bytes.error().what);
+    return std::move(bytes.value());
+  };
+  using D = safetensors::Dtype;
+  const std::string p = "layers." + std::to_string(layer) + ".";
+  const uint64_t experts = moe::kExperts, dim = kDim, inter = 2 * kRows;
+  BackboneLayer b;
+  const auto router = get(p + "ffn.gate.weight", D::BF16, {experts, dim});
+  b.router.resize(router.size() / 2);
+  std::memcpy(b.router.data(), router.data(), router.size());
+  const auto bias = get(p + "ffn.gate.bias", D::F32, {experts});
+  b.bias.resize(experts);
+  std::memcpy(b.bias.data(), bias.data(), bias.size());
+  const auto norm = get(p + "ffn_norm.weight", D::BF16, {dim});
+  for (size_t i = 0; i < dim; i++) {
+    uint16_t bits;
+    std::memcpy(&bits, norm.data() + 2 * i, 2);
+    b.norm.push_back(mx::bf16_value(bits));
+  }
+  const std::string s = p + "ffn.shared_experts.";
+  const auto w1 = get(s + "w1.weight", D::F8_E4M3, {inter, dim}), s1 = get(s + "w1.scale", D::F8_E8M0, {inter / 32, dim / 32});
+  const auto w3 = get(s + "w3.weight", D::F8_E4M3, {inter, dim}), s3 = get(s + "w3.scale", D::F8_E8M0, {inter / 32, dim / 32});
+  const auto w2 = get(s + "w2.weight", D::F8_E4M3, {dim, inter}), s2 = get(s + "w2.scale", D::F8_E8M0, {dim / 32, inter / 32});
+  for (int half = 0; half < 2; half++)
+    b.shared[half] = {fp8_slice(w1, s1, kGateBlocks, half * kRows, kRows, 0, kGateBlocks),
+                      fp8_slice(w3, s3, kGateBlocks, half * kRows, kRows, 0, kGateBlocks),
+                      fp8_slice(w2, s2, 2 * kDownBlocks, 0, kDim, half * kDownBlocks, kDownBlocks)};
+  return b;
+}
+
 moe::RowDot fp8_dot(const Fp8Matrix& m) {
   return [&m](std::span<const mx::ActBlock> act, size_t row, size_t first, size_t count) {
     const size_t k = static_cast<size_t>(m.blocks) * 32;
@@ -152,9 +219,9 @@ struct Agreement {
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string store_path;
+  std::string store_path, backbone_path;
   uint32_t layer = 3;
-  int tokens = 1, splits = 1, iters = 200, sets = 8;
+  int tokens = 1, splits = 2, router_splits = 5, iters = 200, sets = 8;
   unsigned seed = 7;
   for (int i = 1; i < argc; i++) {
     const std::string s = argv[i];
@@ -163,40 +230,54 @@ int main(int argc, char** argv) {
     else if (s == "--layer") layer = static_cast<uint32_t>(std::stoul(argv[++i]));
     else if (s == "--tokens") tokens = std::stoi(argv[++i]);
     else if (s == "--splits") splits = std::stoi(argv[++i]);
+    else if (s == "--router-splits") router_splits = std::stoi(argv[++i]);
     else if (s == "--iters") iters = std::stoi(argv[++i]);
     else if (s == "--seed") seed = static_cast<unsigned>(std::stoul(argv[++i]));
+    else if (s == "--backbone") backbone_path = argv[++i];
     else die("unknown argument " + s);
   }
-  if (store_path.empty() || tokens < 1 || tokens > cuda::kMaxTokens || splits < 1) die("bad arguments");
+  if (store_path.empty() || tokens < 1 || tokens > cuda::kMaxTokens || splits < 1 || router_splits < 1 ||
+      (kDim / 256) % router_splits != 0)
+    die("bad arguments (router splits must divide 20)");
   std::mt19937 rng(seed);
   std::normal_distribution<float> normal(0.0f, 1.0f);
 
-  // Router and input (random, BF16 values).
+  // Router, shared Expert and input scale: the Backbone's layer, or random stand-ins.
+  std::optional<BackboneLayer> real;
+  if (!backbone_path.empty()) real = load_backbone(backbone_path, layer);
   std::vector<__nv_bfloat16> router(static_cast<size_t>(moe::kExperts) * kDim);
-  for (auto& w : router) w = __float2bfloat16(0.02f * normal(rng));
-  std::vector<float> bias(moe::kExperts);
-  for (auto& b : bias) b = 0.05f * normal(rng);
+  std::vector<float> bias(moe::kExperts), norm(kDim, 1.0f);
+  if (real) {
+    router = real->router;
+    bias = real->bias;
+    norm = real->norm;
+  } else {
+    for (auto& w : router) w = __float2bfloat16(0.02f * normal(rng));
+    for (auto& b : bias) b = 0.05f * normal(rng);
+  }
+  // x as after ffn_norm: unit-variance values times the norm's scale.
   std::vector<float> xf(static_cast<size_t>(tokens) * kDim);
   std::vector<__nv_bfloat16> xb(xf.size());
   for (size_t i = 0; i < xf.size(); i++) {
-    xf[i] = mx::round_bf16(normal(rng));
+    xf[i] = mx::round_bf16(normal(rng) * norm[i % kDim]);
     xb[i] = __float2bfloat16(xf[i]);
   }
   auto* d_router = upload(router.data(), router.size());
   auto* d_bias = upload(bias.data(), bias.size());
   auto* d_xf = upload(xf.data(), xf.size());
   auto* d_xb = upload(xb.data(), xb.size());
-  auto* d_logits = device_alloc<float>(static_cast<size_t>(moe::kExperts) * cuda::kMaxTokens);
+  const size_t logit_plane = static_cast<size_t>(moe::kExperts) * cuda::kMaxTokens;
+  auto* d_logits = device_alloc<float>(router_splits * logit_plane);
   auto* d_experts = device_alloc<int32_t>(static_cast<size_t>(tokens) * moe::kTopK);
   auto* d_weights = device_alloc<float>(static_cast<size_t>(tokens) * moe::kTopK);
   auto* d_plan = device_alloc<moe::Plan>(1);
   const cuda::RouterParams router_params{d_bias, nullptr, kRouteScale};
-  cuda::bf16_gemv(d_router, d_xf, moe::kExperts, kDim, tokens, d_logits, nullptr);
-  cuda::route(d_logits, tokens, nullptr, router_params, d_experts, d_weights, d_plan, nullptr);
+  cuda::bf16_gemv(d_router, d_xf, moe::kExperts, kDim, tokens, router_splits, d_logits, nullptr);
+  cuda::route(d_logits, router_splits, tokens, nullptr, router_params, d_experts, d_weights, d_plan, nullptr);
   ck(cudaDeviceSynchronize(), "route");
 
   // Routing versus the oracle on the same logits.
-  const auto logits = download(d_logits, static_cast<size_t>(moe::kExperts) * cuda::kMaxTokens);
+  const auto logit_planes = download(d_logits, router_splits * logit_plane);
   const auto gpu_experts = download(d_experts, static_cast<size_t>(tokens) * moe::kTopK);
   const auto gpu_weights = download(d_weights, static_cast<size_t>(tokens) * moe::kTopK);
   const moe::Plan plan = download(d_plan, 1)[0];
@@ -205,7 +286,11 @@ int main(int argc, char** argv) {
   Agreement weight_agreement;
   for (int n = 0; n < tokens; n++) {
     std::vector<float> token_logits(moe::kExperts);
-    for (int e = 0; e < moe::kExperts; e++) token_logits[e] = logits[static_cast<size_t>(e) * cuda::kMaxTokens + n];
+    for (int e = 0; e < moe::kExperts; e++) {
+      const size_t at = static_cast<size_t>(e) * cuda::kMaxTokens + n;
+      token_logits[e] = logit_planes[at];  // planes added in split order, as the route kernel does
+      for (int s = 1; s < router_splits; s++) token_logits[e] += logit_planes[s * logit_plane + at];
+    }
     auto r = moe::route(token_logits, bias, kRouteScale);
     if (!r) die(r.error().what);
     for (int k = 0; k < moe::kTopK; k++) id_mismatch += r.value().expert[k] != gpu_experts[n * moe::kTopK + k];
@@ -250,9 +335,13 @@ int main(int argc, char** argv) {
       half.down = part(2, kDim, kDownBlocks);
     }
   std::array<std::unique_ptr<SharedHalf>, 2> shared;
-  for (auto& s : shared) {
-    s = std::make_unique<SharedHalf>(SharedHalf{random_fp8(rng, kRows, kGateBlocks), random_fp8(rng, kRows, kGateBlocks),
-                                                random_fp8(rng, kDim, kDownBlocks), nullptr, nullptr, nullptr});
+  for (int h = 0; h < 2; h++) {
+    auto& s = shared[h];
+    s = real ? std::make_unique<SharedHalf>(SharedHalf{std::move(real->shared[h][0]), std::move(real->shared[h][1]),
+                                                       std::move(real->shared[h][2]), nullptr, nullptr, nullptr})
+             : std::make_unique<SharedHalf>(SharedHalf{random_fp8(rng, kRows, kGateBlocks),
+                                                       random_fp8(rng, kRows, kGateBlocks),
+                                                       random_fp8(rng, kDim, kDownBlocks), nullptr, nullptr, nullptr});
     s->d_gate = upload(reinterpret_cast<const uint8_t*>(s->gate.tiles.data()), s->gate.tiles.size());
     s->d_up = upload(reinterpret_cast<const uint8_t*>(s->up.tiles.data()), s->up.tiles.size());
     s->d_down = upload(reinterpret_cast<const uint8_t*>(s->down.tiles.data()), s->down.tiles.size());
@@ -273,34 +362,37 @@ int main(int argc, char** argv) {
                             splits,
                             kDim};
   };
+  // One GPU's MoE GEMVs per phase in one launch each: routed Halves (MXFP4) and the shared Half (FP8).
   struct HalfLaunches {
-    Launch gate_up, shared_gate_up, down, shared_down;
+    Launch gate_up, down;
   };
   auto make_launches = [&](const cuda::MoeBuffers& buf, const std::vector<const uint8_t*>& payloads,
                            const uint8_t* s_gate, const uint8_t* s_up, const uint8_t* s_down) {
+    using cuda::WeightFormat;
     std::vector<cuda::GemvJob> gate_up, down;
     for (int j = 0; j < plan.jobs; j++) {
       const auto hid = buf.hidden_of(j);
-      gate_up.push_back({payloads[j], x_act.codes, x_act.scales, buf.gate_of(j), kRows, kGateBlocks, splits, sb});
-      gate_up.push_back({payloads[j] + store::kHalfPartBytes, x_act.codes, x_act.scales, buf.up_of(j), kRows,
+      gate_up.push_back({WeightFormat::Mxfp4, payloads[j], x_act.codes, x_act.scales, buf.gate_of(j), kRows,
                          kGateBlocks, splits, sb});
-      down.push_back({payloads[j] + 2 * store::kHalfPartBytes, hid.codes, hid.scales, buf.down_of(j), kDim, kDownBlocks,
-                      1, kDownBlocks});
+      gate_up.push_back({WeightFormat::Mxfp4, payloads[j] + store::kHalfPartBytes, x_act.codes, x_act.scales,
+                         buf.up_of(j), kRows, kGateBlocks, splits, sb});
+      down.push_back({WeightFormat::Mxfp4, payloads[j] + 2 * store::kHalfPartBytes, hid.codes, hid.scales,
+                      buf.down_of(j), kDim, kDownBlocks, 1, kDownBlocks});
     }
-    const auto shid = buf.hidden_of(cuda::kSharedJob);
-    return HalfLaunches{
-        make_launch(gate_up),
-        make_launch({{s_gate, x_act.codes, x_act.scales, buf.gate_of(cuda::kSharedJob), kRows, kGateBlocks, splits, sb},
-                     {s_up, x_act.codes, x_act.scales, buf.up_of(cuda::kSharedJob), kRows, kGateBlocks, splits, sb}}),
-        make_launch(down),
-        make_launch({{s_down, shid.codes, shid.scales, buf.down_of(cuda::kSharedJob), kDim, kDownBlocks, 1, kDownBlocks}})};
+    const int shared_slot = cuda::kSharedJob;
+    const auto shid = buf.hidden_of(shared_slot);
+    gate_up.push_back({WeightFormat::Fp8, s_gate, x_act.codes, x_act.scales, buf.gate_of(shared_slot), kRows,
+                       kGateBlocks, splits, sb});
+    gate_up.push_back({WeightFormat::Fp8, s_up, x_act.codes, x_act.scales, buf.up_of(shared_slot), kRows, kGateBlocks,
+                       splits, sb});
+    down.push_back({WeightFormat::Fp8, s_down, shid.codes, shid.scales, buf.down_of(shared_slot), kDim, kDownBlocks, 1,
+                    kDownBlocks});
+    return HalfLaunches{make_launch(gate_up), make_launch(down)};
   };
   auto run_moe = [&](const HalfLaunches& l, const cuda::MoeBuffers& buf, float* y, cudaStream_t st) {
-    cuda::mx_gemv(l.gate_up.jobs, l.gate_up.first, l.gate_up.n, l.gate_up.warps, st);
-    cuda::fp8_gemv(l.shared_gate_up.jobs, l.shared_gate_up.first, l.shared_gate_up.n, l.shared_gate_up.warps, st);
+    cuda::gemv(l.gate_up.jobs, l.gate_up.first, l.gate_up.n, l.gate_up.warps, st);
     cuda::swiglu_quantize(d_plan, buf, moe::kSwigluLimit, st);
-    cuda::mx_gemv(l.down.jobs, l.down.first, l.down.n, l.down.warps, st);
-    cuda::fp8_gemv(l.shared_down.jobs, l.shared_down.first, l.shared_down.n, l.shared_down.warps, st);
+    cuda::gemv(l.down.jobs, l.down.first, l.down.n, l.down.warps, st);
     cuda::combine(d_plan, buf, y, st);
   };
 
@@ -393,39 +485,37 @@ int main(int argc, char** argv) {
     set_launches.push_back(make_launches(bufs[0], payloads, copy_of(sh.d_gate, sh.gate.tiles.size()),
                                          copy_of(sh.d_up, sh.up.tiles.size()), copy_of(sh.d_down, sh.down.tiles.size())));
   }
-  const char* names[] = {"quantize x", "router GEMV", "route", "routed gate/up", "shared gate/up",
-                         "swiglu+quantize", "routed down", "shared down", "combine"};
-  constexpr int kStages = 9;
+  const char* names[] = {"quantize x", "router GEMV", "route", "gate/up GEMV", "swiglu+quantize", "down GEMV", "combine"};
+  constexpr int kStages = 7;
   cudaEvent_t ev[kStages + 1];
   for (auto& e : ev) ck(cudaEventCreate(&e), "event");
   std::vector<double> stage_ms(kStages, 0.0);
+  cudaStream_t st;
+  ck(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking), "stream");
   auto decode_layer = [&](int s, bool timed) {
     const HalfLaunches& l = set_launches[s];
     int k = 0;
     auto mark = [&] {
-      if (timed) ck(cudaEventRecord(ev[k]), "record");
+      if (timed) ck(cudaEventRecord(ev[k], st), "record");
       k++;
     };
     mark();
-    cuda::quantize_activations(d_xb, tokens, x_act, nullptr);
+    cuda::quantize_activations(d_xb, tokens, x_act, st);
     mark();
-    cuda::bf16_gemv(d_router, d_xf, moe::kExperts, kDim, tokens, d_logits, nullptr);
+    cuda::bf16_gemv(d_router, d_xf, moe::kExperts, kDim, tokens, router_splits, d_logits, st);
     mark();
-    cuda::route(d_logits, tokens, nullptr, router_params, d_experts, d_weights, d_plan, nullptr);
+    cuda::route(d_logits, router_splits, tokens, nullptr, router_params, d_experts, d_weights, d_plan, st);
     mark();
-    cuda::mx_gemv(l.gate_up.jobs, l.gate_up.first, l.gate_up.n, l.gate_up.warps, nullptr);
+    cuda::gemv(l.gate_up.jobs, l.gate_up.first, l.gate_up.n, l.gate_up.warps, st);
     mark();
-    cuda::fp8_gemv(l.shared_gate_up.jobs, l.shared_gate_up.first, l.shared_gate_up.n, l.shared_gate_up.warps, nullptr);
+    cuda::swiglu_quantize(d_plan, bufs[0], moe::kSwigluLimit, st);
     mark();
-    cuda::swiglu_quantize(d_plan, bufs[0], moe::kSwigluLimit, nullptr);
+    cuda::gemv(l.down.jobs, l.down.first, l.down.n, l.down.warps, st);
     mark();
-    cuda::mx_gemv(l.down.jobs, l.down.first, l.down.n, l.down.warps, nullptr);
-    mark();
-    cuda::fp8_gemv(l.shared_down.jobs, l.shared_down.first, l.shared_down.n, l.shared_down.warps, nullptr);
-    mark();
-    cuda::combine(d_plan, bufs[0], y[0], nullptr);
+    cuda::combine(d_plan, bufs[0], y[0], st);
     mark();
   };
+  // Per stage, with events between launches (includes launch gaps).
   for (int i = 0; i < iters; i++) {
     decode_layer(i % sets, true);
     ck(cudaEventSynchronize(ev[kStages]), "sync");
@@ -435,22 +525,37 @@ int main(int argc, char** argv) {
       stage_ms[k] += ms;
     }
   }
-  cudaEvent_t a, b;
-  ck(cudaEventCreate(&a), "event");
-  ck(cudaEventCreate(&b), "event");
-  ck(cudaEventRecord(a), "record");
-  for (int i = 0; i < iters; i++) decode_layer(i % sets, false);
-  ck(cudaEventRecord(b), "record");
-  ck(cudaEventSynchronize(b), "sync");
-  float total_ms = 0;
-  ck(cudaEventElapsedTime(&total_ms, a, b), "elapsed");
-  const double per_layer_us = total_ms / iters * 1000.0;
+  auto time_us = [&](auto&& body) {
+    cudaEvent_t a, b;
+    ck(cudaEventCreate(&a), "event");
+    ck(cudaEventCreate(&b), "event");
+    body();  // warm
+    ck(cudaEventRecord(a, st), "record");
+    for (int i = 0; i < iters; i++) body(i);
+    ck(cudaEventRecord(b, st), "record");
+    ck(cudaEventSynchronize(b), "sync");
+    float ms = 0;
+    ck(cudaEventElapsedTime(&ms, a, b), "elapsed");
+    return ms / iters * 1000.0;
+  };
+  // Back to back from the CPU (launch-bound for small kernels), then replayed as CUDA graphs (as decode runs).
+  const double launched_us = time_us([&](int i = 0) { decode_layer(i % sets, false); });
+  std::vector<cudaGraphExec_t> graphs(sets);
+  for (int s = 0; s < sets; s++) {
+    cudaGraph_t g;
+    ck(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal), "capture");
+    decode_layer(s, false);
+    ck(cudaStreamEndCapture(st, &g), "end capture");
+    ck(cudaGraphInstantiate(&graphs[s], g, 0), "instantiate");
+  }
+  const double graph_us = time_us([&](int i = 0) { ck(cudaGraphLaunch(graphs[i % sets], st), "graph launch"); });
   const double bytes = plan.jobs * double(store::kHalfPayloadBytes) + shared[0]->gate.tiles.size() * 2.0 +
                        shared[0]->down.tiles.size() + router.size() * 2.0;
-  std::printf("one GPU's decode-layer MoE (%d token%s, %d routed Halves + shared, splits %d):\n", tokens,
-              tokens > 1 ? "s" : "", plan.jobs, splits);
+  std::printf("one GPU's decode-layer MoE (%d token%s, %d routed Halves + shared, splits %d, %.1f MB):\n", tokens,
+              tokens > 1 ? "s" : "", plan.jobs, splits, bytes / 1e6);
   for (int k = 0; k < kStages; k++) std::printf("  %-16s %7.1f us\n", names[k], stage_ms[k] / iters * 1000.0);
-  std::printf("  back to back: %.1f us per layer, %.0f GB/s; x40 layers = %.2f ms/token\n", per_layer_us,
-              bytes / (per_layer_us * 1e-6) / 1e9, per_layer_us * 40 / 1000.0);
+  std::printf("  launched back to back: %.1f us per layer\n", launched_us);
+  std::printf("  CUDA graph replay:     %.1f us per layer, %.0f GB/s; x40 layers = %.2f ms/token\n", graph_us,
+              bytes / (graph_us * 1e-6) / 1e9, graph_us * 40 / 1000.0);
   return 0;
 }

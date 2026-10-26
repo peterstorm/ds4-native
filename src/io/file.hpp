@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "core/gguf.hpp"
+#include "core/safetensors.hpp"
 #include "core/result.hpp"
 
 namespace ds4n::io {
@@ -59,5 +60,11 @@ class AlignedBuffer {
 
 /** Read a GGUF header, growing the prefix until the parser has enough. */
 Result<gguf::Header, IoError> read_gguf_header(const std::string& path);
+
+/** Read a safetensors header, growing the prefix until the parser has enough; every tensor must lie in the file. */
+Result<safetensors::Header, IoError> read_safetensors_header(const std::string& path);
+
+/** One tensor's bytes (buffered read). */
+Result<std::vector<std::byte>, IoError> read_tensor(const Fd& fd, const safetensors::Tensor& t);
 
 }  // namespace ds4n::io

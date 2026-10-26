@@ -33,13 +33,14 @@ struct RouterParams {
 };
 
 /**
- * Route `tokens` rows from router logits laid out [384][8] (bf16_gemv's
- * output). `image` ([tokens], nonzero inside an image span) may be null.
+ * Route `tokens` rows from router logits given as `logit_splits` partial planes
+ * [split][384][8] (bf16_gemv's output), added in split order. `image` ([tokens],
+ * nonzero inside an image span) may be null.
  * Writes each token's top-6 ([tokens][6], descending) and the step's Plan;
  * non-finite logits give plan->jobs == -1.
  */
-void route(const float* logits, int tokens, const uint8_t* image, RouterParams p, int32_t* experts, float* weights,
-           moe::Plan* plan, cudaStream_t stream);
+void route(const float* logits, int logit_splits, int tokens, const uint8_t* image, RouterParams p, int32_t* experts,
+           float* weights, moe::Plan* plan, cudaStream_t stream);
 
 /** Per-slot scratch for one GPU's MoE work; every array has kJobSlots slots. */
 struct MoeBuffers {

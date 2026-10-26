@@ -80,13 +80,14 @@ int main(int argc, char** argv) {
   ck(cudaMalloc(&dfirst, sizeof(int)), "malloc");
   ck(cudaMemset(dfirst, 0, sizeof(int)), "memset");
   for (int c = 0; c < copies; c++) {
-    jobs[c] = {dw + c * bytes, act.codes, act.scales, splits > 1 ? dpartial : dout, rows, blocks, splits, sb};
+    jobs[c] = {cuda::WeightFormat::Fp8, dw + c * bytes, act.codes, act.scales, splits > 1 ? dpartial : dout, rows, blocks,
+               splits, sb};
     ck(cudaMalloc(&djobs[c], sizeof(cuda::GemvJob)), "malloc");
     ck(cudaMemcpy(djobs[c], &jobs[c], sizeof(cuda::GemvJob), cudaMemcpyHostToDevice), "job");
   }
   const int warps = rows / 16 * splits;
   auto run = [&](int c) {
-    cuda::fp8_gemv(djobs[c], dfirst, 1, warps, nullptr);
+    cuda::gemv(djobs[c], dfirst, 1, warps, nullptr);
     if (splits > 1) cuda::reduce_splits(dpartial, splits, rows, dout, nullptr);
   };
   run(0);

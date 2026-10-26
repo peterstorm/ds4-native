@@ -154,7 +154,7 @@ int main(int argc, char** argv) {
   auto dxf = upload(xf);
   float* dlog;
   ck(cudaMalloc(&dlog, static_cast<size_t>(rows) * 8 * 4), "malloc");
-  cuda::bf16_gemv(dhw, dxf, rows, dim, tokens, dlog, nullptr);
+  cuda::bf16_gemv(dhw, dxf, rows, dim, tokens, 1, dlog, nullptr);
   const auto logits = download(dlog, static_cast<size_t>(rows) * 8);
   max_rel = 0;
   for (int r = 0; r < rows; r += 997)
@@ -175,7 +175,7 @@ int main(int argc, char** argv) {
   ck(cudaEventCreate(&b), "ev");
   float ms = 0;
   ck(cudaEventRecord(a), "rec");
-  for (int i = 0; i < 50; i++) cuda::bf16_gemv(dhw, dxf, rows, dim, tokens, dlog, nullptr);
+  for (int i = 0; i < 50; i++) cuda::bf16_gemv(dhw, dxf, rows, dim, tokens, 1, dlog, nullptr);
   ck(cudaEventRecord(b), "rec");
   ck(cudaEventSynchronize(b), "sync");
   ck(cudaEventElapsedTime(&ms, a, b), "elapsed");

@@ -18,6 +18,7 @@ add_library(ds4n_core STATIC
   src/core/attn_reference.cpp
   src/core/engram.cpp
   src/core/moe_reference.cpp
+  src/core/safetensors.cpp
 )
 target_include_directories(ds4n_core PUBLIC src)
 target_compile_options(ds4n_core PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -87,6 +88,7 @@ add_executable(ds4n_tests
   tests/core/test_engram.cpp
   tests/core/test_moe_reference.cpp
   tests/core/test_det_math.cpp
+  tests/core/test_safetensors.cpp
 )
 target_link_libraries(ds4n_tests PRIVATE ds4n_core doctest::doctest)
 target_compile_options(ds4n_tests PRIVATE -Wall -Wextra)
