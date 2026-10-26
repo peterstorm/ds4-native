@@ -45,6 +45,7 @@
 #include "core/moe_plan.hpp"
 #include "cuda/resolve.cuh"
 #include "engine/device_layer.cuh"
+#include "engine/host_layer.hpp"
 
 namespace ds4n::engine {
 
@@ -109,8 +110,28 @@ class Decoder {
   /** Upload the final norm and the head (BF16 values [129280][5120]); each GPU keeps its half of the vocabulary. */
   void add_head(const std::vector<float>& norm, const std::vector<float>& head);
 
-  /** FP32 logits [rows][129280] of the current Round after the last layer. */
+  /** FP32 logits [rows][129280] of the current Round after the last layer (call before draft()). */
   std::vector<float> logits();
+
+  /**
+   * Upload DSpark (docs/design/dspark.md), after add_head: its stages as layers kLayers + s, the
+   * feature projection and its norm, the final norm, the Markov head (GPU 0) and the noise token's
+   * embedding; its routed Experts follow with add_draft_expert. From now on every Round captures
+   * the target features DSpark drafts from.
+   */
+  void add_draft(const HostDraft& draft, std::span<const float> noise_embedding);
+
+  /** Draft stage `stage`'s Expert `expert` from its store record (two Halves), resident on both GPUs. */
+  void add_draft_expert(int stage, int expert, std::span<const std::byte> record);
+
+  /**
+   * Draft a block for the anchor `token` at position p (embedding `anchor_embedding`): first the
+   * context takes every position below p it has not yet (their target features, captured when a
+   * Round decoded them; the caller guarantees every position below p is committed), then the
+   * stages, the head and the Markov chain. Returns the tokens drafted for positions p + 1 .. p + 5.
+   * Uses the Round buffers: call between Rounds, after the last Round's logits().
+   */
+  std::array<int32_t, model::kDraftRows> draft(int64_t p, int32_t token, std::span<const float> anchor_embedding);
 
  private:
   struct Gpu;
@@ -119,6 +140,8 @@ class Decoder {
   int rows_ = 0;
   int64_t p0_ = 0;
   bool engram_staged_ = false;
+  int64_t seeded_ = 0;       // DSpark's context holds every position below this one (up to kDraftContext)
+  std::vector<float> noise_;  // the noise token's embedding
 };
 
 }  // namespace ds4n::engine

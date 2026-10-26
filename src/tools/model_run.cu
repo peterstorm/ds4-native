@@ -4,7 +4,7 @@
 //   ds4n-model-run --backbone SAFETENSORS --store STORE --gguf MERGED_GGUF --tokens DIR --names a,b
 //                  --out DIR [--oracle DIR] [--force 1] [--steps N] [--slots N] [--ram-records R] [--prior PROFILE]
 //                  [--prior-weight W] [--ram-policy recent|popular] [--ccr LAMBDA] [--prefill R]
-//                  [--access-log FILE] [--vram-policy lru|picks] [--hints 0|1]
+//                  [--access-log FILE] [--vram-policy lru|picks] [--hints 0|1] [--dspark DIR]
 //
 // For each name, DIR/<name>.tokens is antirez's --dump-tokens output (ids on the first line). The
 // prompt runs from position 0 in Rounds of R rows (--prefill, 1 to 8, default 8: the same logits as
@@ -25,6 +25,9 @@
 // --vram-policy lru|picks (default lru: least recently used; picks: decayed pick counts) ranks the
 // VRAM Slots; --hints 0 stops them ranking the router's near-misses as just used (on by default).
 // Placement only: outputs never change.
+// --dspark DIR (the checkpoint shards holding mtp.*) decodes the greedy continuation with DSpark
+// (docs/design/dspark.md): each Round verifies an anchor and a drafted block of 5 and keeps the
+// drafted tokens the target agrees with. The dump is the plain greedy run's, byte for byte.
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -32,8 +35,11 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <array>
+#include <filesystem>
 #include <fstream>
 #include <memory>
+#include <numeric>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <span>
@@ -133,7 +139,7 @@ double median(std::vector<double> v) {
 int main(int argc, char** argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   setenv("CUDA_MODULE_LOADING", "EAGER", 1);  // before any CUDA call: see engine/decoder.cuh
-  std::string backbone_path, store_path, gguf_path, tokens_dir, names_arg, out_dir, oracle_dir, prior_path, access_log;
+  std::string backbone_path, store_path, gguf_path, tokens_dir, names_arg, out_dir, oracle_dir, prior_path, access_log, dspark_dir;
   bool force = false;
   int max_steps = 64, prefill_rows = model::kMaxRows;
   uint32_t slots = 8000, ram_records = 512, prior_weight = 1;
@@ -161,6 +167,7 @@ int main(int argc, char** argv) {
     else if (s == "--prior-weight") prior_weight = static_cast<uint32_t>(std::stoul(argv[++i]));
     else if (s == "--ccr") ccr = std::stof(argv[++i]);
     else if (s == "--access-log") access_log = argv[++i];
+    else if (s == "--dspark") dspark_dir = argv[++i];
     else if (s == "--hints") hints = std::string(argv[++i]) == "1";
     else if (s == "--vram-policy") {
       const std::string v = argv[++i];
@@ -176,6 +183,7 @@ int main(int argc, char** argv) {
     }
     else die("unknown argument " + s);
   }
+  if (!dspark_dir.empty() && force) die("--dspark drafts greedy continuations: it cannot be teacher forced");
   if (backbone_path.empty() || store_path.empty() || gguf_path.empty() || tokens_dir.empty() || names_arg.empty() ||
       out_dir.empty() || prefill_rows < 1 || prefill_rows > model::kMaxRows)
     die("usage: ds4n-model-run --backbone B --store S --gguf G --tokens DIR --names a,b --out DIR [--oracle DIR]");
@@ -217,6 +225,34 @@ int main(int argc, char** argv) {
   }
   std::printf("Backbone: 40 layers and the head loaded in %.1f s\n",
               std::chrono::duration<double>(Clock::now() - t_load).count());
+  auto embedding = [&](int32_t token) {
+    if (token < 0 || token >= model::kVocab) die("token id out of range: " + std::to_string(token));
+    auto emb = engine::load_bf16_row(backbone.value(), "embed.weight", token);
+    if (!emb) die(emb.error().what);
+    return std::move(emb).value();
+  };
+  const bool dspark = !dspark_dir.empty();
+  if (dspark) {
+    const auto t_draft = Clock::now();
+    std::vector<engine::Backbone> shards;
+    for (const auto& entry : std::filesystem::directory_iterator(dspark_dir))
+      if (entry.path().extension() == ".safetensors") {
+        auto b = engine::open_backbone(entry.path().string());
+        if (!b) die(b.error().what);
+        shards.push_back(std::move(b).value());
+      }
+    auto draft = engine::load_draft(shards);
+    if (!draft) die("DSpark: " + draft.error().what);
+    decoder.add_draft(draft.value(), embedding(model::kNoiseToken));
+    for (int stage = 0; stage < model::kDraftStages; stage++)
+      for (int e = 0; e < model::kDraftExperts; e++) {
+        auto record = engine::load_draft_expert(shards, stage, e);
+        if (!record) die("DSpark: " + record.error().what);
+        decoder.add_draft_expert(stage, e, record.value());
+      }
+    std::printf("DSpark: %d stages and %d Experts loaded in %.1f s\n", model::kDraftStages,
+                model::kDraftStages * model::kDraftExperts, std::chrono::duration<double>(Clock::now() - t_draft).count());
+  }
   auto layout = engine::load_engram_layout(gguf_path);
   if (!layout) die(layout.error().what);
   auto rows = engine::EngramRows::open({gguf_path});
@@ -234,22 +270,22 @@ int main(int argc, char** argv) {
     const auto oracle_steps = oracle_steps_json ? steps_of(*oracle_steps_json) : std::vector<OracleStep>{};
     if (force && oracle_steps.empty()) die("--force 1 needs " + oracle_dir + "/" + name + ".logprobs.json");
 
-    // One Round of the whole model (tokens at positions p0, p0 + 1, ...); the last row's logits only
-    // when asked for.
+    // One Round of the whole model (tokens at positions p0, p0 + 1, ...): every row's logits
+    // ([rows][vocab]) when asked for; `histories`, when given, gets the Engram history after each row.
     engram::History history;
     std::vector<double> step_ms, host_ms;  // whole Rounds; the host's part before launching (embeddings, Engram rows)
-    auto run_round = [&](int64_t p0, std::span<const int32_t> tokens, bool want_logits) -> std::vector<float> {
+    auto run_round = [&](int64_t p0, std::span<const int32_t> tokens, bool want_logits,
+                         std::vector<engram::History>* histories = nullptr) -> std::vector<float> {
       const auto t0 = Clock::now();
       std::vector<float> embeddings;
       std::vector<uint8_t> raw_rows;
       for (const int32_t token : tokens) {
-        if (token < 0 || token >= model::kVocab) die("token id out of range: " + std::to_string(token));
-        auto emb = engine::load_bf16_row(backbone.value(), "embed.weight", token);
-        if (!emb) die(emb.error().what);
-        embeddings.insert(embeddings.end(), emb.value().begin(), emb.value().end());
+        const auto emb = embedding(token);
+        embeddings.insert(embeddings.end(), emb.begin(), emb.end());
         auto hashed = engram::hash_token(layout.value(), history, static_cast<uint32_t>(token), true);
         if (!hashed) die(hashed.error().what);
         history = hashed.value().next;
+        if (histories) histories->push_back(history);
         auto raw = rows.value().read_token(hashed.value().rows);
         if (!raw) die(raw.error().what);
         raw_rows.insert(raw_rows.end(), raw.value().begin(), raw.value().end());
@@ -258,14 +294,13 @@ int main(int argc, char** argv) {
       decoder.begin_round(p0, embeddings, raw_rows);
       decoder.decode_round();
       std::vector<float> logits;
-      if (want_logits) {
-        const std::vector<float> all = decoder.logits();
-        logits.assign(all.end() - model::kVocab, all.end());
-      } else {
-        decoder.sync();
-      }
+      if (want_logits) logits = decoder.logits();
+      else decoder.sync();
       step_ms.push_back(std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
       return logits;
+    };
+    auto row = [](const std::vector<float>& all, size_t r) {
+      return std::vector<float>(all.begin() + r * model::kVocab, all.begin() + (r + 1) * model::kVocab);
     };
 
     // The prompt in Rounds of --prefill rows, then the next-token logits at its end.
@@ -275,7 +310,8 @@ int main(int argc, char** argv) {
     std::vector<float> logits;
     for (size_t p0 = 0; p0 < prompt.size(); p0 += prefill_rows) {
       const size_t n = std::min<size_t>(prefill_rows, prompt.size() - p0);
-      logits = run_round(static_cast<int64_t>(p0), std::span(prompt).subspan(p0, n), p0 + n == prompt.size());
+      const auto out = run_round(static_cast<int64_t>(p0), std::span(prompt).subspan(p0, n), p0 + n == prompt.size());
+      if (!out.empty()) logits = row(out, n - 1);
     }
     const double prompt_s = std::chrono::duration<double>(Clock::now() - t_prompt).count();
     write_text(out_dir + "/" + name + ".logits.json", logits_json(logits, prompt.size()));
@@ -301,20 +337,20 @@ int main(int argc, char** argv) {
     double max_dlp = 0.0, sum_dlp = 0.0;
     size_t n_dlp = 0;
     const int steps = oracle_steps.empty() ? max_steps : std::min<int>(max_steps, static_cast<int>(oracle_steps.size()));
-    constexpr int kWindowTokens = 64;
-    auto window_start = residency->stats();
-    for (int s = 0; s < steps; s++) {
-      const auto lp = compare::log_softmax(logits);
-      const auto top = compare::top_k(logits, 20);
+    // Step s from its logits: the greedy choice and the top-20 into the dump, the comparison with the
+    // Oracle; returns the token the step feeds on (the Oracle's under --force, else the greedy choice).
+    auto record_step = [&](int s, std::span<const float> step_logits) -> int32_t {
+      const auto lp = compare::log_softmax(step_logits);
+      const auto top = compare::top_k(step_logits, 20);
       const int32_t selected = top.front();
       if (s) steps_out << ",\n";
-      const int32_t fed = force ? oracle_steps[s].fed : selected;  // the token this step feeds on
+      const int32_t fed = force ? oracle_steps[s].fed : selected;
       steps_out << "    {\"step\":" << s << ",\"selected\":{\"id\":" << selected << "},\"fed\":{\"id\":" << fed
                 << "},\"top_logprobs\":[";
       for (size_t i = 0; i < top.size(); i++) {
         char buf[96];
         std::snprintf(buf, sizeof buf, "%s{\"token\":{\"id\":%d},\"logit\":%.9g,\"logprob\":%.9g}", i ? "," : "", top[i],
-                      logits[top[i]], lp[top[i]]);
+                      step_logits[top[i]], lp[top[i]]);
         steps_out << buf;
       }
       steps_out << "]}";
@@ -330,32 +366,81 @@ int main(int argc, char** argv) {
           n_dlp++;
         }
       }
-      const int32_t next = fed;
-      if (!force && eos && static_cast<uint64_t>(next) == *eos) break;
-      if (s + 1 < steps) logits = run_round(static_cast<int64_t>(prompt.size() + s), std::span(&next, 1), true);
-      // Every 64 tokens: how the Expert cache settles as the context grows.
-      if ((s + 1) % kWindowTokens == 0 && steps > kWindowTokens) {
-        const auto now = residency->stats();
-        const uint64_t hits = now.hits - window_start.hits, ram = now.ram_hits - window_start.ram_hits,
-                       reads = now.store_reads - window_start.store_reads;
-        const std::vector<double> window_ms(step_ms.end() - std::min<size_t>(step_ms.size(), kWindowTokens), step_ms.end());
-        const std::vector<double> window_host(host_ms.end() - std::min<size_t>(host_ms.size(), kWindowTokens), host_ms.end());
-        std::printf("  tokens %4d-%4d: median %.2f ms per token (host %.2f before launch), Hits %.1f %%, %.1f RAM tier and "
-                    "%.1f store reads per token\n",
-                    s + 2 - kWindowTokens, s + 1, median(window_ms), median(window_host),
-                    100.0 * static_cast<double>(hits) / static_cast<double>(std::max<uint64_t>(hits + ram + reads, 1)),
-                    static_cast<double>(ram) / kWindowTokens, static_cast<double>(reads) / kWindowTokens);
-        window_start = now;
+      return fed;
+    };
+    auto is_eos = [&](int32_t t) { return !force && eos && static_cast<uint64_t>(t) == *eos; };
+    const auto t_continuation = Clock::now();
+    int recorded = 0;
+    if (!dspark) {
+      constexpr int kWindowTokens = 64;
+      auto window_start = residency->stats();
+      for (int s = 0; s < steps; s++) {
+        const int32_t next = record_step(s, logits);
+        recorded = s + 1;
+        if (is_eos(next)) break;
+        if (s + 1 < steps) logits = run_round(static_cast<int64_t>(prompt.size() + s), std::span(&next, 1), true);
+        // Every 64 tokens: how the Expert cache settles as the context grows.
+        if ((s + 1) % kWindowTokens == 0 && steps > kWindowTokens) {
+          const auto now = residency->stats();
+          const uint64_t hits = now.hits - window_start.hits, ram = now.ram_hits - window_start.ram_hits,
+                         reads = now.store_reads - window_start.store_reads;
+          const std::vector<double> window_ms(step_ms.end() - std::min<size_t>(step_ms.size(), kWindowTokens), step_ms.end());
+          const std::vector<double> window_host(host_ms.end() - std::min<size_t>(host_ms.size(), kWindowTokens), host_ms.end());
+          std::printf("  tokens %4d-%4d: median %.2f ms per token (host %.2f before launch), Hits %.1f %%, %.1f RAM tier and "
+                      "%.1f store reads per token\n",
+                      s + 2 - kWindowTokens, s + 1, median(window_ms), median(window_host),
+                      100.0 * static_cast<double>(hits) / static_cast<double>(std::max<uint64_t>(hits + ram + reads, 1)),
+                      static_cast<double>(ram) / kWindowTokens, static_cast<double>(reads) / kWindowTokens);
+          window_start = now;
+        }
       }
+    } else {
+      // DSpark: draft a block after the anchor, verify the anchor and the block in one Round, keep the
+      // drafted tokens while the target's greedy choice agrees; the first disagreeing choice (or the
+      // last row's) is the next anchor. Rows after it are discarded (their cache writes are never read).
+      std::array<int, model::kVerifyRows> kept{};  // Rounds by rows committed
+      std::vector<double> draft_ms;
+      int64_t p = static_cast<int64_t>(prompt.size());
+      int32_t anchor = record_step(0, logits);
+      recorded = 1;
+      while (recorded < steps && !is_eos(anchor)) {
+        const auto t_draft = Clock::now();
+        const auto drafted = decoder.draft(p, anchor, embedding(anchor));
+        draft_ms.push_back(std::chrono::duration<double, std::milli>(Clock::now() - t_draft).count());
+        const int n = std::min(model::kVerifyRows, steps - recorded);
+        std::vector<int32_t> tokens = {anchor};
+        tokens.insert(tokens.end(), drafted.begin(), drafted.begin() + (n - 1));
+        std::vector<engram::History> histories;
+        const auto all = run_round(p, tokens, true, &histories);
+        int i = 0;
+        int32_t next = record_step(recorded, row(all, 0));
+        while (i + 1 < n && next == tokens[i + 1] && !is_eos(next)) {
+          i++;
+          next = record_step(recorded + i, row(all, i));
+        }
+        // Rows 0..i are committed.
+        recorded += i + 1;
+        p += i + 1;
+        history = histories[i];
+        anchor = next;
+        kept[i]++;
+      }
+      const int rounds = std::accumulate(kept.begin(), kept.end(), 0);
+      std::printf("%s DSpark: %d Rounds, %.2f tokens per Round (committed rows:", name.c_str(), rounds,
+                  rounds ? static_cast<double>(recorded - 1) / rounds : 0.0);
+      for (int k = 0; k < model::kVerifyRows; k++) std::printf(" %d:%d", k + 1, kept[k]);
+      std::printf("); median draft %.2f ms, median verify Round %.2f ms\n", median(draft_ms), median(step_ms));
     }
+    const double continuation_s = std::chrono::duration<double>(Clock::now() - t_continuation).count();
     steps_out << "\n  ]\n}\n";
     write_text(out_dir + "/" + name + ".logprobs.json", steps_out.str());
     residency->check();
     const auto after = residency->stats();
     const uint64_t needed = (after.hits + after.ram_hits + after.store_reads) - (before.hits + before.ram_hits + before.store_reads);
-    std::printf("%s continuation: %zu steps, median %.2f ms per token (%.1f tok/s); Expert Hits %.1f %% over the prompt "
-                "and continuation (%llu RAM tier, %llu store reads)\n",
-                name.c_str(), step_ms.size(), median(step_ms), 1e3 / std::max(median(step_ms), 1e-9),
+    // Step 0 came with the prompt; the continuation decoded the other recorded steps.
+    std::printf("%s continuation: %d steps in %.2f s (%.1f tok/s, median Round %.2f ms); Expert Hits %.1f %% over the "
+                "prompt and continuation (%llu RAM tier, %llu store reads)\n",
+                name.c_str(), recorded, continuation_s, (recorded - 1) / std::max(continuation_s, 1e-9), median(step_ms),
                 needed ? 100.0 * static_cast<double>(after.hits - before.hits) / static_cast<double>(needed) : 0.0,
                 static_cast<unsigned long long>(after.ram_hits - before.ram_hits),
                 static_cast<unsigned long long>(after.store_reads - before.store_reads));

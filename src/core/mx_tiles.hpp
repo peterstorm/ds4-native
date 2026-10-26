@@ -42,6 +42,16 @@ Result<std::vector<std::byte>, TileError> tile_matrix(std::span<const std::byte>
 Result<std::vector<std::byte>, TileError> untile_matrix(std::span<const std::byte> tiled, size_t rows, size_t blocks);
 
 /**
+ * Checkpoint MXFP4 (E2M1 codes packed two per byte, element 2j in the low nibble of byte j:
+ * `codes` [rows][blocks * 16]; E8M0 scales `scales` [rows][blocks]) -> GGML row-major blocks (per 32
+ * weights: the scale byte, then 16 bytes holding element i in the low nibble and i + 16 in the high
+ * nibble of byte i). The same codes and scales, reordered: lossless.
+ */
+Result<std::vector<std::byte>, TileError> ggml_from_packed_e2m1(std::span<const uint8_t> codes,
+                                                               std::span<const uint8_t> scales, size_t rows,
+                                                               size_t blocks);
+
+/**
  * FP8 (E4M3) weights with 32x32 E8M0 tile scales, in fragment order. Per
  * 16-row tile: codes, then scales. Codes: per K block, 512 bytes; lane t's 16
  * bytes at t*16 are exactly its A registers {a0, a1, a2, a3}: row g k 4q..4q+3,

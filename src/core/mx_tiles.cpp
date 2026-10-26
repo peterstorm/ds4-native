@@ -96,4 +96,21 @@ uint32_t lane_scales(std::span<const std::byte> tiled, size_t blocks, size_t til
   return v;
 }
 
+Result<std::vector<std::byte>, TileError> ggml_from_packed_e2m1(std::span<const uint8_t> codes,
+                                                               std::span<const uint8_t> scales, size_t rows,
+                                                               size_t blocks) {
+  using R = Result<std::vector<std::byte>, TileError>;
+  if (codes.size() != rows * blocks * 16 || scales.size() != rows * blocks) return R::err({"packed E2M1 shape mismatch"});
+  std::vector<std::byte> out(rows * blocks * 17);
+  for (size_t r = 0; r < rows; r++)
+    for (size_t b = 0; b < blocks; b++) {
+      const uint8_t* in = codes.data() + (r * blocks + b) * 16;
+      std::byte* block = out.data() + (r * blocks + b) * 17;
+      block[0] = static_cast<std::byte>(scales[r * blocks + b]);
+      auto element = [in](size_t e) { return static_cast<uint8_t>(e & 1 ? in[e / 2] >> 4 : in[e / 2] & 0x0F); };
+      for (size_t i = 0; i < 16; i++) block[1 + i] = static_cast<std::byte>(element(i) | element(i + 16) << 4);
+    }
+  return R::ok(std::move(out));
+}
+
 }  // namespace ds4n::mx

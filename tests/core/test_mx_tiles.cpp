@@ -133,3 +133,25 @@ TEST_CASE("fragment emulation over the tiled layout reproduces the oracle exactl
     }
   }
 }
+
+TEST_CASE("checkpoint MXFP4 repacks into GGML blocks element for element") {
+  constexpr size_t rows = 3, blocks = 5;
+  std::mt19937 rng(9);
+  std::vector<uint8_t> codes(rows * blocks * 16), scales(rows * blocks);
+  for (auto& c : codes) c = static_cast<uint8_t>(rng());
+  for (auto& s : scales) s = static_cast<uint8_t>(rng());
+  const auto ggml = ds4n::mx::ggml_from_packed_e2m1(codes, scales, rows, blocks);
+  REQUIRE(ggml);
+  REQUIRE(ggml.value().size() == rows * blocks * 17);
+  for (size_t r = 0; r < rows; r++)
+    for (size_t b = 0; b < blocks; b++) {
+      const auto block = std::span(ggml.value()).subspan((r * blocks + b) * 17).first<17>();
+      CHECK(std::to_integer<uint8_t>(block[0]) == scales[r * blocks + b]);
+      for (size_t e = 0; e < 32; e++) {
+        const uint8_t byte = codes[(r * blocks + b) * 16 + e / 2];
+        const uint8_t code = e % 2 ? byte >> 4 : byte & 0x0F;  // element 2j low, 2j + 1 high
+        CHECK(ds4n::mx::ggml_block_element(block, e) == ds4n::mx::e2m1_value(code));
+      }
+    }
+  CHECK_FALSE(ds4n::mx::ggml_from_packed_e2m1(std::span(codes).first(10), scales, rows, blocks));
+}

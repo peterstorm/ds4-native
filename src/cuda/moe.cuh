@@ -39,13 +39,15 @@ struct RouterParams {
   // Each token's near-misses ([tokens][moe::kNear], best first), or null for none. Only written: they
   // never change routing.
   int32_t* near = nullptr;
+  // The router's shape: 384 Experts, top 6 (a target layer) or 128, top 3 (a DSpark stage).
+  int experts = moe::kExperts, top_k = moe::kTopK;
 };
 
 /**
  * Route `tokens` rows from router logits given as `logit_splits` partial planes
- * [split][384][8] (bf16_gemv's output), added in split order. `image` ([tokens],
+ * [split][experts][8] (bf16_gemv's output), added in split order. `image` ([tokens],
  * nonzero inside an image span) may be null.
- * Writes each token's top-6 ([tokens][6], descending) and the step's Plan;
+ * Writes each token's top-k ([tokens][top_k], descending) and the step's Plan;
  * non-finite logits give plan->jobs == -1.
  */
 void route(const float* logits, int logit_splits, int tokens, const uint8_t* image, RouterParams p, int32_t* experts,

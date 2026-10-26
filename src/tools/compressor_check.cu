@@ -135,7 +135,7 @@ int main(int argc, char** argv) {
     auto* d_latent = device_alloc<__nv_bfloat16>(kRows);
     auto* d_pos = device_alloc<int64_t>(1);
     auto* d_produced = device_alloc<int>(1);
-    const cuda::PoolSlots slots{device_alloc<float>(2 * kRows), device_alloc<float>(2 * kRows)};
+    const cuda::PoolSlots slots{device_alloc<float>(cuda::kPoolRing * kRows), device_alloc<float>(cuda::kPoolRing * kRows)};
     cuda::init_pool(slots, nullptr);
 
     compressor::PoolState state = compressor::empty_pool();

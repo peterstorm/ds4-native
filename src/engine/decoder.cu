@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -7,8 +8,10 @@
 #include "core/model.hpp"
 #include "core/moe_reference.hpp"
 #include "core/mx_tiles.hpp"
+#include "core/store_layout.hpp"
 #include "cuda/attn.cuh"
 #include "cuda/compressor.cuh"
+#include "cuda/dspark.cuh"
 #include "cuda/engram.cuh"
 #include "cuda/exchange.cuh"
 #include "cuda/fused.cuh"
@@ -32,6 +35,8 @@ static_assert(cuda::kAttnWindow == kRing, "attention reads window ring slots bel
 constexpr float kSoftmaxScale = 0.044194173824159216f;  // head_dim^-0.5, as core/layer_reference
 constexpr int kExpertRows = 1152, kExpertDownBlocks = 36, kDimBlocks = kDim / 32;
 constexpr size_t kExpertPartBytes = static_cast<size_t>(kExpertRows) * (kDim / 32) * 17;  // one tiled part of a Half
+static_assert(3 * kExpertPartBytes == store::kHalfPayloadBytes, "a Slot holds a Half: gate, up and down parts");
+constexpr int kSplitsMainProj = 4;  // DSpark's feature projection (K = 15360): proposal numerics, not Reference
 
 /** A batched GEMV launch prepared on the device. */
 struct Launch {
@@ -102,6 +107,13 @@ cudaGraphExec_t capture(cudaStream_t stream, Enqueue&& enqueue) {
  * asynchronous, and graph copy nodes read these fixed addresses when they run).
  * The host rewrites a field only after the copy that read it last finished.
  */
+/** The positions a context seed projects (device-read): per row, its position and its two ring slots. */
+struct SeedIndex {
+  int64_t pos[kDraftContext];
+  int64_t context_slot[kDraftContext];  // p % kDraftContext: the stages' context rings
+  int32_t feature_slot[kDraftContext];  // p % kRing: the target feature rings
+};
+
 struct Staging {
   model::RoundIndex round;
   int32_t idx[kMaxRows][kIdxStride];  // the window slots; the top-k part is filled on the device
@@ -109,6 +121,10 @@ struct Staging {
   uint8_t engram_rows[2][kMaxRows][kEngramTableBytes];  // per table (layer 1, layer 14), then row
   moe::Plan plan;
   float logits[kMaxRows][kVocab / kGpus];  // this GPU's half of the vocabulary
+  // DSpark: a block's attention slots (context ring, then the block), the seed, the Markov chain.
+  int32_t draft_idx[kDraftRows][kIdxStride];
+  SeedIndex seed;
+  int32_t chain[kDraftRows + 1];  // the anchor, then the drafted tokens
 };
 
 struct Decoder::Gpu {
@@ -173,8 +189,36 @@ struct Decoder::Gpu {
   bf16 *norm = nullptr, *head = nullptr;
   float *head_planes = nullptr, *head_out = nullptr;
 
+  /** DSpark on this GPU (add_draft); `features[0]` stays null until then. */
+  struct Draft {
+    std::array<bf16*, kDraftTargetLayers.size()> features{};  // [kRing][5120] per target layer, by position
+    DeviceFp8 main_proj;
+    bf16 *main_norm = nullptr, *norm = nullptr;
+    Launch main_proj_launch;
+    std::array<Launch, kDraftStages> seed_kv;
+    cuda::ActFragments act_features{};                 // the three features of a seed row
+    bf16 *seed_x = nullptr, *seed_raw = nullptr, *main_x = nullptr;  // [8][15360], [8][5120] twice
+    float* planes_main = nullptr;
+    SeedIndex* seed = nullptr;
+    cuda::ExpertDirectory experts{};  // every draft Expert resident: no mailbox, no Misses
+    cuda::ResolvedMoe resolved{};
+    uint8_t* pool = nullptr;          // this GPU's Halves, Slot stage * 128 + expert
+    int64_t* block_slots = nullptr;   // [kDraftRows]: kDraftContext + r, where block rows keep their KV
+    int32_t* idx = nullptr;           // [kDraftRows][kIdxStride]
+    cudaGraphExec_t block = nullptr;  // the stages and the head over a block
+    // GPU 0: the Markov chain over the whole vocabulary.
+    bf16 *markov_embed = nullptr, *markov_head = nullptr;
+    float *markov_x = nullptr, *markov_planes = nullptr, *logits = nullptr;  // [256], [vocab][8], [rows][vocab]
+    int32_t* chain = nullptr;  // [kDraftRows + 1]
+  } draft;
+  cudaEvent_t staged_seed = nullptr, logits_copied = nullptr;
+
   /** One layer step for `rows` rows from a position of parity `parity`. */
   void enqueue_layer(int layer, int rows, int parity);
+  /** The head over `rows` rows of the stream after the last layer: this GPU's half of the logits into head_out. */
+  void enqueue_head(const bf16* final_norm, int rows);
+  /** Project `rows` accepted positions (from row `first` of the seed index) into every stage's context ring. */
+  void enqueue_seed(int first, int rows);
 };
 
 Decoder::Decoder(std::array<int, 2> devices, std::array<cuda::ExpertDirectory, 2> experts, Launches launches)
@@ -201,7 +245,7 @@ Decoder::Decoder(std::array<int, 2> devices, std::array<cuda::ExpertDirectory, 2
     for (cudaEvent_t& ev : s.branch) check(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "cudaEventCreate");
     check(cudaMallocHost(&s.staging, sizeof(Staging)), "cudaMallocHost");
     s.experts = experts[g];
-    for (cudaEvent_t* ev : {&s.staged_round, &s.staged_rows[0], &s.staged_rows[1]})
+    for (cudaEvent_t* ev : {&s.staged_round, &s.staged_rows[0], &s.staged_rows[1], &s.staged_seed, &s.logits_copied})
       check(cudaEventCreateWithFlags(ev, cudaEventDisableTiming), "cudaEventCreate");
     DeviceArena& a = s.arena;
     s.link.rank = g;
@@ -308,7 +352,9 @@ Decoder::~Decoder() {
       cudaStreamSynchronize(g->stream);
       for (auto& [key, exec] : g->graphs) cudaGraphExecDestroy(exec);
       for (auto& [key, exec] : g->round_graphs) cudaGraphExecDestroy(exec);
-      for (cudaEvent_t ev : {g->staged_round, g->staged_rows[0], g->staged_rows[1]}) cudaEventDestroy(ev);
+      if (g->draft.block) cudaGraphExecDestroy(g->draft.block);
+      for (cudaEvent_t ev : {g->staged_round, g->staged_rows[0], g->staged_rows[1], g->staged_seed, g->logits_copied})
+        cudaEventDestroy(ev);
       cudaStreamDestroy(g->stream);
       for (cudaStream_t side : g->sides) {
         cudaStreamSynchronize(side);
@@ -350,7 +396,7 @@ void Decoder::add_layer(const HostLayer& w) {
       s.compressed[w.id] = s.arena.alloc<bf16>(static_cast<size_t>(kMaxCompressed) * kHeadDim);
       s.index_cache[w.id] = s.arena.alloc<uint8_t>(cuda::index_cache_bytes(kMaxCompressed));
       if (kind.compress_ratio == 2) {
-        s.pools[w.id] = {s.arena.alloc<float>(2 * kHeadDim), s.arena.alloc<float>(2 * kHeadDim)};
+        s.pools[w.id] = {s.arena.alloc<float>(cuda::kPoolRing * kHeadDim), s.arena.alloc<float>(cuda::kPoolRing * kHeadDim)};
         cuda::init_pool(s.pools[w.id], s.stream);
       }
     }
@@ -368,6 +414,7 @@ void Decoder::begin_round(int64_t p0, std::span<const float> embeddings, std::sp
     throw CudaError("begin_round: Engram rows must be each row's 2 x 24 rows of 264 bytes");
   rows_ = static_cast<int>(rows);
   p0_ = p0;
+  if (p0 == 0) seeded_ = 0;  // a new Session: DSpark's context starts over
   const model::RoundIndex round = model::round_index(p0, rows_);
   engram_staged_ = !engram_rows.empty();
   for (auto& gp : gpus_) {
@@ -411,11 +458,23 @@ void Decoder::Gpu::enqueue_layer(int layer, int rows, int parity) {
   const LayerLaunches& l = launches.at(layer);
   const cudaStream_t st = stream;
   const int64_t* pos = round->pos;
-  const int n_idx = ratio ? kWindow + kTopK : kWindow;
+  const int n_idx = kind.draft ? kDraftContext + kDraftRows : ratio ? kWindow + kTopK : kWindow;
+  // A DSpark stage writes its block's KV after its context ring and attends over both (non-causal),
+  // and routes over its own resident Experts with their own step count (the Miss protocol counts the
+  // target's layer steps only).
+  const int32_t* attn_idx = kind.draft ? draft.idx : idx;
+  const int64_t* kv_slots = kind.draft ? draft.block_slots : round->ring_slot;
+  const cuda::ExpertDirectory& dir = kind.draft ? draft.experts : experts;
+  const cuda::ResolvedMoe& res = kind.draft ? draft.resolved : resolved;
   // Row r's position p0 + r has the parity of parity + r, all a group's completion depends on.
   auto produced_row = [&](int r) { return kind.kv_source && model::completes_group(parity + r, ratio); };
   auto compress_len = [&](int r) { return IntArg::at(&round->compress_len[ratio][r], kMaxCompressed); };
   auto compress_row = [&](int r) { return IntArg::at(&round->compress_row[ratio][r], kMaxCompressed - 1); };
+
+  // The target features DSpark drafts from: the input streams of its target layers.
+  if (draft.features[0] != nullptr)
+    for (size_t t = 0; t < kDraftTargetLayers.size(); t++)
+      if (layer == kDraftTargetLayers[t]) cuda::capture_features(h, rows, kDim, pos, draft.features[t], kRing, st);
 
   // Engram adds its memory into the stream this layer reads.
   bf16* h_in = h;
@@ -449,7 +508,7 @@ void Decoder::Gpu::enqueue_layer(int layer, int rows, int parity) {
   // Branch 1: the rows' KV into the window ring (only attention reads it) beside the q path.
   fork(1);
   cuda::kv_to_cache({planes_kv, kSplitsWkv, kHeadDim}, rows, d.kv_norm, kNormEps, d.rope_freqs, kRopeDim, pos,
-                    window.at(layer), round->ring_slot, side(1));
+                    window.at(layer), kv_slots, side(1));
   branch_done(1);
   run(l.qb, st);
   cuda::planes_rope({planes_qb, kSplitsWqB, kLocalHeads * kHeadDim}, rows, kLocalHeads, kHeadDim, kRopeDim, d.rope_freqs, pos,
@@ -515,7 +574,8 @@ void Decoder::Gpu::enqueue_layer(int layer, int rows, int parity) {
   // Attention, its output projections and the exchange.
   join(1);
   const cuda::KvSources kv_sources{window.at(layer), ratio ? compressed.at(kind.cache_owner) : nullptr};
-  check(cuda::sparse_attn(q, kv_sources, idx, n_idx, kIdxStride, d.sink, rows, kSoftmaxScale, attn, o, st), "sparse_attn");
+  check(cuda::sparse_attn(q, kv_sources, attn_idx, n_idx, kIdxStride, d.sink, rows, kSoftmaxScale, attn, o, st),
+        "sparse_attn");
   cuda::unrope_quantize(o, rows, kLocalHeads, kHeadDim, kRopeDim, d.rope_freqs, pos, kLocalHeads / kLocalGroups,
                         {{act_o[0], act_o[1], act_o[2], act_o[3]}}, st);
   run(l.oa, st);
@@ -542,23 +602,24 @@ void Decoder::Gpu::enqueue_layer(int layer, int rows, int parity) {
   cuda::swiglu_quantize_shared(rows, moe, moe::kSwigluLimit, side(3));
   run(l.shared_down, side(3));
   branch_done(3);
-  cuda::bf16_gemv(d.router, xf_f, moe::kExperts, kDim, rows, kSplitsBf16, logits, st);
-  cuda::route(logits, kSplitsBf16, rows, nullptr,
-              {d.router_bias, nullptr, kRouteScale, experts.slot_of, layer % experts.key_layers, experts.route_bonus,
-               route_near},
-              route_experts, route_weights, plan, st);
+  cuda::bf16_gemv(d.router, xf_f, kind.experts, kDim, rows, kSplitsBf16, logits, st);
+  const cuda::RouterParams router =
+      kind.draft ? cuda::RouterParams{d.router_bias, nullptr, kRouteScale, nullptr, 0, 0.0f, nullptr, kind.experts, kind.top_k}
+                 : cuda::RouterParams{d.router_bias, nullptr, kRouteScale, experts.slot_of, layer % experts.key_layers,
+                                      experts.route_bonus, route_near, kind.experts, kind.top_k};
+  cuda::route(logits, kSplitsBf16, rows, nullptr, router, route_experts, route_weights, plan, st);
 
   // The routed Experts: resolved on the device (a Miss waits for the Expert cache's service), then
   // gate/up, SwiGLU, down; then the combine in Plan order with the shared Expert, the exchange, hc_post.
-  const int max_jobs = moe::kTopK * rows;
+  const int max_jobs = kind.top_k * rows;
   const cuda::RoutedShape shape{kExpertRows, kDimBlocks, kSplitsExpert, cuda::split_blocks_for(kDimBlocks, kSplitsExpert),
                                 kDim,        kExpertDownBlocks, kExpertPartBytes};
-  cuda::resolve_experts(plan, route_near, layer, experts, shape, moe, act_xf, resolved, st);
-  cuda::gemv(resolved.jobs, resolved.first, resolved.gate_up_jobs(max_jobs), resolved.gate_up_warps(max_jobs, kGateUpWarps),
-             st);
+  cuda::resolve_experts(plan, kind.draft ? nullptr : route_near, kind.draft ? layer - kLayers : layer, dir, shape, moe, act_xf,
+                        res, st);
+  cuda::gemv(res.jobs, res.first, res.gate_up_jobs(max_jobs), res.gate_up_warps(max_jobs, kGateUpWarps), st);
   cuda::swiglu_quantize_routed(plan, moe, moe::kSwigluLimit, st);
-  cuda::gemv(resolved.jobs + cuda::ResolvedMoe::kDownList, resolved.first + cuda::ResolvedMoe::kDownList,
-             resolved.down_jobs(max_jobs), resolved.down_warps(max_jobs, kDownWarps), st);
+  cuda::gemv(res.jobs + cuda::ResolvedMoe::kDownList, res.first + cuda::ResolvedMoe::kDownList, res.down_jobs(max_jobs),
+             res.down_warps(max_jobs, kDownWarps), st);
   join(3);
   cuda::combine(plan, moe, y, st);
   cuda::exchange_add(link, y, static_cast<size_t>(rows) * kDim, moe_out, st);
@@ -651,7 +712,8 @@ void Decoder::decode_round() {
     check(cudaSetDevice(s.device), "cudaSetDevice");
     if (launches_ == Launches::Graphs && !s.round_graphs.contains(key))
       s.round_graphs[key] = capture(s.stream, [&] {
-        for (const auto& [layer, d] : s.layers) s.enqueue_layer(layer, rows_, parity);
+        for (const auto& [layer, d] : s.layers)
+          if (layer < kLayers) s.enqueue_layer(layer, rows_, parity);  // DSpark stages run in draft()
       });
   }
   for (auto& gp : gpus_) {
@@ -659,7 +721,8 @@ void Decoder::decode_round() {
     check(cudaSetDevice(s.device), "cudaSetDevice");
     if (launches_ == Launches::Graphs) check(cudaGraphLaunch(s.round_graphs.at(key), s.stream), "cudaGraphLaunch");
     else
-      for (const auto& [layer, d] : s.layers) s.enqueue_layer(layer, rows_, parity);
+      for (const auto& [layer, d] : s.layers)
+        if (layer < kLayers) s.enqueue_layer(layer, rows_, parity);
     for (int t = 0; t < 2; t++)
       if (s.layers.contains(kEngramLayers[t])) check(cudaEventRecord(s.staged_rows[t], s.stream), "cudaEventRecord");
   }
@@ -690,13 +753,9 @@ std::vector<float> Decoder::logits() {
     Gpu& s = *gp;
     if (s.head == nullptr) throw CudaError("logits() before add_head()");
     check(cudaSetDevice(s.device), "cudaSetDevice");
-    const cudaStream_t st = s.stream;
-    cuda::hc_pre(s.h, s.mix_ffn, kDim, rows_, s.x0, st);
-    cuda::rmsnorm(s.x0, s.norm, kDim, rows_, kNormEps, s.xf, st);
-    cuda::bf16_to_f32(s.xf, static_cast<size_t>(rows_) * kDim, s.xf_f, st);
-    cuda::bf16_gemv(s.head, s.xf_f, static_cast<int>(half), kDim, rows_, 1, s.head_planes, st);
-    cuda::sum_planes_f32(s.head_planes, 1, static_cast<int>(half), rows_, s.head_out, st);
-    check(cudaMemcpyAsync(s.staging->logits, s.head_out, rows_ * half * sizeof(float), cudaMemcpyDeviceToHost, st), "logits");
+    s.enqueue_head(s.norm, rows_);
+    check(cudaMemcpyAsync(s.staging->logits, s.head_out, rows_ * half * sizeof(float), cudaMemcpyDeviceToHost, s.stream),
+          "logits");
   }
   std::vector<float> out(static_cast<size_t>(rows_) * kVocab);
   for (auto& gp : gpus_) {
@@ -706,6 +765,212 @@ std::vector<float> Decoder::logits() {
       std::memcpy(out.data() + static_cast<size_t>(r) * kVocab + gp->rank * half, gp->staging->logits[r], half * sizeof(float));
   }
   return out;
+}
+
+}  // namespace ds4n::engine
+
+namespace ds4n::engine {
+
+void Decoder::Gpu::enqueue_head(const bf16* final_norm, int rows) {
+  constexpr int half = kVocab / kGpus;
+  const cudaStream_t st = stream;
+  cuda::hc_pre(h, mix_ffn, kDim, rows, x0, st);
+  cuda::rmsnorm(x0, final_norm, kDim, rows, kNormEps, xf, st);
+  cuda::bf16_to_f32(xf, static_cast<size_t>(rows) * kDim, xf_f, st);
+  cuda::bf16_gemv(head, xf_f, half, kDim, rows, 1, head_planes, st);
+  cuda::sum_planes_f32(head_planes, 1, half, rows, head_out, st);
+}
+
+void Decoder::Gpu::enqueue_seed(int first, int rows) {
+  const cudaStream_t st = stream;
+  const SeedIndex* index = draft.seed;
+  cuda::gather_features({draft.features[0], draft.features[1], draft.features[2]}, kDim, index->feature_slot + first, rows,
+                        draft.seed_x, st);
+  cuda::quantize_activations(draft.seed_x, rows, draft.act_features, st);
+  run(draft.main_proj_launch, st);
+  cuda::sum_planes_bf16(draft.planes_main, kSplitsMainProj, kDim, rows, draft.seed_raw, st);
+  cuda::rmsnorm(draft.seed_raw, draft.main_norm, kDim, rows, kNormEps, draft.main_x, st);
+  cuda::quantize_activations(draft.main_x, rows, act_x, st);
+  for (int stage = 0; stage < kDraftStages; stage++) {
+    const DeviceLayer& d = layers.at(kLayers + stage);
+    run(draft.seed_kv[stage], st);
+    cuda::kv_to_cache({planes_kv, kSplitsWkv, kHeadDim}, rows, d.kv_norm, kNormEps, d.rope_freqs, kRopeDim, index->pos + first,
+                      window.at(kLayers + stage), index->context_slot + first, st);
+  }
+  check(cudaGetLastError(), "seed launches");
+}
+
+void Decoder::add_draft(const HostDraft& w, std::span<const float> noise_embedding) {
+  if (noise_embedding.size() != static_cast<size_t>(kDim)) throw CudaError("add_draft: the noise token's embedding has 5120 values");
+  if (gpus_[0]->head == nullptr) throw CudaError("add_draft before add_head (the draft shares the target's head)");
+  for (const HostLayer& stage : w.stages) add_layer(stage);
+  noise_.assign(noise_embedding.begin(), noise_embedding.end());
+  constexpr size_t pool_bytes = static_cast<size_t>(kDraftStages) * kDraftExperts * store::kHalfPayloadBytes;
+  for (auto& gp : gpus_) {
+    Gpu& s = *gp;
+    check(cudaSetDevice(s.device), "cudaSetDevice");
+    DeviceArena& a = s.arena;
+    Gpu::Draft& dr = s.draft;
+    // Graphs captured so far lack the feature capture.
+    for (auto& [key, exec] : s.graphs) check(cudaGraphExecDestroy(exec), "cudaGraphExecDestroy");
+    for (auto& [key, exec] : s.round_graphs) check(cudaGraphExecDestroy(exec), "cudaGraphExecDestroy");
+    s.graphs.clear();
+    s.round_graphs.clear();
+    for (bf16*& f : dr.features) {
+      f = a.alloc<bf16>(static_cast<size_t>(kRing) * kDim);
+      check(cudaMemset(f, 0, static_cast<size_t>(kRing) * kDim * 2), "memset");
+    }
+    dr.main_proj = upload_fp8(w.main_proj, a);
+    dr.main_norm = a.upload_bf16(w.main_norm);
+    dr.norm = a.upload_bf16(w.norm);
+    dr.act_features = fragments(a, static_cast<int>(kDraftTargetLayers.size()) * kDimBlocks);
+    cuda::clear_fragments(dr.act_features, s.stream);
+    dr.seed_x = a.alloc<bf16>(static_cast<size_t>(kMaxRows) * kDraftTargetLayers.size() * kDim);
+    dr.seed_raw = a.alloc<bf16>(static_cast<size_t>(kMaxRows) * kDim);
+    dr.main_x = a.alloc<bf16>(static_cast<size_t>(kMaxRows) * kDim);
+    dr.planes_main = a.alloc<float>(static_cast<size_t>(kSplitsMainProj) * kDim * 8);
+    dr.main_proj_launch = prepare(a, {fp8_job(dr.main_proj, 0, dr.act_features, dr.planes_main, kDim, kSplitsMainProj)});
+    for (int stage = 0; stage < kDraftStages; stage++)
+      dr.seed_kv[stage] =
+          prepare(a, {fp8_job(s.layers.at(kLayers + stage).wkv, 0, s.act_x, s.planes_kv, kHeadDim, kSplitsWkv)});
+    dr.seed = a.alloc<SeedIndex>(1);
+    // The draft's Experts: all resident, Slot stage * 128 + expert, keyed stage * 384 + expert.
+    dr.pool = a.alloc<uint8_t>(pool_bytes);
+    std::vector<int32_t> table(static_cast<size_t>(kDraftStages) * moe::kExperts, -1);
+    for (int stage = 0; stage < kDraftStages; stage++)
+      for (int e = 0; e < kDraftExperts; e++) table[stage * moe::kExperts + e] = stage * kDraftExperts + e;
+    dr.experts.slot_of = a.upload(table.data(), table.size());
+    dr.experts.pool = dr.pool;
+    dr.experts.slot_bytes = store::kHalfPayloadBytes;
+    dr.experts.rank = s.rank;
+    dr.experts.key_layers = kDraftStages;
+    dr.resolved = {a.alloc<cuda::GemvJob>(3 * cuda::kJobSlots), a.alloc<int>(3 * cuda::kJobSlots), a.alloc<int64_t>(4),
+                   a.alloc<uint64_t>(1)};
+    check(cudaMemset(dr.resolved.step, 0, sizeof(uint64_t)), "memset");
+    std::vector<int64_t> block_slots(kDraftRows);
+    for (int r = 0; r < kDraftRows; r++) block_slots[r] = kDraftContext + r;
+    dr.block_slots = a.upload(block_slots.data(), block_slots.size());
+    dr.idx = a.alloc<int32_t>(static_cast<size_t>(kDraftRows) * kIdxStride);
+    if (s.rank == 0) {
+      dr.markov_embed = a.upload_bf16(w.markov_embed);
+      dr.markov_head = a.upload_bf16(w.markov_head);
+      dr.markov_x = a.alloc<float>(kMarkovRank);
+      dr.markov_planes = a.alloc<float>(static_cast<size_t>(kVocab) * 8);
+      dr.logits = a.alloc<float>(static_cast<size_t>(kDraftRows) * kVocab);
+      dr.chain = a.alloc<int32_t>(kDraftRows + 1);
+    }
+    check(cudaStreamSynchronize(s.stream), "add_draft");
+  }
+}
+
+void Decoder::add_draft_expert(int stage, int expert, std::span<const std::byte> record) {
+  if (stage < 0 || stage >= kDraftStages || expert < 0 || expert >= kDraftExperts)
+    throw CudaError("add_draft_expert: no such draft Expert");
+  if (record.size() != store::kRecordStride) throw CudaError("add_draft_expert: not an Expert record");
+  if (gpus_[0]->draft.pool == nullptr) throw CudaError("add_draft_expert before add_draft");
+  const size_t slot = static_cast<size_t>(stage) * kDraftExperts + expert;
+  for (auto& gp : gpus_) {
+    check(cudaSetDevice(gp->device), "cudaSetDevice");
+    check(cudaMemcpy(gp->draft.pool + slot * store::kHalfPayloadBytes, record.data() + gp->rank * store::kHalfStride,
+                     store::kHalfPayloadBytes, cudaMemcpyHostToDevice),
+          "draft Expert");
+  }
+}
+
+std::array<int32_t, kDraftRows> Decoder::draft(int64_t p, int32_t token, std::span<const float> anchor_embedding) {
+  constexpr size_t half = kVocab / kGpus;
+  Gpu& lead = *gpus_[0];
+  Gpu& peer = *gpus_[1];
+  if (lead.draft.features[0] == nullptr) throw CudaError("draft() before add_draft()");
+  if (p < 1 || p + kDraftRows > kMaxCompressed) throw CudaError("draft: the anchor needs a context and room for the block");
+  if (token < 0 || token >= kVocab || anchor_embedding.size() != static_cast<size_t>(kDim))
+    throw CudaError("draft: bad anchor token or embedding");
+  // The context: every accepted position below p not yet seeded, at most the last kDraftContext.
+  const int64_t oldest = std::max<int64_t>(0, p - kDraftContext);
+  const int64_t start = seeded_ >= oldest && seeded_ <= p ? seeded_ : oldest;
+  const int count = static_cast<int>(p - start);
+  const model::RoundIndex round = model::round_index(p, kDraftRows);
+  for (auto& gp : gpus_) {
+    Gpu& s = *gp;
+    check(cudaSetDevice(s.device), "cudaSetDevice");
+    Staging& sg = *s.staging;
+    if (count > 0) {
+      check(cudaEventSynchronize(s.staged_seed), "staging");
+      for (int i = 0; i < count; i++) {
+        const int64_t q = start + i;
+        sg.seed.pos[i] = q;
+        sg.seed.context_slot[i] = q % kDraftContext;
+        sg.seed.feature_slot[i] = static_cast<int32_t>(q % kRing);
+      }
+      check(cudaMemcpyAsync(s.draft.seed, &sg.seed, sizeof(SeedIndex), cudaMemcpyHostToDevice, s.stream), "seed");
+      check(cudaEventRecord(s.staged_seed, s.stream), "cudaEventRecord");
+      for (int first = 0; first < count; first += kMaxRows) s.enqueue_seed(first, std::min(kMaxRows, count - first));
+    }
+    // The block starts like a Round: positions p .. p + 4, the anchor's and the noise token's
+    // embeddings in all four copies; every row attends to the context ring and the whole block.
+    check(cudaEventSynchronize(s.staged_round), "staging");
+    sg.round = round;
+    for (int r = 0; r < kDraftRows; r++) {
+      for (int i = 0; i < kDraftContext; i++) {
+        const int64_t q = p - kDraftContext + i;
+        sg.draft_idx[r][i] = q >= 0 ? static_cast<int32_t>(q % kDraftContext) : -1;
+      }
+      for (int i = 0; i < kDraftRows; i++) sg.draft_idx[r][kDraftContext + i] = kDraftContext + i;
+      const float* emb = r == 0 ? anchor_embedding.data() : noise_.data();
+      for (int c = 0; c < kHcCopies; c++)
+        for (int i = 0; i < kDim; i++) sg.h[r][c * kDim + i] = __float2bfloat16(emb[i]);
+    }
+    sg.chain[0] = token;
+    const cudaStream_t st = s.stream;
+    check(cudaMemcpyAsync(s.round, &sg.round, sizeof(sg.round), cudaMemcpyHostToDevice, st), "round");
+    check(cudaMemcpyAsync(s.draft.idx, sg.draft_idx, sizeof(sg.draft_idx), cudaMemcpyHostToDevice, st), "draft idx");
+    check(cudaMemcpyAsync(s.h, sg.h, kDraftRows * sizeof(sg.h[0]), cudaMemcpyHostToDevice, st), "embeddings");
+    check(cudaMemcpyAsync(s.mix_ffn, s.identities, kDraftRows * sizeof(cuda::HcMixes), cudaMemcpyDeviceToDevice, st),
+          "identity");
+    if (s.rank == 0) check(cudaMemcpyAsync(s.draft.chain, sg.chain, sizeof(int32_t), cudaMemcpyHostToDevice, st), "anchor");
+    check(cudaEventRecord(s.staged_round, st), "cudaEventRecord");
+  }
+  seeded_ = p;
+
+  // The stages and the head, one graph per GPU, both captured before either launches.
+  const bool graphs = launches_ == Launches::Graphs;
+  auto enqueue_block = [](Gpu& s) {
+    for (int stage = 0; stage < kDraftStages; stage++) s.enqueue_layer(kLayers + stage, kDraftRows, 0);
+    s.enqueue_head(s.draft.norm, kDraftRows);
+  };
+  for (auto& gp : gpus_) {
+    check(cudaSetDevice(gp->device), "cudaSetDevice");
+    if (graphs && gp->draft.block == nullptr) gp->draft.block = capture(gp->stream, [&] { enqueue_block(*gp); });
+  }
+  for (auto& gp : gpus_) {
+    check(cudaSetDevice(gp->device), "cudaSetDevice");
+    if (graphs) check(cudaGraphLaunch(gp->draft.block, gp->stream), "cudaGraphLaunch");
+    else enqueue_block(*gp);
+  }
+
+  // GPU 1's half of the block's logits beside GPU 0's, then the Markov chain on GPU 0.
+  check(cudaSetDevice(peer.device), "cudaSetDevice");
+  check(cudaMemcpy2DAsync(lead.draft.logits + half, kVocab * sizeof(float), peer.head_out, half * sizeof(float),
+                          half * sizeof(float), kDraftRows, cudaMemcpyDefault, peer.stream),
+        "peer logits");
+  check(cudaEventRecord(peer.logits_copied, peer.stream), "cudaEventRecord");
+  check(cudaSetDevice(lead.device), "cudaSetDevice");
+  const cudaStream_t st = lead.stream;
+  check(cudaMemcpy2DAsync(lead.draft.logits, kVocab * sizeof(float), lead.head_out, half * sizeof(float),
+                          half * sizeof(float), kDraftRows, cudaMemcpyDeviceToDevice, st),
+        "logits");
+  check(cudaStreamWaitEvent(st, peer.logits_copied, 0), "cudaStreamWaitEvent");
+  Gpu::Draft& dr = lead.draft;
+  for (int r = 0; r < kDraftRows; r++) {
+    cuda::embedding_row(dr.markov_embed, kMarkovRank, dr.chain + r, dr.markov_x, st);
+    cuda::bf16_gemv(dr.markov_head, dr.markov_x, kVocab, kMarkovRank, 1, 1, dr.markov_planes, st);
+    cuda::add_argmax(dr.logits + static_cast<size_t>(r) * kVocab, dr.markov_planes, kVocab, dr.chain + r + 1, st);
+  }
+  check(cudaMemcpyAsync(lead.staging->chain, dr.chain, sizeof(lead.staging->chain), cudaMemcpyDeviceToHost, st), "chain");
+  check(cudaStreamSynchronize(st), "draft");
+  std::array<int32_t, kDraftRows> tokens;
+  std::copy(lead.staging->chain + 1, lead.staging->chain + 1 + kDraftRows, tokens.begin());
+  return tokens;
 }
 
 }  // namespace ds4n::engine

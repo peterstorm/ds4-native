@@ -1,10 +1,14 @@
 #pragma once
 // Imperative shell: one layer's Backbone weights from the safetensors file into
 // a HostLayer, checking every tensor's dtype and shape.
+#include <array>
+#include <cstddef>
+#include <span>
 #include <string>
 #include <vector>
 
 #include "core/layer_weights.hpp"
+#include "core/model.hpp"
 #include "core/result.hpp"
 #include "core/safetensors.hpp"
 #include "io/file.hpp"
@@ -33,5 +37,30 @@ struct HostHead {
   std::vector<float> norm, head;
 };
 Result<HostHead, io::IoError> load_head(const Backbone& b);
+
+}  // namespace ds4n::engine
+
+namespace ds4n::engine {
+
+/**
+ * DSpark's weights besides its routed Experts (docs/design/dspark.md), from the checkpoint's
+ * `mtp.*` shards: three window-only stages (ids kLayers + s, 128 routed Experts each), the
+ * projection of the three target features to main_x and its norm, the final norm, the Markov head
+ * (embed and head, [129280][256] each) and the confidence head ([5120 + 256]), all BF16 values
+ * but the FP8 matrices.
+ */
+struct HostDraft {
+  std::array<HostLayer, model::kDraftStages> stages;
+  Fp8Matrix main_proj;  // [5120][15360]
+  std::vector<float> main_norm, norm;
+  std::vector<float> markov_embed, markov_head;
+  std::vector<float> confidence;
+};
+
+/** The draft from the checkpoint shards holding `mtp.*` (each opened like the Backbone). */
+Result<HostDraft, io::IoError> load_draft(std::span<const Backbone> shards);
+
+/** Draft stage `stage`'s routed Expert `expert` as an Expert store record: two tiled Halves. */
+Result<std::vector<std::byte>, io::IoError> load_draft_expert(std::span<const Backbone> shards, int stage, int expert);
 
 }  // namespace ds4n::engine

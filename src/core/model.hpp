@@ -51,6 +51,20 @@ constexpr std::array<int, 8> kIndexSources = {2, 8, 14, 20, 24, 28, 32, 36};
 constexpr std::array<int, 2> kEngramLayers = {1, 14};
 constexpr int kCandidateSource = 20;
 
+// DSpark, the drafter (docs/design/dspark.md): three stages after the target's layers, stage s
+// being layer kLayers + s, drafting kDraftRows tokens per block from the target's features at
+// kDraftTargetLayers (the input streams of those layers).
+constexpr int kDraftStages = 3;
+constexpr int kDraftRows = 5;
+constexpr int kVerifyRows = kDraftRows + 1;  // the anchor, then the drafted tokens
+constexpr int kDraftContext = 128;           // accepted positions a stage attends to
+constexpr int kDraftExperts = 128, kDraftTopK = 3;
+constexpr int kMarkovRank = 256;
+constexpr int32_t kNoiseToken = 128799;      // the input of block rows after the anchor
+constexpr std::array<int, 3> kDraftTargetLayers = {37, 38, 39};
+static_assert(kVerifyRows <= kMaxRows, "a verify Round is one Round");
+static_assert(kDraftContext + kDraftRows <= kRing, "a stage's window ring holds its context and its block");
+
 /** What a layer does in decode; owners are the layers whose caches it reads. */
 struct LayerKind {
   int id;
@@ -62,9 +76,15 @@ struct LayerKind {
   bool engram;
   int cache_owner;       // the KV source whose caches this layer reads (-1 for window-only layers)
   int index_owner;       // the index source whose top-k this layer uses (-1 for window-only layers)
+  // A DSpark stage: window-only and non-causal (every block row attends to the stage's context and
+  // to the whole block), over its own routed Experts.
+  bool draft;
+  int experts, top_k;    // routed Experts and how many each token takes
 };
 
 constexpr LayerKind kind(int layer) {
+  if (layer >= kLayers)
+    return {layer, 0, false, false, false, false, false, -1, -1, true, kDraftExperts, kDraftTopK};
   auto contains = [](const auto& list, int v) {
     for (int x : list)
       if (x == v) return true;
@@ -85,12 +105,17 @@ constexpr LayerKind kind(int layer) {
           layer > kCandidateSource && contains(kIndexSources, layer),
           contains(kEngramLayers, layer),
           ratio ? last_at_most(kKvSources, layer) : -1,
-          ratio ? last_at_most(kIndexSources, layer) : -1};
+          ratio ? last_at_most(kIndexSources, layer) : -1,
+          false,
+          384,
+          6};
 }
 
 static_assert(kind(3).cache_owner == 2 && kind(3).index_owner == 2 && !kind(3).index_source);
 static_assert(kind(26).cache_owner == 20 && kind(26).index_owner == 24 && !kind(26).uses_candidates);
 static_assert(kind(28).uses_candidates && kind(20).candidate_source && kind(1).engram);
+static_assert(kind(41).draft && kind(41).compress_ratio == 0 && kind(41).experts == 128 && !kind(39).draft &&
+              kind(39).experts == 384);
 
 /** RoPE for a layer: plain theta 1e4 for window-only layers, YaRN with theta 1.6e5 otherwise. */
 struct RopeParams {

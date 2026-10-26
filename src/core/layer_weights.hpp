@@ -31,7 +31,7 @@ struct HostLayer {
   Fp8Matrix index_wq_b;                      // [4096, 1280]
   std::vector<float> index_weights_proj;     // [32][5120]
   std::vector<float> index_wk, index_k_norm; // [128][512], [128]
-  // MoE: router BF16 [384][5120], bias [384]; shared Expert FP8 w1/w3 [2304,5120], w2 [5120,2304].
+  // MoE: router BF16 [experts][5120], bias [experts] (384, or 128 in a DSpark stage); shared Expert FP8 w1/w3 [2304,5120], w2 [5120,2304].
   std::vector<float> router, router_bias;
   Fp8Matrix shared_w1, shared_w2, shared_w3;
   // Engram (layers 1 and 14): wkv FP8 [25600, 6144], q/k weights [4][5120].

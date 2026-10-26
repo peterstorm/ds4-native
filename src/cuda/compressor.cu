@@ -34,7 +34,7 @@ __device__ void rmsnorm_pair(const float (&x)[2], const __nv_bfloat16* norm, flo
 
 __global__ void init_kernel(PoolSlots s) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < 2 * kCompressDim) {
+  if (i < kPoolRing * kCompressDim) {
     s.kv[i] = 0.0f;
     s.score[i] = -INFINITY;
   }
@@ -46,7 +46,8 @@ __global__ void __launch_bounds__(kThreads) pool_kernel(const float* __restrict_
                                                        __nv_bfloat16* __restrict__ latent, int* __restrict__ produced) {
   const int t = threadIdx.x;
   const int64_t p = *pos;
-  const int slot = static_cast<int>(p % 2);
+  const int slot = static_cast<int>(p % kPoolRing);
+  const bool completes = p % 2 == 1;
   float kv[2], sc[2];
   for (int u = 0; u < 2; u++) {
     const int d = t + kThreads * u;
@@ -55,12 +56,14 @@ __global__ void __launch_bounds__(kThreads) pool_kernel(const float* __restrict_
     s.kv[slot * kCompressDim + d] = kv[u];
     s.score[slot * kCompressDim + d] = sc[u];
   }
-  if (t == 0) *produced = slot == 1;
-  if (slot == 0) return;  // the group is still filling (uniform across the block)
+  if (t == 0) *produced = completes;
+  if (!completes) return;  // the group is still filling (uniform across the block)
+  const int first = static_cast<int>((p - 1) % kPoolRing);
   float pooled[2];
   for (int u = 0; u < 2; u++) {
     const int d = t + kThreads * u;
-    const float s0 = s.score[d], kv0 = s.kv[d];  // slot 0, written by this thread earlier or a previous step
+    // Position p - 1's slot, written by this thread earlier or by a previous step.
+    const float s0 = s.score[first * kCompressDim + d], kv0 = s.kv[first * kCompressDim + d];
     const float m = fmaxf(s0, sc[u]);
     const float e0 = det::exp(__fsub_rn(s0, m)), e1 = det::exp(__fsub_rn(sc[u], m));
     const float sum = __fadd_rn(e0, e1);
@@ -81,7 +84,9 @@ __global__ void __launch_bounds__(kThreads) project_kernel(const float* __restri
 
 }  // namespace
 
-void init_pool(PoolSlots slots, cudaStream_t stream) { init_kernel<<<4, 256, 0, stream>>>(slots); }
+void init_pool(PoolSlots slots, cudaStream_t stream) {
+  init_kernel<<<(kPoolRing * kCompressDim + 255) / 256, 256, 0, stream>>>(slots);
+}
 
 void compress_pool(const float* planes, int splits, int token, const int64_t* pos, PoolSlots slots,
                    const __nv_bfloat16* norm, float eps, __nv_bfloat16* latent, int* produced, cudaStream_t stream) {

@@ -78,6 +78,9 @@ struct DeviceLayer {
   __nv_bfloat16 *engram_q = nullptr, *engram_k = nullptr;
 };
 
+/** An FP8 matrix tiled for cuda::gemv on the current device, whole (replicated). */
+DeviceFp8 upload_fp8(const Fp8Matrix& m, DeviceArena& arena);
+
 /** Upload `w` to the current device for tensor-parallel rank `rank`; `arena` owns the memory. */
 DeviceLayer upload_layer(const HostLayer& w, int rank, DeviceArena& arena);
 

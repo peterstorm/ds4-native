@@ -1,15 +1,16 @@
 #include <cuda/atomic>
 
 #include <climits>
+#include <stdexcept>
 
 #include "core/det_math.hpp"
+#include "core/model.hpp"
 #include "cuda/act_quant.cuh"
 #include "cuda/moe.cuh"
 
 namespace ds4n::cuda {
 namespace {
 
-constexpr int kPerLane = moe::kExperts / 32;  // Experts per lane in a routing warp
 constexpr float kSoftplusThreshold = 20.0f;
 constexpr float kWeightSumEps = 1e-20f;
 
@@ -29,11 +30,12 @@ __device__ __forceinline__ unsigned ordered_key(float v) {
  * untaken Expert (lane L holds L + 32 i), the warp takes the highest key and, among equal keys, the
  * lowest Expert id, and marks it taken.
  */
+template <int PerLane>
 __device__ __forceinline__ int take_best(const float* row, int lane, unsigned& taken) {
   float bv = -INFINITY;
   int be = INT_MAX;
 #pragma unroll
-  for (int i = 0; i < kPerLane; i++) {
+  for (int i = 0; i < PerLane; i++) {
     const float v = row[lane + 32 * i];
     if (!((taken >> i) & 1) && v > bv) {  // ascending i: ties keep the lower id
       bv = v;
@@ -54,14 +56,16 @@ __device__ __forceinline__ int take_best(const float* row, int lane, unsigned& t
  * further rounds). Warp 0 finally builds the Plan, lane L owning Experts
  * [12 L, 12 L + 12) so a prefix sum over lanes keeps jobs in ascending id.
  */
-__global__ void __launch_bounds__(moe::kExperts) route_kernel(const float* __restrict__ logits, int logit_splits,
+template <int Experts, int TopK>
+__global__ void __launch_bounds__(Experts) route_kernel(const float* __restrict__ logits, int logit_splits,
                                                               int tokens, const uint8_t* __restrict__ image,
                                                               RouterParams p, int32_t* __restrict__ experts,
                                                               float* __restrict__ weights, moe::Plan* __restrict__ plan) {
-  __shared__ float scores[kMaxTokens][moe::kExperts];
-  __shared__ float biased[kMaxTokens][moe::kExperts];
-  __shared__ unsigned mask[moe::kExperts];
-  __shared__ float routed_weight[moe::kExperts][kMaxTokens];
+  constexpr int kPerLane = Experts / 32;  // Experts per lane in a routing warp
+  __shared__ float scores[kMaxTokens][Experts];
+  __shared__ float biased[kMaxTokens][Experts];
+  __shared__ unsigned mask[Experts];
+  __shared__ float routed_weight[Experts][kMaxTokens];
   __shared__ int failed;
   const int e = threadIdx.x, warp = e >> 5, lane = e & 31;
   mask[e] = 0;
@@ -82,7 +86,7 @@ __global__ void __launch_bounds__(moe::kExperts) route_kernel(const float* __res
     if (n >= tokens) break;
     float l = logits[e * kMaxTokens + n];
     for (int s = 1; s < logit_splits; s++)
-      l = __fadd_rn(l, logits[(static_cast<size_t>(s) * moe::kExperts + e) * kMaxTokens + n]);
+      l = __fadd_rn(l, logits[(static_cast<size_t>(s) * Experts + e) * kMaxTokens + n]);
     finite = finite && isfinite(l);
     const float* bias = image != nullptr && image[n] != 0 && p.bias_vl != nullptr ? p.bias_vl : p.bias;
     const float sc = score(l);
@@ -95,28 +99,28 @@ __global__ void __launch_bounds__(moe::kExperts) route_kernel(const float* __res
   if (!failed && warp < tokens) {
     const int n = warp;
     unsigned taken = 0;  // bit i: Expert lane + 32 i already selected
-    int sel[moe::kTopK];
-    float w[moe::kTopK];
+    int sel[TopK];
+    float w[TopK];
 #pragma unroll
-    for (int k = 0; k < moe::kTopK; k++) {
-      sel[k] = take_best(biased[n], lane, taken);
+    for (int k = 0; k < TopK; k++) {
+      sel[k] = take_best<kPerLane>(biased[n], lane, taken);
       w[k] = scores[n][sel[k]];
     }
     float sum = 0.0f;
-    for (int k = 0; k < moe::kTopK; k++) sum = __fadd_rn(sum, w[k]);
+    for (int k = 0; k < TopK; k++) sum = __fadd_rn(sum, w[k]);
     const float denom = __fadd_rn(sum, kWeightSumEps);
-    for (int k = 0; k < moe::kTopK; k++) w[k] = __fmul_rn(__fdiv_rn(w[k], denom), p.route_scale);
+    for (int k = 0; k < TopK; k++) w[k] = __fmul_rn(__fdiv_rn(w[k], denom), p.route_scale);
     if (lane == 0)
-      for (int k = 0; k < moe::kTopK; k++) {
-        experts[n * moe::kTopK + k] = sel[k];
-        weights[n * moe::kTopK + k] = w[k];
+      for (int k = 0; k < TopK; k++) {
+        experts[n * TopK + k] = sel[k];
+        weights[n * TopK + k] = w[k];
         atomicOr(&mask[sel[k]], 1u << n);
         routed_weight[sel[k]][n] = w[k];
       }
     // Near-misses: the same tournament, continued past the top 6 (routing is already fixed).
     if (p.near != nullptr)
       for (int k = 0; k < moe::kNear; k++) {
-        const int winner = take_best(biased[n], lane, taken);
+        const int winner = take_best<kPerLane>(biased[n], lane, taken);
         if (lane == 0) p.near[n * moe::kNear + k] = winner;
       }
   }
@@ -253,7 +257,14 @@ __global__ void add_round_kernel(const float* __restrict__ a, const float* __res
 
 void route(const float* logits, int logit_splits, int tokens, const uint8_t* image, RouterParams p, int32_t* experts,
            float* weights, moe::Plan* plan, cudaStream_t stream) {
-  route_kernel<<<1, moe::kExperts, 0, stream>>>(logits, logit_splits, tokens, image, p, experts, weights, plan);
+  if (p.experts == moe::kExperts && p.top_k == moe::kTopK)
+    route_kernel<moe::kExperts, moe::kTopK>
+        <<<1, moe::kExperts, 0, stream>>>(logits, logit_splits, tokens, image, p, experts, weights, plan);
+  else if (p.experts == model::kDraftExperts && p.top_k == model::kDraftTopK)
+    route_kernel<model::kDraftExperts, model::kDraftTopK>
+        <<<1, model::kDraftExperts, 0, stream>>>(logits, logit_splits, tokens, image, p, experts, weights, plan);
+  else
+    throw std::invalid_argument("route: no kernel for this router shape");
 }
 
 void swiglu_quantize(const moe::Plan* plan, MoeBuffers buf, float limit, cudaStream_t stream) {
