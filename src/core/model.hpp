@@ -32,10 +32,10 @@ constexpr int kLocalGroups = kOGroups / kGpus;   // 4
 constexpr int kGroupWidth = kHeads / kOGroups * kHeadDim;  // 4096: one wo_a group's input
 
 // Split-K ways per GEMV (they fix the summation order).
-constexpr int kSplitsWqA = 4;
+constexpr int kSplitsWqA = 8;
 constexpr int kSplitsWqB = 2;
-constexpr int kSplitsWkv = 4;
-constexpr int kSplitsWoA = 2;
+constexpr int kSplitsWkv = 8;
+constexpr int kSplitsWoA = 4;
 constexpr int kSplitsWoB = 4;
 constexpr int kSplitsIndexQ = 2;
 constexpr int kSplitsBf16 = 5;   // router, compressor, weights_proj (k = 5120)

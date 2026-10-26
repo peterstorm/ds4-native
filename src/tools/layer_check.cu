@@ -8,16 +8,16 @@
 //                    [--expert-layers M] [--gguf-meta GGUF --engram-shards A,B,...] [--head 1]
 //                    [--timing N] [--launches graphs|eager] [--slots N --ram-records R]
 // --head 1 also compares the full logits after the last layer of every step. --timing N then
-// times N more steps on the GPUs alone with every Half of the loaded layers resident. --launches
+// times N more steps on the GPUs alone (pseudo-random tokens) under the same Expert cache. --launches
 // picks how the decoder issues kernels: replayed CUDA graphs (the default) or eager launches.
 // With --gguf-meta (a GGUF carrying deepseek41.engram.*) and --engram-shards (the files holding
 // the Engram tables), Engram layers hash the tokens and read real table rows.
 // --expert-layers M reads layer L's Experts from store layer L % M (a store holding only the
 // first M layers can still exercise later layers: exactness needs the same Experts on both sides).
-// --slots N --ram-records R serve the decoder's Experts through engine::ExpertResidency: N VRAM
-// Slots, R RAM tier records, Misses read from the store. Outputs must not change with N (the
-// Slot-count invariance gate); the Hit, RAM and store counts are reported. The timing steps then
-// run under the same cache instead of with every Half resident. Timing tokens are pseudo-random ids.
+// The decoder's Experts come through engine::ExpertResidency: by default a Slot for every Expert the
+// steps can touch (at most 8,000); --slots N --ram-records R set the VRAM Slots and RAM tier records,
+// Misses read from the store. Outputs must not change with N (the Slot-count invariance gate); the
+// Hit, RAM and store counts are reported.
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -137,13 +137,41 @@ int main(int argc, char** argv) {
   if (backbone_path.empty() || store_path.empty() || layers < 1 || first < 0 || first + layers > model::kLayers ||
       expert_layers < 1)
     die("bad arguments");
-  if (slot_count > 0 && expert_layers != model::kLayers) die("--slots reads the store's own layers: drop --expert-layers");
+
+  // Experts for the decoder through the Expert cache (opened first: the decoder resolves against
+  // it). By default every Expert key the steps can touch has a Slot (capped at 8,000 Slots), so
+  // after the warm start every step hits; --slots N fewer forces Misses. Layer L's Experts are
+  // keyed (and read) as store layer L % --expert-layers, as the oracle reads them.
+  const uint32_t key_layers = static_cast<uint32_t>(expert_layers);
+  const uint32_t touched = key_layers < model::kLayers ? key_layers * moe::kExperts
+                                                       : static_cast<uint32_t>(layers) * moe::kExperts;
+  if (slot_count == 0) slot_count = std::min<uint32_t>(touched, 8000);
+  if (ram_records == 0) ram_records = moe::kMaxJobs;
+  std::vector<uint32_t> prior;  // warm the loaded layers' Experts first
+  if (key_layers == model::kLayers) {
+    prior.assign(moe::kResidencyKeys, 0);
+    std::fill(prior.begin() + first * moe::kExperts, prior.begin() + (first + layers) * moe::kExperts, 1u);
+  }
+  auto residency = engine::ExpertResidency::open({store_path, {0, 1}, slot_count, ram_records, prior, key_layers});
+  std::printf("Expert cache: %u Slots warm in %.0f ms, RAM tier %u records\n", slot_count, residency->stats().warm_ms,
+              ram_records);
+  auto report_cache = [&](const char* when) {
+    residency->check();
+    const auto st = residency->stats();
+    const uint64_t needed = st.hits + st.ram_hits + st.store_reads;
+    std::printf("Expert cache (%s): %llu layer steps, %llu Experts needed: %llu Hits (%.1f %%), %llu RAM tier, "
+                "%llu store reads; exposed %.1f ms (%.2f ms per Miss)\n",
+                when, static_cast<unsigned long long>(st.layer_steps), static_cast<unsigned long long>(needed),
+                static_cast<unsigned long long>(st.hits), needed ? 100.0 * st.hits / needed : 0.0,
+                static_cast<unsigned long long>(st.ram_hits), static_cast<unsigned long long>(st.store_reads),
+                st.exposed_ms, needed > st.hits ? st.exposed_ms / static_cast<double>(needed - st.hits) : 0.0);
+  };
 
   auto backbone = engine::open_backbone(backbone_path);
   if (!backbone) die(backbone.error().what);
   StoreReader store(store_path);
   std::vector<HostLayer> host;
-  engine::Decoder decoder({0, 1}, launches);
+  engine::Decoder decoder({0, 1}, {residency->directory(0), residency->directory(1)}, launches);
   for (int l = first; l < first + layers; l++) {
     auto w = engine::load_layer(backbone.value(), l);
     if (!w) die(w.error().what);
@@ -160,50 +188,11 @@ int main(int argc, char** argv) {
     std::printf("head loaded\n");
   }
 
-  // Experts for the decoder: through the Expert cache with --slots, else every Half the steps
-  // touch uploaded once and kept (per rank, store layer, expert). GGML Halves for the oracle.
-  std::unique_ptr<engine::ExpertResidency> residency;
-  if (slot_count > 0) {
-    residency = engine::ExpertResidency::open({store_path, {0, 1}, slot_count, ram_records, {}});
-    std::printf("Expert cache: %u Slots warm in %.0f ms, RAM tier %u records\n", slot_count, residency->stats().warm_ms,
-                ram_records);
-  }
-  std::map<std::tuple<int, int, int>, uint8_t*> device_halves;
+  // GGML Halves for the oracle, read from the same store.
   std::map<std::tuple<int, int, int>, GgmlHalf> ggml_halves;
-  const engine::ExpertSlots slots = [&](int layer, const moe::Plan& plan) {
-    if (residency) return residency->place(layer, plan);
-    std::array<std::vector<const uint8_t*>, 2> out;
-    for (int rank = 0; rank < 2; rank++) {
-      engine::check(cudaSetDevice(rank), "cudaSetDevice");
-      for (int j = 0; j < plan.jobs; j++) {
-        const auto key = std::make_tuple(rank, layer % expert_layers, plan.expert[j]);  // mapped layers share bytes
-        auto it = device_halves.find(key);
-        if (it == device_halves.end()) {
-          const auto bytes = store.payload(layer % expert_layers, plan.expert[j], rank);
-          uint8_t* d = nullptr;
-          engine::check(cudaMalloc(&d, bytes.size()), "cudaMalloc");
-          engine::check(cudaMemcpy(d, bytes.data(), bytes.size(), cudaMemcpyHostToDevice), "expert upload");
-          it = device_halves.emplace(key, d).first;
-        }
-        out[rank].push_back(it->second);
-      }
-    }
-    return out;
-  };
-  auto report_cache = [&](const char* when) {
-    if (!residency) return;
-    const auto& st = residency->stats();
-    const uint64_t needed = st.hits + st.ram_hits + st.store_reads;
-    std::printf("Expert cache (%s): %llu layer steps, %llu Experts needed: %llu Hits (%.1f %%), %llu RAM tier, "
-                "%llu store reads; exposed %.1f ms (%.2f ms per Miss)\n",
-                when, static_cast<unsigned long long>(st.layer_steps), static_cast<unsigned long long>(needed),
-                static_cast<unsigned long long>(st.hits), needed ? 100.0 * st.hits / needed : 0.0,
-                static_cast<unsigned long long>(st.ram_hits), static_cast<unsigned long long>(st.store_reads),
-                st.exposed_ms, needed > st.hits ? st.exposed_ms / static_cast<double>(needed - st.hits) : 0.0);
-  };
   int current_layer = 0;  // the oracle runs one layer at a time
   const layer_ref::ExpertHalf halves = [&](int expert, int half) -> moe::HalfWeights {
-    const auto key = std::make_tuple(current_layer, expert, half);
+    const auto key = std::make_tuple(current_layer % expert_layers, expert, half);
     auto it = ggml_halves.find(key);
     if (it == ggml_halves.end()) {
       const auto bytes = store.payload(current_layer % expert_layers, expert, half);
@@ -217,7 +206,8 @@ int main(int argc, char** argv) {
     return {fp4_dot(it->second.gate, 160), fp4_dot(it->second.up, 160), fp4_dot(it->second.down, 36), 1152, 160, 5120};
   };
 
-  // Engram: real hashed rows when the metadata and tables are given, else random rows.
+  // Engram: real hashed rows when the metadata and tables are given, else random rows. Both tables'
+  // rows are known at the token's start; tables of Engram layers outside the range stay zero.
   std::optional<engram::Layout> engram_layout;
   std::optional<engine::EngramRows> engram_rows;
   if (!gguf_meta.empty()) {
@@ -235,9 +225,48 @@ int main(int argc, char** argv) {
     engram_rows = std::move(rows).value();
   }
   engram::History history;
+  std::mt19937 rng(21);
+  auto in_range = [&](int l) { return l >= first && l < first + layers; };
+  auto token_rows = [&](uint32_t token) {
+    std::vector<uint8_t> raw(engine::kEngramTokenBytes, 0);
+    std::optional<engram::Step> hashed;
+    if (engram_layout) {
+      auto h = engram::hash_token(*engram_layout, history, token, true);
+      if (!h) die(h.error().what);
+      hashed = h.value();
+      history = hashed->next;
+    }
+    for (int t = 0; t < 2; t++) {
+      if (!in_range(model::kEngramLayers[t])) continue;
+      uint8_t* out = raw.data() + t * engine::kEngramTableBytes;
+      if (hashed) {
+        auto rows = engram_rows->read(t, hashed->rows[t]);
+        if (!rows) die(rows.error().what);
+        std::copy(rows.value().begin(), rows.value().end(), out);
+      } else {
+        for (size_t i = 0; i < engine::kEngramTableBytes; i++) {
+          const bool scale_byte = i % cuda::kEngramRowBytes >= 256;
+          uint8_t v = static_cast<uint8_t>(rng());
+          if (!scale_byte && (v & 0x7F) == 0x7F) v = 0x38;
+          out[i] = scale_byte ? static_cast<uint8_t>(118 + rng() % 4) : v;
+        }
+      }
+    }
+    return raw;
+  };
+  auto decoded_rows = [](const std::vector<uint8_t>& raw, int table) {
+    std::vector<float> decoded;
+    for (int c = 0; c < cuda::kEngramCols; c++) {
+      const auto row = engram::decode_row(
+          std::as_bytes(std::span(raw).subspan(table * engine::kEngramTableBytes + c * cuda::kEngramRowBytes,
+                                               cuda::kEngramRowBytes))
+              .first<engram::kRowBytes>());
+      decoded.insert(decoded.end(), row.begin(), row.end());
+    }
+    return decoded;
+  };
 
   const int tokens[] = {128000, 3923, 374, 279, 6864, 315, 9822, 30};  // a fixed little sequence of ids
-  std::mt19937 rng(21);
   layer_ref::State state;
   for (int step = 0; step < steps; step++) {
     const int64_t p = step;
@@ -245,41 +274,13 @@ int main(int argc, char** argv) {
     auto emb = engine::load_bf16_row(backbone.value(), "embed.weight", token);
     if (!emb) die(emb.error().what);
     layer_ref::Stream stream = layer_ref::embed(emb.value());
-    decoder.begin_token(p, emb.value());
-    std::optional<engram::Step> hashed;
-    if (engram_layout) {
-      auto h = engram::hash_token(*engram_layout, history, static_cast<uint32_t>(token), true);
-      if (!h) die(h.error().what);
-      hashed = h.value();
-      history = hashed->next;
-    }
+    const auto raw = token_rows(static_cast<uint32_t>(token));
+    decoder.begin_token(p, emb.value(), raw);
     for (int l = first; l < first + layers; l++) {
-      std::vector<uint8_t> raw;
-      std::vector<float> decoded;
-      if (model::kind(l).engram && hashed) {
-        const int table = l == model::kEngramLayers[0] ? 0 : 1;
-        auto rows = engram_rows->read(table, hashed->rows[table]);
-        if (!rows) die(rows.error().what);
-        raw = std::move(rows).value();
-      } else if (model::kind(l).engram) {
-        raw.resize(static_cast<size_t>(cuda::kEngramCols) * cuda::kEngramRowBytes);
-        for (size_t i = 0; i < raw.size(); i++) {
-          const bool scale_byte = i % cuda::kEngramRowBytes >= 256;
-          uint8_t v = static_cast<uint8_t>(rng());
-          if (!scale_byte && (v & 0x7F) == 0x7F) v = 0x38;
-          raw[i] = scale_byte ? static_cast<uint8_t>(118 + rng() % 4) : v;
-        }
-      }
-      if (model::kind(l).engram) {
-        for (int c = 0; c < cuda::kEngramCols; c++) {
-          const auto row = engram::decode_row(
-              std::as_bytes(std::span(raw).subspan(static_cast<size_t>(c) * cuda::kEngramRowBytes, cuda::kEngramRowBytes))
-                  .first<engram::kRowBytes>());
-          decoded.insert(decoded.end(), row.begin(), row.end());
-        }
-      }
+      const std::vector<float> decoded =
+          model::kind(l).engram ? decoded_rows(raw, l == model::kEngramLayers[0] ? 0 : 1) : std::vector<float>{};
       std::printf("step %d layer %d: GPUs...\n", step, l);
-      const engine::StepTrace got = decoder.decode_layer(l, raw, slots);
+      const engine::StepTrace got = decoder.decode_layer(l);
       std::printf("  oracle...\n");
       current_layer = l;
       layer_ref::Trace want;
@@ -312,29 +313,19 @@ int main(int argc, char** argv) {
   std::printf("%d steps x %d layers: GPUs and oracle bit-identical\n", steps, layers);
   report_cache("checked steps");
 
-  // Timing: decode steps on the GPUs alone, under the Expert cache with --slots, else with every
-  // Half of the loaded layers resident.
+  // Timing: decode steps on the GPUs alone, pseudo-random tokens, under the same Expert cache.
   if (timing_steps > 0) {
-    if (!residency) {
-      moe::Plan all{};
-      all.jobs = moe::kMaxJobs;
-      for (int l = first; l < first + layers; l++)
-        for (int e0 = 0; e0 < moe::kExperts; e0 += moe::kMaxJobs) {
-          for (int j = 0; j < moe::kMaxJobs; j++) all.expert[j] = e0 + j;
-          slots(l, all);
-        }
-    }
     std::mt19937 token_rng(77);
     std::uniform_int_distribution<int> token_id(0, model::kVocab - 1);
+    const std::vector<uint8_t> raw(engine::kEngramTokenBytes, 0x38);
     std::vector<double> step_ms;
     for (int step = steps; step < steps + timing_steps; step++) {
       const int token = token_id(token_rng);
       auto emb = engine::load_bf16_row(backbone.value(), "embed.weight", token);
       if (!emb) die(emb.error().what);
-      std::vector<uint8_t> raw(static_cast<size_t>(cuda::kEngramCols) * cuda::kEngramRowBytes, 0x38);
       const auto t0 = std::chrono::steady_clock::now();
-      decoder.begin_token(step, emb.value());
-      for (int l = first; l < first + layers; l++) decoder.decode_layer(l, raw, slots, false);
+      decoder.begin_token(step, emb.value(), raw);
+      for (int l = first; l < first + layers; l++) decoder.decode_layer(l, false);
       if (with_head) decoder.logits();
       decoder.sync();
       step_ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
@@ -342,11 +333,11 @@ int main(int argc, char** argv) {
     std::sort(step_ms.begin(), step_ms.end());
     const double median = step_ms[step_ms.size() / 2];
     const double mean = std::accumulate(step_ms.begin(), step_ms.end(), 0.0) / static_cast<double>(step_ms.size());
-    std::printf("timing (%s): %d steps x %d layers%s, %s: median %.2f ms per step (mean %.2f), %.3f ms per layer\n",
+    std::printf("timing (%s): %d steps x %d layers%s, %u Slots: median %.2f ms per step (mean %.2f), %.3f ms per layer\n",
                 launches == engine::Launches::Graphs ? "graphs" : "eager", timing_steps, layers,
-                with_head ? " + head" : "", residency ? "Expert cache" : "Experts resident", median, mean,
-                median / layers);
+                with_head ? " + head" : "", slot_count, median, mean, median / layers);
     report_cache("all steps");
   }
+  decoder.sync();  // nothing in flight reads the Expert cache once it closes
   return 0;
 }

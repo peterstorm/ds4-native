@@ -172,14 +172,23 @@ no launch skew between the GPUs).
 
 ## Expert residency
 
-`engine::ExpertResidency` serves the decoder's Experts (the `ExpertSlots` seam, called once per
-layer step for both GPUs). Placement is `cache::ExpertCache` twice: the VRAM Slots (warm from
+The GPUs resolve their Experts themselves (`cuda/resolve.cuh`): after routing, one block reads
+each routed Expert's Slot from the residency table (host-mapped, shared by both GPUs) and writes
+the MoE GEMV job lists and launch counts, which the GEMVs read as device arguments -- a layer step
+is one graph with no host round trip. The Miss protocol (`core/miss_protocol.hpp`): GPU 0 posts
+every step's needs into a ring the host drains in order (so the cache sees every access, Hits
+included); a GPU that meets a Miss waits on a host-written board, polling every 2 us (back-to-back
+polls of host memory starved the very PCIe copies it waits for). `engine::ExpertResidency` is the
+host side: a service thread serves each posted step through the cache, and for Loads updates the
+table only after both GPUs' copies landed. Residency changes only while a step with Loads is
+served, and both GPUs wait at that step, so they always resolve against the same table state.
+Placement is `cache::ExpertCache` twice: the VRAM Slots (warm from
 construction, ranked by decayed pick count) and the RAM tier's pinned 18 MiB record buffers
 (empty at first, least recently used). A Load comes from its RAM tier record when there (two
 Half copies, one per GPU link, in parallel), otherwise from the store: 1 MiB O_DIRECT chunks
 into a RAM tier buffer, each chunk copied to its GPU as it lands, so only the last chunk's copy
-is exposed. Evicting is safe because place() runs after both GPUs finished the previous layer's
-Experts, and the cache never evicts what the same call needs.
+is exposed. Evicting is safe because a GPU resolving step s has passed step s's attention
+exchange (the peer finished step s-1's Experts), and the cache never evicts what step s needs.
 
 Measured (`ds4n-layer-check --slots N --ram-records R`, layers 0-3, real Experts):
 - **Slot-count invariance gate**: 48 and 200 Slots (31-68 % Hits) give logits and every layer
@@ -189,6 +198,10 @@ Measured (`ds4n-layer-check --slots N --ram-records R`, layers 0-3, real Experts
 - Misses: 1.78 ms per Expert at ~3.4 Misses per layer step, 2.37 ms at ~1.9 (whole-record reads
   with copies after each record: 1.94 and 2.55). Measured while a download wrote to the same
   NVMe; the store dataset caches metadata only, so every Miss reads the drive.
+- Device-side resolution: the invariance gate holds at 1,536 and 48 Slots (logits bit-identical);
+  1,200 forty-layer steps and 300 steps at 50 % Hits ran clean; Misses 1.70 ms per Expert. The
+  Base step barely moved (9.53 ms vs 9.59 with the per-layer round trip): the earlier profile's
+  idle time was mostly node-tracing overhead, and the step is GPU work (~200 us per layer).
 
 Next: Miss telemetry by Loads per call, prefetch from a predicted next-layer routing, a pick-count
 prior for the warm start, and Cache-conditional routing behind a flag (default off: not Exact).

@@ -146,11 +146,15 @@ int main(int argc, char** argv) {
     at = comma + 1;
   }
 
-  // The model: every layer and the head on both GPUs, Experts through the cache, Engram from the GGUF.
+  // The model: the Expert cache first (the decoder resolves against it), then every layer and the
+  // head on both GPUs, Engram from the GGUF.
+  auto residency = engine::ExpertResidency::open({store_path, {0, 1}, slots, ram_records, {}});
+  std::printf("Expert cache: %u Slots warm in %.1f s, RAM tier %u records\n", slots, residency->stats().warm_ms / 1e3,
+              ram_records);
   const auto t_load = Clock::now();
   auto backbone = engine::open_backbone(backbone_path);
   if (!backbone) die(backbone.error().what);
-  engine::Decoder decoder({0, 1});
+  engine::Decoder decoder({0, 1}, {residency->directory(0), residency->directory(1)});
   for (int l = 0; l < model::kLayers; l++) {
     auto w = engine::load_layer(backbone.value(), l);
     if (!w) die(w.error().what);
@@ -163,10 +167,6 @@ int main(int argc, char** argv) {
   }
   std::printf("Backbone: 40 layers and the head loaded in %.1f s\n",
               std::chrono::duration<double>(Clock::now() - t_load).count());
-  auto residency = engine::ExpertResidency::open({store_path, {0, 1}, slots, ram_records, {}});
-  std::printf("Expert cache: %u Slots warm in %.1f s, RAM tier %u records\n", slots, residency->stats().warm_ms / 1e3,
-              ram_records);
-  const engine::ExpertSlots experts = [&](int layer, const moe::Plan& plan) { return residency->place(layer, plan); };
   auto layout = engine::load_engram_layout(gguf_path);
   if (!layout) die(layout.error().what);
   auto rows = engine::EngramRows::open({gguf_path});
@@ -195,17 +195,14 @@ int main(int argc, char** argv) {
       auto hashed = engram::hash_token(layout.value(), history, static_cast<uint32_t>(token), true);
       if (!hashed) die(hashed.error().what);
       history = hashed.value().next;
-      decoder.begin_token(p, emb.value());
-      for (int l = 0; l < model::kLayers; l++) {
-        std::vector<uint8_t> raw;
-        if (model::kind(l).engram) {
-          const int table = l == model::kEngramLayers[0] ? 0 : 1;
-          auto r = rows.value().read(table, hashed.value().rows[table]);
-          if (!r) die(r.error().what);
-          raw = std::move(r).value();
-        }
-        decoder.decode_layer(l, raw, experts, false);
+      std::vector<uint8_t> raw;
+      for (int table = 0; table < 2; table++) {
+        auto r = rows.value().read(table, hashed.value().rows[table]);
+        if (!r) die(r.error().what);
+        raw.insert(raw.end(), r.value().begin(), r.value().end());
       }
+      decoder.begin_token(p, emb.value(), raw);
+      for (int l = 0; l < model::kLayers; l++) decoder.decode_layer(l, false);
       std::vector<float> logits;
       if (want_logits) logits = decoder.logits();
       else decoder.sync();
@@ -214,6 +211,7 @@ int main(int argc, char** argv) {
     };
 
     // The prompt, then the next-token logits at its end.
+    residency->check();
     const auto before = residency->stats();
     const auto t_prompt = Clock::now();
     std::vector<float> logits;
@@ -272,7 +270,8 @@ int main(int argc, char** argv) {
     }
     steps_out << "\n  ]\n}\n";
     write_text(out_dir + "/" + name + ".logprobs.json", steps_out.str());
-    const auto& after = residency->stats();
+    residency->check();
+    const auto after = residency->stats();
     const uint64_t needed = (after.hits + after.ram_hits + after.store_reads) - (before.hits + before.ram_hits + before.store_reads);
     std::printf("%s continuation: %zu steps, median %.2f ms per token (%.1f tok/s); Expert Hits %.1f %% over the prompt "
                 "and continuation (%llu RAM tier, %llu store reads)\n",
@@ -287,5 +286,6 @@ int main(int argc, char** argv) {
                   name.c_str(), force ? "teacher forced" : "free running", agree, compared, first_difference.c_str(),
                   n_dlp ? sum_dlp / static_cast<double>(n_dlp) : 0.0, max_dlp);
   }
+  decoder.sync();  // nothing in flight reads the Expert cache once it closes
   return 0;
 }

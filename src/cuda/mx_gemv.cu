@@ -100,10 +100,12 @@ __device__ __forceinline__ void fp8_tile(const GemvJob& job, int tile, int split
 }
 
 __global__ void __launch_bounds__(128) gemv_kernel(const GemvJob* __restrict__ jobs,
-                                                   const int* __restrict__ first_warp, int n_jobs, int total_warps) {
+                                                   const int* __restrict__ first_warp, IntArg job_count,
+                                                   IntArg warp_count) {
   const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
   const unsigned lane = threadIdx.x & 31;
-  if (warp >= total_warps) return;
+  if (warp >= warp_count.get()) return;
+  const int n_jobs = static_cast<int>(job_count.get());
   const int j = find_job(first_warp, n_jobs, warp);
   const GemvJob job = jobs[j];
   const int local = warp - first_warp[j];
@@ -135,7 +137,13 @@ void quantize_activations(const __nv_bfloat16* x, int tokens, ActFragments act, 
 }
 
 void gemv(const GemvJob* jobs, const int* first_warp, int n_jobs, int total_warps, cudaStream_t stream) {
-  gemv_kernel<<<(total_warps * 32 + 127) / 128, 128, 0, stream>>>(jobs, first_warp, n_jobs, total_warps);
+  gemv(jobs, first_warp, IntArg::of(n_jobs), IntArg::of(total_warps), stream);
+}
+
+void gemv(const GemvJob* jobs, const int* first_warp, IntArg n_jobs, IntArg total_warps, cudaStream_t stream) {
+  const int64_t warps = total_warps.bound();
+  if (warps <= 0) return;
+  gemv_kernel<<<static_cast<unsigned>((warps * 32 + 127) / 128), 128, 0, stream>>>(jobs, first_warp, n_jobs, total_warps);
 }
 
 }  // namespace ds4n::cuda

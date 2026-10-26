@@ -17,6 +17,7 @@
 #include "cuda/moe.cuh"
 #include "cuda/mx_gemv.cuh"
 #include "cuda/planes.cuh"
+#include "cuda/resolve.cuh"
 #include "engine/decoder.cuh"
 
 namespace ds4n::engine {
@@ -61,22 +62,15 @@ cuda::GemvJob fp8_job(const DeviceFp8& w, int row0, const cuda::ActFragments& ac
           cuda::split_blocks_for(w.blocks, splits)};
 }
 
-/** Per-layer launches prepared once. */
+/** Per-layer launches prepared once; `shared_moe` holds the shared Expert's gate, up and down jobs. */
 struct LayerLaunches {
   Launch qa_kv, qb, oa, ob, engram;
+  cuda::GemvJob* shared_moe = nullptr;
 };
 
-/** Phase B's launch shape: the job lists' lengths and warps, fixed by the plan's job count. */
-struct MoeShape {
-  int n_gate_up = 0, warps_gate_up = 0, n_down = 0, warps_down = 0;
-  bool operator==(const MoeShape&) const = default;
-};
-
-/** A captured phase B and the shape it was captured for. */
-struct CapturedMoe {
-  cudaGraphExec_t exec = nullptr;
-  MoeShape shape;
-};
+// Routed and shared Expert jobs alike: gate/up 72 tiles x 2 splits, down 320 tiles unsplit.
+constexpr int kGateUpWarps = kExpertRows / 16 * kSplitsExpert, kDownWarps = kDim / 16;
+constexpr int kStepJobs = moe::kTopK;  // routed Experts in a one-token step, at most
 
 /** What `enqueue` puts on `stream`, captured as an executable graph (nothing runs). */
 template <class Enqueue>
@@ -110,26 +104,26 @@ struct Staging {
   model::StepIndex step;
   int32_t window_idx[kWindow];
   bf16 h[kHcCopies * kDim];
-  uint8_t engram_rows[cuda::kEngramCols * cuda::kEngramRowBytes];
-  cuda::GemvJob jobs[3 * cuda::kJobSlots];
-  int first[3 * cuda::kJobSlots];
+  uint8_t engram_rows[2][kEngramTableBytes];  // per table (layer 1, layer 14)
   moe::Plan plan;
   float logits[kVocab / kGpus];  // this GPU's half of the vocabulary
 };
 
 struct Decoder::Gpu {
   Staging* staging = nullptr;  // pinned
-  // Recorded after the copies out of each staging field.
-  cudaEvent_t staged_token = nullptr, staged_rows = nullptr, staged_jobs = nullptr;
+  // Recorded after the copies out of each staging field (the token's, then each Engram table's).
+  cudaEvent_t staged_token = nullptr;
+  std::array<cudaEvent_t, 2> staged_rows{};
   int rank = 0, device = 0;
   cudaStream_t stream = nullptr;
   DeviceArena arena;
   cuda::ExchangeLink link{};
   std::map<int, DeviceLayer> layers;
   std::map<int, LayerLaunches> launches;
-  // Captured phases: A by (layer, produced), B by (layer, plan jobs).
-  std::map<std::pair<int, int>, cudaGraphExec_t> phase_a;
-  std::map<std::pair<int, int>, CapturedMoe> phase_b;
+  // Captured layer steps by (layer, whether a ratio-2 KV source completes a group).
+  std::map<std::pair<int, int>, cudaGraphExec_t> graphs;
+  cuda::ExpertDirectory experts{};  // this GPU's view of the Expert cache
+  cuda::ResolvedMoe resolved{};
   // The stream between layers: h in, h_next after Engram, h_mid after attention, back to h after the FFN.
   bf16 *h = nullptr, *h_next = nullptr, *h_mid = nullptr;
   // The mixes; mix_ffn starts each token as `identity` (pre mix one-hot on copy 0).
@@ -158,18 +152,16 @@ struct Decoder::Gpu {
   float* route_weights = nullptr;
   moe::Plan* plan = nullptr;
   cuda::MoeBuffers moe{};
-  cuda::GemvJob* moe_jobs = nullptr;
-  int* moe_first = nullptr;
   // The head: this GPU's half of the vocabulary.
   bf16 *norm = nullptr, *head = nullptr;
   float *head_planes = nullptr, *head_out = nullptr;
 
-  void enqueue_phase_a(int layer, bool produced_now);
-  void enqueue_phase_b(const MoeShape& shape);
-  MoeShape stage_moe(int layer, const moe::Plan& routes, const std::vector<const uint8_t*>& halves);
+  /** One layer step: Engram, attention, routing, Expert resolution, the Experts, hc_post. */
+  void enqueue_layer(int layer, bool produced_now);
 };
 
-Decoder::Decoder(std::array<int, 2> devices, Launches launches) : launches_(launches) {
+Decoder::Decoder(std::array<int, 2> devices, std::array<cuda::ExpertDirectory, 2> experts, Launches launches)
+    : launches_(launches) {
   const char* loading = std::getenv("CUDA_MODULE_LOADING");
   if (loading == nullptr || std::string(loading) != "EAGER")
     throw CudaError("the two-GPU decoder needs CUDA_MODULE_LOADING=EAGER set before CUDA initializes");
@@ -188,7 +180,8 @@ Decoder::Decoder(std::array<int, 2> devices, Launches launches) : launches_(laun
     s.device = devices[g];
     check(cudaStreamCreateWithFlags(&s.stream, cudaStreamNonBlocking), "cudaStreamCreate");
     check(cudaMallocHost(&s.staging, sizeof(Staging)), "cudaMallocHost");
-    for (cudaEvent_t* ev : {&s.staged_token, &s.staged_rows, &s.staged_jobs})
+    s.experts = experts[g];
+    for (cudaEvent_t* ev : {&s.staged_token, &s.staged_rows[0], &s.staged_rows[1]})
       check(cudaEventCreateWithFlags(ev, cudaEventDisableTiming), "cudaEventCreate");
     DeviceArena& a = s.arena;
     s.link.rank = g;
@@ -274,8 +267,9 @@ Decoder::Decoder(std::array<int, 2> devices, Launches launches) : launches_(laun
              kExpertRows,
              kSplitsExpert,
              kDim};
-    s.moe_jobs = a.alloc<cuda::GemvJob>(3 * cuda::kJobSlots);
-    s.moe_first = a.alloc<int>(3 * cuda::kJobSlots);
+    s.resolved = {a.alloc<cuda::GemvJob>(3 * cuda::kJobSlots), a.alloc<int>(3 * cuda::kJobSlots), a.alloc<int64_t>(4),
+                  a.alloc<uint64_t>(1)};
+    check(cudaMemset(s.resolved.step, 0, sizeof(uint64_t)), "memset");
     gpus_[g] = std::move(gpu);
   }
   for (int g = 0; g < 2; g++) {
@@ -289,9 +283,8 @@ Decoder::~Decoder() {
     if (g) {
       cudaSetDevice(g->device);
       cudaStreamSynchronize(g->stream);
-      for (auto& [key, exec] : g->phase_a) cudaGraphExecDestroy(exec);
-      for (auto& [key, captured] : g->phase_b) cudaGraphExecDestroy(captured.exec);
-      for (cudaEvent_t ev : {g->staged_token, g->staged_rows, g->staged_jobs}) cudaEventDestroy(ev);
+      for (auto& [key, exec] : g->graphs) cudaGraphExecDestroy(exec);
+      for (cudaEvent_t ev : {g->staged_token, g->staged_rows[0], g->staged_rows[1]}) cudaEventDestroy(ev);
       cudaStreamDestroy(g->stream);
       cudaFreeHost(g->staging);
     }
@@ -317,6 +310,12 @@ void Decoder::add_layer(const HostLayer& w) {
     l.oa = prepare(s.arena, oa);
     l.ob = prepare(s.arena, {fp8_job(d.wo_b, 0, s.act_lora, s.planes_ob, kDim, kSplitsWoB)});
     if (kind.engram) l.engram = prepare(s.arena, {fp8_job(d.engram_wkv, 0, s.act_engram, s.planes_eg, cuda::kEngramKvRows, 1)});
+    const int shared = cuda::kSharedJob;
+    const cuda::GemvJob shared_moe[3] = {
+        fp8_job(d.shared_gate, 0, s.act_xf, s.moe.gate_of(shared), kExpertRows, kSplitsExpert),
+        fp8_job(d.shared_up, 0, s.act_xf, s.moe.up_of(shared), kExpertRows, kSplitsExpert),
+        fp8_job(d.shared_down, 0, s.moe.hidden_of(shared), s.moe.down_of(shared), kDim, 1)};
+    l.shared_moe = s.arena.upload(shared_moe, 3);
     // Caches this layer owns.
     s.window[w.id] = s.arena.alloc<bf16>(static_cast<size_t>(kWindow) * kHeadDim);
     check(cudaMemset(s.window[w.id], 0, static_cast<size_t>(kWindow) * kHeadDim * 2), "memset");
@@ -332,17 +331,25 @@ void Decoder::add_layer(const HostLayer& w) {
   }
 }
 
-void Decoder::begin_token(int64_t p, std::span<const float> embedding_row) {
+void Decoder::begin_token(int64_t p, std::span<const float> embedding_row, std::span<const uint8_t> engram_rows) {
   if (p < 0 || p >= kMaxCompressed) throw CudaError("position outside this executor's compressed capacity");
   if (embedding_row.size() != static_cast<size_t>(kDim)) throw CudaError("begin_token: the embedding row has the wrong size");
+  if (!engram_rows.empty() && engram_rows.size() != kEngramTokenBytes)
+    throw CudaError("begin_token: Engram rows must be both tables' 24 rows of 264 bytes");
   step_ = model::step_index(p);
   in_token_ = true;
+  engram_staged_ = !engram_rows.empty();
   for (auto& gp : gpus_) {
     Gpu& s = *gp;
     const cudaStream_t st = s.stream;
     check(cudaSetDevice(s.device), "cudaSetDevice");
     check(cudaEventSynchronize(s.staged_token), "staging");
     Staging& sg = *s.staging;
+    if (engram_staged_)
+      for (int t = 0; t < 2; t++) {
+        check(cudaEventSynchronize(s.staged_rows[t]), "staging");  // the previous token's Engram layer copied them
+        std::memcpy(sg.engram_rows[t], engram_rows.data() + t * kEngramTableBytes, kEngramTableBytes);
+      }
     sg.step = step_;
     for (int i = 0; i < kWindow; i++) sg.window_idx[i] = window_slot(p, i);
     for (int c = 0; c < kHcCopies; c++)
@@ -362,7 +369,7 @@ void Decoder::sync() {
   }
 }
 
-void Decoder::Gpu::enqueue_phase_a(int layer, bool produced_now) {
+void Decoder::Gpu::enqueue_layer(int layer, bool produced_now) {
   const LayerKind kind = model::kind(layer);
   const int ratio = kind.compress_ratio;
   const DeviceLayer& d = layers.at(layer);
@@ -377,8 +384,8 @@ void Decoder::Gpu::enqueue_phase_a(int layer, bool produced_now) {
   // Engram adds its memory into the stream this layer reads.
   bf16* h_in = h;
   if (kind.engram) {
-    check(cudaMemcpyAsync(engram_rows, staging->engram_rows, sizeof(staging->engram_rows), cudaMemcpyHostToDevice, st),
-          "rows");
+    const int table = layer == kEngramLayers[0] ? 0 : 1;
+    check(cudaMemcpyAsync(engram_rows, staging->engram_rows[table], kEngramTableBytes, cudaMemcpyHostToDevice, st), "rows");
     cuda::engram_quantize_rows(engram_rows, 1, rank * (cuda::kEngramBlocks / kGpus), act_engram, st);
     run(l.engram, st);
     cuda::sum_planes_f32(planes_eg, 1, cuda::kEngramKvRows, 1, packed, st);
@@ -469,126 +476,55 @@ void Decoder::Gpu::enqueue_phase_a(int layer, bool produced_now) {
   cuda::bf16_gemv(d.router, xf_f, moe::kExperts, kDim, 1, kSplitsBf16, logits, st);
   cuda::route(logits, kSplitsBf16, 1, nullptr, {d.router_bias, nullptr, kRouteScale}, route_experts, route_weights, plan,
               st);
-  check(cudaGetLastError(), "phase A launches");
-}
 
-MoeShape Decoder::Gpu::stage_moe(int layer, const moe::Plan& routes, const std::vector<const uint8_t*>& halves) {
-  if (halves.size() != static_cast<size_t>(routes.jobs)) throw CudaError("ExpertSlots gave the wrong number of Halves");
-  const DeviceLayer& d = layers.at(layer);
-  const int sb = cuda::split_blocks_for(kDimBlocks, kSplitsExpert);
-  std::vector<cuda::GemvJob> gate_up, down;
-  for (int j = 0; j < routes.jobs; j++) {
-    const auto hid = moe.hidden_of(j);
-    gate_up.push_back({cuda::WeightFormat::Mxfp4, halves[j], act_xf.codes, act_xf.scales, moe.gate_of(j), kExpertRows,
-                       kDimBlocks, kSplitsExpert, sb});
-    gate_up.push_back({cuda::WeightFormat::Mxfp4, halves[j] + kExpertPartBytes, act_xf.codes, act_xf.scales, moe.up_of(j),
-                       kExpertRows, kDimBlocks, kSplitsExpert, sb});
-    down.push_back({cuda::WeightFormat::Mxfp4, halves[j] + 2 * kExpertPartBytes, hid.codes, hid.scales, moe.down_of(j), kDim,
-                    kExpertDownBlocks, 1, kExpertDownBlocks});
-  }
-  const int shared = cuda::kSharedJob;
-  const auto shid = moe.hidden_of(shared);
-  gate_up.push_back(fp8_job(d.shared_gate, 0, act_xf, moe.gate_of(shared), kExpertRows, kSplitsExpert));
-  gate_up.push_back(fp8_job(d.shared_up, 0, act_xf, moe.up_of(shared), kExpertRows, kSplitsExpert));
-  down.push_back(fp8_job(d.shared_down, 0, shid, moe.down_of(shared), kDim, 1));
-
-  // Both job lists back to back, each with its own warp prefix sums.
-  MoeShape shape{static_cast<int>(gate_up.size()), 0, static_cast<int>(down.size()), 0};
-  check(cudaEventSynchronize(staged_jobs), "staging");
-  int at = 0;
-  for (const auto& j : gate_up) {
-    staging->jobs[at] = j;
-    staging->first[at++] = shape.warps_gate_up;
-    shape.warps_gate_up += cuda::job_warps(j);
-  }
-  for (const auto& j : down) {
-    staging->jobs[at] = j;
-    staging->first[at++] = shape.warps_down;
-    shape.warps_down += cuda::job_warps(j);
-  }
-  return shape;
-}
-
-void Decoder::Gpu::enqueue_phase_b(const MoeShape& shape) {
-  const cudaStream_t st = stream;
-  const int n = shape.n_gate_up + shape.n_down;
-  check(cudaMemcpyAsync(moe_jobs, staging->jobs, n * sizeof(cuda::GemvJob), cudaMemcpyHostToDevice, st), "jobs");
-  check(cudaMemcpyAsync(moe_first, staging->first, n * sizeof(int), cudaMemcpyHostToDevice, st), "first");
-  cuda::gemv(moe_jobs, moe_first, shape.n_gate_up, shape.warps_gate_up, st);
+  // The Experts: resolved on the device (a Miss waits for the Expert cache's service), then gate/up,
+  // SwiGLU, down, the combine in Plan order, the exchange and hc_post.
+  const cuda::RoutedShape shape{kExpertRows, kDimBlocks, kSplitsExpert, cuda::split_blocks_for(kDimBlocks, kSplitsExpert),
+                                kDim,        kExpertDownBlocks, kExpertPartBytes};
+  cuda::resolve_experts(plan, layer, experts, shape, moe, act_xf, l.shared_moe, resolved, st);
+  cuda::gemv(resolved.jobs, resolved.first, resolved.gate_up_jobs(kStepJobs),
+             resolved.gate_up_warps(kStepJobs, kGateUpWarps, kGateUpWarps), st);
   cuda::swiglu_quantize(plan, moe, moe::kSwigluLimit, st);
-  cuda::gemv(moe_jobs + shape.n_gate_up, moe_first + shape.n_gate_up, shape.n_down, shape.warps_down, st);
+  cuda::gemv(resolved.jobs + cuda::ResolvedMoe::kDownList, resolved.first + cuda::ResolvedMoe::kDownList,
+             resolved.down_jobs(kStepJobs), resolved.down_warps(kStepJobs, kDownWarps, kDownWarps), st);
   cuda::combine(plan, moe, y, st);
   cuda::exchange_add(link, y, kDim, moe_out, st);
   cuda::hc_post(moe_out, h_mid, mix_ffn, kDim, 1, h, st);
-  check(cudaGetLastError(), "phase B launches");
+  check(cudaGetLastError(), "layer step launches");
 }
 
-StepTrace Decoder::decode_layer(int layer, std::span<const uint8_t> engram_rows, const ExpertSlots& experts,
-                                bool trace_step) {
+StepTrace Decoder::decode_layer(int layer, bool trace_step) {
   if (!in_token_) throw CudaError("decode_layer before begin_token");
   const LayerKind kind = model::kind(layer);
+  if (kind.engram && !engram_staged_) throw CudaError("an Engram layer needs the token's Engram rows (begin_token)");
   const bool produced = kind.kv_source && step_.produced[kind.compress_ratio] != 0;
-  if (kind.engram && engram_rows.size() != sizeof(Staging::engram_rows))
-    throw CudaError("an Engram layer needs 24 raw table rows");
   const bool graphs = launches_ == Launches::Graphs;
-  const std::pair<int, int> key_a{layer, produced};
+  const std::pair<int, int> key{layer, produced};
 
-  // Phase A: stage and capture on both GPUs, then launch on both.
+  // Capture on both GPUs (instantiation may allocate), then launch on both.
   for (auto& gp : gpus_) {
     Gpu& s = *gp;
     check(cudaSetDevice(s.device), "cudaSetDevice");
-    if (kind.engram) {
-      check(cudaEventSynchronize(s.staged_rows), "staging");
-      std::memcpy(s.staging->engram_rows, engram_rows.data(), engram_rows.size());
-    }
-    if (graphs && !s.phase_a.contains(key_a))
-      s.phase_a[key_a] = capture(s.stream, [&] { s.enqueue_phase_a(layer, produced); });
+    if (graphs && !s.graphs.contains(key)) s.graphs[key] = capture(s.stream, [&] { s.enqueue_layer(layer, produced); });
   }
   for (auto& gp : gpus_) {
     Gpu& s = *gp;
     check(cudaSetDevice(s.device), "cudaSetDevice");
-    if (graphs) check(cudaGraphLaunch(s.phase_a.at(key_a), s.stream), "cudaGraphLaunch");
-    else s.enqueue_phase_a(layer, produced);
-    if (kind.engram) check(cudaEventRecord(s.staged_rows, s.stream), "cudaEventRecord");
+    if (graphs) check(cudaGraphLaunch(s.graphs.at(key), s.stream), "cudaGraphLaunch");
+    else s.enqueue_layer(layer, produced);
+    if (kind.engram) check(cudaEventRecord(s.staged_rows[layer == kEngramLayers[0] ? 0 : 1], s.stream), "cudaEventRecord");
   }
 
-  // The plan (identical on both GPUs) decides which Halves this step needs.
   StepTrace trace;
+  if (!trace_step) return trace;
+
+  // Rank 0's trace; both ranks' streams must agree. The plan is identical on both.
   Gpu& lead = *gpus_[0];
   check(cudaSetDevice(lead.device), "cudaSetDevice");
   check(cudaMemcpyAsync(&lead.staging->plan, lead.plan, sizeof(moe::Plan), cudaMemcpyDeviceToHost, lead.stream), "plan");
-  check(cudaStreamSynchronize(lead.stream), "phase A");
+  check(cudaStreamSynchronize(lead.stream), "layer step");
   trace.plan = lead.staging->plan;
   if (trace.plan.jobs < 1) throw CudaError("routing failed (non-finite router logits)");
-
-  // Both GPUs' Halves in place, job lists staged and graphs captured before either launches phase B
-  // (loading and instantiation may allocate or synchronize).
-  const std::pair<int, int> key_b{layer, trace.plan.jobs};
-  const auto halves = experts(layer, trace.plan);
-  std::array<MoeShape, 2> shapes;
-  for (auto& gp : gpus_) {
-    Gpu& s = *gp;
-    check(cudaSetDevice(s.device), "cudaSetDevice");
-    shapes[s.rank] = s.stage_moe(layer, trace.plan, halves[s.rank]);
-    if (!graphs) continue;
-    auto it = s.phase_b.find(key_b);
-    if (it == s.phase_b.end()) {
-      const MoeShape shape = shapes[s.rank];
-      it = s.phase_b.emplace(key_b, CapturedMoe{capture(s.stream, [&] { s.enqueue_phase_b(shape); }), shape}).first;
-    }
-    if (it->second.shape != shapes[s.rank]) throw CudaError("phase B's launch shape changed for the same job count");
-  }
-  for (auto& gp : gpus_) {
-    Gpu& s = *gp;
-    check(cudaSetDevice(s.device), "cudaSetDevice");
-    if (graphs) check(cudaGraphLaunch(s.phase_b.at(key_b).exec, s.stream), "cudaGraphLaunch");
-    else s.enqueue_phase_b(shapes[s.rank]);
-    check(cudaEventRecord(s.staged_jobs, s.stream), "cudaEventRecord");
-  }
-
-  if (!trace_step) return trace;
-
-  // Rank 0's trace; both ranks' streams must agree.
   auto download_bf16 = [](const bf16* d, size_t n, cudaStream_t st) {
     std::vector<bf16> b(n);
     check(cudaMemcpyAsync(b.data(), d, n * 2, cudaMemcpyDeviceToHost, st), "download");

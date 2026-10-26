@@ -1,24 +1,26 @@
 #pragma once
 // Imperative shell: Expert Halves in VRAM Slots on both GPUs, served on a Miss
-// from the RAM tier or the Expert store. Placement is core/expert_cache, twice:
-// the VRAM Slots (warm from construction, ranked by recent pick counts) and the
-// RAM tier's pinned record buffers (empty at first, least recently used). A
-// Slot index means the same Expert on both GPUs, GPU r holding Half r.
-// Residency never changes outputs: the kernels read the same Half bytes from
-// whichever Slot holds them (the Slot-count invariance gate).
+// from the RAM tier or the Expert store -- the host side of the Miss protocol
+// (core/miss_protocol.hpp). The GPUs resolve their Experts themselves
+// (cuda/resolve.cuh): GPU 0 posts every layer step, and a GPU that meets a Miss
+// waits until this service has served the step. A service thread drains the
+// posted steps in order through core/expert_cache, so the cache sees every
+// access, Hits included.
 //
-// place() serves one layer step. Hits return their Slots. Each Load is copied
-// into the Slot it takes, from its RAM-tier record when there, otherwise from
-// the store: one O_DIRECT read of the whole record (both Halves) into a RAM-tier
-// buffer, so the RAM tier keeps the most recently loaded records. Each Half then
-// crosses its own GPU's link on that GPU's copy stream, and place() returns once
-// both GPUs' copies landed.
+// Placement is core/expert_cache twice: the VRAM Slots (warm from construction,
+// ranked by decayed pick count) and the RAM tier's pinned record buffers (empty
+// at first, least recently used). A Slot index means the same Expert on both
+// GPUs, GPU r holding Half r. A Load comes from its RAM tier record when there,
+// otherwise from the store in 1 MiB O_DIRECT chunks into a RAM tier buffer, each
+// chunk copied to its GPU as it lands. Only after both GPUs' copies landed does
+// the table name the new Slots and the board mark the step served.
 //
-// Evicting a Slot is safe because of when the decoder calls place(): after both
-// GPUs finished the previous layer's Experts (each GPU's phase A of this layer
-// passed its exchange, which follows its phase B of the previous layer), and the
-// cache never evicts an Expert the same call needs. place() allocates nothing and
-// copies only from pinned memory, so it keeps the decoder's deadlock rule.
+// Residency changes only while a step with Loads is being served, and both GPUs
+// wait at that step, so they always resolve against the same table state, the
+// one the cache had before the step. Evicting a Slot is safe: a GPU resolving
+// step s has passed step s's attention exchange, so the peer finished step s-1's
+// Experts, and the cache never evicts what step s needs. Residency never changes
+// outputs (the Slot-count invariance gate).
 #include <cuda_runtime.h>
 
 #include <array>
@@ -28,7 +30,7 @@
 #include <string>
 #include <vector>
 
-#include "core/moe_plan.hpp"
+#include "cuda/resolve.cuh"
 
 namespace ds4n::engine {
 
@@ -42,31 +44,35 @@ struct ResidencyConfig {
   std::array<int, 2> devices{0, 1};  // device of Half 0, Half 1
   uint32_t slots = 0;                // VRAM Slots, at least moe::kMaxJobs
   uint32_t ram_records = 0;          // RAM tier record buffers (18 MiB pinned each), at least moe::kMaxJobs
-  std::vector<uint32_t> prior;       // pick counts per Expert for the warm start (empty: by key)
+  std::vector<uint32_t> prior;       // pick counts per Expert key for the warm start (empty: by key)
+  // Experts of layer L are keyed (and read from the store) as layer L % key_layers: a test store
+  // holding only the first few layers can serve every layer. 40 for a real store.
+  uint32_t key_layers = 40;
 };
 
 /** Counters since open(); a Hit is a needed Expert found in a VRAM Slot. */
 struct ResidencyStats {
   uint64_t layer_steps = 0, hits = 0, ram_hits = 0, store_reads = 0;
-  double exposed_ms = 0.0;  // wall time inside place() calls that loaded anything
+  double exposed_ms = 0.0;  // service time of steps with Loads (the GPUs wait that long)
   double warm_ms = 0.0;     // filling the Slots at open()
 };
 
 class ExpertResidency {
  public:
-  /** Allocate the Slots and the RAM tier, then fill every Slot with the warm-start Experts. */
+  /** Allocate the Slots, the RAM tier and the protocol pages, warm every Slot, then start serving. */
   static std::unique_ptr<ExpertResidency> open(const ResidencyConfig& config);
-  ~ExpertResidency();
+  ~ExpertResidency();  // stops the service
   ExpertResidency(const ExpertResidency&) = delete;
   ExpertResidency& operator=(const ExpertResidency&) = delete;
 
-  /**
-   * Both GPUs' Half pointers for the plan's jobs, in plan order (engine::ExpertSlots),
-   * valid until the next call.
-   */
-  std::array<std::vector<const uint8_t*>, 2> place(int layer, const moe::Plan& plan);
+  /** GPU `rank`'s view for the resolve kernel (rank 0 posts the steps). */
+  cuda::ExpertDirectory directory(int rank) const;
 
-  const ResidencyStats& stats() const;
+  /** A snapshot of the counters. */
+  ResidencyStats stats() const;
+
+  /** Throws the service's failure, if it failed (the GPUs then trap at their next Miss). */
+  void check() const;
 
  private:
   struct State;

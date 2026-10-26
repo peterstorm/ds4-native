@@ -8,6 +8,7 @@
 #include <cstdint>
 
 #include "core/split_k.hpp"
+#include "cuda/int_arg.cuh"
 
 namespace ds4n::cuda {
 
@@ -61,6 +62,9 @@ constexpr int job_warps(const GemvJob& j) { return j.rows / 16 * j.splits; }
  * on the device.
  */
 void gemv(const GemvJob* jobs, const int* first_warp, int n_jobs, int total_warps, cudaStream_t stream);
+
+/** The same with the job and warp counts read on the device when the kernel runs (launch sized for the bound). */
+void gemv(const GemvJob* jobs, const int* first_warp, IntArg n_jobs, IntArg total_warps, cudaStream_t stream);
 
 /** out[r][c] = sum over s = 0..splits-1, in order, of partials[s][r][c]. */
 void reduce_splits(const float* partials, int splits, int rows, float* out, cudaStream_t stream);
