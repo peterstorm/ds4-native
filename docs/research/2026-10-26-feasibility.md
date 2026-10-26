@@ -63,6 +63,29 @@ VRAM per GPU after Backbone share, draft, KV, prefill scratch and CUDA context: 
 - `c_ram` ≈ 0.36–0.5 ms (est.; Halves over both x8 links in parallel).
 - Misses per token at ~60 % residency, exact routing: Maya telemetry on our own traffic showed 0.7–2 % of picks missing VRAM at 61–69 % residency → **1.7–4.8 Misses/token** (measured on Maya with a sluggish promotion policy; a proper cache should do better). Cache-conditional routing cut Misses 52–73 % on the recipe host.
 
+**Static coverage from real traffic (measured, `bun tools/expert-profile/cli.ts`).** Maya's
+pick counts from the owner's agent traffic, with the globally hottest (layer, Expert) pairs
+resident:
+
+| Slots | Share | Static hit rate | Misses/token (exact) |
+|---|---|---|---|
+| 3,700 | 24.1 % | 66.7 % | 79.9 |
+| 4,832 | 31.5 % | 74.6 % | 61.1 |
+| 8,600 | 56.0 % | 91.3 % | 21.0 |
+| 9,600 | 62.5 % | 94.0 % | 14.4 |
+| 10,578 | 68.9 % | 96.1 % | 9.4 |
+| 11,500 | 74.9 % | 97.6 % | 5.7 |
+| 12,500 | 81.4 % | 98.8 % | 2.8 |
+| 13,500 | 87.9 % | 99.6 % | 1.0 |
+
+Picks are spread thin (DeepSeek's auxiliary-loss-free load balancing): per layer, 50 % of picks
+need a median 54 Experts and 90 % need 207 of 384. A static placement therefore buys little;
+the dynamic cache must earn its hit rate from locality. Maya measured 0.7–2 % misses at ~61–69 %
+residency, versus 3.9–8.7 % static at that size — locality cut Misses 2–4×; the recipe saw ~3×
+(91.5 % dynamic vs 74.6 % static at 31.5 %). Implications: the RAM tier pays more than first
+estimated (each +1,000 Slots of victim tier ≈ −25–35 % Misses at our size), and exact routing
+alone likely lands nearer the low end of the table below.
+
 | Setup (est.) | Exact routing | + Cache-conditional routing | + DSpark (code) |
 |---|---|---|---|
 | NVMe only | ~60–100 tok/s | ~100–130 | ~130–190 |
