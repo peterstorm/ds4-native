@@ -1,0 +1,8 @@
+build/
+*.o
+*.gguf
+*.safetensors
+*.bin
+!data/maya-expert-profile.bin
+*.log
+.cache/
