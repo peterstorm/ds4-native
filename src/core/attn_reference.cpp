@@ -11,6 +11,8 @@
 namespace ds4n::attn {
 namespace {
 
+constexpr size_t kSplitRows = 64;  // rows per attention split (one CTA)
+
 constexpr float kE2M1[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
 
 /** ceil(log2(v)) from the FP32 bits, as the reference fast_log2_ceil. */
@@ -125,44 +127,65 @@ void apply_rope(std::span<float> x, const Rope& r, std::span<const float> freqs,
 
 std::vector<float> sparse_attn(std::span<const float> q, std::span<const float> kv, std::span<const bool> valid,
                                std::span<const float> sink, int heads, int d, float scale) {
-  constexpr size_t kBlockRows = 64;
-  const size_t n = valid.size();
-  std::vector<float> out(static_cast<size_t>(heads) * d);
-  for (int h = 0; h < heads; h++) {
-    const float* qh = q.data() + static_cast<size_t>(h) * d;
-    float run_max = -1e30f, sum_exp = 0.0f;
-    std::vector<float> acc(d, 0.0f);
-    for (size_t b0 = 0; b0 < n; b0 += kBlockRows) {
-      const size_t bn = std::min(kBlockRows, n - b0);
-      std::vector<float> s(bn);
-      float bmax = run_max;
-      for (size_t i = 0; i < bn; i++) {
-        if (!valid[b0 + i]) {
-          s[i] = -INFINITY;
+  const size_t n = valid.size(), splits = (n + kSplitRows - 1) / kSplitRows;
+  std::vector<float> m_s(splits * heads), l_s(splits * heads), o_s(splits * heads * d, 0.0f);
+  std::array<float, 16> a{}, b{};
+  for (size_t s = 0; s < splits; s++) {
+    const size_t r0 = s * kSplitRows, rows = std::min(kSplitRows, n - r0);
+    for (int h = 0; h < heads; h++) {
+      const float* qh = q.data() + static_cast<size_t>(h) * d;
+      // Scores on the BF16 MMA (k16 steps over d), scaled; the split's own max.
+      float sc[kSplitRows], m = -1e30f;
+      for (size_t i = 0; i < rows; i++) {
+        if (!valid[r0 + i]) {
+          sc[i] = -INFINITY;
           continue;
         }
-        float dot = 0.0f;
-        for (int k = 0; k < d; k++) dot += qh[k] * kv[(b0 + i) * d + k];
-        s[i] = dot * scale;
-        bmax = std::max(bmax, s[i]);
+        float acc = 0.0f;
+        for (int k0 = 0; k0 < d; k0 += 16)
+          acc = mx::mma_step_bf16(acc, std::span<const float, 16>(qh + k0, 16),
+                                  std::span<const float, 16>(kv.data() + (r0 + i) * d + k0, 16));
+        sc[i] = acc * scale;
+        m = std::max(m, sc[i]);
       }
-      const float rescale = det::exp(run_max - bmax);
-      float bsum = 0.0f;
-      for (size_t i = 0; i < bn; i++) {
-        s[i] = det::exp(s[i] - bmax);
-        bsum += s[i];
+      // Probabilities: summed unrounded in row order, rounded to BF16 for P.V.
+      float p_bf16[kSplitRows] = {}, l = 0.0f;
+      for (size_t i = 0; i < rows; i++) {
+        const float p = det::exp(sc[i] - m);
+        l += p;
+        p_bf16[i] = mx::round_bf16(p);
       }
-      sum_exp = sum_exp * rescale + bsum;
-      for (int k = 0; k < d; k++) acc[k] *= rescale;
-      for (size_t i = 0; i < bn; i++) {
-        const float p = mx::round_bf16(s[i]);  // acc_s_cast: probabilities in BF16 for P.V
-        if (p == 0.0f) continue;
-        for (int k = 0; k < d; k++) acc[k] += p * kv[(b0 + i) * d + k];
+      m_s[s * heads + h] = m;
+      l_s[s * heads + h] = l;
+      // P.V on the BF16 MMA: k16 steps over the split's 64 rows (rows past n are zero).
+      for (int c = 0; c < d; c++) {
+        float acc = 0.0f;
+        for (size_t k0 = 0; k0 < kSplitRows; k0 += 16) {
+          for (size_t j = 0; j < 16; j++) {
+            const size_t i = k0 + j;
+            a[j] = i < rows ? p_bf16[i] : 0.0f;
+            b[j] = i < rows && valid[r0 + i] ? kv[(r0 + i) * d + c] : 0.0f;
+          }
+          acc = mx::mma_step_bf16(acc, a, b);
+        }
+        o_s[(s * heads + h) * d + c] = acc;
       }
-      run_max = bmax;
     }
-    sum_exp += det::exp(sink[h] - run_max);
-    for (int k = 0; k < d; k++) out[static_cast<size_t>(h) * d + k] = mx::round_bf16(acc[k] / sum_exp);
+  }
+  // Combine the splits in order, rescaled to the overall max; the sink joins the denominator.
+  std::vector<float> out(static_cast<size_t>(heads) * d);
+  for (int h = 0; h < heads; h++) {
+    float m = -1e30f;
+    for (size_t s = 0; s < splits; s++) m = std::max(m, m_s[s * heads + h]);
+    float l = 0.0f;
+    std::vector<float> o(d, 0.0f);
+    for (size_t s = 0; s < splits; s++) {
+      const float w = det::exp(m_s[s * heads + h] - m);
+      l += l_s[s * heads + h] * w;
+      for (int c = 0; c < d; c++) o[c] += o_s[(s * heads + h) * d + c] * w;
+    }
+    l += det::exp(sink[h] - m);
+    for (int c = 0; c < d; c++) out[static_cast<size_t>(h) * d + c] = mx::round_bf16(o[c] / l);
   }
   return out;
 }

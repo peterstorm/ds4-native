@@ -51,9 +51,9 @@ float to_float_rz(double v) {
   return f;
 }
 
-/** The MMA step of mma_step_e2m1 / mma_step_e4m3 over prepared products. */
+/** One MMA step (k32 block-scaled or k16 BF16) over prepared products. */
 constexpr int kMmaAlignBits = 25;
-float mma_step(float acc, std::span<const Product, kBlock> products) {
+float mma_step(float acc, std::span<const Product> products) {
   int top = acc != 0.0f ? std::ilogb(acc) : std::numeric_limits<int>::min();
   for (const auto& p : products)
     if (p.value != 0.0) top = std::max(top, p.exp);
@@ -145,6 +145,14 @@ float mma_step_e2m1(float acc, const ActBlock& a, std::span<const uint8_t, kBloc
 
 float mma_step_e4m3(float acc, const ActBlock& a, std::span<const uint8_t, kBlock> w_codes, uint8_t w_scale) {
   return mma_step_codes(acc, a, w_codes, w_scale, e4m3_value, e4m3_exponent);
+}
+
+float mma_step_bf16(float acc, std::span<const float, 16> a, std::span<const float, 16> b) {
+  // A BF16 significand's exponent as the hardware aligns it: the biased field, subnormals at the minimum.
+  auto exponent = [](float v) { return std::max(static_cast<int>((std::bit_cast<uint32_t>(v) >> 23) & 0xFF), 1) - 127; };
+  std::array<Product, 16> products;
+  for (size_t i = 0; i < 16; i++) products[i] = {double(a[i]) * b[i], exponent(a[i]) + exponent(b[i])};
+  return mma_step(acc, products);
 }
 
 float fp4_row_dot(std::span<const ActBlock> act, std::span<const std::byte> row, size_t first, size_t count) {

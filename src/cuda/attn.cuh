@@ -22,13 +22,28 @@ void fp4_quant_dequant_e4m3(__nv_bfloat16* x, int rows, int dim, cudaStream_t st
 void rope(__nv_bfloat16* x, int rows, int heads, int head_dim, int rope_dim, const float* freqs,
           const int64_t* positions, bool inverse, cudaStream_t stream);
 
+constexpr int kAttnHeads = 32;      // heads per GPU
+constexpr int kAttnDim = 512;       // head_dim (one shared latent KV)
+constexpr int kAttnSplitRows = 64;  // index slots per split (one CTA)
+
+constexpr int attn_splits(int n_idx) { return (n_idx + kAttnSplitRows - 1) / kAttnSplitRows; }
+
+/** Per-split partials: m and l [rows][splits][32], o [rows][splits][32][512] (FP32). */
+struct AttnScratch {
+  float* m;
+  float* l;
+  float* o;
+};
+
 /**
- * Decode/verify sparse attention. For each query row t: q[t] is [heads][d],
- * idx[t] lists n_idx KV rows of `kv` ([positions][d]), -1 for none. Online
- * softmax in blocks of 64 rows (index order), BF16 probabilities for P.V, sink
- * in the denominator. o[t] is [heads][d] BF16. One block per (row, head).
+ * Decode/verify sparse attention for 32 heads of 512 (one GPU's share). For
+ * each query row t: q[t] is [32][512], idx[t] lists n_idx rows of `kv`
+ * ([positions][512]), -1 for none. Flash decoding on the BF16 MMA, one CTA per
+ * split of 64 slots, then a combine in split order; the arithmetic is
+ * attn::sparse_attn's bit for bit. o[t] is [32][512] BF16. n_idx is 1 .. 640 (the
+ * window plus the top-k); otherwise nothing runs and cudaErrorInvalidValue is returned.
  */
-void sparse_attn(const __nv_bfloat16* q, const __nv_bfloat16* kv, const int32_t* idx, int n_idx, const float* sink,
-                 int rows, int heads, int d, float scale, __nv_bfloat16* o, cudaStream_t stream);
+cudaError_t sparse_attn(const __nv_bfloat16* q, const __nv_bfloat16* kv, const int32_t* idx, int n_idx, const float* sink,
+                        int rows, float scale, AttnScratch scratch, __nv_bfloat16* o, cudaStream_t stream);
 
 }  // namespace ds4n::cuda

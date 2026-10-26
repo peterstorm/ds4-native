@@ -63,14 +63,16 @@ TEST_CASE("RoPE then inverse RoPE returns the input within BF16 rounding") {
 }
 
 TEST_CASE("sparse_attn: one valid key returns its value scaled by the sink share") {
-  const int heads = 2, d = 4;
-  std::vector<float> q = {1, 0, 0, 0, 0, 1, 0, 0};
-  std::vector<float> kv = {9, 9, 9, 9, 1, 2, 3, 4};  // row 0 invalid, row 1 valid
+  const int heads = 2, d = 16;  // d is a multiple of the MMA's k16
+  std::vector<float> q(heads * d, 0.0f), kv(2 * d, 9.0f);
+  q[0] = 1.0f;      // head 0 looks at dimension 0
+  q[d + 1] = 1.0f;  // head 1 at dimension 1
+  for (int k = 0; k < d; k++) kv[d + k] = static_cast<float>(k % 4 + 1);  // row 0 invalid, row 1 valid: 1 2 3 4 ...
   const bool valid[2] = {false, true};
   std::vector<float> sink = {-1e9f, 0.0f};  // head 0: no sink mass; head 1: sink logit 0
   const auto o = sparse_attn(q, kv, valid, sink, heads, d, 1.0f);
-  for (int k = 0; k < d; k++) CHECK(o[k] == kv[4 + k]);  // softmax over one key = that value
+  for (int k = 0; k < d; k++) CHECK(o[k] == kv[d + k]);  // softmax over one key = that value
   // head 1: score q.k = 2, weights e^2 / (e^2 + e^0)
   const float w = std::exp(2.0f) / (std::exp(2.0f) + 1.0f);
-  for (int k = 0; k < d; k++) CHECK(o[d + k] == doctest::Approx(kv[4 + k] * w).epsilon(1e-2));
+  for (int k = 0; k < d; k++) CHECK(o[d + k] == doctest::Approx(kv[d + k] * w).epsilon(1e-2));
 }

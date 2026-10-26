@@ -54,8 +54,14 @@ void apply_rope(std::span<float> x, const Rope& r, std::span<const float> freqs,
 /**
  * Sparse attention for one query position: `q` is [heads][d], `kv` holds the
  * gathered rows [n][d] with `valid[i]` false for -1 indices (in index order).
- * Online softmax over blocks of 64 rows, probabilities rounded to BF16 before
- * P.V, sink added to the denominator. Returns [heads][d] BF16 values.
+ * The Reference configuration's split form (flash decoding): per split of 64
+ * rows, scores on the BF16 MMA (mx::mma_step_bf16, k16 steps over d) times
+ * `scale`, the split's max m_s (-1e30 when no row is valid, the reference's
+ * finite start), p = exp(s - m_s) summed unrounded in row order and rounded to
+ * BF16 for P.V on the BF16 MMA (k16 steps over the rows); then the splits
+ * combine in order, rescaled by exp(m_s - m) to the overall max m, with
+ * exp(sink - m) added to the denominator. d is a multiple of 16. Returns
+ * [heads][d] BF16 values.
  */
 std::vector<float> sparse_attn(std::span<const float> q, std::span<const float> kv, std::span<const bool> valid,
                                std::span<const float> sink, int heads, int d, float scale);

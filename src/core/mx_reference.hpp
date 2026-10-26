@@ -60,6 +60,9 @@ float ggml_block_element(std::span<const std::byte, kGgmlBlockBytes> block, size
 float mma_step_e2m1(float acc, const ActBlock& a, std::span<const uint8_t, kBlock> w_codes, uint8_t w_scale);
 float mma_step_e4m3(float acc, const ActBlock& a, std::span<const uint8_t, kBlock> w_codes, uint8_t w_scale);
 
+/** One k16 step of mma.sync m16n8k16 BF16 (FP32 accumulate), the same measured arithmetic: a and b are BF16 values. */
+float mma_step_bf16(float acc, std::span<const float, 16> a, std::span<const float, 16> b);
+
 /**
  * FP32 dot product of quantized activations with one weight row over blocks
  * [first, first + count) (the whole row when count spans it). Not rounded to BF16.
