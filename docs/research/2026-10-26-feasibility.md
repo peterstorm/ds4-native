@@ -33,7 +33,22 @@ Conclusions:
 - Small random reads are where ZFS costs: ~5× below raw even after the queue fix. Engram rows (264 B, 48/token, ~192k rows/s at 4k tok/s prefill before dedupe) sit near that ceiling.
 - Device read amplification on 16K records for 4 KiB reads: ~3.9–5.4×.
 
-GPU transfer costs (pinned H2D per x8 link, both links concurrently, P2P one-way latency, 20 KB / 143 KB peer copies): `xferbench` (`/models/ds41/xferbench.cu`) runs when the GPUs are free; results land in `/models/ds41/baseline/xferbench.log`. Until then: H2D ~26 GB/s per x8 link (est.), so one Half (9.4 MB) ≈ 0.36 ms and a whole Expert over one link ≈ 0.72 ms.
+**ds4-native measurements (2026-10-26, our own store, kernels and pipeline):**
+
+| What | Result |
+|---|---|
+| Miss read from our store (both Halves, io_uring O_DIRECT), 1 in flight | **1.64 ms p50**, 10.95 GB/s (GGUF layout: 2.32 ms, 7.55 GB/s) |
+| Store streaming, ≥ 2 Misses in flight | **13.0 GB/s** (GGUF layout: 9.6 GB/s) |
+| H2D of one Half (9.4 MB, pinned → VRAM, PCIe 5.0 x8) | **0.33 ms, 28.7 GB/s** |
+| One-GPU Miss: read Half + H2D, 1 in flight | 1.24 ms p50 (p99 1.43) |
+| Routed-Expert GEMV (native block-scaled MXFP4 MMA), one decode layer's Half (6 Experts × gate/up/down) | **37.0 µs, 1,525 GB/s**, flat from 1 to 8 tokens; 1.48 ms/token over 40 layers |
+| GEMV vs CPU oracle (DeepSeek act_quant + fp4_gemm semantics) | 99.97 % bit-identical (1 token), max error 1.0e-7 of the largest output |
+| Store conversion from GGUF | 2.6–3.7 GB/s source (the whole store in ~2 min); verify: all records identical |
+
+So `c_ssd` ≈ 1.7–2.0 ms for a whole TP Miss (both Halves share the drive; chunked
+read/H2D pipelining brings it toward the read time) and `c_ram` ≈ 0.33 ms (each GPU
+copies its Half over its own link in parallel). GPU-to-GPU P2P latency: pending
+(`xferbench` runs when Maya releases the GPUs).
 
 ## Model byte budget (DS4.1-1017)
 
