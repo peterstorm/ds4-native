@@ -213,5 +213,18 @@ prior for the warm start, and Cache-conditional routing behind a flag (default o
    next-token logits and 64-step greedy top-20 logprobs for code, prose and math prompts.
    antirez runs Q8_0 dense, ds4-native FP8 dense, so the anchor is KL / top-1 agreement,
    not bit equality; the per-kernel oracles carry exactness.
+   **Result** (`ds4n-model-run --force 1`: the whole model, 7,500 Slots, Experts from the real
+   store, real Engram rows; prompts as antirez's token ids, continuation teacher forced):
+
+   | Prompt | KL at the prompt end | argmax | top-20 overlap | greedy agreement |
+   |---|---|---|---|---|
+   | code (78 tokens) | 0.0042 nats | same | 18 | 64 / 64 |
+   | prose (48) | 0.144 | same | 15 | 59 / 64 |
+   | math (66) | 0.148 | same | 16 | 62 / 64 |
+
+   The code continuation runs past the 128-slot window (positions 78-141), so compressed
+   attention is exercised. Softmax scale (head_dim^-0.5, no YaRN mscale) and RoPE/YaRN match
+   `inference/config.json` and `model.py`; the remaining gap is consistent with antirez's
+   FP8 -> Q8_0 dense conversion. A BF16 run of `model.py` would be the sharper anchor.
 3. Reference configuration gates: same binary twice byte-identical; Slot-count invariance
    (different Expert cache sizes give identical logits).

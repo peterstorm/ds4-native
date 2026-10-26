@@ -164,3 +164,39 @@ TEST_CASE("an empty cache returns every need once and evicts only when full") {
   }
   CHECK(filled == c.slots());
 }
+
+namespace {
+
+std::vector<std::byte> encode_profile(const std::vector<uint32_t>& counts) {
+  std::vector<std::byte> out;
+  for (uint32_t c : counts)
+    for (int b = 0; b < 4; b++) out.push_back(std::byte(static_cast<uint8_t>(c >> (8 * b))));
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("a profile becomes a prior of per-layer shares") {
+  std::vector<uint32_t> counts(43 * 384, 1);  // 40 layers and 3 draft rows
+  counts[0] = 385;                            // layer 0: Expert 0 takes 385 of 768 picks
+  for (uint32_t e = 0; e < 384; e++) counts[5 * 384 + e] = 1000;  // layer 5: uniform but profiled longer
+  const Policy policy{4096, true};
+  const auto prior = ExpertCache::prior_from_profile(encode_profile(counts), policy).value();
+  REQUIRE(prior.size() == kKeys);
+  CHECK(prior[0] > prior[1]);
+  CHECK(prior[0] == std::lround(385.0 / 768.0 * 2 * 6 * 4096 / 40.0 * ExpertCache::kPriorWeight));
+  CHECK(prior[5 * 384 + 7] == prior[9 * 384 + 7]);  // a longer-profiled uniform layer ranks like any uniform layer
+  CHECK(prior[1 * 384] == prior[39 * 384 + 383]);
+
+  // The warm start takes the hottest share first.
+  auto c = ExpertCache::create(1, prior, policy).value();
+  CHECK(c.slot_of(0).has_value());
+}
+
+TEST_CASE("prior_from_profile rejects malformed profiles") {
+  CHECK_FALSE(ExpertCache::prior_from_profile(encode_profile(std::vector<uint32_t>(39 * 384, 1)), {}).is_ok());
+  CHECK_FALSE(ExpertCache::prior_from_profile(encode_profile(std::vector<uint32_t>(40 * 384 + 1, 1)), {}).is_ok());
+  std::vector<uint32_t> empty_layer(40 * 384, 1);
+  std::fill(empty_layer.begin() + 3 * 384, empty_layer.begin() + 4 * 384, 0u);
+  CHECK_FALSE(ExpertCache::prior_from_profile(encode_profile(empty_layer), {}).is_ok());
+}

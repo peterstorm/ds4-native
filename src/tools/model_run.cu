@@ -2,7 +2,7 @@
 // Expert cache, real Engram rows -- over prompts given as token ids, against antirez/ds4.
 //
 //   ds4n-model-run --backbone SAFETENSORS --store STORE --gguf MERGED_GGUF --tokens DIR --names a,b
-//                  --out DIR [--oracle DIR] [--force 1] [--steps N] [--slots N] [--ram-records R]
+//                  --out DIR [--oracle DIR] [--force 1] [--steps N] [--slots N] [--ram-records R] [--prior PROFILE]
 //
 // For each name, DIR/<name>.tokens is antirez's --dump-tokens output (ids on the first line). The
 // prompt runs as decode steps from position 0; the next-token logits at its end go to
@@ -12,6 +12,8 @@
 // prompt end, per step the greedy choice and the logprob difference over the Oracle's top-20.
 // --force 1 feeds the Oracle's chosen tokens (teacher forcing), so every step compares the same
 // context; otherwise our own greedy tokens are fed until the end-of-sequence token.
+// --prior PROFILE warms the Expert cache from a pick-count profile (uint32[rows][384], e.g. Maya's
+// expert-profile.bin) instead of by key.
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -28,6 +30,7 @@
 #include <vector>
 
 #include "core/compare.hpp"
+#include "core/expert_cache.hpp"
 #include "core/engram.hpp"
 #include "core/model.hpp"
 #include "cuda/engram.cuh"
@@ -116,7 +119,7 @@ double median(std::vector<double> v) {
 int main(int argc, char** argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   setenv("CUDA_MODULE_LOADING", "EAGER", 1);  // before any CUDA call: see engine/decoder.cuh
-  std::string backbone_path, store_path, gguf_path, tokens_dir, names_arg, out_dir, oracle_dir;
+  std::string backbone_path, store_path, gguf_path, tokens_dir, names_arg, out_dir, oracle_dir, prior_path;
   bool force = false;
   int max_steps = 64;
   uint32_t slots = 8000, ram_records = 512;
@@ -134,6 +137,7 @@ int main(int argc, char** argv) {
     else if (s == "--steps") max_steps = std::stoi(argv[++i]);
     else if (s == "--slots") slots = static_cast<uint32_t>(std::stoul(argv[++i]));
     else if (s == "--ram-records") ram_records = static_cast<uint32_t>(std::stoul(argv[++i]));
+    else if (s == "--prior") prior_path = argv[++i];
     else die("unknown argument " + s);
   }
   if (backbone_path.empty() || store_path.empty() || gguf_path.empty() || tokens_dir.empty() || names_arg.empty() ||
@@ -148,7 +152,16 @@ int main(int argc, char** argv) {
 
   // The model: the Expert cache first (the decoder resolves against it), then every layer and the
   // head on both GPUs, Engram from the GGUF.
-  auto residency = engine::ExpertResidency::open({store_path, {0, 1}, slots, ram_records, {}});
+  std::vector<uint32_t> prior;
+  if (!prior_path.empty()) {
+    std::ifstream f(prior_path, std::ios::binary);
+    const std::vector<char> raw{std::istreambuf_iterator<char>(f), {}};
+    if (!f && !f.eof()) die("cannot read " + prior_path);
+    auto p = cache::ExpertCache::prior_from_profile(std::as_bytes(std::span(raw)), cache::Policy{});
+    if (!p) die(prior_path + ": " + p.error().what);
+    prior = std::move(p).value();
+  }
+  auto residency = engine::ExpertResidency::open({store_path, {0, 1}, slots, ram_records, prior});
   std::printf("Expert cache: %u Slots warm in %.1f s, RAM tier %u records\n", slots, residency->stats().warm_ms / 1e3,
               ram_records);
   const auto t_load = Clock::now();

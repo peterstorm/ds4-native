@@ -13,6 +13,7 @@
 // The same policy places Experts in the VRAM Slots (warm: every Slot occupied
 // from construction on) and in the RAM tier's host buffers (empty at first:
 // Loads fill free Slots, lowest first, before anything is evicted).
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <set>
@@ -64,6 +65,16 @@ class ExpertCache {
    * at construction (by key without a prior).
    */
   static Result<ExpertCache, CacheError> create(uint32_t slots, std::span<const uint32_t> prior, Policy policy);
+
+  /**
+   * A prior from a pick-count profile (little-endian uint32[rows][384], rows >= 40; rows past the
+   * model's 40 layers, such as draft blocks, are ignored). Each layer's counts become shares first,
+   * so a layer profiled longer does not win Slots it does not deserve; shares are scaled to
+   * kPriorWeight times the score an Expert with that share reaches under `policy`, so the profile
+   * ranks finely at first and decays into recent picks within a few decay periods.
+   */
+  static Result<std::vector<uint32_t>, CacheError> prior_from_profile(std::span<const std::byte> profile, Policy policy);
+  static constexpr uint32_t kPriorWeight = 16;
 
   /** No Expert resident: Loads take free Slots, lowest first, until none is left. */
   static Result<ExpertCache, CacheError> empty(uint32_t slots, Policy policy);

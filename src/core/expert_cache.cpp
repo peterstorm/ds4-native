@@ -1,6 +1,8 @@
 #include "core/expert_cache.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <cstddef>
 #include <numeric>
 
 namespace ds4n::cache {
@@ -113,6 +115,39 @@ Result<Plan, CacheError> ExpertCache::plan(std::span<const ExpertKey> needed) {
     plan.loads.push_back({k, slot, evicted});
   }
   return R::ok(std::move(plan));
+}
+
+}  // namespace ds4n::cache
+
+namespace ds4n::cache {
+
+Result<std::vector<uint32_t>, CacheError> ExpertCache::prior_from_profile(std::span<const std::byte> profile,
+                                                                         Policy policy) {
+  using R = Result<std::vector<uint32_t>, CacheError>;
+  constexpr uint32_t kLayers = kKeys / 384, kExperts = 384;
+  constexpr size_t kRowBytes = kExperts * 4;
+  if (profile.size() % kRowBytes != 0 || profile.size() / kRowBytes < kLayers)
+    return R::err({"a profile is uint32[rows][384] with at least 40 rows"});
+  if (policy.decay_period == 0) return R::err({"decay period must be positive"});
+  auto count = [&](uint32_t key) {
+    uint32_t v = 0;
+    for (int b = 3; b >= 0; b--) v = v << 8 | std::to_integer<uint32_t>(profile[key * 4 + b]);
+    return v;
+  };
+  // Under exact top-6 routing a layer sees 6 picks per token; in steady state a score is about
+  // twice the picks of one decay period (halved once per period).
+  const double steady = 2.0 * 6.0 * policy.decay_period / kLayers;
+  std::vector<uint32_t> prior(kKeys);
+  for (uint32_t layer = 0; layer < kLayers; layer++) {
+    uint64_t total = 0;
+    for (uint32_t e = 0; e < kExperts; e++) total += count(layer * kExperts + e);
+    if (total == 0) return R::err({"profile layer " + std::to_string(layer) + " has no picks"});
+    for (uint32_t e = 0; e < kExperts; e++) {
+      const double share = static_cast<double>(count(layer * kExperts + e)) / static_cast<double>(total);
+      prior[layer * kExperts + e] = static_cast<uint32_t>(std::lround(share * steady * kPriorWeight));
+    }
+  }
+  return R::ok(std::move(prior));
 }
 
 }  // namespace ds4n::cache
