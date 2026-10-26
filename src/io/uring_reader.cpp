@@ -6,7 +6,7 @@
 
 namespace ds4n::io {
 
-Result<UringReader, IoError> UringReader::create(unsigned queue_depth) {
+Result<UringReader, IoError> UringReader::create(unsigned queue_depth, bool direct) {
   using R = Result<UringReader, IoError>;
   if (queue_depth == 0) return R::err({"queue depth must be positive"});
   UringReader r;
@@ -18,10 +18,12 @@ Result<UringReader, IoError> UringReader::create(unsigned queue_depth) {
     return R::err({std::string("io_uring_queue_init: ") + std::strerror(-rc)});
   }
   r.depth_ = queue_depth;
+  r.direct_ = direct;
   return R::ok(std::move(r));
 }
 
-UringReader::UringReader(UringReader&& o) noexcept : ring_(o.ring_), depth_(o.depth_), in_flight_(o.in_flight_) {
+UringReader::UringReader(UringReader&& o) noexcept
+    : ring_(o.ring_), depth_(o.depth_), in_flight_(o.in_flight_), direct_(o.direct_) {
   o.ring_ = nullptr;
 }
 
@@ -31,6 +33,7 @@ UringReader& UringReader::operator=(UringReader&& o) noexcept {
     ring_ = o.ring_;
     depth_ = o.depth_;
     in_flight_ = o.in_flight_;
+    direct_ = o.direct_;
     o.ring_ = nullptr;
   }
   return *this;
@@ -48,7 +51,7 @@ Result<unsigned, IoError> UringReader::submit(std::span<const ReadRequest> reqs)
   using R = Result<unsigned, IoError>;
   if (in_flight_ + reqs.size() > depth_) return R::err({"submit would exceed the queue depth"});
   for (const ReadRequest& q : reqs) {
-    if (q.offset % 4096 || reinterpret_cast<uintptr_t>(q.dest.data()) % 4096 || q.dest.size() % 4096)
+    if (direct_ && (q.offset % 4096 || reinterpret_cast<uintptr_t>(q.dest.data()) % 4096 || q.dest.size() % 4096))
       return R::err({"O_DIRECT read is not 4 KiB aligned"});
     io_uring_sqe* sqe = io_uring_get_sqe(ring_);
     if (!sqe) return R::err({"submission queue full"});

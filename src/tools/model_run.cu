@@ -199,7 +199,7 @@ int main(int argc, char** argv) {
 
     // One decode step of the whole model; the logits only when asked for.
     engram::History history;
-    std::vector<double> step_ms;
+    std::vector<double> step_ms, host_ms;  // whole steps; the host's part before launching (embedding, Engram rows)
     auto run_token = [&](int64_t p, int32_t token, bool want_logits) -> std::vector<float> {
       if (token < 0 || token >= model::kVocab) die("token id out of range: " + std::to_string(token));
       const auto t0 = Clock::now();
@@ -208,13 +208,10 @@ int main(int argc, char** argv) {
       auto hashed = engram::hash_token(layout.value(), history, static_cast<uint32_t>(token), true);
       if (!hashed) die(hashed.error().what);
       history = hashed.value().next;
-      std::vector<uint8_t> raw;
-      for (int table = 0; table < 2; table++) {
-        auto r = rows.value().read(table, hashed.value().rows[table]);
-        if (!r) die(r.error().what);
-        raw.insert(raw.end(), r.value().begin(), r.value().end());
-      }
-      decoder.begin_token(p, emb.value(), raw);
+      auto raw = rows.value().read_token(hashed.value().rows);
+      if (!raw) die(raw.error().what);
+      host_ms.push_back(std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+      decoder.begin_token(p, emb.value(), raw.value());
       decoder.decode_token();
       std::vector<float> logits;
       if (want_logits) logits = decoder.logits();
@@ -246,12 +243,15 @@ int main(int argc, char** argv) {
 
     // The greedy continuation.
     step_ms.clear();
+    host_ms.clear();
     std::ostringstream steps_out;
     steps_out << "{\n  \"source\":\"ds4n\",\n  \"prompt_tokens\":" << prompt.size() << ",\n  \"top_k\":20,\n  \"steps\":[\n";
     int agree = 0, compared = 0, first_disagreement = -1;
     double max_dlp = 0.0, sum_dlp = 0.0;
     size_t n_dlp = 0;
     const int steps = oracle_steps.empty() ? max_steps : std::min<int>(max_steps, static_cast<int>(oracle_steps.size()));
+    constexpr int kWindowTokens = 64;
+    auto window_start = residency->stats();
     for (int s = 0; s < steps; s++) {
       const auto lp = compare::log_softmax(logits);
       const auto top = compare::top_k(logits, 20);
@@ -280,6 +280,20 @@ int main(int argc, char** argv) {
       const int32_t next = force ? oracle_steps[s].selected : selected;
       if (!force && eos && static_cast<uint64_t>(next) == *eos) break;
       if (s + 1 < steps) logits = run_token(static_cast<int64_t>(prompt.size() + s), next, true);
+      // Every 64 tokens: how the Expert cache settles as the context grows.
+      if ((s + 1) % kWindowTokens == 0 && steps > kWindowTokens) {
+        const auto now = residency->stats();
+        const uint64_t hits = now.hits - window_start.hits, ram = now.ram_hits - window_start.ram_hits,
+                       reads = now.store_reads - window_start.store_reads;
+        const std::vector<double> window_ms(step_ms.end() - std::min<size_t>(step_ms.size(), kWindowTokens), step_ms.end());
+        const std::vector<double> window_host(host_ms.end() - std::min<size_t>(host_ms.size(), kWindowTokens), host_ms.end());
+        std::printf("  tokens %4d-%4d: median %.2f ms per token (host %.2f before launch), Hits %.1f %%, %.1f RAM tier and "
+                    "%.1f store reads per token\n",
+                    s + 2 - kWindowTokens, s + 1, median(window_ms), median(window_host),
+                    100.0 * static_cast<double>(hits) / static_cast<double>(std::max<uint64_t>(hits + ram + reads, 1)),
+                    static_cast<double>(ram) / kWindowTokens, static_cast<double>(reads) / kWindowTokens);
+        window_start = now;
+      }
     }
     steps_out << "\n  ]\n}\n";
     write_text(out_dir + "/" + name + ".logprobs.json", steps_out.str());

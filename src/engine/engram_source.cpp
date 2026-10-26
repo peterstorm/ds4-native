@@ -70,6 +70,9 @@ Result<EngramRows, io::IoError> EngramRows::open(const std::vector<std::string>&
     if (!fd) return Out::err(fd.error());
     r.fds_.push_back(std::move(fd).value());
   }
+  auto reader = io::UringReader::create(2 * engram::kCols, false);
+  if (!reader) return Out::err(reader.error());
+  r.reader_.emplace(std::move(reader).value());
   for (int t = 0; t < engram::kLayers; t++) {
     const std::string name = "blk." + std::to_string(t == 0 ? 1 : 14) + ".engram_embd.weight";
     for (size_t s = 0; s < headers.size() && r.tables_[t].rows == 0; s++)
@@ -94,6 +97,34 @@ Result<std::vector<uint8_t>, io::IoError> EngramRows::read(int table, std::span<
     auto span = std::as_writable_bytes(std::span(out).subspan(i * engram::kRowBytes, engram::kRowBytes));
     if (auto r = io::pread_exact(fds_[t.shard], span, t.offset + static_cast<uint64_t>(ids[i]) * engram::kRowBytes); !r)
       return Out::err(r.error());
+  }
+  return Out::ok(std::move(out));
+}
+
+Result<std::vector<uint8_t>, io::IoError> EngramRows::read_token(
+    const std::array<std::array<uint32_t, engram::kCols>, engram::kLayers>& rows) const {
+  using Out = Result<std::vector<uint8_t>, io::IoError>;
+  std::vector<uint8_t> out(engram::kLayers * engram::kCols * engram::kRowBytes);
+  std::vector<io::ReadRequest> reads;
+  for (int table = 0; table < engram::kLayers; table++) {
+    const Table& t = tables_[table];
+    if (t.rows == 0) return Out::err({"Engram table " + std::to_string(table) + " is not in the opened shards"});
+    for (int i = 0; i < engram::kCols; i++) {
+      const uint32_t id = rows[table][i];
+      if (id >= t.rows) return Out::err({"Engram row id out of range"});
+      const size_t at = (static_cast<size_t>(table) * engram::kCols + i) * engram::kRowBytes;
+      reads.push_back({fds_[t.shard].get(), t.offset + static_cast<uint64_t>(id) * engram::kRowBytes,
+                       std::as_writable_bytes(std::span(out).subspan(at, engram::kRowBytes)), reads.size()});
+    }
+  }
+  if (auto s = reader_->submit(reads); !s) return Out::err(s.error());
+  for (size_t done = 0; done < reads.size();) {
+    auto c = reader_->wait(1);
+    if (!c) return Out::err(c.error());
+    for (const auto& r : c.value()) {
+      if (r.result != static_cast<int32_t>(engram::kRowBytes)) return Out::err({"Engram row read failed or short"});
+      done++;
+    }
   }
   return Out::ok(std::move(out));
 }

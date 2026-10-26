@@ -16,8 +16,8 @@ namespace ds4n::io {
 
 struct ReadRequest {
   int fd;
-  uint64_t offset;       // must be 4 KiB aligned
-  std::span<std::byte> dest;  // must be 4 KiB aligned, size a multiple of 4 KiB
+  uint64_t offset;            // 4 KiB aligned for a direct reader
+  std::span<std::byte> dest;  // 4 KiB aligned, size a multiple of 4 KiB, for a direct reader
   uint64_t tag;          // returned with the completion
 };
 
@@ -28,7 +28,8 @@ struct Completion {
 
 class UringReader {
  public:
-  static Result<UringReader, IoError> create(unsigned queue_depth);
+  /** `direct`: requests must be 4 KiB aligned (O_DIRECT files); buffered files take any offset and size. */
+  static Result<UringReader, IoError> create(unsigned queue_depth, bool direct = true);
   UringReader(UringReader&&) noexcept;
   UringReader& operator=(UringReader&&) noexcept;
   UringReader(const UringReader&) = delete;
@@ -47,6 +48,7 @@ class UringReader {
   io_uring* ring_ = nullptr;
   unsigned depth_ = 0;
   unsigned in_flight_ = 0;
+  bool direct_ = true;
 };
 
 }  // namespace ds4n::io
