@@ -3,6 +3,7 @@
 //
 //   ds4n-model-run --backbone SAFETENSORS --store STORE --gguf MERGED_GGUF --tokens DIR --names a,b
 //                  --out DIR [--oracle DIR] [--force 1] [--steps N] [--slots N] [--ram-records R] [--prior PROFILE]
+//                  [--prior-weight W] [--ram-policy recent|popular] [--ccr LAMBDA]
 //
 // For each name, DIR/<name>.tokens is antirez's --dump-tokens output (ids on the first line). The
 // prompt runs as decode steps from position 0; the next-token logits at its end go to
@@ -13,7 +14,11 @@
 // --force 1 feeds the Oracle's chosen tokens (teacher forcing), so every step compares the same
 // context; otherwise our own greedy tokens are fed until the end-of-sequence token.
 // --prior PROFILE warms the Expert cache from a pick-count profile (uint32[rows][384], e.g. Maya's
-// expert-profile.bin) instead of by key.
+// expert-profile.bin) instead of by key. --prior-weight W (default 1) scales it against recent picks (see
+// cache::ExpertCache::prior_from_profile). --ram-policy popular ranks the RAM tier by load count and
+// warms it with the profile's next-hottest Experts (default recent: last loaded, empty at first).
+// --ccr LAMBDA turns on Cache-conditional routing: resident Experts' selection scores gain LAMBDA (not
+// Exact; 0, the default, keeps routing exact).
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -67,16 +72,18 @@ std::vector<float> logits_of(const nlohmann::json& dump) {
   return v;
 }
 
-/** One step of an antirez --dump-logprobs file. */
+/** One step of a --dump-logprobs file: the greedy choice, the token the step fed on, the top-20. */
 struct OracleStep {
   int32_t selected;
+  int32_t fed;  // antirez feeds its greedy choice; a teacher-forced ds4n dump records the forced token
   std::vector<std::pair<int32_t, double>> top;  // (id, logprob)
 };
 
 std::vector<OracleStep> steps_of(const nlohmann::json& dump) {
   std::vector<OracleStep> out;
   for (const auto& s : dump.at("steps")) {
-    OracleStep o{s.at("selected").at("id").get<int32_t>(), {}};
+    const int32_t selected = s.at("selected").at("id").get<int32_t>();
+    OracleStep o{selected, s.contains("fed") ? s.at("fed").at("id").get<int32_t>() : selected, {}};
     for (const auto& t : s.at("top_logprobs")) o.top.emplace_back(t.at("token").at("id").get<int32_t>(), t.at("logprob").get<double>());
     out.push_back(std::move(o));
   }
@@ -122,7 +129,9 @@ int main(int argc, char** argv) {
   std::string backbone_path, store_path, gguf_path, tokens_dir, names_arg, out_dir, oracle_dir, prior_path;
   bool force = false;
   int max_steps = 64;
-  uint32_t slots = 8000, ram_records = 512;
+  uint32_t slots = 8000, ram_records = 512, prior_weight = 1;
+  float ccr = 0.0f;
+  engine::RamPolicy ram_policy = engine::RamPolicy::Recent;
   for (int i = 1; i < argc; i++) {
     const std::string s = argv[i];
     if (i + 1 >= argc) die("missing value for " + s);
@@ -138,6 +147,14 @@ int main(int argc, char** argv) {
     else if (s == "--slots") slots = static_cast<uint32_t>(std::stoul(argv[++i]));
     else if (s == "--ram-records") ram_records = static_cast<uint32_t>(std::stoul(argv[++i]));
     else if (s == "--prior") prior_path = argv[++i];
+    else if (s == "--prior-weight") prior_weight = static_cast<uint32_t>(std::stoul(argv[++i]));
+    else if (s == "--ccr") ccr = std::stof(argv[++i]);
+    else if (s == "--ram-policy") {
+      const std::string v = argv[++i];
+      if (v == "recent") ram_policy = engine::RamPolicy::Recent;
+      else if (v == "popular") ram_policy = engine::RamPolicy::Popular;
+      else die("--ram-policy takes recent or popular");
+    }
     else die("unknown argument " + s);
   }
   if (backbone_path.empty() || store_path.empty() || gguf_path.empty() || tokens_dir.empty() || names_arg.empty() ||
@@ -157,11 +174,11 @@ int main(int argc, char** argv) {
     std::ifstream f(prior_path, std::ios::binary);
     const std::vector<char> raw{std::istreambuf_iterator<char>(f), {}};
     if (!f && !f.eof()) die("cannot read " + prior_path);
-    auto p = cache::ExpertCache::prior_from_profile(std::as_bytes(std::span(raw)), cache::Policy{});
+    auto p = cache::ExpertCache::prior_from_profile(std::as_bytes(std::span(raw)), cache::Policy{}, prior_weight);
     if (!p) die(prior_path + ": " + p.error().what);
     prior = std::move(p).value();
   }
-  auto residency = engine::ExpertResidency::open({store_path, {0, 1}, slots, ram_records, prior});
+  auto residency = engine::ExpertResidency::open({store_path, {0, 1}, slots, ram_records, prior, 40, ram_policy, ccr});
   std::printf("Expert cache: %u Slots warm in %.1f s, RAM tier %u records\n", slots, residency->stats().warm_ms / 1e3,
               ram_records);
   const auto t_load = Clock::now();
@@ -257,7 +274,9 @@ int main(int argc, char** argv) {
       const auto top = compare::top_k(logits, 20);
       const int32_t selected = top.front();
       if (s) steps_out << ",\n";
-      steps_out << "    {\"step\":" << s << ",\"selected\":{\"id\":" << selected << "},\"top_logprobs\":[";
+      const int32_t fed = force ? oracle_steps[s].fed : selected;  // the token this step feeds on
+      steps_out << "    {\"step\":" << s << ",\"selected\":{\"id\":" << selected << "},\"fed\":{\"id\":" << fed
+                << "},\"top_logprobs\":[";
       for (size_t i = 0; i < top.size(); i++) {
         char buf[96];
         std::snprintf(buf, sizeof buf, "%s{\"token\":{\"id\":%d},\"logit\":%.9g,\"logprob\":%.9g}", i ? "," : "", top[i],
@@ -277,7 +296,7 @@ int main(int argc, char** argv) {
           n_dlp++;
         }
       }
-      const int32_t next = force ? oracle_steps[s].selected : selected;
+      const int32_t next = fed;
       if (!force && eos && static_cast<uint64_t>(next) == *eos) break;
       if (s + 1 < steps) logits = run_token(static_cast<int64_t>(prompt.size() + s), next, true);
       // Every 64 tokens: how the Expert cache settles as the context grows.

@@ -30,6 +30,12 @@ struct RouterParams {
   const float* bias;     // [384]
   const float* bias_vl;  // [384], used for image-span tokens; may be null
   float route_scale;
+  // Cache-conditional routing: `resident_bonus` is added to the selection score of every Expert the
+  // residency table (host-mapped, -1: no Slot) says is resident, row `resident_layer`; 0 keeps
+  // routing exact (the table is not read). The routing weights stay the unbiased scores.
+  const int32_t* resident = nullptr;
+  int resident_layer = 0;
+  float resident_bonus = 0.0f;
 };
 
 /**

@@ -1,3 +1,5 @@
+#include <cuda/atomic>
+
 #include <climits>
 
 #include "core/det_math.hpp"
@@ -44,6 +46,14 @@ __global__ void __launch_bounds__(moe::kExperts) route_kernel(const float* __res
   if (e == 0) failed = 0;
   __syncthreads();
 
+  // Cache-conditional routing (opt-in): a resident Expert's selection score gains the bonus.
+  float bonus = 0.0f;
+  if (p.resident_bonus != 0.0f) {
+    ::cuda::atomic_ref<int32_t, ::cuda::thread_scope_system> slot(
+        *const_cast<int32_t*>(p.resident + p.resident_layer * moe::kExperts + e));
+    if (slot.load(::cuda::memory_order_relaxed) >= 0) bonus = p.resident_bonus;
+  }
+
   bool finite = true;
 #pragma unroll
   for (int n = 0; n < kMaxTokens; n++) {
@@ -55,7 +65,7 @@ __global__ void __launch_bounds__(moe::kExperts) route_kernel(const float* __res
     const float* bias = image != nullptr && image[n] != 0 && p.bias_vl != nullptr ? p.bias_vl : p.bias;
     const float sc = score(l);
     scores[n][e] = sc;
-    biased[n][e] = __fadd_rn(sc, bias[e]);
+    biased[n][e] = bonus != 0.0f ? __fadd_rn(__fadd_rn(sc, bias[e]), bonus) : __fadd_rn(sc, bias[e]);
   }
   if (!finite) atomicOr(&failed, 1);
   __syncthreads();

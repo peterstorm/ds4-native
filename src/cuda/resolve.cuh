@@ -22,7 +22,9 @@ struct ExpertDirectory {
   const int32_t* slot_of = nullptr;  // [moe::kResidencyKeys], host-mapped, shared by both GPUs; -1: no Slot
   const uint8_t* pool = nullptr;     // this GPU's Slots: one Half payload per Slot, back to back
   uint64_t slot_bytes = 0;           // one Half payload (gate part, up part, down part)
-  moe::Mailbox* mailbox = nullptr;   // host-mapped; set on GPU 0 only (it posts the steps)
+  moe::Mailbox* mailbox = nullptr;   // host-mapped; GPU 0 posts the steps, GPU 1 its routed count
+  int rank = 0;
+  float route_bonus = 0.0f;          // Cache-conditional routing: added to resident Experts' selection scores (0: exact)
   const moe::Board* board = nullptr; // host-mapped
   int key_layers = 40;               // layer L's Experts are keyed as layer L % key_layers (a test store's few layers)
 };

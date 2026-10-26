@@ -82,12 +82,22 @@ struct ExpertResidency::State {
   }
   /** Both Halves of RAM tier record `record` into VRAM Slot `slot`, each on its GPU's copy stream. */
   void copy_record(uint32_t record, uint32_t slot);
-  /** Fill the Loads' VRAM Slots (at most kBatch), returning when both GPUs' copies landed. */
+  /** One record to read from the store: into RAM tier buffer `buffer`, then (if set) VRAM Slot `slot`. */
+  struct RecordRead {
+    cache::ExpertKey key;
+    uint32_t buffer;
+    std::optional<uint32_t> slot;
+  };
+  /** Read records (at most kBatch) in 1 MiB chunks; each chunk bound for VRAM is copied to its GPU as it lands. */
+  void read_records(std::span<const RecordRead> records_in);
+  /** Fill the Loads' VRAM Slots (at most kBatch) through the RAM tier, returning when both GPUs' copies landed. */
   void load(std::span<const cache::Load> loads, ResidencyStats& counts);
+  /** Wait until both GPUs' copy streams drained. */
+  void sync_copies();
   /** Drain posted steps in order until stopped. */
   void serve();
-  /** One posted step through the cache; Loads land before the table names them. */
-  void serve_step(const moe::PostedStep& step, ResidencyStats& counts);
+  /** Posted step `s` through the cache; Loads land, and GPU 1 has routed the step, before the table changes. */
+  void serve_step(const moe::PostedStep& step, uint64_t s, ResidencyStats& counts);
 };
 
 ExpertResidency::State::~State() {
@@ -126,15 +136,30 @@ void ExpertResidency::State::load(std::span<const cache::Load> loads, ResidencyS
     copy_record(h.slot, slot_of.at(h.key));
     counts.ram_hits++;
   }
-  // Store reads land in the RAM tier buffers they took, chunk by chunk; each chunk's copy to its
-  // GPU starts as it lands. Tag: key << 8 | chunk index within the record (Half-major).
+  // Store reads land in the RAM tier buffers they took.
+  std::vector<RecordRead> from_store;
+  for (const auto& l : placed.value().loads) from_store.push_back({l.key, l.slot, slot_of.at(l.key)});
+  counts.store_reads += from_store.size();
+  read_records(from_store);
+  sync_copies();
+}
+
+void ExpertResidency::State::sync_copies() {
+  for (int h = 0; h < 2; h++) {
+    engine::check(cudaSetDevice(config.devices[h]), "cudaSetDevice");
+    engine::check(cudaStreamSynchronize(copy[h]), "Half upload");
+  }
+}
+
+void ExpertResidency::State::read_records(std::span<const RecordRead> records_in) {
+  // Tag: index into records_in << 8 | chunk index within the record (Half-major).
   std::vector<io::ReadRequest> reads;
-  for (const auto& l : placed.value().loads) {
-    const store::ExpertId id{l.key / store::kExperts, l.key % store::kExperts};
+  for (size_t i = 0; i < records_in.size(); i++) {
+    const RecordRead& r = records_in[i];
+    const store::ExpertId id{r.key / store::kExperts, r.key % store::kExperts};
     for (uint32_t c = 0; c < store::kHalves * kChunksPerHalf; c++)
       reads.push_back({store.get(), store::record_offset(id) + c * kReadChunk,
-                       std::span(records[l.slot] + c * kReadChunk, kReadChunk), uint64_t{l.key} << 8 | c});
-    counts.store_reads++;
+                       std::span(records[r.buffer] + c * kReadChunk, kReadChunk), uint64_t{i} << 8 | c});
   }
   if (!reads.empty()) {
     if (auto s = reader.submit(reads); !s) fail("Expert store: " + s.error().what);
@@ -144,26 +169,23 @@ void ExpertResidency::State::load(std::span<const cache::Load> loads, ResidencyS
       for (const auto& c : done.value()) {
         if (c.result != static_cast<int32_t>(kReadChunk))
           fail("Expert store: short or failed read (" + std::to_string(c.result) + ")");
-        const auto key = static_cast<cache::ExpertKey>(c.tag >> 8);
+        const RecordRead& r = records_in[c.tag >> 8];
+        landed++;
+        if (!r.slot) continue;
         const auto chunk = static_cast<uint32_t>(c.tag & 0xFF);
         const int h = static_cast<int>(chunk / kChunksPerHalf);
         const uint64_t at = (chunk % kChunksPerHalf) * kReadChunk;  // within the Half
         const uint64_t bytes = std::min(kReadChunk, store::kHalfPayloadBytes - at);
         engine::check(cudaSetDevice(config.devices[h]), "cudaSetDevice");
-        engine::check(cudaMemcpyAsync(slot_ptr(h, slot_of.at(key)) + at, records[*ram.slot_of(key)] + h * store::kHalfStride + at,
-                              bytes, cudaMemcpyHostToDevice, copy[h]),
-              "Half upload");
-        landed++;
+        engine::check(cudaMemcpyAsync(slot_ptr(h, *r.slot) + at, records[r.buffer] + h * store::kHalfStride + at, bytes,
+                                      cudaMemcpyHostToDevice, copy[h]),
+                      "Half upload");
       }
     }
   }
-  for (int h = 0; h < 2; h++) {
-    engine::check(cudaSetDevice(config.devices[h]), "cudaSetDevice");
-    engine::check(cudaStreamSynchronize(copy[h]), "Half upload");
-  }
 }
 
-void ExpertResidency::State::serve_step(const moe::PostedStep& step, ResidencyStats& counts) {
+void ExpertResidency::State::serve_step(const moe::PostedStep& step, uint64_t s, ResidencyStats& counts) {
   counts.layer_steps++;
   if (step.jobs <= 0) return;  // failed routing: nothing to place (the GPUs run the shared Expert only)
   if (step.jobs > moe::kMaxJobs || step.layer < 0 || step.layer >= static_cast<int32_t>(store::kLayers))
@@ -176,6 +198,12 @@ void ExpertResidency::State::serve_step(const moe::PostedStep& step, ResidencySt
   if (placed.value().loads.empty()) return;
   const auto t0 = Clock::now();
   load(placed.value().loads, counts);
+  // The table changes only once GPU 1 routed this step too: Cache-conditional routing reads it.
+  const auto wait_start = Clock::now();
+  while (std::atomic_ref<uint64_t>(mailbox->peer_routed).load(std::memory_order_acquire) < s) {
+    if (Clock::now() - wait_start > std::chrono::seconds(10)) fail("GPU 1 never routed step " + std::to_string(s));
+    _mm_pause();
+  }
   // The copies landed: now the table may name the new Slots (and forget the evicted Experts).
   for (const auto& l : placed.value().loads) {
     if (l.evicted) std::atomic_ref<int32_t>(table[*l.evicted]).store(-1, std::memory_order_relaxed);
@@ -198,7 +226,7 @@ void ExpertResidency::State::serve() {
       ResidencyStats counts;
       for (uint64_t s = done + 1; s <= posted; s++) {
         const moe::PostedStep step = mailbox->ring[(s - 1) % moe::kMissRing];
-        serve_step(step, counts);
+        serve_step(step, s, counts);
         std::atomic_ref<uint64_t>(board->served).store(s, std::memory_order_release);
         done = s;
       }
@@ -246,7 +274,17 @@ std::unique_ptr<ExpertResidency> ExpertResidency::open(const ResidencyConfig& co
   }
   auto vram = cache::ExpertCache::create(config.slots, prior, cache::Policy{});
   if (!vram) fail("Expert cache: " + vram.error().what);
-  auto ram = cache::ExpertCache::empty(config.ram_records, cache::Policy{4096, false});
+  // The RAM tier: Recent ranks by last load and starts empty; Popular ranks by decayed load count
+  // and, with a prior, starts with the profile's next-hottest Experts after the VRAM set.
+  const bool popular = config.ram_policy == RamPolicy::Popular;
+  const cache::Policy ram_policy{4096, popular};
+  std::vector<uint32_t> ram_prior;
+  if (popular && !prior.empty()) {
+    ram_prior = prior;
+    for (const auto& l : vram.value().warm_start()) ram_prior[l.key] = 0;
+  }
+  auto ram = ram_prior.empty() ? cache::ExpertCache::empty(config.ram_records, ram_policy)
+                               : cache::ExpertCache::create(config.ram_records, ram_prior, ram_policy);
   if (!ram) fail("RAM tier: " + ram.error().what);
   auto s = std::make_unique<State>(config, std::move(fd).value(), std::move(reader).value(), std::move(vram).value(),
                                    std::move(ram).value());
@@ -265,12 +303,25 @@ std::unique_ptr<ExpertResidency> ExpertResidency::open(const ResidencyConfig& co
     for (uint32_t i = 0; i < n; i++) s->records.push_back(static_cast<std::byte*>(p) + i * store::kRecordStride);
   }
 
-  // Warm start: every Slot gets its Expert, kBatch records at a time; then the table names them.
+  // Warm start: every Slot gets its Expert, kBatch records at a time through the first RAM tier
+  // buffers as plain staging (outside the RAM tier's policy); then a warm RAM tier is filled, and
+  // the table names the Slots.
   const auto t0 = Clock::now();
   const auto warm = s->vram.warm_start();
-  ResidencyStats ignored;
-  for (size_t i = 0; i < warm.size(); i += kBatch)
-    s->load(std::span(warm).subspan(i, std::min<size_t>(kBatch, warm.size() - i)), ignored);
+  for (size_t i = 0; i < warm.size(); i += kBatch) {
+    std::vector<State::RecordRead> batch;
+    for (size_t j = i; j < std::min<size_t>(warm.size(), i + kBatch); j++)
+      batch.push_back({warm[j].key, static_cast<uint32_t>(j - i), warm[j].slot});
+    s->read_records(batch);
+    s->sync_copies();
+  }
+  const auto ram_warm = s->ram.warm_start();
+  for (size_t i = 0; i < ram_warm.size(); i += kBatch) {
+    std::vector<State::RecordRead> batch;
+    for (size_t j = i; j < std::min<size_t>(ram_warm.size(), i + kBatch); j++)
+      batch.push_back({ram_warm[j].key, ram_warm[j].slot, std::nullopt});
+    s->read_records(batch);
+  }
   s->table = host_mapped<int32_t>(moe::kResidencyKeys);
   std::fill(s->table, s->table + moe::kResidencyKeys, -1);
   for (const auto& l : warm) s->table[l.key] = static_cast<int32_t>(l.slot);
@@ -288,10 +339,10 @@ std::unique_ptr<ExpertResidency> ExpertResidency::open(const ResidencyConfig& co
     d.slot_of = static_cast<const int32_t*>(p);
     engine::check(cudaHostGetDevicePointer(&p, s->board, 0), "cudaHostGetDevicePointer");
     d.board = static_cast<const moe::Board*>(p);
-    if (g == 0) {
-      engine::check(cudaHostGetDevicePointer(&p, s->mailbox, 0), "cudaHostGetDevicePointer");
-      d.mailbox = static_cast<moe::Mailbox*>(p);
-    }
+    engine::check(cudaHostGetDevicePointer(&p, s->mailbox, 0), "cudaHostGetDevicePointer");
+    d.mailbox = static_cast<moe::Mailbox*>(p);
+    d.rank = g;
+    d.route_bonus = config.route_bonus;
     d.pool = s->pool[g];
     d.slot_bytes = store::kHalfPayloadBytes;
     d.key_layers = static_cast<int>(config.key_layers);

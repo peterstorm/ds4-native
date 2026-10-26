@@ -39,6 +39,14 @@ struct ResidencyError : std::runtime_error {
   using std::runtime_error::runtime_error;
 };
 
+/**
+ * How the RAM tier chooses its records. Recent: the most recently loaded (least recently used
+ * goes), empty at first. Popular: ranked by decayed load count like the VRAM Slots, warmed (with a
+ * prior) by the profile's next-hottest Experts after the VRAM set, so a first Miss on a popular
+ * Expert is served from RAM.
+ */
+enum class RamPolicy { Recent, Popular };
+
 struct ResidencyConfig {
   std::string store_path;
   std::array<int, 2> devices{0, 1};  // device of Half 0, Half 1
@@ -48,6 +56,10 @@ struct ResidencyConfig {
   // Experts of layer L are keyed (and read from the store) as layer L % key_layers: a test store
   // holding only the first few layers can serve every layer. 40 for a real store.
   uint32_t key_layers = 40;
+  RamPolicy ram_policy = RamPolicy::Recent;
+  // Cache-conditional routing: a bonus added to resident Experts' router selection scores. Not Exact:
+  // outputs then depend on what is resident. 0 (the default) keeps routing exact.
+  float route_bonus = 0.0f;
 };
 
 /** Counters since open(); a Hit is a needed Expert found in a VRAM Slot. */

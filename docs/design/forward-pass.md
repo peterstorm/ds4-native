@@ -203,8 +203,25 @@ Measured (`ds4n-layer-check --slots N --ram-records R`, layers 0-3, real Experts
   Base step barely moved (9.53 ms vs 9.59 with the per-layer round trip): the earlier profile's
   idle time was mostly node-tracing overhead, and the step is GPU work (~200 us per layer).
 
-Next: Miss telemetry by Loads per call, prefetch from a predicted next-layer routing, a pick-count
-prior for the warm start, and Cache-conditional routing behind a flag (default off: not Exact).
+**Whole model, long generations** (`ds4n-model-run`, 8,500 Slots, 2,048 RAM tier records, the Maya
+profile as a weight-1 prior, RAM tier ranked by load count; code prompt, free running to EOS):
+
+| Routing | tok/s | steady ms/token | steady Hits | store reads/token |
+|---|---|---|---|---|
+| exact | 49.3 | 19.5 | 97.4 % | 6.2 |
+| Cache-conditional, λ 0.05 | 69.9 | 13.9 | 98.7 % | 2.9 |
+| λ 0.1 | 83.6 | 11.6 | 99.2 % | 1.6 |
+| λ 0.2 | 99.5 | 9.8 | 99.6 % | 0.9 |
+
+Its cost against the exact run (teacher forced on the same tokens, 64 steps; λ = 0 reproduces the
+exact run to the bit in another process): greedy agreement code / prose / math 64 / 54 / 61 at
+λ 0.05, 63 / 52 / 61 at λ 0.2 -- antirez's Q8_0 dense differs from exact by 64 / 59 / 62. Prompt-end
+KL against exact: code 0.001-0.007, prose and math 0.11-0.46 (routing-sensitive prompts). A
+profile prior at weight 16 hurt (29.5 tok/s: the profile outranked this traffic's recent picks);
+weight 1 helps the cold start. Per Miss ~1.6-1.8 ms (one NVMe, ~13 GB/s).
+
+Next: prefetch from a predicted next-layer routing; the warm start from a profile of the
+engine's own traffic.
 
 ## Validation path
 

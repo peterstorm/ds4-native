@@ -69,12 +69,13 @@ class ExpertCache {
   /**
    * A prior from a pick-count profile (little-endian uint32[rows][384], rows >= 40; rows past the
    * model's 40 layers, such as draft blocks, are ignored). Each layer's counts become shares first,
-   * so a layer profiled longer does not win Slots it does not deserve; shares are scaled to
-   * kPriorWeight times the score an Expert with that share reaches under `policy`, so the profile
-   * ranks finely at first and decays into recent picks within a few decay periods.
+   * so a layer profiled longer does not win Slots it does not deserve; shares are scaled to `weight`
+   * times the score an Expert with that share reaches under `policy`: weight 1 lets recent picks
+   * outrank the profile within about a decay period, larger weights keep the profile for longer
+   * (log2(weight) more decay periods) and rank its tail more finely.
    */
-  static Result<std::vector<uint32_t>, CacheError> prior_from_profile(std::span<const std::byte> profile, Policy policy);
-  static constexpr uint32_t kPriorWeight = 16;
+  static Result<std::vector<uint32_t>, CacheError> prior_from_profile(std::span<const std::byte> profile, Policy policy,
+                                                                     uint32_t weight);
 
   /** No Expert resident: Loads take free Slots, lowest first, until none is left. */
   static Result<ExpertCache, CacheError> empty(uint32_t slots, Policy policy);

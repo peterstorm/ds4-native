@@ -85,7 +85,7 @@ One Step's routing: the distinct routed Experts in ascending id, the tokens each
 _Avoid_: dispatch table, job list
 
 **Cache-conditional routing**:
-Adding a bonus λ to resident Experts' router scores before top-6 selection (approximation, opt-in).
+Adding a bonus λ to resident Experts' router selection scores before top-6 (the routing weights stay the unbiased scores): an approximation, opt-in (`ResidencyConfig::route_bonus`, `ds4n-model-run --ccr`), λ = 0 by default. Both GPUs route against the same residency table, since the host changes it for a step only after both routed it.
 _Avoid_: CCR in prose (acronym fine in tables), routing bias (ambiguous with model's own bias terms)
 
 ### Correctness

@@ -12,7 +12,10 @@
 //     the host served that step;
 //   - the host drains the ring in order: Hits only touch the cache; Loads copy
 //     both Halves into their Slots, then (only after the copies landed) update
-//     the table, then mark the step served.
+//     the table, then mark the step served;
+//   - the host changes the table for step s only after both GPUs routed step s
+//     (GPU 1 posts its step count too), so routing that reads the table
+//     (Cache-conditional routing) sees the same state on both GPUs.
 // GPU 0 never runs more than kMissRing steps ahead of the host (it waits for
 // ring space), so no posted step is overwritten before the host read it.
 #include <cstdint>
@@ -30,9 +33,10 @@ struct PostedStep {
   int32_t expert[kMaxJobs];
 };
 
-/** Written by GPU 0. */
+/** Written by the GPUs: GPU 0 posts each step's needs; GPU 1 posts only how far it has routed. */
 struct Mailbox {
-  uint64_t posted;  // steps posted; step s is at ring[(s - 1) % kMissRing]
+  uint64_t posted;       // GPU 0: steps posted; step s is at ring[(s - 1) % kMissRing]
+  uint64_t peer_routed;  // GPU 1: steps routed (and resolved)
   PostedStep ring[kMissRing];
 };
 

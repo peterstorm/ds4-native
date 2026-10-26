@@ -63,8 +63,13 @@ __global__ void __launch_bounds__(kThreads) resolve_kernel(const moe::Plan* __re
   int32_t slot = mine ? load_slot(dir.slot_of, key) : 0;
   if (mine && slot < 0) atomicOr(&any_miss, 1);
 
-  // GPU 0 posts the step, once the ring has room (the host lags at most kMissRing steps).
-  if (dir.mailbox) {
+  // GPU 0 posts the step, once the ring has room (the host lags at most kMissRing steps); GPU 1 posts
+  // that it routed the step (the host changes the table for a step only after both GPUs routed it).
+  if (dir.mailbox && dir.rank == 1 && t == 0) {
+    ::cuda::atomic_ref<uint64_t, ::cuda::thread_scope_system> routed(dir.mailbox->peer_routed);
+    routed.store(s, ::cuda::memory_order_release);
+  }
+  if (dir.mailbox && dir.rank == 0) {
     if (t == 0) wait_for_host(dir.board, [s](uint64_t served) { return s - served <= moe::kMissRing; });
     __syncthreads();
     moe::PostedStep& e = dir.mailbox->ring[(s - 1) % moe::kMissRing];

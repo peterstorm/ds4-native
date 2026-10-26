@@ -181,10 +181,10 @@ TEST_CASE("a profile becomes a prior of per-layer shares") {
   counts[0] = 385;                            // layer 0: Expert 0 takes 385 of 768 picks
   for (uint32_t e = 0; e < 384; e++) counts[5 * 384 + e] = 1000;  // layer 5: uniform but profiled longer
   const Policy policy{4096, true};
-  const auto prior = ExpertCache::prior_from_profile(encode_profile(counts), policy).value();
+  const auto prior = ExpertCache::prior_from_profile(encode_profile(counts), policy, 16).value();
   REQUIRE(prior.size() == kKeys);
   CHECK(prior[0] > prior[1]);
-  CHECK(prior[0] == std::lround(385.0 / 768.0 * 2 * 6 * 4096 / 40.0 * ExpertCache::kPriorWeight));
+  CHECK(prior[0] == std::lround(385.0 / 768.0 * 2 * 6 * 4096 / 40.0 * 16));
   CHECK(prior[5 * 384 + 7] == prior[9 * 384 + 7]);  // a longer-profiled uniform layer ranks like any uniform layer
   CHECK(prior[1 * 384] == prior[39 * 384 + 383]);
 
@@ -194,9 +194,10 @@ TEST_CASE("a profile becomes a prior of per-layer shares") {
 }
 
 TEST_CASE("prior_from_profile rejects malformed profiles") {
-  CHECK_FALSE(ExpertCache::prior_from_profile(encode_profile(std::vector<uint32_t>(39 * 384, 1)), {}).is_ok());
-  CHECK_FALSE(ExpertCache::prior_from_profile(encode_profile(std::vector<uint32_t>(40 * 384 + 1, 1)), {}).is_ok());
+  CHECK_FALSE(ExpertCache::prior_from_profile(encode_profile(std::vector<uint32_t>(39 * 384, 1)), {}, 1).is_ok());
+  CHECK_FALSE(ExpertCache::prior_from_profile(encode_profile(std::vector<uint32_t>(40 * 384 + 1, 1)), {}, 1).is_ok());
   std::vector<uint32_t> empty_layer(40 * 384, 1);
   std::fill(empty_layer.begin() + 3 * 384, empty_layer.begin() + 4 * 384, 0u);
-  CHECK_FALSE(ExpertCache::prior_from_profile(encode_profile(empty_layer), {}).is_ok());
+  CHECK_FALSE(ExpertCache::prior_from_profile(encode_profile(empty_layer), {}, 1).is_ok());
+  CHECK_FALSE(ExpertCache::prior_from_profile(encode_profile(std::vector<uint32_t>(40 * 384, 1)), {}, 0).is_ok());
 }

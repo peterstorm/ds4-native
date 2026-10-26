@@ -508,8 +508,9 @@ void Decoder::Gpu::enqueue_layer(int layer, bool produced_now) {
   run(l.shared_down, side(3));
   branch_done(3);
   cuda::bf16_gemv(d.router, xf_f, moe::kExperts, kDim, 1, kSplitsBf16, logits, st);
-  cuda::route(logits, kSplitsBf16, 1, nullptr, {d.router_bias, nullptr, kRouteScale}, route_experts, route_weights, plan,
-              st);
+  cuda::route(logits, kSplitsBf16, 1, nullptr,
+              {d.router_bias, nullptr, kRouteScale, experts.slot_of, layer % experts.key_layers, experts.route_bonus},
+              route_experts, route_weights, plan, st);
 
   // The routed Experts: resolved on the device (a Miss waits for the Expert cache's service), then
   // gate/up, SwiGLU, down; then the combine in Plan order with the shared Expert, the exchange, hc_post.
