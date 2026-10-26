@@ -3,9 +3,11 @@
 // the Backbone's real weights and the Expert store's real routed Experts.
 // Every layer of every step compares the attention slots, the routing plan,
 // the attention and MoE outputs after their exchanges, and the stream. Engram
-// table rows are random (identical on both sides) until the tables are converted.
+// table rows are random (identical on both sides) unless real tables are given.
 //   ds4n-layer-check --backbone SAFETENSORS --store STORE [--first L] [--layers N] [--steps S]
-//                    [--expert-layers M]
+//                    [--expert-layers M] [--gguf-meta GGUF --engram-shards A,B,...]
+// With --gguf-meta (a GGUF carrying deepseek41.engram.*) and --engram-shards (the files holding
+// the Engram tables), Engram layers hash the tokens and read real table rows.
 // --expert-layers M reads layer L's Experts from store layer L % M (a store holding only the
 // first M layers can still exercise later layers: exactness needs the same Experts on both sides).
 #include <cuda_runtime.h>
@@ -14,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <optional>
 #include <random>
 #include <string>
 #include <tuple>
@@ -25,6 +28,7 @@
 #include "core/store_layout.hpp"
 #include "cuda/engram.cuh"
 #include "engine/decoder.cuh"
+#include "engine/engram_source.hpp"
 #include "engine/host_layer.hpp"
 #include "io/file.hpp"
 
@@ -89,6 +93,7 @@ int main(int argc, char** argv) {
   setenv("CUDA_MODULE_LOADING", "EAGER", 1);  // before any CUDA call: see engine/decoder.cuh
   std::string backbone_path, store_path;
   int first = 0, layers = 4, steps = 3, expert_layers = model::kLayers;
+  std::string gguf_meta, engram_shards;
   for (int i = 1; i < argc; i++) {
     const std::string s = argv[i];
     if (i + 1 >= argc) die("missing value for " + s);
@@ -98,6 +103,8 @@ int main(int argc, char** argv) {
     else if (s == "--steps") steps = std::stoi(argv[++i]);
     else if (s == "--first") first = std::stoi(argv[++i]);
     else if (s == "--expert-layers") expert_layers = std::stoi(argv[++i]);
+    else if (s == "--gguf-meta") gguf_meta = argv[++i];
+    else if (s == "--engram-shards") engram_shards = argv[++i];
     else die("unknown argument " + s);
   }
   if (backbone_path.empty() || store_path.empty() || layers < 1 || first < 0 || first + layers > model::kLayers ||
@@ -152,6 +159,25 @@ int main(int argc, char** argv) {
     return {fp4_dot(it->second.gate, 160), fp4_dot(it->second.up, 160), fp4_dot(it->second.down, 36), 1152, 160, 5120};
   };
 
+  // Engram: real hashed rows when the metadata and tables are given, else random rows.
+  std::optional<engram::Layout> engram_layout;
+  std::optional<engine::EngramRows> engram_rows;
+  if (!gguf_meta.empty()) {
+    auto layout = engine::load_engram_layout(gguf_meta);
+    if (!layout) die(layout.error().what);
+    engram_layout = std::move(layout).value();
+    std::vector<std::string> shards;
+    for (size_t start = 0; start < engram_shards.size();) {
+      const size_t comma = engram_shards.find(',', start);
+      shards.push_back(engram_shards.substr(start, comma == std::string::npos ? std::string::npos : comma - start));
+      start = comma == std::string::npos ? engram_shards.size() : comma + 1;
+    }
+    auto rows = engine::EngramRows::open(shards);
+    if (!rows) die(rows.error().what);
+    engram_rows = std::move(rows).value();
+  }
+  engram::History history;
+
   const int tokens[] = {128000, 3923, 374, 279, 6864, 315, 9822, 30};  // a fixed little sequence of ids
   std::mt19937 rng(21);
   layer_ref::State state;
@@ -162,10 +188,22 @@ int main(int argc, char** argv) {
     if (!emb) die(emb.error().what);
     layer_ref::Stream stream = layer_ref::embed(emb.value());
     decoder.begin_token(emb.value());
+    std::optional<engram::Step> hashed;
+    if (engram_layout) {
+      auto h = engram::hash_token(*engram_layout, history, static_cast<uint32_t>(token), true);
+      if (!h) die(h.error().what);
+      hashed = h.value();
+      history = hashed->next;
+    }
     for (int l = first; l < first + layers; l++) {
       std::vector<uint8_t> raw;
       std::vector<float> decoded;
-      if (model::kind(l).engram) {
+      if (model::kind(l).engram && hashed) {
+        const int table = l == model::kEngramLayers[0] ? 0 : 1;
+        auto rows = engram_rows->read(table, hashed->rows[table]);
+        if (!rows) die(rows.error().what);
+        raw = std::move(rows).value();
+      } else if (model::kind(l).engram) {
         raw.resize(static_cast<size_t>(cuda::kEngramCols) * cuda::kEngramRowBytes);
         for (size_t i = 0; i < raw.size(); i++) {
           const bool scale_byte = i % cuda::kEngramRowBytes >= 256;
@@ -173,6 +211,8 @@ int main(int argc, char** argv) {
           if (!scale_byte && (v & 0x7F) == 0x7F) v = 0x38;
           raw[i] = scale_byte ? static_cast<uint8_t>(118 + rng() % 4) : v;
         }
+      }
+      if (model::kind(l).engram) {
         for (int c = 0; c < cuda::kEngramCols; c++) {
           const auto row = engram::decode_row(
               std::as_bytes(std::span(raw).subspan(static_cast<size_t>(c) * cuda::kEngramRowBytes, cuda::kEngramRowBytes))

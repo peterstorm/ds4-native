@@ -37,7 +37,7 @@ target_link_libraries(ds4n_io PUBLIC ds4n_core ${URING_LIB})
 target_compile_options(ds4n_io PRIVATE -Wall -Wextra -Wpedantic -Werror)
 
 # Engine shell (host side): loading Backbone layers.
-add_library(ds4n_engine STATIC src/engine/host_layer.cpp)
+add_library(ds4n_engine STATIC src/engine/host_layer.cpp src/engine/engram_source.cpp)
 target_link_libraries(ds4n_engine PUBLIC ds4n_io)
 target_compile_options(ds4n_engine PRIVATE -Wall -Wextra -Wpedantic -Werror)
 
