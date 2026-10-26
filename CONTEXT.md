@@ -63,7 +63,7 @@ Byte arithmetic that fixes Slot counts per GPU and phase from mandatory state, n
 One forward pass producing one token for one Session.
 
 **Round**:
-One forward pass over several rows: DSpark verification rows and/or several Sessions' decode rows.
+One forward pass over up to 8 rows at consecutive positions of one Session (a prefill chunk, DSpark verification rows, or one decode row), layer by layer; its outputs are exactly those of its rows decoded one at a time. Rows of several Sessions in one Round need per-Session caches (not built).
 
 **Base step**:
 The time of a Step with zero Misses.
@@ -104,7 +104,7 @@ An independent slow implementation (antirez/ds4, Maya's `ref.py`, or the HF refe
 - An **Expert** has one **Expert record** in the **Expert store** and, under tensor parallelism, two **Halves**
 - A **Slot** holds at most one **Expert**; the **Ledger** fixes how many **Slots** each GPU has
 - A **Miss** is served from the **RAM tier** if present there, otherwise from the **Expert store**
-- A **Round** contains one or more rows from one or more **Sessions**; a **Step** is a one-row **Round**
+- A **Round** contains one to eight rows of one **Session**; a **Step** is a one-row **Round**; a **Round**'s **Routing plan** is the union of its rows' Experts
 - A **KV checkpoint** belongs to exactly one **Session** prefix
 - **Cache-conditional routing** makes outputs depend on **Expert cache** contents; with λ = 0 every policy is **Exact**
 

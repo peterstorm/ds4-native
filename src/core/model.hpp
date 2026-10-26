@@ -17,7 +17,11 @@ constexpr int kRopeDim = 64;
 constexpr int kQLora = 1280;
 constexpr int kOLora = 1024;
 constexpr int kOGroups = 8;
-constexpr int kWindow = 128;
+constexpr int kWindow = 128;  // positions a query attends in the window: itself and the 127 before
+constexpr int kMaxRows = 8;   // rows of a Round (decode, DSpark verify, prefill chunks)
+// Window ring slots: a Round writes all its rows' KV before attending, so the ring outlasts the
+// window by a Round (else row r would overwrite position p0 + r - 128, which earlier rows still see).
+constexpr int kRing = kWindow + kMaxRows;
 constexpr int kTopK = 512;
 constexpr int kHcCopies = 4;
 constexpr int kSinkhornIters = 20;
@@ -99,46 +103,57 @@ constexpr RopeParams rope(int layer) {
                                     : RopeParams{10000.0f, 0, 16.0f, 32.0f, 1.0f};
 }
 
-/** Window slot s (ring order, oldest first) at decode position p: the KV row index, or -1 while the ring fills. */
+/** Window slot s (oldest first) at position p: the ring slot of position p - 127 + s, or -1 before position 0. */
 constexpr int32_t window_slot(int64_t p, int s) {
-  const int oldest = static_cast<int>(p % kWindow) + 1;
-  const int slot = (oldest + s) % kWindow;
-  return slot > p ? -1 : slot;
+  const int64_t q = p - (kWindow - 1) + s;
+  return q < 0 ? -1 : static_cast<int32_t>(q % kRing);
 }
 
-}  // namespace ds4n::model
-
-namespace ds4n::model {
+static_assert(window_slot(0, kWindow - 1) == 0 && window_slot(0, 0) == -1 && window_slot(200, 0) == (200 - 127) % kRing);
 
 /**
- * Everything a decode step at position p derives from p, computed once on the
- * host and handed to the GPUs (CUDA graphs replay kernels whose sizes and
- * addresses must not depend on host values). All int64 so kernels can take
- * pointers to any field.
+ * Whether position p completes a group of `ratio` (1 or 2) positions, so a KV source compresses a
+ * latent there. Only p modulo the ratio matters: for a Round, the parity of its first position
+ * decides which rows produce.
  */
-struct StepIndex {
-  int64_t pos;            // p: RoPE position of q, kv and o
-  int64_t latent_pos[3];  // by ratio: the compressed latent's position p + 1 - ratio (index 0 unused)
-  int64_t ring_slot;      // p % 128: this step's window row
-  int64_t compress_len[3];  // by ratio: compressed positions visible, (p + 1) / ratio (index 0: 0)
-  int64_t compress_row[3];  // by ratio: the row a completed latent is written to, p / ratio
-  int64_t produced[3];      // by ratio: 1 when this step completes a group
+constexpr bool completes_group(int64_t p, int ratio) { return (p + 1) % ratio == 0; }
+
+static_assert(completes_group(5, 2) && !completes_group(4, 2) && completes_group(4, 1));
+
+/**
+ * Everything a Round -- `rows` consecutive positions p0 .. p0 + rows - 1, one row each -- derives
+ * from its positions, computed once on the host and handed to the GPUs (CUDA graphs replay kernels
+ * whose sizes and addresses must not depend on host values). Struct of arrays, all int64: a kernel
+ * takes a pointer to a field and reads row r's value at index r. A decode step is a one-row Round.
+ */
+struct RoundIndex {
+  int64_t rows;
+  int64_t pos[kMaxRows];              // row r's position: RoPE of q, kv and o
+  int64_t latent_pos[3][kMaxRows];    // by ratio: the compressed latent's position p + 1 - ratio (ratio 0 unused)
+  int64_t ring_slot[kMaxRows];        // p % kRing: the row's window ring slot
+  int64_t compress_len[3][kMaxRows];  // by ratio: compressed positions the row sees, (p + 1) / ratio
+  int64_t compress_row[3][kMaxRows];  // by ratio: the row a latent completed at p is written to, p / ratio
 };
 
-constexpr StepIndex step_index(int64_t p) {
-  StepIndex s{};
-  s.pos = p;
-  s.ring_slot = p % kWindow;
-  for (int r = 1; r <= 2; r++) {
-    s.latent_pos[r] = p + 1 - r;
-    s.compress_len[r] = (p + 1) / r;
-    s.compress_row[r] = p / r;
-    s.produced[r] = (p + 1) % r == 0;
+/** The Round of `rows` positions from p0 (rows in 1..kMaxRows); rows past `rows` stay zero. */
+constexpr RoundIndex round_index(int64_t p0, int rows) {
+  RoundIndex s{};
+  s.rows = rows;
+  for (int i = 0; i < rows; i++) {
+    const int64_t p = p0 + i;
+    s.pos[i] = p;
+    s.ring_slot[i] = p % kRing;
+    for (int r = 1; r <= 2; r++) {
+      s.latent_pos[r][i] = p + 1 - r;
+      s.compress_len[r][i] = (p + 1) / r;
+      s.compress_row[r][i] = p / r;
+    }
   }
   return s;
 }
 
-static_assert(step_index(5).compress_len[2] == 3 && step_index(5).produced[2] == 1 && step_index(4).produced[2] == 0);
-static_assert(step_index(130).ring_slot == 2 && step_index(7).compress_row[2] == 3 && step_index(7).latent_pos[2] == 6);
+static_assert(round_index(5, 1).compress_len[2][0] == 3 && round_index(140, 1).ring_slot[0] == 4 &&
+              round_index(7, 1).compress_row[2][0] == 3 && round_index(7, 1).latent_pos[2][0] == 6);
+static_assert(round_index(4, 3).pos[2] == 6 && round_index(4, 3).pos[3] == 0 && round_index(4, 3).compress_len[1][2] == 7);
 
 }  // namespace ds4n::model

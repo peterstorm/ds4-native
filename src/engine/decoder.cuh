@@ -1,18 +1,23 @@
 #pragma once
-// Imperative shell: decode steps through layers on two GPUs, the sequence
-// core/layer_reference defines, kernel for kernel and split for split. A layer
-// step is Engram, attention and routing, then the GPU resolves the routed
-// Experts itself (cuda/resolve.cuh: Slots from the Expert cache's table, a Miss
-// served by engine::ExpertResidency's service thread), then the Experts, the
-// MoE exchange and hc_post. No host round trip per layer: a step only waits when
+// Imperative shell: Rounds through layers on two GPUs, the sequence
+// core/layer_reference defines, kernel for kernel and split for split. A Round
+// is up to 8 rows at consecutive positions (a decode step is a one-row Round;
+// prefill chunks and DSpark verification use more), processed layer by layer:
+// every row's KV enters the caches before any row attends, and each row sees
+// only its own position and earlier ones, so a Round computes exactly what the
+// same tokens would as one-row Rounds in turn. A layer step is Engram,
+// attention and routing, then the GPU resolves the routed Experts itself
+// (cuda/resolve.cuh: Slots from the Expert cache's table, a Miss served by
+// engine::ExpertResidency's service thread), then the Experts, the MoE
+// exchange and hc_post. No host round trip per layer: a step only waits when
 // an Expert is missing, and then on the service, not on the caller.
 //
 // Each layer step replays as a CUDA graph captured on first use, per (layer,
-// whether a ratio-2 KV source completes a group this step). Nothing a graph
-// launches takes a per-step host value: begin_token uploads the token's
-// model::StepIndex (positions, ring slot, cache lengths and rows), which kernels
-// read when they run, and stages both Engram tables' rows in fixed pinned
-// memory that the graphs copy from.
+// rows, parity of the first position: which rows complete a ratio-2 group).
+// Nothing a graph launches takes a per-step host value: begin_round uploads the
+// Round's model::RoundIndex (positions, ring slots, cache lengths and rows),
+// which kernels read when they run, and stages both Engram tables' rows in
+// fixed pinned memory that the graphs copy from.
 //
 // The rule that keeps the exchanges from deadlocking: once one GPU may be
 // spinning in an exchange, the host must not make a call that can wait on that
@@ -50,7 +55,11 @@ constexpr int64_t kMaxCompressed = 65536;
 constexpr size_t kEngramTableBytes = static_cast<size_t>(24) * 264;
 constexpr size_t kEngramTokenBytes = 2 * kEngramTableBytes;
 
-/** What one layer step leaves on rank 0, for stage-by-stage checks. */
+/**
+ * What one layer step leaves on rank 0 for one row, for stage-by-stage checks. `plan` is the
+ * Round's routing restricted to the row: its Experts ascending, weights in column 0, as a
+ * one-token Plan.
+ */
 struct StepTrace {
   std::vector<float> attn_out, moe_out, stream;  // BF16 values
   std::vector<int32_t> idx;
@@ -72,27 +81,27 @@ class Decoder {
   void add_layer(const HostLayer& w);
 
   /**
-   * Start the token at position p: its embedding (BF16 values) in all four
-   * copies, pre mix one-hot on copy 0, the step's positions, and the Engram rows
-   * (kEngramTokenBytes, or empty when no Engram layer runs this token). p = 0
-   * starts a new Session: every cache read is bounded by p (window slots past p,
-   * compressed and index rows below its compressed length, a ratio-2 pool slot
-   * written before it is read), so a previous Session's rows are never read.
+   * Start a Round of rows at positions p0, p0 + 1, ...: their embeddings ([rows][5120] BF16 values,
+   * 1 to 8 rows) in all four copies each, pre mix one-hot on copy 0, the Round's positions, and the
+   * Engram rows ([rows] x kEngramTokenBytes, or empty when no Engram layer runs). p0 = 0 starts a
+   * new Session: every cache read is bounded by the reading row's position (window slots, compressed
+   * and index rows below its compressed length, a ratio-2 pool slot written before it is read), so a
+   * previous Session's rows are never read.
    */
-  void begin_token(int64_t p, std::span<const float> embedding_row, std::span<const uint8_t> engram_rows = {});
+  void begin_round(int64_t p0, std::span<const float> embeddings, std::span<const uint8_t> engram_rows = {});
 
   /**
-   * One decode step of `layer` for the current token. With `trace`, waits for
-   * the step and returns rank 0's trace, throwing unless both ranks' streams
-   * match; without, returns as soon as the step is launched (an empty trace).
+   * One step of `layer` for the current Round. With `trace`, waits for the step and returns rank 0's
+   * trace per row, throwing unless both ranks' streams match; without, returns as soon as the step is
+   * launched (no traces).
    */
-  StepTrace decode_layer(int layer, bool trace = true);
+  std::vector<StepTrace> decode_layer(int layer, bool trace = true);
 
   /**
-   * Every added layer, in order, for the current token: one graph per GPU (per whether the
-   * token completes a ratio-2 group), returning as soon as it is launched.
+   * Every added layer, in order, for the current Round: one graph per GPU (per rows and parity),
+   * returning as soon as it is launched.
    */
-  void decode_token();
+  void decode_round();
 
   /** Wait until both GPUs finished everything launched so far. */
   void sync();
@@ -100,15 +109,15 @@ class Decoder {
   /** Upload the final norm and the head (BF16 values [129280][5120]); each GPU keeps its half of the vocabulary. */
   void add_head(const std::vector<float>& norm, const std::vector<float>& head);
 
-  /** FP32 logits [129280] of the current token after the last layer (rank 0's half, then rank 1's). */
+  /** FP32 logits [rows][129280] of the current Round after the last layer. */
   std::vector<float> logits();
 
  private:
   struct Gpu;
   std::array<std::unique_ptr<Gpu>, 2> gpus_;
   Launches launches_;
-  model::StepIndex step_{};
-  bool in_token_ = false;
+  int rows_ = 0;
+  int64_t p0_ = 0;
   bool engram_staged_ = false;
 };
 

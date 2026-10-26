@@ -29,7 +29,7 @@ Stream embed(std::span<const float> embedding_row);
 
 /** Caches and recurrent state shared across decode steps. */
 struct State {
-  std::map<int, std::vector<float>> window;             // layer -> [128][512] ring (zeros while filling)
+  std::map<int, std::vector<float>> window;             // layer -> [kRing][512] ring (zeros while filling)
   std::map<int, std::vector<float>> compressed;         // KV source -> [n][512]
   std::map<int, std::vector<indexer::Row>> index_keys;  // KV source -> keys
   std::map<int, compressor::PoolState> pools;           // ratio-2 KV sources

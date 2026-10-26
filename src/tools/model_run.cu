@@ -3,10 +3,11 @@
 //
 //   ds4n-model-run --backbone SAFETENSORS --store STORE --gguf MERGED_GGUF --tokens DIR --names a,b
 //                  --out DIR [--oracle DIR] [--force 1] [--steps N] [--slots N] [--ram-records R] [--prior PROFILE]
-//                  [--prior-weight W] [--ram-policy recent|popular] [--ccr LAMBDA]
+//                  [--prior-weight W] [--ram-policy recent|popular] [--ccr LAMBDA] [--prefill R]
 //
 // For each name, DIR/<name>.tokens is antirez's --dump-tokens output (ids on the first line). The
-// prompt runs as decode steps from position 0; the next-token logits at its end go to
+// prompt runs from position 0 in Rounds of R rows (--prefill, 1 to 8, default 8: the same logits as
+// one token at a time, see engine/decoder.cuh); the next-token logits at its end go to
 // OUT/<name>.logits.json, then a greedy continuation of up to N steps (default 64) with top-20
 // logprobs per step goes to OUT/<name>.logprobs.json, both in antirez's schema. With --oracle,
 // ORACLE/<name>.logits.json and .logprobs.json are compared as they come: KL and top-20 at the
@@ -30,6 +31,7 @@
 #include <memory>
 #include <nlohmann/json.hpp>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -128,7 +130,7 @@ int main(int argc, char** argv) {
   setenv("CUDA_MODULE_LOADING", "EAGER", 1);  // before any CUDA call: see engine/decoder.cuh
   std::string backbone_path, store_path, gguf_path, tokens_dir, names_arg, out_dir, oracle_dir, prior_path;
   bool force = false;
-  int max_steps = 64;
+  int max_steps = 64, prefill_rows = model::kMaxRows;
   uint32_t slots = 8000, ram_records = 512, prior_weight = 1;
   float ccr = 0.0f;
   engine::RamPolicy ram_policy = engine::RamPolicy::Recent;
@@ -144,6 +146,7 @@ int main(int argc, char** argv) {
     else if (s == "--oracle") oracle_dir = argv[++i];
     else if (s == "--force") force = std::string(argv[++i]) == "1";
     else if (s == "--steps") max_steps = std::stoi(argv[++i]);
+    else if (s == "--prefill") prefill_rows = std::stoi(argv[++i]);
     else if (s == "--slots") slots = static_cast<uint32_t>(std::stoul(argv[++i]));
     else if (s == "--ram-records") ram_records = static_cast<uint32_t>(std::stoul(argv[++i]));
     else if (s == "--prior") prior_path = argv[++i];
@@ -158,7 +161,7 @@ int main(int argc, char** argv) {
     else die("unknown argument " + s);
   }
   if (backbone_path.empty() || store_path.empty() || gguf_path.empty() || tokens_dir.empty() || names_arg.empty() ||
-      out_dir.empty())
+      out_dir.empty() || prefill_rows < 1 || prefill_rows > model::kMaxRows)
     die("usage: ds4n-model-run --backbone B --store S --gguf G --tokens DIR --names a,b --out DIR [--oracle DIR]");
   std::vector<std::string> names;
   for (size_t at = 0; at <= names_arg.size();) {
@@ -214,39 +217,53 @@ int main(int argc, char** argv) {
     const auto oracle_steps = oracle_steps_json ? steps_of(*oracle_steps_json) : std::vector<OracleStep>{};
     if (force && oracle_steps.empty()) die("--force 1 needs " + oracle_dir + "/" + name + ".logprobs.json");
 
-    // One decode step of the whole model; the logits only when asked for.
+    // One Round of the whole model (tokens at positions p0, p0 + 1, ...); the last row's logits only
+    // when asked for.
     engram::History history;
-    std::vector<double> step_ms, host_ms;  // whole steps; the host's part before launching (embedding, Engram rows)
-    auto run_token = [&](int64_t p, int32_t token, bool want_logits) -> std::vector<float> {
-      if (token < 0 || token >= model::kVocab) die("token id out of range: " + std::to_string(token));
+    std::vector<double> step_ms, host_ms;  // whole Rounds; the host's part before launching (embeddings, Engram rows)
+    auto run_round = [&](int64_t p0, std::span<const int32_t> tokens, bool want_logits) -> std::vector<float> {
       const auto t0 = Clock::now();
-      auto emb = engine::load_bf16_row(backbone.value(), "embed.weight", token);
-      if (!emb) die(emb.error().what);
-      auto hashed = engram::hash_token(layout.value(), history, static_cast<uint32_t>(token), true);
-      if (!hashed) die(hashed.error().what);
-      history = hashed.value().next;
-      auto raw = rows.value().read_token(hashed.value().rows);
-      if (!raw) die(raw.error().what);
+      std::vector<float> embeddings;
+      std::vector<uint8_t> raw_rows;
+      for (const int32_t token : tokens) {
+        if (token < 0 || token >= model::kVocab) die("token id out of range: " + std::to_string(token));
+        auto emb = engine::load_bf16_row(backbone.value(), "embed.weight", token);
+        if (!emb) die(emb.error().what);
+        embeddings.insert(embeddings.end(), emb.value().begin(), emb.value().end());
+        auto hashed = engram::hash_token(layout.value(), history, static_cast<uint32_t>(token), true);
+        if (!hashed) die(hashed.error().what);
+        history = hashed.value().next;
+        auto raw = rows.value().read_token(hashed.value().rows);
+        if (!raw) die(raw.error().what);
+        raw_rows.insert(raw_rows.end(), raw.value().begin(), raw.value().end());
+      }
       host_ms.push_back(std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
-      decoder.begin_token(p, emb.value(), raw.value());
-      decoder.decode_token();
+      decoder.begin_round(p0, embeddings, raw_rows);
+      decoder.decode_round();
       std::vector<float> logits;
-      if (want_logits) logits = decoder.logits();
-      else decoder.sync();
+      if (want_logits) {
+        const std::vector<float> all = decoder.logits();
+        logits.assign(all.end() - model::kVocab, all.end());
+      } else {
+        decoder.sync();
+      }
       step_ms.push_back(std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
       return logits;
     };
 
-    // The prompt, then the next-token logits at its end.
+    // The prompt in Rounds of --prefill rows, then the next-token logits at its end.
     residency->check();
     const auto before = residency->stats();
     const auto t_prompt = Clock::now();
     std::vector<float> logits;
-    for (size_t p = 0; p < prompt.size(); p++) logits = run_token(static_cast<int64_t>(p), prompt[p], p + 1 == prompt.size());
+    for (size_t p0 = 0; p0 < prompt.size(); p0 += prefill_rows) {
+      const size_t n = std::min<size_t>(prefill_rows, prompt.size() - p0);
+      logits = run_round(static_cast<int64_t>(p0), std::span(prompt).subspan(p0, n), p0 + n == prompt.size());
+    }
     const double prompt_s = std::chrono::duration<double>(Clock::now() - t_prompt).count();
     write_text(out_dir + "/" + name + ".logits.json", logits_json(logits, prompt.size()));
-    std::printf("%s: %zu prompt tokens in %.1f s (%.1f tok/s, median step %.2f ms)\n", name.c_str(), prompt.size(),
-                prompt_s, prompt.size() / prompt_s, median(step_ms));
+    std::printf("%s: %zu prompt tokens in Rounds of %d in %.2f s (%.1f tok/s, median Round %.2f ms)\n", name.c_str(),
+                prompt.size(), prefill_rows, prompt_s, prompt.size() / prompt_s, median(step_ms));
     if (oracle_logits) {
       const auto ref = logits_of(*oracle_logits);
       const auto c = compare::compare_logits(ref, logits);
@@ -298,7 +315,7 @@ int main(int argc, char** argv) {
       }
       const int32_t next = fed;
       if (!force && eos && static_cast<uint64_t>(next) == *eos) break;
-      if (s + 1 < steps) logits = run_token(static_cast<int64_t>(prompt.size() + s), next, true);
+      if (s + 1 < steps) logits = run_round(static_cast<int64_t>(prompt.size() + s), std::span(&next, 1), true);
       // Every 64 tokens: how the Expert cache settles as the context grows.
       if ((s + 1) % kWindowTokens == 0 && steps > kWindowTokens) {
         const auto now = residency->stats();

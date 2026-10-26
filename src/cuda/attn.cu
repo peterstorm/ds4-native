@@ -77,7 +77,7 @@ __device__ __forceinline__ uint32_t pack_bf16(__nv_bfloat16 lo, __nv_bfloat16 hi
  * order, then P.V on the BF16 MMA into the split's FP32 partial.
  */
 __global__ void __launch_bounds__(kSplitThreads) split_kernel(const __nv_bfloat16* __restrict__ q, KvSources kv,
-                                                             const int32_t* __restrict__ idx, int n_idx, float scale,
+                                                             const int32_t* __restrict__ idx, int n_idx, int idx_stride, float scale,
                                                              AttnScratch scratch) {
   extern __shared__ __align__(16) unsigned char smem[];
   __nv_bfloat16* kvs = reinterpret_cast<__nv_bfloat16*>(smem);
@@ -87,7 +87,7 @@ __global__ void __launch_bounds__(kSplitThreads) split_kernel(const __nv_bfloat1
   __shared__ int slot_valid[kAttnSplitRows];
   const int split = blockIdx.x, row = blockIdx.y, splits = gridDim.x;
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, qq = lane & 3;
-  const int32_t* ids = idx + static_cast<size_t>(row) * n_idx + split * kAttnSplitRows;
+  const int32_t* ids = idx + static_cast<size_t>(row) * idx_stride + split * kAttnSplitRows;
   const int rows = min(kAttnSplitRows, n_idx - split * kAttnSplitRows);
 
   // Gather: 64 rows x 1 KB as uint4, zeros for -1 and for slots past n_idx; 8 loads in flight per thread.
@@ -259,7 +259,7 @@ void rope(__nv_bfloat16* x, int rows, int heads, int head_dim, int rope_dim, con
   rope_kernel<<<dim3(heads, rows), rope_dim / 2, 0, stream>>>(x, heads, head_dim, rope_dim, freqs, positions, inverse);
 }
 
-cudaError_t sparse_attn(const __nv_bfloat16* q, KvSources kv, const int32_t* idx, int n_idx, const float* sink, int rows,
+cudaError_t sparse_attn(const __nv_bfloat16* q, KvSources kv, const int32_t* idx, int n_idx, int idx_stride, const float* sink, int rows,
                         float scale, AttnScratch scratch, __nv_bfloat16* o, cudaStream_t stream) {
   const int splits = attn_splits(n_idx);
   if (n_idx < 1 || splits > kMaxSplits) return cudaErrorInvalidValue;  // more slots than the window plus top-k
@@ -273,7 +273,7 @@ cudaError_t sparse_attn(const __nv_bfloat16* q, KvSources kv, const int32_t* idx
     if (e != cudaSuccess) return e;
     configured[device] = true;
   }
-  split_kernel<<<dim3(splits, rows), kSplitThreads, kSplitSmem, stream>>>(q, kv, idx, n_idx, scale, scratch);
+  split_kernel<<<dim3(splits, rows), kSplitThreads, kSplitSmem, stream>>>(q, kv, idx, n_idx, idx_stride, scale, scratch);
   combine_kernel<<<dim3(kAttnHeads, rows), kAttnDim, 0, stream>>>(sink, splits, scratch, o);
   return cudaGetLastError();
 }

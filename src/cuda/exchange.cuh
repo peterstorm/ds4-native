@@ -20,7 +20,7 @@
 namespace ds4n::cuda {
 
 constexpr int kExchangeChunk = 1024;   // floats per block
-constexpr int kExchangeMaxBlocks = 64;  // up to 8 tokens x 5120 values (40 blocks) with room
+constexpr int kExchangeMaxBlocks = 256;  // up to 8 tokens x 25600 values (Engram's KV: 200 blocks) with room
 constexpr size_t kExchangeInboxFloats = 2 * size_t{kExchangeMaxBlocks} * kExchangeChunk;  // two parities
 
 /** One GPU's end of the link; `peer_*` are P2P pointers into the other GPU's memory. */

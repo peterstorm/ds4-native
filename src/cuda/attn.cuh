@@ -26,8 +26,8 @@ constexpr int kAttnHeads = 32;      // heads per GPU
 constexpr int kAttnDim = 512;       // head_dim (one shared latent KV)
 constexpr int kAttnSplitRows = 64;  // index slots per split (one CTA)
 
-/** The KV rows a slot index names: window ring rows below kAttnWindow, then the compressed cache. */
-constexpr int kAttnWindow = 128;
+/** The KV rows a slot index names: window ring rows below kAttnWindow (the ring's slots, model::kRing), then the compressed cache. */
+constexpr int kAttnWindow = 136;
 struct KvSources {
   const __nv_bfloat16* window;      // [128][512]
   const __nv_bfloat16* compressed;  // [n][512]: slot index i >= 128 reads row i - 128
@@ -44,13 +44,13 @@ struct AttnScratch {
 
 /**
  * Decode/verify sparse attention for 32 heads of 512 (one GPU's share). For
- * each query row t: q[t] is [32][512], idx[t] lists n_idx slots of `kv`
+ * each query row t: q[t] is [32][512], idx[t] (at idx + t * idx_stride) lists n_idx slots of `kv`
  * (KvSources), -1 for none. Flash decoding on the BF16 MMA, one CTA per
  * split of 64 slots, then a combine in split order; the arithmetic is
  * attn::sparse_attn's bit for bit. o[t] is [32][512] BF16. n_idx is 1 .. 640 (the
  * window plus the top-k); otherwise nothing runs and cudaErrorInvalidValue is returned.
  */
-cudaError_t sparse_attn(const __nv_bfloat16* q, KvSources kv, const int32_t* idx, int n_idx, const float* sink, int rows,
-                        float scale, AttnScratch scratch, __nv_bfloat16* o, cudaStream_t stream);
+cudaError_t sparse_attn(const __nv_bfloat16* q, KvSources kv, const int32_t* idx, int n_idx, int idx_stride,
+                        const float* sink, int rows, float scale, AttnScratch scratch, __nv_bfloat16* o, cudaStream_t stream);
 
 }  // namespace ds4n::cuda

@@ -125,50 +125,80 @@ with the routing round trip.
 
 ## Layer assembly
 
-`engine::Decoder` runs decode steps through layers on both GPUs: one layer's weights per GPU
-from `engine/host_layer` + `engine/device_layer` (tensor-parallel slices tiled for the kernels),
-caches per GPU (window rings, compressed and index-key caches per KV source, pool states), and
-the step in two phases per layer -- A: Engram, attention, routing, launched on both GPUs before
-anything waits; the host reads the plan and places both GPUs' Expert Halves; B: Experts, MoE
-exchange, hc_post. `core/layer_reference` is the same step on the CPU, composed from the
-component oracles. `ds4n-layer-check` (real Backbone layers 0-3, real Experts from the store):
-**4 decode steps x 4 layers bit-identical** -- slots, plan, attention and MoE outputs, stream --
-and layers 20-24 (ratio-1 KV source and candidate source, candidate-masked indexer, reuse)
-likewise, with Experts mapped from the store's first layers (`--expert-layers 4`).
+`engine::Decoder` runs Rounds through layers on both GPUs: one layer's weights per GPU from
+`engine/host_layer` + `engine/device_layer` (tensor-parallel slices tiled for the kernels), and
+caches per GPU (window rings, compressed and index-key caches per KV source, pool states). A
+layer step is Engram, attention and routing, then the GPU resolves its routed Experts itself (see
+Expert residency), then the Experts, the MoE exchange and hc_post: no host round trip.
+`core/layer_reference` is the same step on the CPU for one token, composed from the component
+oracles.
+
+**Rounds.** A Round is up to 8 rows at consecutive positions p0 .. p0 + 7 of one Session
+(`model::kMaxRows`; a decode step is a one-row Round, prefill chunks and DSpark verification use
+more), processed layer by layer. The Round's rows are the GEMVs' token columns (the MMA's N is 8,
+so a GEMV streams its weights once for any row count, and each output column is its own dot
+product: a row's bits do not depend on the other rows). The rows' KV enters the caches before
+any row attends, and each row reads only its own position and earlier ones. What makes a Round
+compute exactly what its rows would one at a time (`tests/core/test_round.cpp`):
+- the window ring has `kRing` = 128 + 8 slots, so a Round's KV writes never overwrite a position
+  that an earlier row of the Round still reads;
+- a row's compressed length excludes every latent a later row completes, so index keys and
+  compressed rows for the whole Round can be written before any row scores;
+- ratio-2 pools take the rows in position order, and which rows complete a group
+  (`model::completes_group`) depends only on the parity of p0.
+Work that is per row by nature (compressor pooling, index-key appends, index scoring and top-k,
+compressed stores) loops over the rows inside the graph. The routing Plan is the union of the
+rows' Experts, so each routed Expert streams once per Round.
+
+`ds4n-layer-check --round R` decodes in Rounds against the oracle decoding one token at a time.
+Bit-identical: Rounds of 8 over layers 0-3 (20 steps, logits), layers 20-21 (150 steps, past the
+ring) and all 40 layers with the head (10 steps, 853 store reads); layers 2-3 in Rounds of 7 (150
+steps, both parities); layers 0-3 at 64 Slots (4.9 % Hits: Rounds waiting on Misses).
+
+Measured (40 layers + head, every Half resident, graphs, pseudo-random tokens -- the widest
+Expert union, ~5 new Experts per layer per added row):
+
+| Rows | ms per Round | tokens/s |
+|---|---|---|
+| 1 | 7.69 | 130 |
+| 2 | 9.01 | 222 |
+| 4 | 11.58 | 345 |
+| 8 | 16.33 | 490 |
+
+An added row costs ~31 us per layer, what streaming its new Experts' Halves costs (5 x 9.4 MB at
+1.45 TB/s): Rounds are bound by routed-Expert bandwidth, and by Misses once Experts are not
+resident. Prefill much past this needs an Expert-major path -- route a long chunk, then stream
+each Expert once per layer for every row it serves -- with GEMMs for N > 8.
 
 Deadlock rules the decoder states and enforces: no host call that can wait on a GPU while its
-peer's side of an exchange is unlaunched -- per-step uploads through pinned staging, Expert
-Halves for both GPUs placed (and both GPUs' graphs captured) before a phase launches on either,
-eager module loading (`CUDA_MODULE_LOADING=EAGER`: a lazy first launch can wait on the device),
-and a 10 s watchdog in the exchange that traps instead of hanging.
+peer's side of an exchange is unlaunched -- per-Round uploads through pinned staging, both GPUs'
+graphs captured before either launches, eager module loading (`CUDA_MODULE_LOADING=EAGER`: a
+lazy first launch can wait on the device), and a 10 s watchdog in the exchange that traps
+instead of hanging.
 
-**Graph replay.** Each phase replays as a CUDA graph captured on first use: phase A per
-(layer, whether a ratio-2 KV source completes a group), phase B per (layer, plan job count).
-No captured launch takes a per-step host value: `begin_token(p)` uploads the token's
-`model::StepIndex` (position, latent positions, ring slot, compressed lengths and rows per
-ratio), and kernels read it as `cuda::IntArg` device arguments -- launches are sized for the
-argument's bound and give the same bytes for any grid that covers it (`ds4n-indexer-check`:
+**Graph replay.** A layer step replays as a CUDA graph captured on first use per (layer, rows,
+parity of p0), and a whole Round as one graph per (rows, parity). No captured launch takes a
+per-Round host value: `begin_round(p0)` uploads the Round's `model::RoundIndex` (per row:
+position, latent positions, ring slot, compressed lengths and rows per ratio) and the rows'
+window slots, and kernels read them as `cuda::IntArg` device arguments -- launches are sized for
+the argument's bound and give the same bytes for any grid that covers it (`ds4n-indexer-check`:
 device lengths with capacity-sized launches identical to host lengths, 0 to 40000 positions).
-Engram rows and Expert job lists are copies from fixed pinned staging inside the graph; the
-host rewrites a staging field only after the event recorded behind its last reader. The Engram
-output is the layer's stream input (`h_next`), never a host-side pointer swap, so a captured
-graph's buffers are right on every replay. `ds4n-layer-check --steps 6` (both variants
-replayed, real Engram rows, logits): bit-identical to the oracle.
+Engram rows are copies from fixed pinned staging inside the graph; the host rewrites a staging
+field only after the event recorded behind its last reader. The Engram output is the layer's
+stream input (`h_next`), never a host-side pointer swap, so a captured graph's buffers are right
+on every replay. Work only a later stage needs runs on graph branches (side streams forked and
+joined with events): the hc mixes beside attention and beside the MoE, the KV rows beside the q
+path, the shared Expert beside routing and resolution.
 
-**Full depth**: `ds4n-layer-check --first 0 --layers 40 --steps 2 --head 1 --expert-layers 4`: all 40
-layers and the head bit-identical to the oracle (logits 129280/129280 at both steps); Base step
-**9.67 ms per token** (~103 tok/s, every Half resident, graphs).
-
-Measured (layers 0-3, Experts resident, `--timing 40`): graphs 0.27 ms per layer, eager 0.31;
-the head on both GPUs at once 0.35 ms. Profile per layer step (graph nodes, GPU 0): busy
-~220 us -- GEMVs 116 (MoE gate/up 34 us at 1.48 TB/s, down 17, wo_b 15, wq_b 14, wo_a 15 at
-1.18 TB/s with 512 warps, wq_a+wkv 10 at 0.96 TB/s with 448 warps), exchange waits 25 (GPU 1
-launches later), ~45 small kernels ~80; kernel-to-kernel gaps inside a graph 0.2 us; the plan
-round trip (readback to phase B's first copy) 9 us. Next levers, in size order: fuse the small
-kernels (norm + quantize + plane sums, rope + quant + cache store), more warps for the narrow
-GEMVs (split ways are Reference configuration constants, so the oracles follow), and the whole
-token as one graph per GPU with device-side Expert resolution (no per-layer host round trip,
-no launch skew between the GPUs).
+**Full depth**: all 40 layers and the head bit-identical to the oracle (logits 129280/129280).
+Base step (one-row Rounds, every Half resident, graphs, head included), by change: 9.67 ms per
+token -> 9.53 device-side Expert resolution -> 8.75 fused glue (plane sums with RMSNorm, RoPE,
+quant-dequant and cache stores; act_quant stays its own wide kernel) -> 7.96 graph branches ->
+7.74 the shared-Expert branch -> **7.66 ms** (~130 tok/s) with plane sums before the exchange
+instead of inside it. Inside a graph, kernel-to-kernel gaps are 0.2 us; per layer step the GPU
+spends ~100 us in GEMVs (~1.45 TB/s) and ~60 us in glue, at 8-22 % achieved occupancy; more
+split-K ways did not help. Folding wide work into a reduction's single block made it slower
+(act_quant of a 5120-row inside RMSNorm's block 8.2 us vs 2.9 for two kernels).
 
 ## Expert residency
 

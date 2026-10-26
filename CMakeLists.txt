@@ -123,6 +123,7 @@ add_executable(ds4n_tests
   tests/core/test_indexer.cpp
   tests/core/test_compressor.cpp
   tests/core/test_compare.cpp
+  tests/core/test_round.cpp
 )
 target_link_libraries(ds4n_tests PRIVATE ds4n_core doctest::doctest)
 target_compile_options(ds4n_tests PRIVATE -Wall -Wextra)

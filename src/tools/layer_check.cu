@@ -6,11 +6,13 @@
 // table rows are random (identical on both sides) unless real tables are given.
 //   ds4n-layer-check --backbone SAFETENSORS --store STORE [--first L] [--layers N] [--steps S]
 //                    [--expert-layers M] [--gguf-meta GGUF --engram-shards A,B,...] [--head 1]
-//                    [--timing N] [--launches graphs|eager] [--per-layer 1] [--slots N --ram-records R]
+//                    [--round R] [--timing N] [--launches graphs|eager] [--per-layer 1] [--slots N --ram-records R]
+// --round R (1 to 8, default 1) runs the decoder's steps in Rounds of R rows, layer by layer; the
+// oracle still decodes one token at a time, so every row must match sequential decode.
 // --head 1 also compares the full logits after the last layer of every step. --timing N then
-// times N more steps on the GPUs alone (pseudo-random tokens) under the same Expert cache. --launches
-// picks how the decoder issues kernels: replayed CUDA graphs (the default) or eager launches. Timing
-// launches one graph per token (decode_token) unless --per-layer 1 launches one per layer.
+// times N more steps in Rounds on the GPUs alone (pseudo-random tokens) under the same Expert cache.
+// --launches picks how the decoder issues kernels: replayed CUDA graphs (the default) or eager
+// launches. Timing launches one graph per Round (decode_round) unless --per-layer 1 launches one per layer.
 // With --gguf-meta (a GGUF carrying deepseek41.engram.*) and --engram-shards (the files holding
 // the Engram tables), Engram layers hash the tokens and read real table rows.
 // --expert-layers M reads layer L's Experts from store layer L % M (a store holding only the
@@ -106,7 +108,7 @@ int main(int argc, char** argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);  // progress shows even if a step hangs
   setenv("CUDA_MODULE_LOADING", "EAGER", 1);  // before any CUDA call: see engine/decoder.cuh
   std::string backbone_path, store_path;
-  int first = 0, layers = 4, steps = 3, expert_layers = model::kLayers;
+  int first = 0, layers = 4, steps = 3, expert_layers = model::kLayers, round_rows = 1;
   std::string gguf_meta, engram_shards;
   bool with_head = false;
   int timing_steps = 0;
@@ -126,6 +128,7 @@ int main(int argc, char** argv) {
     else if (s == "--engram-shards") engram_shards = argv[++i];
     else if (s == "--head" && argv[++i] == std::string("1")) with_head = true;
     else if (s == "--timing") timing_steps = std::stoi(argv[++i]);
+    else if (s == "--round") round_rows = std::stoi(argv[++i]);
     else if (s == "--slots") slot_count = static_cast<uint32_t>(std::stoul(argv[++i]));
     else if (s == "--ram-records") ram_records = static_cast<uint32_t>(std::stoul(argv[++i]));
     else if (s == "--per-layer") per_layer = std::string(argv[++i]) == "1";
@@ -138,7 +141,7 @@ int main(int argc, char** argv) {
     else die("unknown argument " + s);
   }
   if (backbone_path.empty() || store_path.empty() || layers < 1 || first < 0 || first + layers > model::kLayers ||
-      expert_layers < 1)
+      expert_layers < 1 || round_rows < 1 || round_rows > model::kMaxRows)
     die("bad arguments");
 
   // Experts for the decoder through the Expert cache (opened first: the decoder resolves against
@@ -269,77 +272,108 @@ int main(int argc, char** argv) {
     return decoded;
   };
 
+  // The decoder runs the steps in Rounds of --round rows, layer by layer; the oracle runs them one
+  // token at a time through every layer (sequential decode, the definition), and every row of every
+  // layer must match it.
   const int tokens[] = {128000, 3923, 374, 279, 6864, 315, 9822, 30};  // a fixed little sequence of ids
   layer_ref::State state;
-  for (int step = 0; step < steps; step++) {
-    const int64_t p = step;
-    const int token = tokens[step % 8];
-    auto emb = engine::load_bf16_row(backbone.value(), "embed.weight", token);
-    if (!emb) die(emb.error().what);
-    layer_ref::Stream stream = layer_ref::embed(emb.value());
-    const auto raw = token_rows(static_cast<uint32_t>(token));
-    decoder.begin_token(p, emb.value(), raw);
-    for (int l = first; l < first + layers; l++) {
-      const std::vector<float> decoded =
-          model::kind(l).engram ? decoded_rows(raw, l == model::kEngramLayers[0] ? 0 : 1) : std::vector<float>{};
-      std::printf("step %d layer %d: GPUs...\n", step, l);
-      const engine::StepTrace got = decoder.decode_layer(l);
-      std::printf("  oracle...\n");
-      current_layer = l;
-      layer_ref::Trace want;
-      stream = layer_ref::decode_layer(host[l - first], halves, state, stream, p, decoded, &want);
-
-      Compare idx, attn, moe_c, h;
-      const bool idx_ok = idx.add(got.idx, want.idx);
-      const bool plan_ok = std::memcmp(&got.plan, &want.plan, sizeof(moe::Plan)) == 0;
-      const bool attn_ok = attn.add(got.attn_out, want.attn_out);
-      const bool moe_ok = moe_c.add(got.moe_out, want.moe_out);
-      const bool h_ok = h.add(got.stream, stream.h);
-      std::printf("step %d (token %d) layer %d: slots %s, plan %s (%d jobs), attention %zu/%zu, MoE %zu/%zu, stream %zu/%zu\n",
-                  step, token, l, idx_ok ? "identical" : "DIFFER", plan_ok ? "identical" : "DIFFERS", got.plan.jobs,
-                  attn.same, attn.total, moe_c.same, moe_c.total, h.same, h.total);
-      if (!(idx_ok && plan_ok && attn_ok && moe_ok && h_ok)) die("the GPUs and the oracle disagree");
+  for (int step0 = 0; step0 < steps; step0 += round_rows) {
+    const int rows = std::min(round_rows, steps - step0);
+    std::vector<std::vector<float>> embs;
+    std::vector<std::vector<uint8_t>> raws;
+    std::vector<float> embeddings;
+    std::vector<uint8_t> raw_round;
+    for (int r = 0; r < rows; r++) {
+      auto emb = engine::load_bf16_row(backbone.value(), "embed.weight", tokens[(step0 + r) % 8]);
+      if (!emb) die(emb.error().what);
+      embeddings.insert(embeddings.end(), emb.value().begin(), emb.value().end());
+      embs.push_back(std::move(emb).value());
+      raws.push_back(token_rows(static_cast<uint32_t>(tokens[(step0 + r) % 8])));
+      raw_round.insert(raw_round.end(), raws.back().begin(), raws.back().end());
     }
-    if (with_head) {
-      const auto got = decoder.logits();
-      const auto want = layer_ref::logits(stream, head->norm, head->head);
-      Compare logit;
-      const bool ok = logit.add(got, want);
-      std::vector<int> order(got.size());
-      for (size_t i = 0; i < order.size(); i++) order[i] = static_cast<int>(i);
-      std::partial_sort(order.begin(), order.begin() + 5, order.end(), [&](int a, int b) { return got[a] > got[b]; });
-      std::printf("step %d logits: %zu/%zu identical; top-5 ids %d %d %d %d %d\n", step, logit.same, logit.total, order[0],
-                  order[1], order[2], order[3], order[4]);
-      if (!ok) die("the logits differ");
+    decoder.begin_round(step0, embeddings, raw_round);
+    std::vector<std::vector<engine::StepTrace>> got(layers);  // [layer][row]
+    for (int l = first; l < first + layers; l++) {
+      std::printf("steps %d-%d layer %d: GPUs...\n", step0, step0 + rows - 1, l);
+      got[l - first] = decoder.decode_layer(l);
+    }
+    const std::vector<float> got_logits = with_head ? decoder.logits() : std::vector<float>{};
+
+    for (int r = 0; r < rows; r++) {
+      const int step = step0 + r;
+      const int64_t p = step;
+      const int token = tokens[step % 8];
+      layer_ref::Stream stream = layer_ref::embed(embs[r]);
+      std::printf("step %d: oracle...\n", step);
+      for (int l = first; l < first + layers; l++) {
+        const std::vector<float> decoded =
+            model::kind(l).engram ? decoded_rows(raws[r], l == model::kEngramLayers[0] ? 0 : 1) : std::vector<float>{};
+        current_layer = l;
+        layer_ref::Trace want;
+        stream = layer_ref::decode_layer(host[l - first], halves, state, stream, p, decoded, &want);
+
+        const engine::StepTrace& g = got[l - first][r];
+        Compare idx, attn, moe_c, h;
+        const bool idx_ok = idx.add(g.idx, want.idx);
+        const bool plan_ok = std::memcmp(&g.plan, &want.plan, sizeof(moe::Plan)) == 0;
+        const bool attn_ok = attn.add(g.attn_out, want.attn_out);
+        const bool moe_ok = moe_c.add(g.moe_out, want.moe_out);
+        const bool h_ok = h.add(g.stream, stream.h);
+        std::printf(
+            "step %d (token %d) layer %d: slots %s, plan %s (%d jobs), attention %zu/%zu, MoE %zu/%zu, stream %zu/%zu\n",
+            step, token, l, idx_ok ? "identical" : "DIFFER", plan_ok ? "identical" : "DIFFERS", g.plan.jobs, attn.same,
+            attn.total, moe_c.same, moe_c.total, h.same, h.total);
+        if (!(idx_ok && plan_ok && attn_ok && moe_ok && h_ok)) die("the GPUs and the oracle disagree");
+      }
+      if (with_head) {
+        const std::vector<float> row(got_logits.begin() + static_cast<size_t>(r) * model::kVocab,
+                                     got_logits.begin() + static_cast<size_t>(r + 1) * model::kVocab);
+        const auto want = layer_ref::logits(stream, head->norm, head->head);
+        Compare logit;
+        const bool ok = logit.add(row, want);
+        std::vector<int> order(row.size());
+        std::iota(order.begin(), order.end(), 0);
+        std::partial_sort(order.begin(), order.begin() + 5, order.end(), [&](int a, int b) { return row[a] > row[b]; });
+        std::printf("step %d logits: %zu/%zu identical; top-5 ids %d %d %d %d %d\n", step, logit.same, logit.total,
+                    order[0], order[1], order[2], order[3], order[4]);
+        if (!ok) die("the logits differ");
+      }
     }
   }
-  std::printf("%d steps x %d layers: GPUs and oracle bit-identical\n", steps, layers);
+  std::printf("%d steps x %d layers in Rounds of %d: GPUs and oracle bit-identical\n", steps, layers, round_rows);
   report_cache("checked steps");
 
-  // Timing: decode steps on the GPUs alone, pseudo-random tokens, under the same Expert cache.
+  // Timing: Rounds on the GPUs alone, pseudo-random tokens, under the same Expert cache.
   if (timing_steps > 0) {
     std::mt19937 token_rng(77);
     std::uniform_int_distribution<int> token_id(0, model::kVocab - 1);
-    const std::vector<uint8_t> raw(engine::kEngramTokenBytes, 0x38);
-    std::vector<double> step_ms;
-    for (int step = steps; step < steps + timing_steps; step++) {
-      const int token = token_id(token_rng);
-      auto emb = engine::load_bf16_row(backbone.value(), "embed.weight", token);
-      if (!emb) die(emb.error().what);
+    std::vector<double> round_ms;
+    for (int step0 = steps; step0 < steps + timing_steps; step0 += round_rows) {
+      const int rows = std::min(round_rows, steps + timing_steps - step0);
+      std::vector<float> embeddings;
+      for (int r = 0; r < rows; r++) {
+        auto emb = engine::load_bf16_row(backbone.value(), "embed.weight", token_id(token_rng));
+        if (!emb) die(emb.error().what);
+        embeddings.insert(embeddings.end(), emb.value().begin(), emb.value().end());
+      }
+      const std::vector<uint8_t> raw(rows * engine::kEngramTokenBytes, 0x38);
       const auto t0 = std::chrono::steady_clock::now();
-      decoder.begin_token(step, emb.value(), raw);
+      decoder.begin_round(step0, embeddings, raw);
       if (per_layer) for (int l = first; l < first + layers; l++) decoder.decode_layer(l, false);
-      else decoder.decode_token();
+      else decoder.decode_round();
       if (with_head) decoder.logits();
       decoder.sync();
-      step_ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+      if (rows == round_rows)
+        round_ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     }
-    std::sort(step_ms.begin(), step_ms.end());
-    const double median = step_ms[step_ms.size() / 2];
-    const double mean = std::accumulate(step_ms.begin(), step_ms.end(), 0.0) / static_cast<double>(step_ms.size());
-    std::printf("timing (%s): %d steps x %d layers%s, %u Slots: median %.2f ms per step (mean %.2f), %.3f ms per layer\n",
-                launches == engine::Launches::Graphs ? "graphs" : "eager", timing_steps, layers,
-                with_head ? " + head" : "", slot_count, median, mean, median / layers);
+    if (round_ms.empty()) die("--timing needs at least one full Round");
+    std::sort(round_ms.begin(), round_ms.end());
+    const double median = round_ms[round_ms.size() / 2];
+    const double mean = std::accumulate(round_ms.begin(), round_ms.end(), 0.0) / static_cast<double>(round_ms.size());
+    std::printf("timing (%s): %zu Rounds of %d x %d layers%s, %u Slots: median %.2f ms per Round (mean %.2f), "
+                "%.3f ms per layer, %.1f tokens/s\n",
+                launches == engine::Launches::Graphs ? "graphs" : "eager", round_ms.size(), round_rows, layers,
+                with_head ? " + head" : "", slot_count, median, mean, median / layers, 1000.0 * round_rows / median);
     report_cache("all steps");
   }
   decoder.sync();  // nothing in flight reads the Expert cache once it closes

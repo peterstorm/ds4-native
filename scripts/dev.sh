@@ -4,6 +4,8 @@
 #   scripts/dev.sh image          build the dev image on the host
 #   scripts/dev.sh test           sync, configure, build, run the unit tests
 #   scripts/dev.sh run -- CMD...  sync, then run CMD in the image (GPUs and /models visible)
+#   scripts/dev.sh bg NAME -- CMD  the same, detached in container ds4n-NAME (for runs past ~10 min)
+#   scripts/dev.sh log NAME [N]   the last N lines of a bg run, and whether it is still up
 #
 # From another machine the checkout is mirrored (without .git or build/) to
 # ~/dev/ds4-native-sync on the host, so the host's own git clone stays clean.
@@ -26,8 +28,8 @@ else
   }
 fi
 
-in_image() {  # $1: extra docker args, $2: command
-  on_host "cd $REMOTE_DIR && docker run --rm --user \$(id -u):\$(id -g) -e HOME=/tmp \
+in_image() {  # $1: extra docker args, $2: command, $3: container lifetime (default --rm)
+  on_host "cd $REMOTE_DIR && docker run ${3---rm} --user \$(id -u):\$(id -g) -e HOME=/tmp \
     --ulimit memlock=-1 --ipc=host $1 -v \$PWD:/src -v /models:/models -w /src $IMAGE bash -c $(printf '%q' "$2")"
 }
 
@@ -48,8 +50,20 @@ case "${1:-}" in
     # a production unit needs a profile that allows exactly the io_uring syscalls.
     in_image "--gpus all --security-opt seccomp=unconfined" "$*"
     ;;
+  bg)
+    name="ds4n-$2"
+    shift 2
+    [ "${1:-}" = "--" ] && shift
+    sync
+    on_host "docker rm -f $name >/dev/null 2>&1; true"
+    in_image "-d --name $name --gpus all --security-opt seccomp=unconfined" "$*" " " >/dev/null
+    echo "started $name"
+    ;;
+  log)
+    on_host "docker logs ds4n-$2 2>&1 | tail -${3:-40}; docker ps -a --filter name=ds4n-$2 --format '{{.Status}}'"
+    ;;
   *)
-    sed -n '2,9p' "$0"
+    sed -n '2,11p' "$0"
     exit 2
     ;;
 esac

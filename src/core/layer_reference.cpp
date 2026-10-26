@@ -101,8 +101,8 @@ std::vector<float> attention(const HostLayer& w, State& state, const std::vector
   rope_heads(kv, 1, kHeadDim, rope, p, false);
   kv = attn::fp8_quant_dequant(kv);
   auto& ring = state.window[w.id];
-  ring.resize(static_cast<size_t>(kWindow) * kHeadDim, 0.0f);
-  std::copy(kv.begin(), kv.end(), ring.begin() + (p % kWindow) * kHeadDim);
+  ring.resize(static_cast<size_t>(kRing) * kHeadDim, 0.0f);
+  std::copy(kv.begin(), kv.end(), ring.begin() + (p % kRing) * kHeadDim);
 
   std::vector<int32_t> idx;
   for (int s = 0; s < kWindow; s++) idx.push_back(window_slot(p, s));
@@ -146,7 +146,7 @@ std::vector<float> attention(const HostLayer& w, State& state, const std::vector
       std::span<const uint8_t> allowed;
       if (kind.candidate_source) state.candidates = indexer::candidates(scores, compress_len).value();
       if (kind.uses_candidates) allowed = state.candidates;
-      state.topk = indexer::top_positions(scores, allowed, compress_len, kWindow).value();
+      state.topk = indexer::top_positions(scores, allowed, compress_len, kRing).value();
       state.topk.resize(kTopK, -1);
     }
     if (kind.kv_source && latent) {
@@ -159,16 +159,16 @@ std::vector<float> attention(const HostLayer& w, State& state, const std::vector
     idx.insert(idx.end(), state.topk.begin(), state.topk.end());
   }
 
-  // Gather the slots: window rows below 128, the owner's compressed rows above.
+  // Gather the slots: window ring rows below kRing, the owner's compressed rows above.
   const int n = static_cast<int>(idx.size());
   std::vector<float> gathered(static_cast<size_t>(n) * kHeadDim, 0.0f);
   std::unique_ptr<bool[]> valid(new bool[n]);
   for (int i = 0; i < n; i++) {
     valid[i] = idx[i] >= 0;
     if (!valid[i]) continue;
-    const float* row = idx[i] < kWindow ? ring.data() + static_cast<size_t>(idx[i]) * kHeadDim
-                                        : state.compressed[kind.cache_owner].data() +
-                                              static_cast<size_t>(idx[i] - kWindow) * kHeadDim;
+    const float* row = idx[i] < kRing ? ring.data() + static_cast<size_t>(idx[i]) * kHeadDim
+                                      : state.compressed[kind.cache_owner].data() +
+                                            static_cast<size_t>(idx[i] - kRing) * kHeadDim;
     std::copy_n(row, kHeadDim, gathered.begin() + static_cast<size_t>(i) * kHeadDim);
   }
   if (trace) trace->idx = idx;
