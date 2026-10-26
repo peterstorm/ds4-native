@@ -71,6 +71,24 @@ __global__ void __launch_bounds__(1024) add_argmax_kernel(const float* __restric
   }
 }
 
+__global__ void __launch_bounds__(1024) confidence_kernel(const float* __restrict__ proj,
+                                                          const __nv_bfloat16* __restrict__ hidden, int dim,
+                                                          const float* __restrict__ markov, int rank,
+                                                          float* __restrict__ out) {
+  __shared__ float part[32];
+  float acc = 0.0f;
+  for (int i = threadIdx.x; i < dim + rank; i += blockDim.x)
+    acc = __fmaf_rn(proj[i], i < dim ? __bfloat162float(hidden[i]) : markov[i - dim], acc);
+  for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, o);
+  if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = acc;
+  __syncthreads();
+  if (threadIdx.x < 32) {
+    acc = threadIdx.x < blockDim.x / 32 ? part[threadIdx.x] : 0.0f;
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, o);
+    if (threadIdx.x == 0) *out = 1.0f / (1.0f + __expf(-acc));
+  }
+}
+
 }  // namespace
 
 void capture_features(const __nv_bfloat16* h, int rows, int dim, const int64_t* pos, __nv_bfloat16* ring, int ring_rows,
@@ -90,6 +108,11 @@ void embedding_row(const __nv_bfloat16* table, int width, const int32_t* token, 
 
 void add_argmax(const float* base, const float* bias_planes, int n, int32_t* token, cudaStream_t stream) {
   add_argmax_kernel<<<1, 1024, 0, stream>>>(base, bias_planes, n, token);
+}
+
+void confidence(const float* proj, const __nv_bfloat16* hidden, int dim, const float* markov, int rank, float* out,
+                cudaStream_t stream) {
+  confidence_kernel<<<1, 1024, 0, stream>>>(proj, hidden, dim, markov, rank, out);
 }
 
 }  // namespace ds4n::cuda

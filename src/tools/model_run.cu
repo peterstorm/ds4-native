@@ -4,7 +4,7 @@
 //   ds4n-model-run --backbone SAFETENSORS --store STORE --gguf MERGED_GGUF --tokens DIR --names a,b
 //                  --out DIR [--oracle DIR] [--force 1] [--steps N] [--slots N] [--ram-records R] [--prior PROFILE]
 //                  [--prior-weight W] [--ram-policy recent|popular] [--ccr LAMBDA] [--prefill R]
-//                  [--access-log FILE] [--vram-policy lru|picks] [--hints 0|1] [--dspark DIR]
+//                  [--access-log FILE] [--vram-policy lru|picks] [--hints 0|1] [--dspark DIR [--verify-rows N]]
 //
 // For each name, DIR/<name>.tokens is antirez's --dump-tokens output (ids on the first line). The
 // prompt runs from position 0 in Rounds of R rows (--prefill, 1 to 8, default 8: the same logits as
@@ -27,7 +27,9 @@
 // Placement only: outputs never change.
 // --dspark DIR (the checkpoint shards holding mtp.*) decodes the greedy continuation with DSpark
 // (docs/design/dspark.md): each Round verifies an anchor and a drafted block of 5 and keeps the
-// drafted tokens the target agrees with. The dump is the plain greedy run's, byte for byte.
+// drafted tokens the target agrees with. The dump is the plain greedy run's, byte for byte. The
+// verify width adapts to the confidence head and the measured cost of rows (core/speculation),
+// falling back to plain steps while drafting loses to them; --verify-rows N (1 .. 6) fixes it.
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -51,6 +53,7 @@
 #include "core/expert_cache.hpp"
 #include "core/engram.hpp"
 #include "core/model.hpp"
+#include "core/speculation.hpp"
 #include "cuda/engram.cuh"
 #include "engine/decoder.cuh"
 #include "engine/engram_source.hpp"
@@ -141,7 +144,7 @@ int main(int argc, char** argv) {
   setenv("CUDA_MODULE_LOADING", "EAGER", 1);  // before any CUDA call: see engine/decoder.cuh
   std::string backbone_path, store_path, gguf_path, tokens_dir, names_arg, out_dir, oracle_dir, prior_path, access_log, dspark_dir;
   bool force = false;
-  int max_steps = 64, prefill_rows = model::kMaxRows;
+  int max_steps = 64, prefill_rows = model::kMaxRows, verify_rows = 0;
   uint32_t slots = 8000, ram_records = 512, prior_weight = 1;
   float ccr = 0.0f;
   engine::RamPolicy ram_policy = engine::RamPolicy::Recent;
@@ -168,6 +171,7 @@ int main(int argc, char** argv) {
     else if (s == "--ccr") ccr = std::stof(argv[++i]);
     else if (s == "--access-log") access_log = argv[++i];
     else if (s == "--dspark") dspark_dir = argv[++i];
+    else if (s == "--verify-rows") verify_rows = std::stoi(argv[++i]);
     else if (s == "--hints") hints = std::string(argv[++i]) == "1";
     else if (s == "--vram-policy") {
       const std::string v = argv[++i];
@@ -185,7 +189,8 @@ int main(int argc, char** argv) {
   }
   if (!dspark_dir.empty() && force) die("--dspark drafts greedy continuations: it cannot be teacher forced");
   if (backbone_path.empty() || store_path.empty() || gguf_path.empty() || tokens_dir.empty() || names_arg.empty() ||
-      out_dir.empty() || prefill_rows < 1 || prefill_rows > model::kMaxRows)
+      out_dir.empty() || prefill_rows < 1 || prefill_rows > model::kMaxRows || verify_rows < 0 ||
+      verify_rows > model::kVerifyRows)
     die("usage: ds4n-model-run --backbone B --store S --gguf G --tokens DIR --names a,b --out DIR [--oracle DIR]");
   std::vector<std::string> names;
   for (size_t at = 0; at <= names_arg.size();) {
@@ -395,23 +400,39 @@ int main(int argc, char** argv) {
         }
       }
     } else {
-      // DSpark: draft a block after the anchor, verify the anchor and the block in one Round, keep the
-      // drafted tokens while the target's greedy choice agrees; the first disagreeing choice (or the
-      // last row's) is the next anchor. Rows after it are discarded (their cache writes are never read).
-      std::array<int, model::kVerifyRows> kept{};  // Rounds by rows committed
+      // DSpark: draft a block after the anchor, verify the anchor and (some of) the block in one
+      // Round, keep the drafted tokens while the target's greedy choice agrees; the first disagreeing
+      // choice (or the last row's) is the next anchor. Rows after it are discarded (their cache writes
+      // are never read). The verify width is adaptive (core/speculation) unless --verify-rows fixes it.
+      auto ms_since = [](Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); };
+      std::array<int, model::kVerifyRows> kept{}, widths{};  // drafted Rounds by rows committed, by rows verified
+      int plain_steps = 0;
       std::vector<double> draft_ms;
+      spec::Policy policy = verify_rows ? spec::Policy{} : spec::start();
       int64_t p = static_cast<int64_t>(prompt.size());
       int32_t anchor = record_step(0, logits);
       recorded = 1;
       while (recorded < steps && !is_eos(anchor)) {
+        if (!spec::drafts(policy)) {
+          const auto t_round = Clock::now();
+          const auto all = run_round(p, std::span(&anchor, 1), true);
+          policy = spec::after_plain(policy, ms_since(t_round));
+          anchor = record_step(recorded++, all);
+          p++;
+          plain_steps++;
+          continue;
+        }
         const auto t_draft = Clock::now();
-        const auto drafted = decoder.draft(p, anchor, embedding(anchor));
-        draft_ms.push_back(std::chrono::duration<double, std::milli>(Clock::now() - t_draft).count());
-        const int n = std::min(model::kVerifyRows, steps - recorded);
+        const engine::DraftBlock block = decoder.draft(p, anchor, embedding(anchor));
+        const double this_draft_ms = ms_since(t_draft);
+        draft_ms.push_back(this_draft_ms);
+        const int n = std::min(verify_rows ? verify_rows : spec::choose_rows(policy, block.confidence), steps - recorded);
         std::vector<int32_t> tokens = {anchor};
-        tokens.insert(tokens.end(), drafted.begin(), drafted.begin() + (n - 1));
+        tokens.insert(tokens.end(), block.tokens.begin(), block.tokens.begin() + (n - 1));
         std::vector<engram::History> histories;
+        const auto t_round = Clock::now();
         const auto all = run_round(p, tokens, true, &histories);
+        const double round_ms = ms_since(t_round);
         int i = 0;
         int32_t next = record_step(recorded, row(all, 0));
         while (i + 1 < n && next == tokens[i + 1] && !is_eos(next)) {
@@ -424,12 +445,16 @@ int main(int argc, char** argv) {
         history = histories[i];
         anchor = next;
         kept[i]++;
+        widths[n - 1]++;
+        if (!verify_rows) policy = spec::after_draft(policy, n, i + 1, this_draft_ms, round_ms);
       }
       const int rounds = std::accumulate(kept.begin(), kept.end(), 0);
-      std::printf("%s DSpark: %d Rounds, %.2f tokens per Round (committed rows:", name.c_str(), rounds,
-                  rounds ? static_cast<double>(recorded - 1) / rounds : 0.0);
+      std::printf("%s DSpark: %d drafted Rounds, %.2f tokens each; %d plain steps; verified rows:", name.c_str(), rounds,
+                  rounds ? static_cast<double>(recorded - 1 - plain_steps) / rounds : 0.0, plain_steps);
+      for (int k = 0; k < model::kVerifyRows; k++) std::printf(" %d:%d", k + 1, widths[k]);
+      std::printf("; committed rows:");
       for (int k = 0; k < model::kVerifyRows; k++) std::printf(" %d:%d", k + 1, kept[k]);
-      std::printf("); median draft %.2f ms, median verify Round %.2f ms\n", median(draft_ms), median(step_ms));
+      std::printf("; median draft %.2f ms, median Round %.2f ms\n", median(draft_ms), median(step_ms));
     }
     const double continuation_s = std::chrono::duration<double>(Clock::now() - t_continuation).count();
     steps_out << "\n  ]\n}\n";

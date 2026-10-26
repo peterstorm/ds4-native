@@ -67,6 +67,15 @@ struct StepTrace {
   moe::Plan plan;
 };
 
+/**
+ * A drafted block: the tokens for positions p + 1 .. p + 5 and, per token, the confidence head's
+ * probability that the target accepts it given that it accepts the ones before.
+ */
+struct DraftBlock {
+  std::array<int32_t, model::kDraftRows> tokens;
+  std::array<float, model::kDraftRows> confidence;
+};
+
 /** How the decoder issues a layer step's kernels. */
 enum class Launches { Graphs, Eager };
 
@@ -128,10 +137,10 @@ class Decoder {
    * Draft a block for the anchor `token` at position p (embedding `anchor_embedding`): first the
    * context takes every position below p it has not yet (their target features, captured when a
    * Round decoded them; the caller guarantees every position below p is committed), then the
-   * stages, the head and the Markov chain. Returns the tokens drafted for positions p + 1 .. p + 5.
+   * stages, the head, the Markov chain and the confidence head.
    * Uses the Round buffers: call between Rounds, after the last Round's logits().
    */
-  std::array<int32_t, model::kDraftRows> draft(int64_t p, int32_t token, std::span<const float> anchor_embedding);
+  DraftBlock draft(int64_t p, int32_t token, std::span<const float> anchor_embedding);
 
  private:
   struct Gpu;

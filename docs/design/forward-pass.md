@@ -266,12 +266,15 @@ The replay reproduces the engine's own counts (93.66 % against 92.3-94.4 % on th
 Online policies saturate at LRU; Belady's 2.4x fewer Misses is knowledge of the future that
 neither pick counts nor the router's near-misses (ranks 7-16, posted by GPU 0 beside each step)
 carry. Near-misses as hints still read 8-10 % less from the store in the engine (code / history /
-guide store reads 6,794 / 8,335 / 13,763 -> 6,128 / 7,591 / 12,713; 84.6 / 71.9 / 47.8 -> 87.4 /
-73.7 / 51.0 tok/s, outputs byte-identical), so LRU with hints is the default. At tiny caches hints
-hurt (64 Slots: 4.9 -> 1.8 % Hits): they protect Experts that real reuse would need the Slot for.
+guide store reads 6,794 / 8,335 / 13,763 -> 6,128 / 7,591 / 12,713; by median step 84.6 / 71.9 /
+47.8 -> 87.4 / 73.7 / 51.0 tok/s, outputs byte-identical), so LRU with hints is the default. At
+tiny caches hints hurt (64 Slots: 4.9 -> 1.8 % Hits): they protect Experts that real reuse would
+need the Slot for.
 
-Exact decode on these long generations: code 87 tok/s median (steady ~100: 99.5 % Hits, ~1.2
-store reads per token), history 74, guide 51 -- locality grows with a single long context.
+Exact decode on these long generations, wall clock: code 73.4 tok/s (the median step 11.4 ms; the
+steady state ~10 ms: 99.5 % Hits, ~1.2 store reads per token), history 60.5, guide 43.0 --
+locality grows with a single long context. Misses make the mean step much longer than the median.
+DSpark (dspark.md) takes code to 102 tok/s.
 
 Next: prefetch from a predicted routing (the remaining gap to Belady is foresight); the warm start
 from a profile of the engine's own traffic.

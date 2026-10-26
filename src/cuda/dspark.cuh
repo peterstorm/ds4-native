@@ -28,4 +28,8 @@ void embedding_row(const __nv_bfloat16* table, int width, const int32_t* token, 
  */
 void add_argmax(const float* base, const float* bias_planes, int n, int32_t* token, cudaStream_t stream);
 
+/** *out = sigmoid(proj . concat(float(hidden) [dim], markov [rank])): the confidence head ([dim + rank] FP32). */
+void confidence(const float* proj, const __nv_bfloat16* hidden, int dim, const float* markov, int rank, float* out,
+                cudaStream_t stream);
+
 }  // namespace ds4n::cuda

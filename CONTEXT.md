@@ -72,6 +72,16 @@ One forward pass producing one token for one Session.
 **Round**:
 One forward pass over up to 8 rows at consecutive positions of one Session (a prefill chunk, DSpark verification rows, or one decode row), layer by layer; its outputs are exactly those of its rows decoded one at a time. Rows of several Sessions in one Round need per-Session caches (not built).
 
+**Anchor**:
+The last committed token, which the target has not decoded yet; a Draft starts from it, and a verify Round's first row is it.
+
+**Draft**:
+DSpark's five tokens after an Anchor, made in one pass by its three stages from the target's features at layers 37-39, each with a confidence (the probability the target accepts it given it accepts the ones before).
+_Avoid_: speculation (the whole scheme), proposal
+
+**Verify width**:
+The rows a verify Round takes: the Anchor and that many minus one drafted tokens; 1 is a plain step. Chosen per Round from the confidences and the measured cost of rows (`core/speculation`).
+
 **Base step**:
 The time of a Step with zero Misses.
 

@@ -125,6 +125,7 @@ struct Staging {
   int32_t draft_idx[kDraftRows][kIdxStride];
   SeedIndex seed;
   int32_t chain[kDraftRows + 1];  // the anchor, then the drafted tokens
+  float confidence[kDraftRows];
 };
 
 struct Decoder::Gpu {
@@ -210,6 +211,7 @@ struct Decoder::Gpu {
     bf16 *markov_embed = nullptr, *markov_head = nullptr;
     float *markov_x = nullptr, *markov_planes = nullptr, *logits = nullptr;  // [256], [vocab][8], [rows][vocab]
     int32_t* chain = nullptr;  // [kDraftRows + 1]
+    float *confidence_proj = nullptr, *confidences = nullptr;  // [5120 + 256], [kDraftRows]
   } draft;
   cudaEvent_t staged_seed = nullptr, logits_copied = nullptr;
 
@@ -858,6 +860,8 @@ void Decoder::add_draft(const HostDraft& w, std::span<const float> noise_embeddi
       dr.markov_planes = a.alloc<float>(static_cast<size_t>(kVocab) * 8);
       dr.logits = a.alloc<float>(static_cast<size_t>(kDraftRows) * kVocab);
       dr.chain = a.alloc<int32_t>(kDraftRows + 1);
+      dr.confidence_proj = a.upload_f32(w.confidence);
+      dr.confidences = a.alloc<float>(kDraftRows);
     }
     check(cudaStreamSynchronize(s.stream), "add_draft");
   }
@@ -877,7 +881,7 @@ void Decoder::add_draft_expert(int stage, int expert, std::span<const std::byte>
   }
 }
 
-std::array<int32_t, kDraftRows> Decoder::draft(int64_t p, int32_t token, std::span<const float> anchor_embedding) {
+DraftBlock Decoder::draft(int64_t p, int32_t token, std::span<const float> anchor_embedding) {
   constexpr size_t half = kVocab / kGpus;
   Gpu& lead = *gpus_[0];
   Gpu& peer = *gpus_[1];
@@ -963,14 +967,20 @@ std::array<int32_t, kDraftRows> Decoder::draft(int64_t p, int32_t token, std::sp
   Gpu::Draft& dr = lead.draft;
   for (int r = 0; r < kDraftRows; r++) {
     cuda::embedding_row(dr.markov_embed, kMarkovRank, dr.chain + r, dr.markov_x, st);
+    cuda::confidence(dr.confidence_proj, lead.x0 + static_cast<size_t>(r) * kDim, kDim, dr.markov_x, kMarkovRank,
+                     dr.confidences + r, st);  // x0: the block's collapsed rows, from the head
     cuda::bf16_gemv(dr.markov_head, dr.markov_x, kVocab, kMarkovRank, 1, 1, dr.markov_planes, st);
     cuda::add_argmax(dr.logits + static_cast<size_t>(r) * kVocab, dr.markov_planes, kVocab, dr.chain + r + 1, st);
   }
   check(cudaMemcpyAsync(lead.staging->chain, dr.chain, sizeof(lead.staging->chain), cudaMemcpyDeviceToHost, st), "chain");
+  check(cudaMemcpyAsync(lead.staging->confidence, dr.confidences, sizeof(lead.staging->confidence), cudaMemcpyDeviceToHost,
+                        st),
+        "confidence");
   check(cudaStreamSynchronize(st), "draft");
-  std::array<int32_t, kDraftRows> tokens;
-  std::copy(lead.staging->chain + 1, lead.staging->chain + 1 + kDraftRows, tokens.begin());
-  return tokens;
+  DraftBlock block;
+  std::copy(lead.staging->chain + 1, lead.staging->chain + 1 + kDraftRows, block.tokens.begin());
+  std::copy(lead.staging->confidence, lead.staging->confidence + kDraftRows, block.confidence.begin());
+  return block;
 }
 
 }  // namespace ds4n::engine

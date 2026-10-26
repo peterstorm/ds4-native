@@ -25,6 +25,7 @@ add_library(ds4n_core STATIC
   src/core/layer_weights.cpp
   src/core/compare.cpp
   src/core/cache_replay.cpp
+  src/core/speculation.cpp
 )
 target_include_directories(ds4n_core PUBLIC src)
 target_compile_options(ds4n_core PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -128,6 +129,7 @@ add_executable(ds4n_tests
   tests/core/test_compare.cpp
   tests/core/test_round.cpp
   tests/core/test_cache_replay.cpp
+  tests/core/test_speculation.cpp
 )
 target_link_libraries(ds4n_tests PRIVATE ds4n_core doctest::doctest)
 target_compile_options(ds4n_tests PRIVATE -Wall -Wextra)

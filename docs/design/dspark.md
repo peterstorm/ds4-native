@@ -79,17 +79,20 @@ ran slower with DSpark: 4.3 vs 5.5 tok/s).
 ## Measured
 
 `ds4n-model-run --dspark /models/ds41/hf-1017-mtp`, three long free-running generations (exact
-routing, 8,500 Slots, 2,048 RAM tier records); every dump byte-identical to the plain greedy run:
+routing, 8,500 Slots, 2,048 RAM tier records). Every dump is byte-identical to the plain greedy
+run's. Throughput is wall clock over the continuation (step 0 comes with the prompt):
 
-| Prompt | tokens per verify Round | plain tok/s | DSpark tok/s | store reads plain -> DSpark |
+| Prompt | plain tok/s | DSpark, 6 rows | DSpark, adaptive | tokens per drafted Round (6 / adaptive) |
 |---|---|---|---|---|
-| code (2,048 steps) | 5.08 (241 of 403 Rounds keep all 5) | 87.4 | **100.5** | 6,128 -> 6,891 |
-| history (1,517) | 2.56 | 73.7 | 46.2 | 7,591 -> 11,482 |
-| guide (1,501) | 3.04 | 51.0 | 34.8 | 12,713 -> 18,571 |
+| code (2,048 steps) | 73.4 | 100.5 | **102.0** | 5.08 / 4.51 (450 of 453 Rounds verify 5 rows) |
+| history (1,517) | 60.5 | 46.2 | 60.0 | 2.56 / 1.02 (1,420 plain steps) |
+| guide (1,501) | 43.0 | 34.8 | 42.8 | 3.04 / 1.35 (1,150 plain steps) |
 
-The draft costs 2.4 ms per block (3 stages over 5 rows, the head, 5 Markov steps); the draft's
-384 Experts stay resident (3.6 GB per GPU). A verify Round of 6 rows costs ~14 ms resident, but
-its Expert union is ~3x a token's, so in Miss-bound text it pays for Misses its kept tokens do not
-repay: code's verify Rounds take 36 ms median (17 store reads each), the guide's 72 ms. Without
-Misses the code run would decode at ~300 tok/s. Next: choose the verify width per Round from the
-expected kept tokens (the confidence head) against the measured cost of a row.
+The draft costs 2.4 ms per block (3 stages over 5 rows, the head, 5 Markov steps, the confidence
+head); its 384 Experts stay resident (3.6 GB per GPU). A verify Round of 6 rows costs ~14 ms
+resident, but its Expert union is ~3x a token's, so in Miss-bound text it pays for Misses its kept
+tokens do not repay (6 rows: the guide's verify Rounds take 72 ms median, store reads +46 %).
+Adaptive verification (`core/speculation`) picks the width with the most expected tokens per ms --
+the confidence head's survival probabilities against the measured cost of each width, the draft
+included -- and decodes plain steps for a while when drafting lost to them: +39 % on code, the
+plain speed elsewhere. Without Misses the code run would decode at ~300 tok/s.
