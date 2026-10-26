@@ -59,6 +59,31 @@ Result<std::vector<std::byte>, TileError> untile_matrix(std::span<const std::byt
   return R::ok(std::move(out));
 }
 
+Result<std::vector<std::byte>, TileError> tile_fp8_matrix(std::span<const uint8_t> codes, std::span<const uint8_t> scales,
+                                                          size_t rows, size_t blocks) {
+  using R = Result<std::vector<std::byte>, TileError>;
+  if (rows % kTileRows || !rows || !blocks) return R::err({"rows must be a positive multiple of 16"});
+  const size_t k = blocks * 32;
+  if (codes.size() != rows * k || scales.size() != (rows + 31) / 32 * blocks)
+    return R::err({"FP8 codes or scales do not match the shape"});
+  std::vector<std::byte> out(fp8_tiled_bytes(rows, blocks));
+  for (size_t tile = 0; tile < rows / kTileRows; tile++) {
+    std::byte* t = out.data() + tile * fp8_tile_bytes(blocks);
+    for (size_t b = 0; b < blocks; b++) {
+      for (unsigned lane = 0; lane < 32; lane++) {
+        const unsigned g = lane >> 2, q = lane & 3;
+        for (unsigned reg = 0; reg < 4; reg++) {
+          const size_t row = tile * kTileRows + g + 8 * (reg & 1);
+          const size_t col = b * 32 + 4 * q + 16 * (reg >> 1);
+          std::memcpy(t + b * 512 + lane * 16 + reg * 4, codes.data() + row * k + col, 4);
+        }
+      }
+      t[blocks * 512 + b] = std::byte(scales[(tile * kTileRows / 32) * blocks + b]);
+    }
+  }
+  return R::ok(std::move(out));
+}
+
 std::span<const std::byte, 16> lane_codes(std::span<const std::byte> tiled, size_t blocks, size_t tile, size_t pair,
                                           unsigned lane) {
   return tiled.subspan(tile * tile_bytes(blocks) + pair * kPairBytes + lane * 16).first<16>();

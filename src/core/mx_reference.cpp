@@ -101,6 +101,16 @@ float fp4_row_dot(std::span<const ActBlock> act, std::span<const std::byte> row,
   return acc;
 }
 
+float fp8_row_dot(std::span<const ActBlock> act, std::span<const uint8_t> codes, std::span<const uint8_t> scales) {
+  float acc = 0.0f;
+  for (size_t b = 0; b < act.size(); b++) {
+    double exact = 0.0;  // E4M3 x E4M3 products have <= 8 significant bits: exact in double
+    for (size_t i = 0; i < kBlock; i++) exact += double(e4m3_value(act[b].codes[i])) * e4m3_value(codes[b * kBlock + i]);
+    acc += static_cast<float>(exact) * e8m0_value(act[b].scale) * e8m0_value(scales[b]);
+  }
+  return acc;
+}
+
 std::vector<float> fp4_linear(std::span<const ActBlock> act, std::span<const std::byte> matrix, size_t rows) {
   const size_t row_bytes = act.size() * kGgmlBlockBytes;
   std::vector<float> out(rows);

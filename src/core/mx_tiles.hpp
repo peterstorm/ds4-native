@@ -41,6 +41,23 @@ Result<std::vector<std::byte>, TileError> tile_matrix(std::span<const std::byte>
 /** Inverse of tile_matrix. */
 Result<std::vector<std::byte>, TileError> untile_matrix(std::span<const std::byte> tiled, size_t rows, size_t blocks);
 
+/**
+ * FP8 (E4M3) weights with 32x32 E8M0 tile scales, in fragment order. Per
+ * 16-row tile: codes, then scales. Codes: per K block, 512 bytes; lane t's 16
+ * bytes at t*16 are exactly its A registers {a0, a1, a2, a3}: row g k 4q..4q+3,
+ * row g+8 k 4q..4q+3, row g k 16+4q.., row g+8 k 16+4q... Scales: one byte per
+ * K block (a 16-row tile lies inside one 32-row scale group), padded to 16 bytes.
+ */
+constexpr size_t fp8_tile_bytes(size_t blocks) { return blocks * 512 + (blocks + 15) / 16 * 16; }
+constexpr size_t fp8_tiled_bytes(size_t rows, size_t blocks) { return rows / kTileRows * fp8_tile_bytes(blocks); }
+
+/**
+ * `codes` is [rows][blocks*32] row-major E4M3; `scales` is [ceil(rows/32)][blocks]
+ * E8M0 as in the checkpoint. rows % 16 == 0.
+ */
+Result<std::vector<std::byte>, TileError> tile_fp8_matrix(std::span<const uint8_t> codes, std::span<const uint8_t> scales,
+                                                          size_t rows, size_t blocks);
+
 /** What lane `t` of the warp handling `tile` loads for K-block pair `pair` (16 bytes). */
 std::span<const std::byte, 16> lane_codes(std::span<const std::byte> tiled, size_t blocks, size_t tile, size_t pair,
                                           unsigned lane);

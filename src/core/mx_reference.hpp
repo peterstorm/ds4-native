@@ -54,6 +54,13 @@ float ggml_block_element(std::span<const std::byte, kGgmlBlockBytes> block, size
  */
 float fp4_row_dot(std::span<const ActBlock> act, std::span<const std::byte> row, size_t first, size_t count);
 
+/**
+ * FP8 weight row (E4M3 codes, K values) dotted with quantized activations,
+ * the reference fp8_gemm with 32-wide blocks: `scales[b]` is the E8M0 scale of
+ * this row's 32x32 weight tile in K block b. Not rounded to BF16.
+ */
+float fp8_row_dot(std::span<const ActBlock> act, std::span<const uint8_t> codes, std::span<const uint8_t> scales);
+
 /** Reference linear: every output row's FP32 dot product, rounded to BF16. */
 std::vector<float> fp4_linear(std::span<const ActBlock> act, std::span<const std::byte> matrix, size_t rows);
 
