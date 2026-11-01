@@ -71,6 +71,40 @@ __global__ void __launch_bounds__(kThreads) planes_rope_kernel(Planes in, int he
   for (int e = threadIdx.x; e < head_dim; e += kThreads) row[base + e] = __float2bfloat16_rn(vals[e]);
 }
 
+constexpr int kMaxHeadDim = 512;  // the longest head planes_rope_groups_kernel stages
+constexpr int kGroupStride = kMaxTokens + 1;  // a row's 8 token columns in shared memory, padded against bank conflicts
+
+/**
+ * planes_rope_kernel for column groups (a wave): block (head, group of 8 tokens) reads the head's
+ * planes as they lie, [rows][8] -- every 32-byte sector holds a row's 8 tokens, where block (head,
+ * token) used one float of each -- then the same sums, RoPE and rounding per token.
+ */
+__global__ void __launch_bounds__(kThreads) planes_rope_groups_kernel(Planes in, int tokens, int head_dim, int rope_dim,
+                                                                      const float* __restrict__ freqs,
+                                                                      const int64_t* __restrict__ positions,
+                                                                      __nv_bfloat16* __restrict__ out) {
+  __shared__ float vals[kMaxHeadDim * kGroupStride];  // [row][token column]
+  const int h = blockIdx.x, t0 = blockIdx.y * kMaxTokens, base = h * head_dim;
+  for (int f = threadIdx.x; f < head_dim * kMaxTokens; f += kThreads) {  // consecutive threads, consecutive floats
+    const int e = f / kMaxTokens, n = f % kMaxTokens;
+    vals[e * kGroupStride + n] = t0 + n < tokens ? plane_sum_bf16(in, base + e, t0 + n) : 0.0f;
+  }
+  __syncthreads();
+  const int tail = head_dim - rope_dim, pairs = rope_dim / 2;
+  for (int i = threadIdx.x; i < kMaxTokens * pairs; i += kThreads) {
+    const int n = i / pairs, p = i % pairs;
+    if (t0 + n < tokens)
+      ops::rope_pair(vals[(tail + 2 * p) * kGroupStride + n], vals[(tail + 2 * p + 1) * kGroupStride + n], positions[t0 + n],
+                     freqs[p], false);
+  }
+  __syncthreads();
+  for (int f = threadIdx.x; f < kMaxTokens * head_dim; f += kThreads) {  // per token, its head's row contiguous
+    const int n = f / head_dim, e = f % head_dim;
+    if (t0 + n < tokens)
+      out[static_cast<size_t>(t0 + n) * gridDim.x * head_dim + base + e] = __float2bfloat16_rn(vals[e * kGroupStride + n]);
+  }
+}
+
 /** Block (head, token). */
 __global__ void __launch_bounds__(kThreads) unrope_quantize_kernel(const __nv_bfloat16* __restrict__ o, int head_dim,
                                                                    int rope_dim, const float* __restrict__ freqs,
@@ -118,7 +152,11 @@ void kv_to_cache(Planes in, int tokens, const __nv_bfloat16* w, float eps, const
 
 void planes_rope(Planes in, int tokens, int heads, int head_dim, int rope_dim, const float* freqs,
                  const int64_t* positions, __nv_bfloat16* out, cudaStream_t stream) {
-  planes_rope_kernel<<<dim3(heads, tokens), kThreads, 0, stream>>>(in, head_dim, rope_dim, freqs, positions, out);
+  if (tokens > kMaxTokens && head_dim <= kMaxHeadDim)
+    planes_rope_groups_kernel<<<dim3(heads, column_groups(tokens)), kThreads, 0, stream>>>(in, tokens, head_dim, rope_dim, freqs,
+                                                                                          positions, out);
+  else
+    planes_rope_kernel<<<dim3(heads, tokens), kThreads, 0, stream>>>(in, head_dim, rope_dim, freqs, positions, out);
 }
 
 void unrope_quantize(const __nv_bfloat16* o, int tokens, int heads, int head_dim, int rope_dim, const float* freqs,
