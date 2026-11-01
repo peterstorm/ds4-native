@@ -93,6 +93,15 @@ head); its 384 Experts stay resident (3.6 GB per GPU). A verify Round of 6 rows 
 resident, but its Expert union is ~3x a token's, so in Miss-bound text it pays for Misses its kept
 tokens do not repay (6 rows: the guide's verify Rounds take 72 ms median, store reads +46 %).
 Adaptive verification (`core/speculation`) picks the width with the most expected tokens per ms --
-the confidence head's survival probabilities against the measured cost of each width, the draft
-included -- and decodes plain steps for a while when drafting lost to them: +39 % on code, the
-plain speed elsewhere. Without Misses the code run would decode at ~300 tok/s.
+the confidence head's survival probabilities (calibrated per position against what the target
+accepted) against a fitted cost line a + b rows (exponentially weighted least squares over every
+Round; every 16th drafted Round verifies the full width so the slope stays measured), the draft
+included -- and decodes plain steps for a while when the model says drafting at the observed
+acceptance loses: +35-39 % on code, the plain speed elsewhere. Per-width cost averages and a
+realized-throughput fallback were worse: single Miss-heavy Rounds swung them (one probe of 6 rows
+sent code under Cache-conditional routing into 1,572 plain steps, 104 instead of 135 tok/s).
+Without Misses the code run would decode at ~300 tok/s.
+
+With Cache-conditional routing (approximate, λ 0.2), DSpark adaptive: code 135.7 tok/s, history
+95.4, guide 89.5 (plain at λ 0.2: 97.8 / 85.1 / 80.8). The head stays well calibrated on code
+(0.96 predicted, 0.98 accepted at the first position) under either routing.

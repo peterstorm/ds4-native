@@ -446,7 +446,7 @@ int main(int argc, char** argv) {
         anchor = next;
         kept[i]++;
         widths[n - 1]++;
-        if (!verify_rows) policy = spec::after_draft(policy, n, i + 1, this_draft_ms, round_ms);
+        if (!verify_rows) policy = spec::after_draft(policy, block.confidence, n, i + 1, this_draft_ms, round_ms);
       }
       const int rounds = std::accumulate(kept.begin(), kept.end(), 0);
       std::printf("%s DSpark: %d drafted Rounds, %.2f tokens each; %d plain steps; verified rows:", name.c_str(), rounds,
@@ -454,6 +454,8 @@ int main(int argc, char** argv) {
       for (int k = 0; k < model::kVerifyRows; k++) std::printf(" %d:%d", k + 1, widths[k]);
       std::printf("; committed rows:");
       for (int k = 0; k < model::kVerifyRows; k++) std::printf(" %d:%d", k + 1, kept[k]);
+      std::printf("; head / target acceptance by position:");
+      for (int k = 0; k < model::kDraftRows; k++) std::printf(" %.2f/%.2f", policy.predicted[k], policy.accepted[k]);
       std::printf("; median draft %.2f ms, median Round %.2f ms\n", median(draft_ms), median(step_ms));
     }
     const double continuation_s = std::chrono::duration<double>(Clock::now() - t_continuation).count();
