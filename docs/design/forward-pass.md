@@ -244,7 +244,8 @@ of ~0.4 ms per Round and layer), ~18 s of a 9K chunk.
 **Grouped MoE** (`Decoder::prefill` with an `ExpertPlacer`). A sweep's layer runs in three parts:
 the attention halves for every Round (Engram, attention, the FFN input rows and the routing, left
 in chunk arrays by token -- in waves, below); the grouped MoE; then the combine halves (the MoE
-exchange and hc_post). The host groups the chunk's routing by Expert (`core/moe_groups`: each
+exchange and hc_post), launched between the next layer's waves (copy-engine exchanges, below). The
+host groups the chunk's routing by Expert (`core/moe_groups`: each
 routed Expert over its tokens ascending, 8 token columns per group, then the shared Expert once per
 Round) and runs the groups 512 at a time: the group's FFN input rows gathered and act_quant'ed
 (`gather_quantize`), gate/up, SwiGLU, down -- each Expert's weights stream once per 8 of its
@@ -278,10 +279,10 @@ grid). Exact by the Round argument stretched to a wave: every row's KV, latents 
 the caches before any row of the wave attends; the window ring is 128 + 512 slots (`model::kRing`),
 so the wave's writes never overwrite a position an earlier row of it still reads
 (`test_row_index`), and every other read is bounded by the reading row's position. Slot numbers
-change with the ring's size; the values attention reads do not. A wave's work is four phases
-(EngramMix, Attention, Ffn, Combine), each ending with at most one exchange, launched on both GPUs
-before either's next phase: a launch that blocks on a full queue can never hold up a peer's side of
-an exchange. Waves launch directly (no graphs).
+change with the ring's size; the values attention reads do not. A wave's work is phases
+(`WavePhase`), each holding at most one exchange, launched on both GPUs before either's next phase:
+a launch that blocks on a full queue can never hold up a peer's side of an exchange. Waves launch
+directly (no graphs).
 
 **One chunk per prompt.** A chunk's state is ~85 KB per token (stream, mixes, window slots, top-k,
 candidate blocks, FFN input rows, routing, the MoE partial); the embeddings go straight into the
@@ -289,7 +290,8 @@ streams' copy 0 and are replicated there, and the Engram rows stay in pinned hos
 read at the two Engram layers. So the whole 64K context fits one chunk (5.4 GB per GPU beside 8,500
 Slots, 92.9 of 97.9 GB in use), and the store reads each Expert outside the decode Slots once per
 prompt, whatever its length. Host prep: the embedding table lives in RAM (1.3 GB, read once) and a
-prompt's Engram rows are read 1,024 in flight across tokens (`EngramRows::read_tokens`).
+prompt's Engram rows were read 1,024 in flight across tokens (`EngramRows::read_tokens`; a sweep now
+reads them beside the GPUs, below).
 
 | Prompt | grouped MoE | + placement beside | + host prep | + waves | + one chunk |
 |---|---|---|---|---|---|
@@ -361,9 +363,64 @@ keeps the bits (the gates above, plus each check named):
 | 60,000 tokens | 1,814 | ~1,800 | **2,766 tok/s** |
 
 Up to ~18K tokens the drive is the bound again (9K: placement 5.5 of 7.2 s). At 60K (21.7 s): 4.6 s
-of host prep, 15.0 s of waves and Experts, 1.6 s of combine halves. What is left: the Engram row
-reads could overlap the first layers (or come from smaller records), the Expert GEMVs run at ~140
-TMAC/s, sparse attention takes 2.1 s, and the exchanges ride PCIe x8.
+of host prep, 15.0 s of waves and Experts, 1.6 s of combine halves.
+
+**Engram rows beside the GPUs.** That host prep was the prompt's Engram rows, all read before the
+first launch. `Decoder::prefill` now takes the tokens' row ids and an `EngramReader`
+(`EngramRows::read_rows`, io_uring) and reads a chunk's rows on a thread of its own into the pinned
+tables the GPUs read: table 0 (layer 1) in token order, then table 1 (layer 14). An Engram layer's
+wave waits only for its own rows (`Progress`, the one counter primitive the placing thread also
+uses). Each distinct row is read once per chunk (`engram::first_occurrence`, pure and tested; a
+repeat is copied from where its first occurrence landed): a real 9K prompt has 49 % distinct rows.
+A non-repeating prompt (random tokens, 99.8 % distinct) made table 0's 1.44 M small reads share the
+one NVMe with layer 0's 1 MiB Expert reads and lose -- its waves waited 8.6 s at 60K. When table 0
+has over 400K distinct rows (~0.5 s of the drive), layer 0's placing thread now waits for them
+first (`EngramReads`): 2,472 -> 2,660 tok/s on that prompt. Fewer rows still share the drive, which
+is faster for them (9K's 110K rows: 1,326 tok/s sharing, 1,276 first).
+
+**Sparse attention fragments.** Nsight had the split kernel's warps stalled on the shared-memory
+instruction queue: QK^T issued 6 loads per MMA and P.V built each V fragment from four 16-bit
+loads. `ldmatrix` (`.trans` for V) fills the same fragment registers with one instruction per 4
+tiles, so the MMAs see the same bits in the same order: decode 11.3 -> 9.8 us a layer, a sweep's
+128 query rows 94.2 -> 88.6 us (`ds4n-attn-check`, best of 3). Combining a row in its last split's
+CTA (L2-hot partials) gained 3 % at 128 rows and lost 2x at decode sizes -- one CTA cannot read a
+row's 640 KB of partials fast -- so the combine stays its own kernel.
+
+**Copy-engine exchanges** (`Decoder::Gpu::SweepLink`). The kernel exchange's blocks spin on the
+peer's flags; beside compute they hold SMs, and a bounded-grid exchange overlapped with the GEMVs
+was slower overall. A sweep's attention-output and MoE-output exchanges now leave the SMs: each GPU
+copies its FP32 partial into the peer's inbox (`cudaMemcpyPeerAsync`) on a link stream of its own,
+cross-device events order the copy after the partial (`ready`) and after the peer added what the
+inbox held (`added`), and `add_round_bf16` sums GPU 0's + GPU 1's on the link stream -- the kernel
+exchange's bits. The host orders the launches so every exchange runs beside compute: wave k's
+attention exchange (AttentionSend, AttentionAdd) goes before wave k - 1's Ffn, and a layer's combines
+(CombineSend, CombineAdd, CombinePost) go between the next layer's waves -- that layer's wave k
+needs only wave k combined, so wave k + 1's exchange is launched ahead of it. What lives across a
+neighbouring wave (the stream after Engram, the attention mixes, the partial, both exchanges'
+outputs) is double-buffered by wave parity. The Engram KV exchange (needed right away by its wave's
+Attention) and decode's (one round trip, 3.25 us) stay the kernel's.
+
+**Slots and RAM records for prompts.** Beside a 64K chunk the VRAM holds 8,800 Slots (95.6 GB at
+the peak; 9,000 runs out), and 3,300 RAM tier records (62 GB pinned) leave 9.9 GB of RAM available
+at the low point: `--slots 8800 --ram-records 3300` is the measured setting.
+
+| Prompt | sweep compute | + Engram beside | + ldmatrix, 8,800 Slots / 3,300 records, copy-engine exchanges |
+|---|---|---|---|
+| 9,129 tokens | 1,269 tok/s | 1,326 | **1,570 tok/s** |
+| 17,965 tokens | 1,663 | 1,914 | **2,247 tok/s** |
+| 35,930 tokens | 2,667 | 3,230 | **3,794-3,813 tok/s** |
+| 60,000 tokens | 2,766 | 3,447 | **4,143-4,166 tok/s** |
+
+(The 36K and 60K prompts repeat the 18K one, so their Engram reads shrink unusually far.) At 8,800 /
+3,300 with the kernel exchanges the 36K and 60K prompts ran 3,497 and 3,745 tok/s: the copy engines
+are worth 9-11 %. All dumps byte-identical (the gates above).
+
+What is left (Nsight Systems at 36K, GPU 0's kernel time before the copy-engine exchanges): the MX
+GEMVs 2.07 s (the tensor pipe 42 % busy), sparse attention 1.22 s, the exchange kernels 1.15 s (now
+the Engram KV's only), `accumulate_tokens` 0.44 s, hc_mixes partials 0.37 s, `planes_rope` 0.29 s,
+`unrope_quantize` 0.28 s, `gather_quantize` 0.27 s. The GPUs' idle time is mostly waiting on the
+drive (Expert copies, Engram rows); up to ~18K tokens the drive, the Slots and the RAM records are
+the bound.
 
 ## Expert residency
 

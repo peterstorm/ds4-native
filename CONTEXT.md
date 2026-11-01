@@ -97,6 +97,10 @@ Up to 64 Rounds of a prompt sweep whose attention halves run as one batch: every
 **Grouped MoE**:
 A prompt sweep's MoE per layer: each routed Expert run once over all the Cohort's tokens it serves, in groups of 8 token columns, accumulated in the Round's combine order (`core/moe_groups`). An Expert's consecutive groups (an **Expert run**) share one GEMV job, each weight read feeding all of them; the accumulation runs per token, its columns in group order.
 
+**Exchange**:
+The two GPUs' sum of a tensor-parallel FP32 partial (attention output, MoE output, Engram KV): both end with bf16(GPU 0's + GPU 1's), the same bits whichever way it travels. The kernel exchange pushes over P2P and spins on the peer's flags (decode, Engram KV); a prompt sweep's attention and MoE exchanges go by the copy engines on a link stream beside compute (`SweepLink`).
+_Avoid_: all-reduce (two GPUs and a fixed operand order, not a collective), sync
+
 **Append**:
 New prompt tokens added to an existing Session (a tool result, a user turn).
 
