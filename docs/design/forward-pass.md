@@ -450,11 +450,35 @@ of staging, stalls on the fixed-latency MMA chain 33 %, the first use of a weigh
 loads 20 %); software-pipelined weight loads, separate A registers per block, non-volatile MMA asm
 and per-format kernels all landed within +-5 % of codegen noise (pipelining decode's one-group path
 cost it 10 %). Column-major down planes for `accumulate_tokens` gained 6 %: its cost is the `y` rows,
-read and written once per batch a token appears in (~7 a layer). Nsight Compute must not profile
-`ds4n-model-run`: replay saves device memory through host RAM, and with ~95 GB a GPU and 62 GB of
-pinned records it hung the host -- profile kernels through the check tools.
+read and written once per batch a token appears in (~7 a layer); Nsight Compute (through
+`ds4n-moe-check`) has it at 71 % of DRAM bandwidth, and neither accumulating several batches at
+once (the `y` traffic falls, the batches' planes leave L2) nor loading a token's columns together
+moved it. Nsight Compute must not profile `ds4n-model-run`: replay saves device memory through host
+RAM, and with ~95 GB a GPU and 62 GB of pinned records it hung the host -- profile kernels through
+the check tools.
 
-What is left at 36K (Nsight Systems after these fixes): kernels 6.5 of an 8.7 s sweep. The idle
+**Plane readers and quantizers per column group.** A wave's GEMV planes are [group][split][rows][8];
+`planes_rope`, `sum_planes` and `group_planes_quantize` read them a token at a time (one float of
+each 32-byte sector, the other 7 tokens' copies fetched again by other blocks: L2-bound on 8x the
+bytes), and `unrope_quantize` and `gather_quantize` did a few dozen values of work per block or warp
+between barriers. With more than a Round's tokens they now run per column group (threads take whole
+sectors, the token fastest, through shared memory padded against bank conflicts) or per group
+column (`gather_quantize`: its warps stride over the K blocks), with the same per-element
+arithmetic; Rounds keep the old kernels. At 36K: `planes_rope` 91 -> 44 us a call,
+`unrope_quantize` 109 -> 57, `gather_quantize` 111 -> 61, `sum_planes` and `group_planes_quantize`
+off the top list. A third block per SM for the hc_mixes partials (`__launch_bounds__(256, 3)`)
+spilled and lost (73 -> 95 us).
+
+| Prompt | Engram KV whole | + plane readers | + quantizers per group | + gather per column |
+|---|---|---|---|---|
+| 9,129 tokens | 1,606 tok/s | 1,614 | 1,653 | **1,668 tok/s** |
+| 17,965 tokens | 2,306 | 2,317 | 2,319 | **2,337 tok/s** |
+| 35,930 tokens | 3,903-3,985 | 3,976-4,101 | 4,000-4,015 | **4,029-4,141 tok/s** |
+| 60,000 tokens | 4,353-4,461 | 4,615-4,640 | 4,659-4,676 | **4,753-4,767 tok/s** |
+
+What is left at 36K (Nsight Systems after the idle-time fixes): kernels 6.5 of an 8.7 s sweep (6.4
+after the plane readers: the MX GEMVs 2.1 s, sparse attention 1.3 s, `accumulate_tokens` and the
+hc_mixes partials 0.43 s each). The idle
 time moved to the drive: each layer's grouped MoE waits a median 21 ms for its Experts' placement
 (1.1 s in all), and layer 1's waves wait 0.65 s for table 0's Engram rows. The drive serves both:
 2,713 store reads (~51 GB) beside 309K Engram rows, each a 16 KB ZFS record read for 264 bytes
