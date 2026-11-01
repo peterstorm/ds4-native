@@ -95,7 +95,7 @@ A Cohort's pass through the model layer by layer: every row through layer L befo
 Up to 64 Rounds of a prompt sweep whose attention halves run as one batch: every kernel over all the Wave's rows, each GEMV's weights read once per Wave. The window ring outlasts the window by a Wave, so the Wave writes its rows' KV before any of them attends.
 
 **Grouped MoE**:
-A prompt sweep's MoE per layer: each routed Expert run once over all the Cohort's tokens it serves, in groups of 8 token columns, accumulated in the Round's combine order (`core/moe_groups`).
+A prompt sweep's MoE per layer: each routed Expert run once over all the Cohort's tokens it serves, in groups of 8 token columns, accumulated in the Round's combine order (`core/moe_groups`). An Expert's consecutive groups (an **Expert run**) share one GEMV job, each weight read feeding all of them; the accumulation runs per token, its columns in group order.
 
 **Append**:
 New prompt tokens added to an existing Session (a tool result, a user turn).

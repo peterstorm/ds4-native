@@ -573,6 +573,9 @@ int main(int argc, char** argv) {
                         gb.down_of(slot), kDim, kDownBlocks, 1, kDownBlocks, n_groups});
       }
       const Launch gu = make_launch(gate_up), dn = make_launch(down);
+      const moe::TokenColumns columns = moe::token_columns(std::span(groups.groups).subspan(at, count));
+      const moe::TokenSlots* d_token_slots = upload(columns.tokens.data(), columns.tokens.size());
+      const int32_t* d_slots = upload(columns.slots.data(), columns.slots.size());
       const int32_t* d_token_of = upload(token_of.data(), token_of.size());
       const float* d_weight = upload(weight.data(), weight.size());
       const int n = static_cast<int>(count);
@@ -581,7 +584,7 @@ int main(int argc, char** argv) {
       cuda::gemv_groups(gu.jobs, gu.first, gu.n, gu.warps, n, nullptr);
       cuda::swiglu_quantize_groups(d_token_of, d_weight, n, gb, moe::kSwigluLimit, nullptr);
       cuda::gemv_groups(dn.jobs, dn.first, dn.n, dn.warps, n, nullptr);
-      cuda::accumulate_groups(d_token_of, n, gb, y_groups, nullptr);
+      cuda::accumulate_tokens(d_token_slots, static_cast<int>(columns.tokens.size()), d_slots, gb, y_groups, nullptr);
       ck(cudaEventRecord(g1), "record");
       ck(cudaEventSynchronize(g1), "grouped MoE");
       float ms = 0;

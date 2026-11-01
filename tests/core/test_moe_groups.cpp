@@ -175,6 +175,51 @@ TEST_CASE("expert_runs: maximal one-Expert runs that partition any stretch of a 
   CHECK(expert_runs(std::span<const Group>{}).empty());
 }
 
+TEST_CASE("token_columns: every served column once, per token in group order") {
+  for (unsigned seed = 0; seed < 8; seed++) {
+    const size_t tokens = 25 + seed * 211;
+    const auto r = random_routing(seed, tokens, 384);
+    const auto plan = group_tokens(r.experts, r.weights, tokens, 384).value();
+    const std::span<const Group> all(plan.groups);
+    const size_t begin = seed * 13 % plan.groups.size(), end = std::min(plan.groups.size(), begin + 1 + seed * 67);
+    const auto stretch = all.subspan(begin, end - begin);
+    const TokenColumns cols = token_columns(stretch);
+    // The slots of each token: its columns, ascending -- what accumulating group by group adds in turn.
+    std::map<int32_t, std::vector<int32_t>> want;
+    for (size_t g = 0; g < stretch.size(); g++)
+      for (int c = 0; c < kMaxTokens; c++)
+        if (stretch[g].token[c] >= 0) want[stretch[g].token[c]].push_back(static_cast<int32_t>(g * kMaxTokens + c));
+    std::map<int32_t, std::vector<int32_t>> got;
+    int32_t next = 0, last_token = -1;
+    for (const TokenSlots& t : cols.tokens) {
+      CHECK(t.token > last_token);  // each token once, ascending
+      last_token = t.token;
+      CHECK(t.first == next);  // the tokens tile the slots
+      CHECK(t.count > 0);
+      next = t.first + t.count;
+      got[t.token].assign(cols.slots.begin() + t.first, cols.slots.begin() + next);
+    }
+    CHECK(static_cast<size_t>(next) == cols.slots.size());
+    CHECK(got == want);
+  }
+  CHECK(token_columns(std::span<const Group>{}) == TokenColumns{});
+}
+
+TEST_CASE("token_columns: the whole plan meets each token at its 6 routed Experts, then the shared one") {
+  const size_t tokens = 77;
+  const auto r = random_routing(4, tokens, 384);
+  const auto plan = group_tokens(r.experts, r.weights, tokens, 384).value();
+  const TokenColumns cols = token_columns(plan.groups);
+  REQUIRE(cols.tokens.size() == tokens);
+  for (const TokenSlots& t : cols.tokens) {
+    REQUIRE(t.count == kTopK + 1);
+    std::vector<int32_t> experts;
+    for (int k = 0; k < t.count; k++) experts.push_back(plan.groups[cols.slots[t.first + k] / kMaxTokens].expert);
+    CHECK(experts.back() == kSharedExpert);
+    CHECK(std::is_sorted(experts.begin(), experts.end() - 1));
+  }
+}
+
 TEST_CASE("malformed routing is rejected") {
   const std::vector<int32_t> experts = {0, 1, 2, 3, 4, 5};
   const std::vector<float> weights(6, 1.0f);

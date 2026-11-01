@@ -68,4 +68,23 @@ struct ExpertRun {
  */
 std::vector<ExpertRun> expert_runs(std::span<const Group> groups);
 
+/** One token's columns among a stretch of groups: TokenColumns::slots[first .. first + count). */
+struct TokenSlots {
+  int32_t token, first, count;
+  friend bool operator==(const TokenSlots&, const TokenSlots&) = default;
+};
+
+/**
+ * The combine order of a stretch of groups, by token: each token it serves (ascending) with its
+ * columns' slots (group * 8 + column, ascending -- the order the groups list its Experts in).
+ * Adding a token's down outputs in slot order is the groups' combine, bit for bit, and different
+ * tokens' sums are independent: one chain per token instead of one over the whole stretch.
+ */
+struct TokenColumns {
+  std::vector<TokenSlots> tokens;
+  std::vector<int32_t> slots;
+  friend bool operator==(const TokenColumns&, const TokenColumns&) = default;
+};
+TokenColumns token_columns(std::span<const Group> groups);
+
 }  // namespace ds4n::moe

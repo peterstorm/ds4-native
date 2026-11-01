@@ -358,6 +358,9 @@ struct Decoder::Gpu {
     cuda::GemvJob *jobs = nullptr, *pinned_jobs = nullptr;    // [3 x layer groups]: per batch gate/up, then down, a
                                                               // job per Expert run (at the run's first group)
     int *first = nullptr, *pinned_first = nullptr;            // their group_warps prefix sums, per list from 0
+    // Per batch, at its groups' columns: the tokens it serves and their columns' slots (accumulate_tokens).
+    moe::TokenSlots *token_slots = nullptr, *pinned_token_slots = nullptr;  // [layer groups][8]
+    int32_t *slots = nullptr, *pinned_slots = nullptr;                      // [layer groups][8]
     size_t layer_groups = 0;
     int32_t* pinned_route_experts = nullptr;  // [capacity * 8][6], GPU 0's
     float* pinned_route_weights = nullptr;    // [capacity * 8][6]
@@ -407,9 +410,12 @@ struct Decoder::Gpu {
   void upload_rows(const model::RowIndex& index);
   /** One phase of `layer` for wave `w` of the current chunk. */
   void enqueue_wave(int layer, const WaveRows& w, WavePhase phase);
-  /** One batch of a layer's grouped MoE: groups [first, first + count) of `plan`, routed ones' Halves at `halves`. */
+  /**
+   * One batch of a layer's grouped MoE: groups [first, first + count) of `plan`, routed ones' Halves
+   * at `halves`, `columns` the batch's moe::token_columns.
+   */
   void enqueue_groups(const moe::GroupPlan& plan, size_t first, size_t count, const DeviceLayer& d,
-                      std::span<const uint8_t* const> halves);
+                      std::span<const uint8_t* const> halves, const moe::TokenColumns& columns);
   /** The head over `rows` rows of the stream after the last layer: this GPU's half of the logits into head_out. */
   void enqueue_head(const bf16* final_norm, int rows);
   /** Project `rows` accepted positions (from row `first` of the seed index) into every stage's context ring. */

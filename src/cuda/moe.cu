@@ -256,22 +256,23 @@ __global__ void __launch_bounds__(128) swiglu_groups_kernel(const int32_t* __res
 }
 
 /**
- * The grouped pass's combine: one thread per output row, the groups in order -- so each token takes
- * its Experts' down outputs in the order the groups list them (ascending Expert, the shared last).
+ * The grouped pass's combine: block (256 rows, token entry e), token tokens[e] taking its columns'
+ * down outputs in slot order (moe::token_columns: the order the groups list its Experts in) -- one
+ * chain per token and row, the tokens side by side.
  */
-__global__ void accumulate_groups_kernel(const int32_t* __restrict__ token_of, int groups, MoeBuffers buf,
-                                         float* __restrict__ y) {
+__global__ void __launch_bounds__(256) accumulate_tokens_kernel(const moe::TokenSlots* __restrict__ tokens,
+                                                                const int32_t* __restrict__ slots, MoeBuffers buf,
+                                                                float* __restrict__ y) {
   const int r = blockIdx.x * blockDim.x + threadIdx.x;
   if (r >= buf.dim) return;
-  for (int g = 0; g < groups; g++) {
-    const float* down = buf.down_of(g) + static_cast<size_t>(r) * kMaxTokens;
-    for (int c = 0; c < kMaxTokens; c++) {
-      const int32_t t = token_of[g * kMaxTokens + c];
-      if (t < 0) break;  // columns fill from the left
-      float* out = y + static_cast<size_t>(t) * buf.dim + r;
-      *out = __fadd_rn(*out, down[c]);
-    }
+  const moe::TokenSlots t = tokens[blockIdx.y];
+  float* out = y + static_cast<size_t>(t.token) * buf.dim + r;
+  float acc = *out;
+  for (int k = 0; k < t.count; k++) {
+    const int32_t s = slots[t.first + k];
+    acc = __fadd_rn(acc, buf.down_of(s / kMaxTokens)[static_cast<size_t>(r) * kMaxTokens + s % kMaxTokens]);
   }
+  *out = acc;
 }
 
 /** One thread per output row r: all tokens' sums in the fixed slot order. */
@@ -346,8 +347,9 @@ void swiglu_quantize_groups(const int32_t* token_of, const float* weight, int gr
   if (warps > 0) swiglu_groups_kernel<<<(warps * 32 + 127) / 128, 128, 0, stream>>>(token_of, weight, groups, buf, limit);
 }
 
-void accumulate_groups(const int32_t* token_of, int groups, MoeBuffers buf, float* y, cudaStream_t stream) {
-  if (groups > 0) accumulate_groups_kernel<<<(buf.dim + 127) / 128, 128, 0, stream>>>(token_of, groups, buf, y);
+void accumulate_tokens(const moe::TokenSlots* tokens, int n_tokens, const int32_t* slots, MoeBuffers buf, float* y,
+                       cudaStream_t stream) {
+  if (n_tokens > 0) accumulate_tokens_kernel<<<dim3((buf.dim + 255) / 256, n_tokens), 256, 0, stream>>>(tokens, slots, buf, y);
 }
 
 void add_round_bf16(const float* a, const float* b, size_t n, __nv_bfloat16* out, cudaStream_t stream) {

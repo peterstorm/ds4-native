@@ -198,10 +198,10 @@ __global__ void __launch_bounds__(128) gemv_kernel(const GemvJob* __restrict__ j
   store_tile(job.out + static_cast<size_t>(split) * job.rows * kMaxTokens, tile, lane, d[0]);
 }
 
-/** What a gemv_groups warp computes: a job's tile and split for column groups g0 .. g0 + ng - 1. */
+/** What a gemv_groups warp computes: a job's tile and split for column groups g0 .. g0 + ng - 1 (none: idle). */
 struct GroupsWarp {
   int job, tile, split, g0, ng;
-  bool live;
+  __device__ bool live() const { return ng > 0; }
 };
 
 /**
@@ -212,13 +212,13 @@ struct GroupsWarp {
  */
 __device__ __forceinline__ GroupsWarp groups_warp(const GemvJob* __restrict__ jobs, const int* __restrict__ first_warp,
                                                   int n_jobs, int warps, int max_groups, int64_t global) {
-  if (global >= warps) return {0, 0, 0, 0, 0, false};
+  if (global >= warps) return {0, 0, 0, 0, 0};
   const int w = static_cast<int>(global);
   const int j = find_job(first_warp, n_jobs, w);
   const int tiles = jobs[j].rows / 16, per_chunk = tiles * jobs[j].splits, local = w - first_warp[j];
   const int g0 = local / per_chunk * kGroupsPerWarp, within = local % per_chunk;
   const int ng = min(kGroupsPerWarp, min(jobs[j].groups, max_groups) - g0);
-  return {j, within % tiles, within / tiles, g0, ng, ng > 0};
+  return {j, within % tiles, within / tiles, g0, ng};
 }
 
 /**
@@ -238,7 +238,7 @@ __global__ void __launch_bounds__(kBlockTiles * 32) gemv_groups_kernel(const Gem
   const int64_t first = static_cast<int64_t>(blockIdx.x) * kBlockTiles;
   const GroupsWarp lead = groups_warp(jobs, first_warp, n_jobs, warps, max_groups, first);
   const GroupsWarp me = groups_warp(jobs, first_warp, n_jobs, warps, max_groups, first + (threadIdx.x >> 5));
-  const bool staged = me.live && me.job == lead.job && me.split == lead.split && me.g0 == lead.g0;
+  const bool staged = me.live() && me.job == lead.job && me.split == lead.split && me.g0 == lead.g0;
   const GemvJob lj = jobs[lead.job];
   const GemvJob job = jobs[me.job];
   float d[kGroupsPerWarp][4] = {};
@@ -265,7 +265,7 @@ __global__ void __launch_bounds__(kBlockTiles * 32) gemv_groups_kernel(const Gem
       run_tile<true, kGroupsPerWarp>(job, me.tile, c0, c0 + n, lane, me.ng,
                                   {stage, stage + kCodes, kStageBlocks * 256, kStageBlocks * kMaxTokens, c0}, d);
   }
-  if (!me.live) return;
+  if (!me.live()) return;
   if (!staged) {
     ActView own = job_view(job);
     own.codes += static_cast<size_t>(me.g0) * job.blocks * 256;

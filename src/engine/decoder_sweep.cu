@@ -97,6 +97,10 @@ void Decoder::Gpu::allocate_sweep(int chunk_rounds) {
   gr.weight = a.alloc<float>(columns);
   gr.jobs = a.alloc<cuda::GemvJob>(jobs);
   gr.first = a.alloc<int>(jobs);
+  gr.token_slots = a.alloc<moe::TokenSlots>(columns);
+  gr.slots = a.alloc<int32_t>(columns);
+  check(cudaMallocHost(&gr.pinned_token_slots, columns * sizeof(moe::TokenSlots)), "cudaMallocHost");
+  check(cudaMallocHost(&gr.pinned_slots, columns * sizeof(int32_t)), "cudaMallocHost");
   check(cudaMallocHost(&gr.pinned_token_of, columns * sizeof(int32_t)), "cudaMallocHost");
   check(cudaMallocHost(&gr.pinned_weight, columns * sizeof(float)), "cudaMallocHost");
   check(cudaMallocHost(&gr.pinned_jobs, jobs * sizeof(cuda::GemvJob)), "cudaMallocHost");
@@ -174,7 +178,8 @@ void Decoder::Gpu::allocate_sweep(int chunk_rounds) {
 void Decoder::Gpu::free_sweep() {
   for (void* p : {static_cast<void*>(chunk.round_numbers), static_cast<void*>(grouped.pinned_token_of),
                   static_cast<void*>(grouped.pinned_weight), static_cast<void*>(grouped.pinned_jobs),
-                  static_cast<void*>(grouped.pinned_first), static_cast<void*>(grouped.pinned_route_experts),
+                  static_cast<void*>(grouped.pinned_first), static_cast<void*>(grouped.pinned_token_slots),
+                  static_cast<void*>(grouped.pinned_slots), static_cast<void*>(grouped.pinned_route_experts),
                   static_cast<void*>(grouped.pinned_route_weights)})
     if (p) cudaFreeHost(p);
   for (cudaEvent_t ev : grouped.segment_done) cudaEventDestroy(ev);
@@ -683,6 +688,9 @@ void Decoder::grouped_moe(int layer, size_t tokens, std::span<const std::optiona
 
   // Groups [begin, end) on both GPUs, kGroupBatch at a time; routed group begin + i in Slot slots[i].
   auto enqueue = [&](size_t begin, size_t end, std::span<const uint32_t> slots) {
+    std::vector<moe::TokenColumns> columns;  // each batch's combine order, the same on both GPUs
+    for (size_t at = begin; at < end; at += kGroupBatch)
+      columns.push_back(moe::token_columns(std::span(plan.groups).subspan(at, std::min<size_t>(kGroupBatch, end - at))));
     for (auto& gp : gpus_) {
       Gpu& s = *gp;
       check(cudaSetDevice(s.device), "cudaSetDevice");
@@ -690,11 +698,11 @@ void Decoder::grouped_moe(int layer, size_t tokens, std::span<const std::optiona
       std::vector<const uint8_t*> halves(slots.size());
       for (size_t i = 0; i < slots.size(); i++) halves[i] = s.experts.pool + slots[i] * s.experts.slot_bytes;
       s.clock.mark(s.stream);
-      for (size_t at = begin; at < end; at += kGroupBatch) {
+      for (size_t at = begin, k = 0; at < end; at += kGroupBatch, k++) {
         const size_t count = std::min<size_t>(kGroupBatch, end - at);
         const std::span<const uint8_t* const> batch_halves =
             halves.empty() ? std::span<const uint8_t* const>{} : std::span<const uint8_t* const>(halves).subspan(at - begin, count);
-        s.enqueue_groups(plan, at, count, d, batch_halves);
+        s.enqueue_groups(plan, at, count, d, batch_halves, columns[k]);
       }
       s.clock.lap(WaveSection::Experts, s.stream);
     }
@@ -715,7 +723,7 @@ void Decoder::grouped_moe(int layer, size_t tokens, std::span<const std::optiona
 namespace ds4n::engine {
 
 void Decoder::Gpu::enqueue_groups(const moe::GroupPlan& plan, size_t first, size_t count, const DeviceLayer& d,
-                                  std::span<const uint8_t* const> halves) {
+                                  std::span<const uint8_t* const> halves, const moe::TokenColumns& columns) {
   // Tables and jobs at the groups' own places in the layer-wide pinned arrays (no upload's source
   // is rewritten before it ran), uploaded, then gather + quantize, gate/up, SwiGLU, down, accumulate.
   // A run of one Expert's groups is one job over the run's column groups (moe::expert_runs): the
@@ -777,12 +785,22 @@ void Decoder::Gpu::enqueue_groups(const moe::GroupPlan& plan, size_t first, size
   check(cudaMemcpyAsync(gr.jobs + 3 * first, jobs, 3 * n_runs * sizeof(cuda::GemvJob), cudaMemcpyHostToDevice, st),
         "group jobs");
   check(cudaMemcpyAsync(gr.first + 3 * first, warps_at, 3 * n_runs * sizeof(int), cudaMemcpyHostToDevice, st), "group jobs");
+  // The batch's combine order (at most 8 columns a group, so it fits the batch's columns).
+  std::copy(columns.tokens.begin(), columns.tokens.end(), gr.pinned_token_slots + cols);
+  std::copy(columns.slots.begin(), columns.slots.end(), gr.pinned_slots + cols);
+  check(cudaMemcpyAsync(gr.token_slots + cols, gr.pinned_token_slots + cols, columns.tokens.size() * sizeof(moe::TokenSlots),
+                        cudaMemcpyHostToDevice, st),
+        "group combine");
+  check(cudaMemcpyAsync(gr.slots + cols, gr.pinned_slots + cols, columns.slots.size() * sizeof(int32_t),
+                        cudaMemcpyHostToDevice, st),
+        "group combine");
   const int n = static_cast<int>(count), runs_n = static_cast<int>(n_runs);
   cuda::gather_quantize(chunk.xf, kDimBlocks, gr.token_of + cols, n, gr.act_codes, gr.act_scales, st);
   cuda::gemv_groups(gr.jobs + 3 * first, gr.first + 3 * first, 2 * runs_n, gate_up_warps, n, st);
   cuda::swiglu_quantize_groups(gr.token_of + cols, gr.weight + cols, n, gr.buf, moe::kSwigluLimit, st);
   cuda::gemv_groups(gr.jobs + 3 * first + 2 * n_runs, gr.first + 3 * first + 2 * n_runs, runs_n, down_warps, n, st);
-  cuda::accumulate_groups(gr.token_of + cols, n, gr.buf, chunk.y, st);
+  cuda::accumulate_tokens(gr.token_slots + cols, static_cast<int>(columns.tokens.size()), gr.slots + cols, gr.buf, chunk.y,
+                          st);
   check(cudaGetLastError(), "grouped MoE launches");
 }
 

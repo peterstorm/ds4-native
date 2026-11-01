@@ -248,8 +248,9 @@ exchange and hc_post). The host groups the chunk's routing by Expert (`core/moe_
 routed Expert over its tokens ascending, 8 token columns per group, then the shared Expert once per
 Round) and runs the groups 512 at a time: the group's FFN input rows gathered and act_quant'ed
 (`gather_quantize`), gate/up, SwiGLU, down -- each Expert's weights stream once per 8 of its
-tokens, not once per Round that meets it -- and `accumulate_groups` adds each column into its
-token's FP32 partial, group by group. Exact: a GEMV output column depends only on its own input
+tokens, not once per Round that meets it; a batch's run of one Expert's groups is one GEMV job
+over the run (`moe::expert_runs`) -- and `accumulate_tokens` adds each token's columns into its
+FP32 partial in group order (`moe::token_columns`). Exact: a GEMV output column depends only on its own input
 column, and a token meets its Experts in ascending id with the shared one last, from 0 --
 `combine`'s order. `ds4n-moe-check --chunk 1027` (layer 3's real router, 224 Experts in several
 groups): the per-GPU partials differ from the Rounds' in 0 of 5.3 M floats.
@@ -267,8 +268,8 @@ hold placement back until the halves nearly ran (placing from the launching thre
 Round's layer step over all of the wave's rows. Rows beyond 8 are 8-column groups back to back --
 token t is column t % 8 of group t / 8, in GEMV planes ([group][split][rows][8], `plane_index`) and
 act_quant fragments ([group][blocks]) alike, so a Round's addresses are group 0's -- and
-`gemv_groups` runs each GEMV job once per group, a tile's warps for every group side by side, so the
-weights come from DRAM once per wave. The per-row loops become batched launches: the compressor
+`gemv_groups` runs each GEMV job once per group (a warp for 8 groups, below). The per-row loops
+become batched launches: the compressor
 (`compress_rows`: a ratio-2 row pools with the row before from the GEMV planes, which hold what its
 pool slot would; the ring keeps the wave's last 16 rows), index keys and compressed rows for every
 producing row (`core/row_index` compacts them), scoring and both selections for 128 rows per launch
@@ -300,12 +301,69 @@ prompt's Engram rows are read 1,024 in flight across tokens (`EngramRows::read_t
 (The 36K and 60K prompts repeat the 18K one.) All dumps byte-identical: the short prompts against the
 exact run, 9K and 18K against the Rounds', 36K against the per-Round sweep (`--grouped 0`).
 
-Where they go (`DS4N_SWEEP_PROFILE=1`): the store reads ~7K Experts per prompt (9.5-10.8 s, the drive
-saturated at 12.8 GB/s) beside the attention halves. Up to ~18K tokens the reads are the bound (the
-host waits 0.1-0.2 s for routing); at 60K the attention halves are (26.9 s for attention and Experts,
-the host waiting 4.9 s for routing), mostly the indexer: every row scores and selects over all
-compressed positions before it, quadratic in the prompt. Host prep grows with the prompt (0.7 s at
-9K, 3.7 s at 60K) and still runs before the first launch; the combine halves take ~34 us per token.
+Where the time went then (`DS4N_SWEEP_PROFILE=1`): the store reads ~7K Experts per prompt (9.5-10.8 s,
+the drive saturated at 12.8 GB/s) beside the attention halves; up to ~18K tokens the reads were the
+bound (the host waits 0.1-0.2 s for routing), at 60K the GPUs (26.9 s for attention and Experts, the
+host waiting 4.9 s for routing). Host prep grows with the prompt (0.7 s at 9K, 3.7-4.6 s at 60K:
+mostly the prompt's Engram rows, 48 scattered 264-byte rows a token, each in its own 16 KB record)
+and runs before the first launch; every number here includes it.
+
+**RAM in sweeps.** A sweep's ~7K one-off Loads used to go through the RAM tier's policy like a
+decode step's, cycling through its records (464 RAM hits of them at 9K tokens). A sweep's Loads now
+only read the tier: records found there are copied, the rest come from the store through 48
+staging records outside it; decode Loads still adapt the tier to the conversation. With 3,000
+records (56 GB pinned: the profile's next-hottest Experts after the VRAM set; the ZFS ARC capped at
+16 GB) a 9K prompt reads 3,670 Experts from the store instead of 6,555. A long generation moves the
+tier toward its own working set, so the prompt after it finds fewer of its Experts there.
+
+**Sweep compute.** `DS4N_WAVE_PROFILE=1` prints GPU 0's time by section (events around each section
+of the waves and the grouped MoE, read after the sweep). At 60K it put the indexer at 1.0 of 17.4 s
+-- not the bound -- and the GEMVs, the exchanges and the MoE's combine at most of the rest. Each fix
+keeps the bits (the gates above, plus each check named):
+- `ops::butterfly_sums`: the warp's xor-butterfly of 32 values per lane by recursive halving -- at
+  distance o a lane keeps the half its bit o selects and adds the partner's copy, which are the
+  butterfly's pairs, so the same sums -- in 31 shuffles instead of 160; value j ends in lane j.
+- BF16 GEMVs over a wave (router, compressor, index projections): a warp owns 4 rows x 8 tokens =
+  32 sums, its weights held in registers across a block's 8 column groups, the activations
+  double-buffered in shared memory (cp.async). The router at 512 tokens 621 -> 69 us, a 1,024-row
+  one 1,140 -> 172 (`ds4n-glue-check --tokens 512`).
+- hc_mixes partials: fn in registers for 8 tokens, the warps' partials summed after one barrier:
+  166 -> 69 us at 512 tokens.
+- MX GEMVs (`gemv_groups`): Nsight Compute had the tensor pipe 8.8 % busy, warps waiting on
+  activation fragments from L2. A warp now runs one tile for 8 groups (each weight fragment feeds 8
+  MMAs) and a block of 8 neighbouring tiles of one split stages the groups' fragments in shared
+  memory 16 K blocks at a time; `GemvJob::groups` gives each job its own count, bounded per launch.
+  wq_b-sized 131 -> 72 us a wave, wo_b 123 -> 64 (`ds4n-mx-check --groups 64`: every group as the
+  one-group kernel's, planes past a job's groups untouched).
+- The grouped MoE: an Expert's run of groups is one job, and `accumulate_tokens` runs one chain per
+  token and row where `accumulate_groups` walked a batch's 4,096 columns as one dependent chain per
+  row (40 blocks, 1.4 ms a batch): 32.5 -> 11.1 ms a layer at 9K tokens (`ds4n-moe-check --chunk
+  9129`: 0 of 46.7 M floats differ from the Rounds').
+- Exchanges of 32+ blocks: a reduce-scatter, then an all-gather (3 bytes a value over PCIe instead
+  of 4): a wave's 411 -> 322 us; smaller ones keep the single round trip (decode 3.25 us).
+
+| 60K tokens, GPU 0 | before | after |
+|---|---|---|
+| mixes | 1,205 ms | 518 |
+| q/kv projections | 1,769 | 1,246 |
+| compressor | 573 | 86 |
+| output projections | 2,110 | 1,541 |
+| exchanges / Engram / combine | 2,465 / 831 / 2,046 | 2,136 / 696 / 1,637 |
+| FFN input + routing | 3,735 | 912 |
+| grouped MoE | 8,558 (first timed) | 3,339 |
+| sparse attention, indexer | 2,029, 637 | 2,065, 618 |
+
+| Prompt | one chunk | + RAM tier, 3,000 records | + sweep compute |
+|---|---|---|---|
+| 9,129 tokens | 735 tok/s | 1,075 | **1,269 tok/s** |
+| 17,965 tokens | 1,170 | 1,360 | **1,663 tok/s** |
+| 35,930 tokens | 1,641 | 1,771 | **2,667 tok/s** |
+| 60,000 tokens | 1,814 | ~1,800 | **2,766 tok/s** |
+
+Up to ~18K tokens the drive is the bound again (9K: placement 5.5 of 7.2 s). At 60K (21.7 s): 4.6 s
+of host prep, 15.0 s of waves and Experts, 1.6 s of combine halves. What is left: the Engram row
+reads could overlap the first layers (or come from smaller records), the Expert GEMVs run at ~140
+TMAC/s, sparse attention takes 2.1 s, and the exchanges ride PCIe x8.
 
 ## Expert residency
 

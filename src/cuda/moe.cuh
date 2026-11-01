@@ -9,6 +9,7 @@
 //   swiglu_quantize  split-K sums, BF16, SwiGLU x weight, act_quant -> down's B fragments
 //   [GEMV down]      same slots
 //   combine          FP32 partial per token: routed slots in Plan order, then the shared slot
+//                    (a prompt sweep's grouped MoE: swiglu_quantize_groups, accumulate_tokens)
 //   add_round_bf16   after the exchange: bf16(GPU 0 + GPU 1)
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -16,6 +17,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "core/moe_groups.hpp"
 #include "core/moe_plan.hpp"
 #include "cuda/mx_gemv.cuh"
 
@@ -113,11 +115,13 @@ void swiglu_quantize_groups(const int32_t* token_of, const float* weight, int gr
                             cudaStream_t stream);
 
 /**
- * y[token][r] += down output of each group's column serving the token, the groups in order (each
- * token's in ascending Expert, the shared last): from y = 0 this is combine's sum, bit for bit.
- * y is [chunk tokens][dim].
+ * y[token][r] += the down outputs of the token's columns among the groups in `buf`, in slot order
+ * (`tokens` and `slots` from moe::token_columns, on the device; slot = group * 8 + column): each
+ * token's in ascending Expert, the shared last, so from y = 0 this is combine's sum, bit for bit.
+ * y is [chunk tokens][dim]; at most 65,535 tokens a launch.
  */
-void accumulate_groups(const int32_t* token_of, int groups, MoeBuffers buf, float* y, cudaStream_t stream);
+void accumulate_tokens(const moe::TokenSlots* tokens, int n_tokens, const int32_t* slots, MoeBuffers buf, float* y,
+                       cudaStream_t stream);
 
 /** out[i] = bf16(a[i] + b[i]): the two GPUs' partials, rounded once. */
 void add_round_bf16(const float* a, const float* b, size_t n, __nv_bfloat16* out, cudaStream_t stream);

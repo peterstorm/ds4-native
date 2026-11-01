@@ -11,6 +11,7 @@ namespace ds4n::cuda {
 namespace {
 
 constexpr int kMaxGemvTokens = 8;
+constexpr int kHcTokenElems = 2;  // a thread's elements of a slice in hc_partial_tokens_kernel (slices up to 2 x its threads)
 
 using ops::block_sum;
 
@@ -67,7 +68,7 @@ __global__ void hc_partial_kernel(const __nv_bfloat16* __restrict__ h, const flo
 template <int Threads, int kTokens>
 __global__ void hc_partial_tokens_kernel(const __nv_bfloat16* __restrict__ h, const float* __restrict__ fn, int width,
                                          int tokens, float* __restrict__ scratch) {
-  constexpr int kElems = 2;  // a thread's elements of a slice (a slice is at most 2 * Threads values)
+  constexpr int kElems = kHcTokenElems;
   __shared__ float warp_part[kTokens][Threads / 32][1 + kHcMix];
   const int part = blockIdx.x, first_token = blockIdx.y * kTokens;
   const int per = (width + kHcPartials - 1) / kHcPartials;
@@ -315,7 +316,7 @@ void rmsnorm(const __nv_bfloat16* x, const __nv_bfloat16* w, int dim, int tokens
 void hc_mix_partials(const __nv_bfloat16* h, const HcParams& p, int dim, int tokens, float* scratch, cudaStream_t stream) {
   const int width = kHcCopies * dim, per = (width + kHcPartials - 1) / kHcPartials;
   constexpr int kTokensPerBlock = 8;
-  if (tokens > kTokensPerBlock && per <= 2 * 256)
+  if (tokens > kTokensPerBlock && per <= kHcTokenElems * 256)
     hc_partial_tokens_kernel<256, kTokensPerBlock>
         <<<dim3(kHcPartials, (tokens + kTokensPerBlock - 1) / kTokensPerBlock), 256, 0, stream>>>(h, p.fn, width,
                                                                                                 tokens, scratch);

@@ -63,6 +63,22 @@ Result<std::vector<int32_t>, GroupError> routed_experts(std::span<const int32_t>
   return R::ok(std::move(out));
 }
 
+TokenColumns token_columns(std::span<const Group> groups) {
+  std::vector<std::pair<int32_t, int32_t>> columns;  // (token, slot), sorted: by token, then slot
+  for (size_t g = 0; g < groups.size(); g++)
+    for (int c = 0; c < kMaxTokens; c++)
+      if (groups[g].token[c] >= 0) columns.push_back({groups[g].token[c], static_cast<int32_t>(g * kMaxTokens + c)});
+  std::sort(columns.begin(), columns.end());
+  TokenColumns out;
+  for (const auto& [token, slot] : columns) {
+    if (out.tokens.empty() || out.tokens.back().token != token)
+      out.tokens.push_back({token, static_cast<int32_t>(out.slots.size()), 0});
+    out.tokens.back().count++;
+    out.slots.push_back(slot);
+  }
+  return out;
+}
+
 std::vector<ExpertRun> expert_runs(std::span<const Group> groups) {
   std::vector<ExpertRun> runs;
   for (size_t i = 0; i < groups.size(); i++)
