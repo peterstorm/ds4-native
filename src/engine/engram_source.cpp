@@ -89,17 +89,25 @@ Result<EngramRows, io::IoError> EngramRows::open(const std::vector<std::string>&
 
 Result<std::vector<uint8_t>, io::IoError> EngramRows::read(int table, std::span<const uint32_t> ids) const {
   using Out = Result<std::vector<uint8_t>, io::IoError>;
+  std::vector<uint8_t> out(ids.size() * engram::kRowBytes);
+  if (auto r = read_rows(table, ids, out); !r) return Out::err(r.error());
+  return Out::ok(std::move(out));
+}
+
+Result<size_t, io::IoError> EngramRows::read_rows(int table, std::span<const uint32_t> ids, std::span<uint8_t> out) const {
+  using Out = Result<size_t, io::IoError>;
   if (table < 0 || table >= engram::kLayers || tables_[table].rows == 0)
     return Out::err({"Engram table " + std::to_string(table) + " is not in the opened shards"});
+  if (out.size() != ids.size() * engram::kRowBytes) return Out::err({"Engram rows: the output is not 264 bytes a row"});
   const Table& t = tables_[table];
-  std::vector<uint8_t> out(ids.size() * engram::kRowBytes);
+  std::vector<io::ReadRequest> reads;
+  reads.reserve(ids.size());
   for (size_t i = 0; i < ids.size(); i++) {
     if (ids[i] >= t.rows) return Out::err({"Engram row id out of range"});
-    auto span = std::as_writable_bytes(std::span(out).subspan(i * engram::kRowBytes, engram::kRowBytes));
-    if (auto r = io::pread_exact(fds_[t.shard], span, t.offset + static_cast<uint64_t>(ids[i]) * engram::kRowBytes); !r)
-      return Out::err(r.error());
+    reads.push_back({fds_[t.shard].get(), t.offset + static_cast<uint64_t>(ids[i]) * engram::kRowBytes,
+                     std::as_writable_bytes(out.subspan(i * engram::kRowBytes, engram::kRowBytes)), i});
   }
-  return Out::ok(std::move(out));
+  return read_all(reads);
 }
 
 Result<std::vector<uint8_t>, io::IoError> EngramRows::read_token(const TokenRows& rows) const {
@@ -124,12 +132,18 @@ Result<std::vector<uint8_t>, io::IoError> EngramRows::read_tokens(std::span<cons
                          std::as_writable_bytes(std::span(out).subspan(at, engram::kRowBytes)), reads.size()});
       }
     }
+  if (auto r = read_all(reads); !r) return Out::err(r.error());
+  return Out::ok(std::move(out));
+}
+
+Result<size_t, io::IoError> EngramRows::read_all(std::span<const io::ReadRequest> reads) const {
+  using Out = Result<size_t, io::IoError>;
   // Keep the queue full: top it up after every reap.
   size_t next = 0, done = 0;
   while (done < reads.size()) {
     const size_t room = std::min<size_t>(reader_->depth() - reader_->in_flight(), reads.size() - next);
     if (room > 0) {
-      if (auto s = reader_->submit(std::span(reads).subspan(next, room)); !s) return Out::err(s.error());
+      if (auto s = reader_->submit(reads.subspan(next, room)); !s) return Out::err(s.error());
       next += room;
     }
     auto c = reader_->wait(1);
@@ -139,7 +153,7 @@ Result<std::vector<uint8_t>, io::IoError> EngramRows::read_tokens(std::span<cons
       done++;
     }
   }
-  return Out::ok(std::move(out));
+  return Out::ok(done);
 }
 
 }  // namespace ds4n::engine

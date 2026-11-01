@@ -79,6 +79,16 @@ std::array<float, kRowValues> decode_row(std::span<const std::byte, kRowBytes> r
   return out;
 }
 
+std::vector<uint32_t> first_occurrence(std::span<const uint32_t> ids) {
+  std::vector<std::pair<uint32_t, uint32_t>> by_row(ids.size());  // (row, position), sorted: a row's positions ascending
+  for (size_t k = 0; k < ids.size(); k++) by_row[k] = {ids[k], static_cast<uint32_t>(k)};
+  std::sort(by_row.begin(), by_row.end());
+  std::vector<uint32_t> first(ids.size());
+  for (size_t i = 0; i < by_row.size(); i++)
+    first[by_row[i].second] = i > 0 && by_row[i - 1].first == by_row[i].first ? first[by_row[i - 1].second] : by_row[i].second;
+  return first;
+}
+
 namespace {
 
 constexpr size_t kThreads = 256;  // cuda::engram_gate block

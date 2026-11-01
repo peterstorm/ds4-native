@@ -1,5 +1,6 @@
 #include <doctest/doctest.h>
 
+#include <map>
 #include <random>
 #include <vector>
 
@@ -99,6 +100,26 @@ TEST_CASE("property: incremental hashing equals the reference's whole-sequence f
       h = s.value().next;
     }
   }
+}
+
+TEST_CASE("property: first_occurrence points every position at its row's first position") {
+  std::mt19937 rng(5);
+  for (int trial = 0; trial < 40; trial++) {
+    std::vector<uint32_t> ids(rng() % 3000);
+    const uint32_t range = 1 + rng() % (trial % 2 ? 50 : 1000000);  // heavy repeats, or nearly none
+    for (auto& id : ids) id = rng() % range;
+    const auto first = first_occurrence(ids);
+    REQUIRE(first.size() == ids.size());
+    std::map<uint32_t, uint32_t> seen;  // row -> its first position, scanning in order
+    size_t reads = 0;
+    for (size_t k = 0; k < ids.size(); k++) {
+      const auto [it, fresh] = seen.try_emplace(ids[k], static_cast<uint32_t>(k));
+      CHECK(first[k] == it->second);  // the earliest position with this row: at or before k
+      reads += first[k] == k;
+    }
+    CHECK(reads == seen.size());  // each distinct row read exactly once
+  }
+  CHECK(first_occurrence({}).empty());
 }
 
 TEST_CASE("decode_row applies one E8M0 scale per 32 values") {

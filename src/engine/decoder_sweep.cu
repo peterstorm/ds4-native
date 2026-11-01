@@ -24,35 +24,37 @@ static_assert([] {
 }  // namespace
 
 /**
- * The segments of a layer's attention halves the host has launched (each with its routing copy and
- * event), counted for the placing thread: an event it waits on must be this layer's record, not the
- * previous layer's.
+ * How far a producer on another thread got, as a count that only grows: the segments of a layer's
+ * attention halves the host launched (each with its routing copy and event, for the placing thread:
+ * an event it waits on must be this layer's record, not the previous layer's), or a chunk's Engram
+ * rows read (for the launching thread).
  */
-struct Decoder::LaunchedSegments {
+struct Decoder::Progress {
   std::mutex m;
   std::condition_variable cv;
   size_t count = 0;
   bool abandoned = false;
 
-  void publish(size_t launched) {
+  void publish(size_t reached) {
     {
       std::lock_guard lock(m);
-      count = launched;
+      count = reached;
     }
-    cv.notify_one();
+    cv.notify_all();
   }
+  /** The producer gave up: wake every waiter. */
   void abandon() {
     {
       std::lock_guard lock(m);
       abandoned = true;
     }
-    cv.notify_one();
+    cv.notify_all();
   }
-  /** Whether segment k was launched (false: the launching thread gave up). */
-  bool wait_for(size_t k) {
+  /** Whether the count reached `n` (false: the producer gave up first). */
+  bool wait_until(size_t n) {
     std::unique_lock lock(m);
-    cv.wait(lock, [&] { return count > k || abandoned; });
-    return count > k;
+    cv.wait(lock, [&] { return count >= n || abandoned; });
+    return count >= n;
   }
 };
 
@@ -400,8 +402,8 @@ void Decoder::Gpu::enqueue_wave(int layer, const WaveRows& w, WavePhase phase) {
   check(cudaGetLastError(), "wave launches");
 }
 
-void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<const uint8_t> engram_rows,
-                      const ExpertPlacer& place) {
+void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<const EngramTokenRows> engram,
+                      const EngramReader& read_engram, const ExpertPlacer& place) {
   Gpu& lead = *gpus_[0];
   const int capacity = lead.chunk.capacity;
   if (capacity == 0) throw CudaError("prefill: this decoder was made without chunk capacity");
@@ -410,8 +412,8 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
   if (p0 < 0 || p0 + static_cast<int64_t>(tokens) > kMaxCompressed)
     throw CudaError("position outside this executor's compressed capacity");
   const bool any_engram = lead.layers.contains(kEngramLayers[0]) || lead.layers.contains(kEngramLayers[1]);
-  if (any_engram && engram_rows.size() != tokens * kEngramTokenBytes)
-    throw CudaError("prefill: the Engram layers need every token's 2 x 24 rows of 264 bytes");
+  if (any_engram && (engram.size() != tokens || !read_engram))
+    throw CudaError("prefill: the Engram layers need every token's row ids and a reader");
   if (p0 == 0) seeded_ = 0;  // a new Session: DSpark's context starts over
   const size_t per_chunk = static_cast<size_t>(capacity) * kMaxRows;
   const bool graphs = launches_ == Launches::Graphs;
@@ -459,11 +461,31 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
     // rows of the previous chunk until it ended). Each token's embedding goes into hc copy 0 of its
     // stream, then into the other three on the device.
     sync();
+    // The chunk's Engram rows, read beside the sweep on a thread of its own into the pinned tables the
+    // GPUs read: table 0 (layer 1) in token order, then table 1 (layer 14), each distinct row of the
+    // chunk once (a repeat copied from where its first occurrence landed). engram_ready[table] counts
+    // the tokens filled; an Engram layer's wave waits for its own. Declared before `reading`, so an
+    // unwinding chunk joins the reader before the counters go.
+    std::array<Progress, 2> engram_ready;
+    std::future<size_t> reading;  // the distinct rows read
     if (any_engram)
-      for (size_t t = 0; t < n; t++)
-        for (int table = 0; table < 2; table++)
-          std::memcpy(sweep_engram_ + table * capacity * kEngramSlot + t * kEngramTableBytes,
-                      engram_rows.data() + (first + t) * kEngramTokenBytes + table * kEngramTableBytes, kEngramTableBytes);
+      reading = std::async(std::launch::async, [&, first, n] {
+        try {
+          return read_chunk_engram(engram.subspan(first, n), read_engram, engram_ready);
+        } catch (...) {
+          for (Progress& ready : engram_ready) ready.abandon();
+          throw;
+        }
+      });
+    // Before the GPUs read tokens [0, upto) of `table`: wait for the reader (the time into the profile).
+    auto engram_rows_for = [&](int table, size_t upto) {
+      const auto t0 = std::chrono::steady_clock::now();
+      if (!engram_ready[table].wait_until(upto)) {
+        reading.get();  // the reader's failure
+        throw CudaError("prefill: the Engram reader stopped");
+      }
+      profile.engram_wait += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    };
     for (auto& gp : gpus_) {
       Gpu& s = *gp;
       check(cudaSetDevice(s.device), "cudaSetDevice");
@@ -540,11 +562,14 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
     };
     // A layer's waves through routing; after each, its routing to the host (GPU 0) and an event on
     // both GPUs, published to `launched`.
-    auto launch_waves = [&](int layer, LaunchedSegments& launched) {
+    auto launch_waves = [&](int layer, Progress& launched) {
       const bool engram_layer = model::kind(layer).engram;
       for (size_t k = 0; k < waves.size(); k++) {
         const WaveRows& w = waves[k];
-        if (engram_layer) phase(layer, w, WavePhase::EngramMix);
+        if (engram_layer) {
+          engram_rows_for(layer == kEngramLayers[0] ? 0 : 1, static_cast<size_t>(w.first + w.rows));
+          phase(layer, w, WavePhase::EngramMix);
+        }
         phase(layer, w, WavePhase::Attention);
         phase(layer, w, WavePhase::Ffn);
         for (auto& gp : gpus_) {
@@ -570,12 +595,13 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
     for (const auto& [layer, unused] : lead.layers) {
       if (layer >= kLayers) continue;  // DSpark stages run in draft()
       if (!grouped) {
+        if (model::kind(layer).engram) engram_rows_for(layer == kEngramLayers[0] ? 0 : 1, n);
         launch_rounds(layer);
         lap(&SweepProfile::steps);
       } else {
         // The Experts are placed on a thread of their own while the waves' attention halves run:
         // launching blocks once CUDA's launch queue is full.
-        LaunchedSegments launched;
+        Progress launched;
         auto placing = std::async(std::launch::async, [&, layer = layer] {
           return place_segments(layer, n, place, launched, profiling ? &profile : nullptr);
         });
@@ -600,6 +626,10 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
       }
     }
     post_as(&Staging::sweep_off);
+    if (reading.valid()) {
+      profile.engram_reads += reading.get();
+      profile.engram_rows += n * engram::kLayers * engram::kCols;
+    }
     // The chunk's last Round is the current one (logits()): per-Round sweeps leave it in the working
     // buffers; waves leave it in the chunk arrays.
     if (grouped)
@@ -630,10 +660,45 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
   else if (profiling)
     std::fprintf(stderr, "sweep profile, %zu tokens (ms, phases waited for): setup %.0f, layer steps %.0f\n", tokens,
                  profile.setup, profile.steps);
+  if (profiling && any_engram)
+    std::fprintf(stderr, "sweep Engram rows: %zu read for %zu positions (%.1f %% distinct), launches waited %.0f ms\n",
+                 profile.engram_reads, profile.engram_rows, 100.0 * profile.engram_reads / std::max<size_t>(profile.engram_rows, 1),
+                 profile.engram_wait);
+}
+
+size_t Decoder::read_chunk_engram(std::span<const EngramTokenRows> engram, const EngramReader& read_engram,
+                                  std::array<Progress, 2>& ready) {
+  constexpr size_t kPiece = 2048;  // tokens a read covers: ~49K rows, many times the reader's queue
+  constexpr size_t kRow = engram::kRowBytes;
+  const size_t n = engram.size(), capacity = static_cast<size_t>(gpus_[0]->chunk.capacity);
+  size_t reads = 0;
+  for (int table = 0; table < engram::kLayers; table++) {
+    uint8_t* rows = sweep_engram_ + table * capacity * kEngramSlot;  // [n][24] x 264, token after token
+    std::vector<uint32_t> ids(n * engram::kCols);
+    for (size_t t = 0; t < n; t++) std::copy(engram[t][table].begin(), engram[t][table].end(), ids.begin() + t * engram::kCols);
+    const std::vector<uint32_t> first = engram::first_occurrence(ids);
+    std::vector<uint32_t> fresh;
+    std::vector<uint8_t> got;
+    for (size_t t0 = 0; t0 < n; t0 += kPiece) {
+      const size_t k0 = t0 * engram::kCols, k1 = std::min(n, t0 + kPiece) * engram::kCols;
+      fresh.clear();
+      for (size_t k = k0; k < k1; k++)
+        if (first[k] == k) fresh.push_back(ids[k]);
+      got.resize(fresh.size() * kRow);
+      read_engram(table, fresh, got);
+      for (size_t k = k0, i = 0; k < k1; k++)  // first occurrences in order, then the repeats from them
+        if (first[k] == k) std::memcpy(rows + k * kRow, got.data() + i++ * kRow, kRow);
+      for (size_t k = k0; k < k1; k++)
+        if (first[k] != k) std::memcpy(rows + k * kRow, rows + static_cast<size_t>(first[k]) * kRow, kRow);
+      reads += fresh.size();
+      ready[table].publish(k1 / engram::kCols);
+    }
+  }
+  return reads;
 }
 
 std::vector<std::optional<uint32_t>> Decoder::place_segments(int layer, size_t tokens, const ExpertPlacer& place,
-                                                             LaunchedSegments& launched, SweepProfile* profile) {
+                                                             Progress& launched, SweepProfile* profile) {
   using Clock = std::chrono::steady_clock;
   using Ms = std::chrono::duration<double, std::milli>;
   const Gpu::Grouped& routing = gpus_[0]->grouped;  // the routing is the same on both GPUs
@@ -646,7 +711,7 @@ std::vector<std::optional<uint32_t>> Decoder::place_segments(int layer, size_t t
   const size_t segment_tokens = kWaveRows;  // a segment is a wave
   for (size_t t0 = 0, k = 0; t0 < tokens; t0 += segment_tokens, k++) {
     const auto t_wait = Clock::now();
-    if (!launched.wait_for(k)) throw CudaError("prefill: the attention halves were not all launched");
+    if (!launched.wait_until(k + 1)) throw CudaError("prefill: the attention halves were not all launched");
     for (auto& gp : gpus_) {
       check(cudaSetDevice(gp->device), "cudaSetDevice");
       check(cudaEventSynchronize(gp->grouped.segment_done[k]), "segment routing");

@@ -45,6 +45,7 @@
 #include <span>
 #include <vector>
 
+#include "core/engram.hpp"
 #include "core/layer_weights.hpp"
 #include "core/model.hpp"
 #include "core/moe_plan.hpp"
@@ -90,6 +91,15 @@ enum class Launches { Graphs, Eager };
  */
 using ExpertPlacer = std::function<std::vector<uint32_t>(int layer, std::span<const int32_t> experts)>;
 
+/** A token's Engram row ids per table (engram::hash_token's Step::rows). */
+using EngramTokenRows = decltype(engram::Step::rows);
+
+/**
+ * Reads Engram table `table`'s rows `ids` into `out` (ids.size() x 264 bytes), throwing on failure:
+ * EngramRows::read_rows. A prompt sweep calls it from a reader thread of its own.
+ */
+using EngramReader = std::function<void(int table, std::span<const uint32_t> ids, std::span<uint8_t> out)>;
+
 class Decoder {
  public:
   /**
@@ -129,9 +139,9 @@ class Decoder {
   void decode_round();
 
   /**
-   * A prompt sweep: tokens at positions p0, p0 + 1, ... (`embeddings` [tokens][5120]; `engram_rows`
-   * [tokens] x kEngramTokenBytes, empty when no Engram layer runs) as Rounds of 8 rows, in chunks of up
-   * to chunk_rounds Rounds, each chunk layer by layer: every Round goes through layer L before any
+   * A prompt sweep: tokens at positions p0, p0 + 1, ... (`embeddings` [tokens][5120]; `engram` the
+   * tokens' Engram row ids, read with `read_engram`, both empty when no Engram layer runs) as Rounds of
+   * 8 rows, in chunks of up to chunk_rounds Rounds, each chunk layer by layer: every Round goes through layer L before any
    * goes through L + 1, so a layer's Experts are read once per chunk instead of once per Round that
    * meets them after an eviction. The same outputs as the Rounds one after another (causality: a row
    * reads only earlier positions, all in the caches by then). The last Round stays the current one
@@ -145,9 +155,13 @@ class Decoder {
    * Round's order. The host waits on each segment's routing only after every halves' exchange of
    * the layer is launched; returns once the last layer's combine halves are launched. Without, each
    * Round runs whole steps.
+   *
+   * A chunk's Engram rows are read beside the sweep on a thread of its own, table 0 (layer 1) in token
+   * order, then table 1 (layer 14), each distinct row once (engram::first_occurrence); an Engram
+   * layer's wave waits only for its own rows.
    */
-  void prefill(int64_t p0, std::span<const float> embeddings, std::span<const uint8_t> engram_rows = {},
-               const ExpertPlacer& place = {});
+  void prefill(int64_t p0, std::span<const float> embeddings, std::span<const EngramTokenRows> engram = {},
+               const EngramReader& read_engram = {}, const ExpertPlacer& place = {});
 
   /** Wait until both GPUs finished everything launched so far. */
   void sync();
@@ -185,17 +199,26 @@ class Decoder {
    * end), and the host's time inside the grouped phase waiting for routing and placing Experts.
    */
   struct SweepProfile {
-    double setup = 0, steps = 0, waiting = 0, placement = 0, combine = 0;
+    double setup = 0, steps = 0, waiting = 0, placement = 0, combine = 0, engram_wait = 0;
+    size_t engram_rows = 0, engram_reads = 0;  // the chunks' row positions, and the distinct rows read
   };
-  struct LaunchedSegments;  // decoder.cu: how many segments of a layer's attention halves are launched
+  /** decoder_sweep.cu: how far a producer on another thread got (launched segments, Engram rows read). */
+  struct Progress;
   /**
    * On a sweep's placing thread, while the host launches `layer`'s attention halves: as each segment
-   * of Rounds ran its halves, the Experts its routing names that no earlier segment placed, placed.
-   * Returns each Expert's Slot (none: no token routed to it); adds the time waiting for routing and
-   * placing to `profile`.
+   * of Rounds ran its halves (`launched` counts them), the Experts its routing names that no earlier
+   * segment placed, placed. Returns each Expert's Slot (none: no token routed to it); adds the time
+   * waiting for routing and placing to `profile`.
    */
   std::vector<std::optional<uint32_t>> place_segments(int layer, size_t tokens, const ExpertPlacer& place,
-                                                      LaunchedSegments& launched, SweepProfile* profile);
+                                                      Progress& launched, SweepProfile* profile);
+  /**
+   * On a sweep's Engram reader thread: a chunk's rows (`engram`, the chunk's tokens) into its pinned
+   * tables, table 0 then table 1, in token order a piece at a time, each distinct row of the chunk once
+   * (engram::first_occurrence); ready[table] counts the tokens filled. Returns the rows read.
+   */
+  size_t read_chunk_engram(std::span<const EngramTokenRows> engram, const EngramReader& read_engram,
+                           std::array<Progress, 2>& ready);
   /** A sweep's grouped MoE for `layer` over the chunk's first `tokens` tokens, its Experts in `slot_of`. */
   void grouped_moe(int layer, size_t tokens, std::span<const std::optional<uint32_t>> slot_of);
   std::array<std::unique_ptr<Gpu>, 2> gpus_;

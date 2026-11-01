@@ -51,6 +51,7 @@
 #include <optional>
 #include <span>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -289,12 +290,12 @@ int main(int argc, char** argv) {
     // `histories`, when given, gets the history after each token.
     engram::History history;
     std::vector<double> step_ms, host_ms;  // whole Rounds; the host's part before launching (embeddings, Engram rows)
-    // All the tokens' rows are read at once (EngramRows::read_tokens keeps the drive's queue full).
-    auto inputs = [&](std::span<const int32_t> tokens, std::vector<engram::History>* histories) {
-      std::pair<std::vector<float>, std::vector<uint8_t>> in;
+    // The embeddings and Engram row ids, then (for Rounds) the rows, all the tokens' at once
+    // (EngramRows::read_tokens keeps the drive's queue full). A sweep reads its rows itself.
+    auto embed_and_hash = [&](std::span<const int32_t> tokens, std::vector<engram::History>* histories) {
+      std::pair<std::vector<float>, std::vector<engine::EngramTokenRows>> in;
       in.first.reserve(tokens.size() * model::kDim);
-      std::vector<engine::EngramRows::TokenRows> wanted;
-      wanted.reserve(tokens.size());
+      in.second.reserve(tokens.size());
       for (const int32_t token : tokens) {
         const auto emb = embedding(token);
         in.first.insert(in.first.end(), emb.begin(), emb.end());
@@ -302,12 +303,15 @@ int main(int argc, char** argv) {
         if (!hashed) die(hashed.error().what);
         history = hashed.value().next;
         if (histories) histories->push_back(history);
-        wanted.push_back(hashed.value().rows);
+        in.second.push_back(hashed.value().rows);
       }
+      return in;
+    };
+    auto inputs = [&](std::span<const int32_t> tokens, std::vector<engram::History>* histories) {
+      auto [embeddings, wanted] = embed_and_hash(tokens, histories);
       auto raw = rows.value().read_tokens(wanted);
       if (!raw) die(raw.error().what);
-      in.second = std::move(raw).value();
-      return in;
+      return std::pair{std::move(embeddings), std::move(raw).value()};
     };
     // One Round of the whole model (tokens at positions p0, p0 + 1, ...): every row's logits
     // ([rows][vocab]) when asked for.
@@ -336,12 +340,15 @@ int main(int argc, char** argv) {
     std::vector<float> logits;
     std::string how;
     if (sweep_rounds > 0) {
-      const auto [embeddings, raw_rows] = inputs(prompt, nullptr);
+      const auto [embeddings, row_ids] = embed_and_hash(prompt, nullptr);
       const double host_s = std::chrono::duration<double>(Clock::now() - t_prompt).count();
       const engine::ExpertPlacer place = [&](int layer, std::span<const int32_t> experts) {
         return residency->place(layer, experts);
       };
-      decoder.prefill(0, embeddings, raw_rows, grouped ? place : engine::ExpertPlacer{});
+      const engine::EngramReader read_engram = [&](int table, std::span<const uint32_t> ids, std::span<uint8_t> out) {
+        if (auto r = rows.value().read_rows(table, ids, out); !r) throw std::runtime_error(r.error().what);
+      };
+      decoder.prefill(0, embeddings, row_ids, read_engram, grouped ? place : engine::ExpertPlacer{});
       const auto all = decoder.logits();
       logits = row(all, all.size() / model::kVocab - 1);
       char buf[128];

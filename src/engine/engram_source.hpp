@@ -25,8 +25,11 @@ class EngramRows {
   /** Find the Engram tables among `shards` (a split set or one merged file); a missing table fails on read. */
   static Result<EngramRows, io::IoError> open(const std::vector<std::string>& shards);
 
-  /** The 24 rows `ids` of Engram table `table` (0: layer 1, 1: layer 14), as 24 x 264 bytes. */
+  /** The rows `ids` of Engram table `table` (0: layer 1, 1: layer 14), as ids.size() x 264 bytes. */
   Result<std::vector<uint8_t>, io::IoError> read(int table, std::span<const uint32_t> ids) const;
+
+  /** The same into `out` (ids.size() x 264 bytes), kBulkDepth reads in flight; returns the rows read. */
+  Result<size_t, io::IoError> read_rows(int table, std::span<const uint32_t> ids, std::span<uint8_t> out) const;
 
   /** A token's table rows, as engram::Step::rows. */
   using TokenRows = std::array<std::array<uint32_t, engram::kCols>, engram::kLayers>;
@@ -47,13 +50,15 @@ class EngramRows {
   static constexpr unsigned kBulkDepth = 1024;
 
  private:
+  /** Every read of `reads` (264 bytes each), the queue kept full. */
+  Result<size_t, io::IoError> read_all(std::span<const io::ReadRequest> reads) const;
   struct Table {
     size_t shard = 0;
     uint64_t offset = 0;  // absolute offset of row 0 in that shard
     uint64_t rows = 0;
   };
   std::vector<io::Fd> fds_;
-  mutable std::optional<io::UringReader> reader_;  // buffered reads, kBulkDepth in flight
+  mutable std::optional<io::UringReader> reader_;  // buffered reads, kBulkDepth in flight: one caller at a time
   std::array<Table, engram::kLayers> tables_{};
 };
 

@@ -59,6 +59,14 @@ Result<Step, LayoutError> hash_token(const Layout& l, const History& h, uint32_t
 /** One table row: 256 E4M3 values times their E8M0 scale per 32, rounded to BF16 (as floats). */
 std::array<float, kRowValues> decode_row(std::span<const std::byte, kRowBytes> row);
 
+/**
+ * For each position of a prompt's row ids of one table (token after token), the first position
+ * holding the same row: itself where the row first occurs. A prompt's n-grams repeat (indentation,
+ * keywords, quoted text): reading the first occurrences and copying the others from them reads each
+ * distinct row once, and the positions of a prefix of the prompt only copy from that prefix.
+ */
+std::vector<uint32_t> first_occurrence(std::span<const uint32_t> ids);
+
 constexpr int kDim = 5120;    // model dimension
 constexpr int kCopies = 4;    // hc_mult
 constexpr int kKvRows = kDim * (kCopies + 1);  // wkv output: one key per copy, then the value
