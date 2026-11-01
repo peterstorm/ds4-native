@@ -204,21 +204,25 @@ class Decoder {
   };
   /** decoder_sweep.cu: how far a producer on another thread got (launched segments, Engram rows read). */
   struct Progress;
+  /** decoder_sweep.cu: a chunk's Engram reads as the sweep's other threads see them. */
+  struct EngramReads;
   /**
    * On a sweep's placing thread, while the host launches `layer`'s attention halves: as each segment
    * of Rounds ran its halves (`launched` counts them), the Experts its routing names that no earlier
-   * segment placed, placed. Returns each Expert's Slot (none: no token routed to it); adds the time
+   * segment placed, placed -- with `drive_first` (the chunk's first layer), after those reads' table
+   * 0 when it has many rows. Returns each Expert's Slot (none: no token routed to it); adds the time
    * waiting for routing and placing to `profile`.
    */
   std::vector<std::optional<uint32_t>> place_segments(int layer, size_t tokens, const ExpertPlacer& place,
-                                                      Progress& launched, SweepProfile* profile);
+                                                      Progress& launched, SweepProfile* profile,
+                                                      EngramReads* drive_first = nullptr);
   /**
    * On a sweep's Engram reader thread: a chunk's rows (`engram`, the chunk's tokens) into its pinned
    * tables, table 0 then table 1, in token order a piece at a time, each distinct row of the chunk once
-   * (engram::first_occurrence); ready[table] counts the tokens filled. Returns the rows read.
+   * (engram::first_occurrence), reported through `progress`. Returns the rows read.
    */
   size_t read_chunk_engram(std::span<const EngramTokenRows> engram, const EngramReader& read_engram,
-                           std::array<Progress, 2>& ready);
+                           EngramReads& progress);
   /** A sweep's grouped MoE for `layer` over the chunk's first `tokens` tokens, its Experts in `slot_of`. */
   void grouped_moe(int layer, size_t tokens, std::span<const std::optional<uint32_t>> slot_of);
   std::array<std::unique_ptr<Gpu>, 2> gpus_;

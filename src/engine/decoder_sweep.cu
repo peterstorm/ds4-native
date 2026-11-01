@@ -58,6 +58,21 @@ struct Decoder::Progress {
   }
 };
 
+/**
+ * A chunk's Engram reads on the reader thread, as the sweep's other threads see them: the tokens
+ * filled per table, and table 0's distinct rows once `planned` reached 1.
+ */
+struct Decoder::EngramReads {
+  std::array<Progress, 2> filled;
+  Progress planned;
+  size_t table0_rows = 0;  // written before planned's publish, read after its wait
+
+  void abandon() {
+    for (Progress& f : filled) f.abandon();
+    planned.abandon();
+  }
+};
+
 void Decoder::Gpu::allocate_sweep(int chunk_rounds) {
   DeviceArena& a = arena;
   constexpr size_t R = kMaxRows;
@@ -463,24 +478,23 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
     sync();
     // The chunk's Engram rows, read beside the sweep on a thread of its own into the pinned tables the
     // GPUs read: table 0 (layer 1) in token order, then table 1 (layer 14), each distinct row of the
-    // chunk once (a repeat copied from where its first occurrence landed). engram_ready[table] counts
-    // the tokens filled; an Engram layer's wave waits for its own. Declared before `reading`, so an
-    // unwinding chunk joins the reader before the counters go.
-    std::array<Progress, 2> engram_ready;
+    // chunk once (a repeat copied from where its first occurrence landed). An Engram layer's wave waits
+    // for its own rows. Declared before `reading`, so an unwinding chunk joins the reader first.
+    EngramReads engram_reads;
     std::future<size_t> reading;  // the distinct rows read
     if (any_engram)
       reading = std::async(std::launch::async, [&, first, n] {
         try {
-          return read_chunk_engram(engram.subspan(first, n), read_engram, engram_ready);
+          return read_chunk_engram(engram.subspan(first, n), read_engram, engram_reads);
         } catch (...) {
-          for (Progress& ready : engram_ready) ready.abandon();
+          engram_reads.abandon();
           throw;
         }
       });
     // Before the GPUs read tokens [0, upto) of `table`: wait for the reader (the time into the profile).
     auto engram_rows_for = [&](int table, size_t upto) {
       const auto t0 = std::chrono::steady_clock::now();
-      if (!engram_ready[table].wait_until(upto)) {
+      if (!engram_reads.filled[table].wait_until(upto)) {
         reading.get();  // the reader's failure
         throw CudaError("prefill: the Engram reader stopped");
       }
@@ -592,6 +606,7 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
 
     // Layer by layer, every Round through the layer before any goes on: a layer's Experts are read
     // once for the chunk.
+    const int first_layer = lead.layers.begin()->first;
     for (const auto& [layer, unused] : lead.layers) {
       if (layer >= kLayers) continue;  // DSpark stages run in draft()
       if (!grouped) {
@@ -601,9 +616,12 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
       } else {
         // The Experts are placed on a thread of their own while the waves' attention halves run:
         // launching blocks once CUDA's launch queue is full.
+        // The chunk's first layer reads no Engram rows, but its placement shares the drive with the
+        // reader's table 0, which the next layer needs (place_segments: many rows go first).
         Progress launched;
+        EngramReads* drive_first = any_engram && layer == first_layer ? &engram_reads : nullptr;
         auto placing = std::async(std::launch::async, [&, layer = layer] {
-          return place_segments(layer, n, place, launched, profiling ? &profile : nullptr);
+          return place_segments(layer, n, place, launched, profiling ? &profile : nullptr, drive_first);
         });
         try {
           launch_waves(layer, launched);
@@ -667,7 +685,7 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
 }
 
 size_t Decoder::read_chunk_engram(std::span<const EngramTokenRows> engram, const EngramReader& read_engram,
-                                  std::array<Progress, 2>& ready) {
+                                  EngramReads& progress) {
   constexpr size_t kPiece = 2048;  // tokens a read covers: ~49K rows, many times the reader's queue
   constexpr size_t kRow = engram::kRowBytes;
   const size_t n = engram.size(), capacity = static_cast<size_t>(gpus_[0]->chunk.capacity);
@@ -677,6 +695,12 @@ size_t Decoder::read_chunk_engram(std::span<const EngramTokenRows> engram, const
     std::vector<uint32_t> ids(n * engram::kCols);
     for (size_t t = 0; t < n; t++) std::copy(engram[t][table].begin(), engram[t][table].end(), ids.begin() + t * engram::kCols);
     const std::vector<uint32_t> first = engram::first_occurrence(ids);
+    if (table == 0) {
+      size_t distinct = 0;
+      for (size_t k = 0; k < first.size(); k++) distinct += first[k] == k;
+      progress.table0_rows = distinct;
+      progress.planned.publish(1);
+    }
     std::vector<uint32_t> fresh;
     std::vector<uint8_t> got;
     for (size_t t0 = 0; t0 < n; t0 += kPiece) {
@@ -691,17 +715,29 @@ size_t Decoder::read_chunk_engram(std::span<const EngramTokenRows> engram, const
       for (size_t k = k0; k < k1; k++)
         if (first[k] != k) std::memcpy(rows + k * kRow, rows + static_cast<size_t>(first[k]) * kRow, kRow);
       reads += fresh.size();
-      ready[table].publish(k1 / engram::kCols);
+      progress.filled[table].publish(k1 / engram::kCols);
     }
   }
   return reads;
 }
 
 std::vector<std::optional<uint32_t>> Decoder::place_segments(int layer, size_t tokens, const ExpertPlacer& place,
-                                                             Progress& launched, SweepProfile* profile) {
+                                                             Progress& launched, SweepProfile* profile,
+                                                             EngramReads* drive_first) {
   using Clock = std::chrono::steady_clock;
   using Ms = std::chrono::duration<double, std::milli>;
   const Gpu::Grouped& routing = gpus_[0]->grouped;  // the routing is the same on both GPUs
+  // Many rows of table 0 go first: sharing the drive with the Experts' 1 MiB reads starves the small
+  // ones (a random 60K prompt's 1.44M rows: layer 1 waited 8.6 s, 1.0 s when they went first), while a
+  // few go faster beside them (a 9K prompt's 110K: 1,326 tok/s sharing, 1,276 first).
+  constexpr size_t kDriveFirstRows = 400'000;  // ~0.5 s of the drive's 16 KB reads
+  if (drive_first != nullptr) {
+    const auto t0 = Clock::now();
+    if (!drive_first->planned.wait_until(1) ||
+        (drive_first->table0_rows > kDriveFirstRows && !drive_first->filled[0].wait_until(tokens)))
+      throw CudaError("prefill: the Engram reader stopped");
+    if (profile) profile->waiting += Ms(Clock::now() - t0).count();
+  }
 
   // Once a wave ran its attention halves on both GPUs (so both finished the previous
   // layer's Experts, whose scratch Slots placement may now evict), the Experts its routing newly

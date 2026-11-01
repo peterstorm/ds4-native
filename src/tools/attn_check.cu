@@ -1,5 +1,5 @@
 // ds4n-attn-check: attention building blocks versus core/attn_reference, plus
-// the decode sparse-attention timing (32 heads per GPU, 128 window + 512 selected rows).
+// the sparse-attention timing (32 heads per GPU, 128 window + 512 selected rows) for decode and a sweep wave.
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -106,8 +106,9 @@ int main() {
   std::printf("rope (yarn, pos 200001) %.4f%% bit-identical, max relative error %.3g\n", 100.0 * same / qx.size(), max_rel);
   if (max_rel > 2e-2) die("rope exceeds one BF16 ulp");
 
-  // Sparse attention: 4096 cached rows, 4 query rows, 128 window + 512 selected indices (some -1), and shorter lists.
-  const int cache_rows = 4096, max_idx = 640, qrows = 4;
+  // Sparse attention: 4096 cached rows, 4 query rows, 128 window + 512 selected indices (some -1), and
+  // shorter lists; then a prompt sweep's launch, 128 query rows (cuda's kAttnRows) of 640.
+  const int cache_rows = 4096, max_idx = 640, qrows = 128;
   const auto kv = attn::fp8_quant_dequant(bf16_random(static_cast<size_t>(cache_rows) * d, 1.0f));
   auto dkv = upload(to_bf16(kv));
   const cuda::KvSources kvs{dkv, dkv + static_cast<size_t>(cuda::kAttnWindow) * d};  // one buffer: slot i is row i
@@ -123,15 +124,15 @@ int main() {
   __nv_bfloat16* dout;
   ck(cudaMalloc(&dout, static_cast<size_t>(qrows) * heads * d * 2), "malloc");
   std::uniform_int_distribution<int32_t> pick(0, cache_rows - 1);
-  for (int n_idx : {640, 200, 64, 1}) {
-    std::vector<int32_t> idx(static_cast<size_t>(qrows) * n_idx);
+  for (const auto [rows_checked, n_idx] : {std::pair{4, 640}, {4, 200}, {4, 64}, {4, 1}, {qrows, 640}}) {
+    std::vector<int32_t> idx(static_cast<size_t>(rows_checked) * n_idx);
     for (size_t i = 0; i < idx.size(); i++) idx[i] = (i % 97 == 5) ? -1 : pick(rng);
     idx[0] = 3;  // row 0 always has a valid first slot
     auto didx = upload(idx);
-    ck(cuda::sparse_attn(dqs, kvs, didx, n_idx, n_idx, dsink, qrows, scale, scratch, dout, nullptr), "sparse_attn");
-    const auto got = download_bf16(dout, static_cast<size_t>(qrows) * heads * d);
+    ck(cuda::sparse_attn(dqs, kvs, didx, n_idx, n_idx, dsink, rows_checked, scale, scratch, dout, nullptr), "sparse_attn");
+    const auto got = download_bf16(dout, static_cast<size_t>(rows_checked) * heads * d);
     size_t same_attn = 0, total = 0;
-    for (int r = 0; r < qrows; r++) {
+    for (int r = 0; r < rows_checked; r++) {
       std::vector<float> gathered(static_cast<size_t>(n_idx) * d, 0.0f);
       std::unique_ptr<bool[]> valid(new bool[n_idx]);
       for (int i = 0; i < n_idx; i++) {
@@ -147,7 +148,7 @@ int main() {
         total++;
       }
     }
-    std::printf("sparse_attn %d heads x %d slots x %d rows: %.4f%% bit-identical\n", heads, n_idx, qrows,
+    std::printf("sparse_attn %d heads x %d slots x %d rows: %.4f%% bit-identical\n", heads, n_idx, rows_checked,
                 100.0 * same_attn / total);
     if (same_attn != total) die("sparse_attn differs from the oracle");
     cudaFree(didx);
@@ -155,8 +156,8 @@ int main() {
 
   if (cuda::sparse_attn(dqs, kvs, nullptr, 641, 641, dsink, 1, scale, scratch, dout, nullptr) != cudaErrorInvalidValue)
     die("sparse_attn accepted 641 slots");
-  // Decode timing: one query row, 640 slots.
-  std::vector<int32_t> idx(max_idx);
+  // Timing: decode (one query row) and a prompt sweep's launch (128), 640 slots each.
+  std::vector<int32_t> idx(static_cast<size_t>(qrows) * max_idx);
   for (auto& i : idx) i = pick(rng);
   auto didx = upload(idx);
   cudaEvent_t a, b;
@@ -164,7 +165,7 @@ int main() {
   ck(cudaEventCreate(&b), "ev");
   cudaStream_t st;
   ck(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking), "stream");
-  for (int rows_timed : {1, 4}) {
+  for (int rows_timed : {1, 4, qrows}) {
     // Replayed as a CUDA graph, as decode runs (plain launches would measure the CPU).
     cudaGraph_t graph;
     cudaGraphExec_t exec;
