@@ -880,25 +880,29 @@ void Decoder::grouped_moe(int layer, size_t tokens, std::span<const std::optiona
     check(cudaMemsetAsync(gp->chunk.y, 0, tokens * kDim * sizeof(float), gp->stream), "chunk MoE output");
   }
 
-  // Groups [begin, end) on both GPUs, kGroupBatch at a time; routed group begin + i in Slot slots[i].
+  // Groups [begin, end) on both GPUs, kGroupBatch at a time, each batch launched on both before the
+  // next is prepared: the host's work for a batch (its combine order, tables and jobs) runs beside
+  // the GPUs' earlier batches rather than ahead of the first launch. Routed group begin + i in Slot
+  // slots[i].
   auto enqueue = [&](size_t begin, size_t end, std::span<const uint32_t> slots) {
-    std::vector<moe::TokenColumns> columns;  // each batch's combine order, the same on both GPUs
-    for (size_t at = begin; at < end; at += kGroupBatch)
-      columns.push_back(moe::token_columns(std::span(plan.groups).subspan(at, std::min<size_t>(kGroupBatch, end - at))));
     for (auto& gp : gpus_) {
-      Gpu& s = *gp;
-      check(cudaSetDevice(s.device), "cudaSetDevice");
-      const DeviceLayer& d = s.layers.at(layer);
-      std::vector<const uint8_t*> halves(slots.size());
-      for (size_t i = 0; i < slots.size(); i++) halves[i] = s.experts.pool + slots[i] * s.experts.slot_bytes;
-      s.clock.mark(s.stream);
-      for (size_t at = begin, k = 0; at < end; at += kGroupBatch, k++) {
-        const size_t count = std::min<size_t>(kGroupBatch, end - at);
-        const std::span<const uint8_t* const> batch_halves =
-            halves.empty() ? std::span<const uint8_t* const>{} : std::span<const uint8_t* const>(halves).subspan(at - begin, count);
-        s.enqueue_groups(plan, at, count, d, batch_halves, columns[k]);
+      check(cudaSetDevice(gp->device), "cudaSetDevice");
+      gp->clock.mark(gp->stream);
+    }
+    for (size_t at = begin; at < end; at += kGroupBatch) {
+      const size_t count = std::min<size_t>(kGroupBatch, end - at);
+      const moe::TokenColumns columns = moe::token_columns(std::span(plan.groups).subspan(at, count));  // both GPUs'
+      for (auto& gp : gpus_) {
+        Gpu& s = *gp;
+        check(cudaSetDevice(s.device), "cudaSetDevice");
+        std::vector<const uint8_t*> halves(slots.empty() ? 0 : count);
+        for (size_t i = 0; i < halves.size(); i++) halves[i] = s.experts.pool + slots[at - begin + i] * s.experts.slot_bytes;
+        s.enqueue_groups(plan, at, count, s.layers.at(layer), halves, columns);
       }
-      s.clock.lap(WaveSection::Experts, s.stream);
+    }
+    for (auto& gp : gpus_) {
+      check(cudaSetDevice(gp->device), "cudaSetDevice");
+      gp->clock.lap(WaveSection::Experts, gp->stream);
     }
   };
   // Every routed group's Expert was placed, its copies landed. The scratch Slots are least recently

@@ -227,4 +227,10 @@ TEST_CASE("malformed routing is rejected") {
   CHECK_FALSE(group_tokens(experts, weights, 2, 384));                                  // shape
   CHECK_FALSE(group_tokens(std::vector<int32_t>{0, 1, 2, 3, 4, 400}, weights, 1, 384));  // out of range
   CHECK_FALSE(group_tokens(std::vector<int32_t>{0, 1, 2, 3, 4, 4}, weights, 1, 384));    // twice
+  // The first fault in routing order is the one reported.
+  const std::vector<float> two(12, 1.0f);
+  CHECK(group_tokens(std::vector<int32_t>{0, 1, 2, 3, 4, 5, 9, 9, 400, 6, 7, 8}, two, 2, 384).error().what ==
+        "a token routes to an Expert twice");
+  CHECK(group_tokens(std::vector<int32_t>{0, 1, 2, 3, 4, 5, 9, 400, 9, 6, 7, 8}, two, 2, 384).error().what ==
+        "routed Expert out of range");
 }
