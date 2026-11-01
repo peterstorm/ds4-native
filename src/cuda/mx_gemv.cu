@@ -8,20 +8,24 @@ namespace {
 
 constexpr int kDepth = 4;  // weight pairs in flight per lane: 2 -> 1418 GB/s, 4 -> 1525, 8 -> 1323 (registers)
 
-__global__ void quantize_kernel(const __nv_bfloat16* __restrict__ x, int tokens, int blocks,
+/** Warp (column group, block, column). */
+__global__ void quantize_kernel(const __nv_bfloat16* __restrict__ x, int tokens, int groups, int blocks,
                                 uint8_t* __restrict__ codes, uint8_t* __restrict__ scales) {
   const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
   const int lane = threadIdx.x & 31;
-  if (warp >= blocks * kMaxTokens) return;
-  const int b = warp / kMaxTokens, n = warp % kMaxTokens;
-  if (n < tokens) {
-    ops::act_quantize_lane(__bfloat162float(x[static_cast<size_t>(n) * blocks * 32 + b * 32 + lane]), b, n, codes, scales);
+  if (warp >= groups * blocks * kMaxTokens) return;
+  const int g = warp / (blocks * kMaxTokens), b = (warp / kMaxTokens) % blocks, n = warp % kMaxTokens;
+  const int t = g * kMaxTokens + n;
+  if (t < tokens) {
+    ops::act_quantize_lane(__bfloat162float(x[static_cast<size_t>(t) * blocks * 32 + b * 32 + lane]), b, t, blocks, codes,
+                           scales);
     return;
   }
   // Columns past `tokens`: zero codes, scale 2^0 (what a fragment holds before any token is written).
   const int q = (lane & 15) >> 2, j = lane & 3, hi = lane >> 4;
-  codes[b * 256 + (4 * n + q) * 8 + hi * 4 + j] = 0;
-  if (lane == 0) scales[b * kMaxTokens + n] = 127;
+  const size_t at = static_cast<size_t>(g) * blocks + b;
+  codes[at * 256 + (4 * n + q) * 8 + hi * 4 + j] = 0;
+  if (lane == 0) scales[at * kMaxTokens + n] = 127;
 }
 
 /** Groups of 8 gathered token rows: warp (group, block, column); the empty columns as quantize_kernel's. */
@@ -35,8 +39,8 @@ __global__ void gather_quantize_kernel(const __nv_bfloat16* __restrict__ x, int 
   uint8_t* group_scales = scales + static_cast<size_t>(g) * blocks * kMaxTokens;
   const int32_t t = token_of[g * kMaxTokens + n];
   if (t >= 0) {
-    ops::act_quantize_lane(__bfloat162float(x[static_cast<size_t>(t) * blocks * 32 + b * 32 + lane]), b, n, group_codes,
-                           group_scales);
+    ops::act_quantize_lane(__bfloat162float(x[static_cast<size_t>(t) * blocks * 32 + b * 32 + lane]), b, n, blocks,
+                           group_codes, group_scales);
     return;
   }
   const int q = (lane & 15) >> 2, j = lane & 3, hi = lane >> 4;
@@ -65,7 +69,17 @@ __device__ __forceinline__ void store_tile(float* out, int tile, unsigned lane, 
   out[(row + 8) * kMaxTokens + col + 1] = d[3];
 }
 
+/**
+ * A weight load: streaming (evict first) when one warp per tile reads it, cached when the warps of
+ * several column groups read the same tile one after another.
+ */
+template <bool kCached>
+__device__ __forceinline__ uint4 load_weights(const uint8_t* p) {
+  return kCached ? __ldg(reinterpret_cast<const uint4*>(p)) : __ldcs(reinterpret_cast<const uint4*>(p));
+}
+
 /** One warp's 16-row MXFP4 tile over its split's K range. */
+template <bool kCached>
 __device__ __forceinline__ void mxfp4_tile(const GemvJob& job, int tile, int split, unsigned lane, float (&d)[4]) {
   const uint8_t* w = job.weights + static_cast<size_t>(tile) * job.blocks * 272;
   const uint8_t* wscale = w + static_cast<size_t>(job.blocks) * 256;
@@ -78,7 +92,7 @@ __device__ __forceinline__ void mxfp4_tile(const GemvJob& job, int tile, int spl
     uint4 c[kDepth];
 #pragma unroll
     for (int i = 0; i < kDepth; i++)
-      if (p0 + i < pairs) c[i] = __ldcs(reinterpret_cast<const uint4*>(w + (p0 + i) * 512 + lane * 16));
+      if (p0 + i < pairs) c[i] = load_weights<kCached>(w + (p0 + i) * 512 + lane * 16);
 #pragma unroll
     for (int i = 0; i < kDepth; i++) {
       const int p = p0 + i;
@@ -99,6 +113,7 @@ __device__ __forceinline__ void mxfp4_tile(const GemvJob& job, int tile, int spl
 }
 
 /** One warp's 16-row FP8 tile over its split's K range. */
+template <bool kCached>
 __device__ __forceinline__ void fp8_tile(const GemvJob& job, int tile, int split, unsigned lane, float (&d)[4]) {
   const size_t tile_bytes = static_cast<size_t>(job.blocks) * 512 + (job.blocks + 15) / 16 * 16;
   const uint8_t* w = job.weights + static_cast<size_t>(tile) * tile_bytes;
@@ -108,7 +123,7 @@ __device__ __forceinline__ void fp8_tile(const GemvJob& job, int tile, int split
     uint4 c[kDepth];
 #pragma unroll
     for (int i = 0; i < kDepth; i++)
-      if (b0 + i < end) c[i] = __ldcs(reinterpret_cast<const uint4*>(w + (b0 + i) * 512 + lane * 16));
+      if (b0 + i < end) c[i] = load_weights<kCached>(w + (b0 + i) * 512 + lane * 16);
 #pragma unroll
     for (int i = 0; i < kDepth; i++) {
       const int blk = b0 + i;
@@ -121,20 +136,26 @@ __device__ __forceinline__ void fp8_tile(const GemvJob& job, int tile, int split
   }
 }
 
+/** Warp w * groups + g: one-group warp w (a job's tile and split) for column group g. */
+template <bool kCached>
 __global__ void __launch_bounds__(128) gemv_kernel(const GemvJob* __restrict__ jobs,
                                                    const int* __restrict__ first_warp, IntArg job_count,
-                                                   IntArg warp_count) {
-  const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+                                                   IntArg warp_count, int groups) {
+  const int64_t global = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) >> 5;
   const unsigned lane = threadIdx.x & 31;
-  if (warp >= warp_count.get()) return;
+  if (global >= warp_count.get() * groups) return;
+  const int warp = static_cast<int>(global / groups), g = static_cast<int>(global % groups);
   const int n_jobs = static_cast<int>(job_count.get());
   const int j = find_job(first_warp, n_jobs, warp);
-  const GemvJob job = jobs[j];
+  GemvJob job = jobs[j];
+  job.act_codes += static_cast<size_t>(g) * job.blocks * 256;
+  job.act_scales += static_cast<size_t>(g) * job.blocks * kMaxTokens;
+  job.out += static_cast<size_t>(g) * job.splits * job.rows * kMaxTokens;
   const int local = warp - first_warp[j];
   const int tile = local / job.splits, split = local % job.splits;
   float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-  if (job.format == WeightFormat::Mxfp4) mxfp4_tile(job, tile, split, lane, d);
-  else fp8_tile(job, tile, split, lane, d);
+  if (job.format == WeightFormat::Mxfp4) mxfp4_tile<kCached>(job, tile, split, lane, d);
+  else fp8_tile<kCached>(job, tile, split, lane, d);
   store_tile(job.out + static_cast<size_t>(split) * job.rows * kMaxTokens, tile, lane, d);
 }
 
@@ -154,8 +175,10 @@ void reduce_splits(const float* partials, int splits, int rows, float* out, cuda
 }
 
 void quantize_activations(const __nv_bfloat16* x, int tokens, ActFragments act, cudaStream_t stream) {
-  const int warps = act.blocks * kMaxTokens;
-  quantize_kernel<<<(warps * 32 + 127) / 128, 128, 0, stream>>>(x, tokens, act.blocks, act.codes, act.scales);
+  const int groups = tokens > kMaxTokens ? column_groups(tokens) : 1;
+  const int64_t warps = static_cast<int64_t>(groups) * act.blocks * kMaxTokens;
+  quantize_kernel<<<static_cast<unsigned>((warps * 32 + 127) / 128), 128, 0, stream>>>(x, tokens, groups, act.blocks,
+                                                                                      act.codes, act.scales);
 }
 
 void gather_quantize(const __nv_bfloat16* x, int blocks, const int32_t* token_of, int groups, uint8_t* codes, uint8_t* scales,
@@ -171,7 +194,15 @@ void gemv(const GemvJob* jobs, const int* first_warp, int n_jobs, int total_warp
 void gemv(const GemvJob* jobs, const int* first_warp, IntArg n_jobs, IntArg total_warps, cudaStream_t stream) {
   const int64_t warps = total_warps.bound();
   if (warps <= 0) return;
-  gemv_kernel<<<static_cast<unsigned>((warps * 32 + 127) / 128), 128, 0, stream>>>(jobs, first_warp, n_jobs, total_warps);
+  gemv_kernel<false><<<static_cast<unsigned>((warps * 32 + 127) / 128), 128, 0, stream>>>(jobs, first_warp, n_jobs,
+                                                                                          total_warps, 1);
+}
+
+void gemv_groups(const GemvJob* jobs, const int* first_warp, int n_jobs, int total_warps, int groups, cudaStream_t stream) {
+  const int64_t warps = static_cast<int64_t>(total_warps) * groups;
+  if (warps <= 0) return;
+  gemv_kernel<true><<<static_cast<unsigned>((warps * 32 + 127) / 128), 128, 0, stream>>>(
+      jobs, first_warp, IntArg::of(n_jobs), IntArg::of(total_warps), groups);
 }
 
 }  // namespace ds4n::cuda

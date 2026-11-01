@@ -19,8 +19,10 @@
 
 namespace ds4n::cuda {
 
-constexpr int kExchangeChunk = 1024;   // floats per block
-constexpr int kExchangeMaxBlocks = 256;  // up to 8 tokens x 25600 values (Engram's KV: 200 blocks) with room
+constexpr int kExchangeChunk = 1024;  // floats per block
+// The largest exchange is a prompt sweep's wave of Engram KV: 512 rows x 25600 values (12800 blocks),
+// one exchange so a wave's phase holds at most one (the decoder alternates GPUs per phase).
+constexpr int kExchangeMaxBlocks = 12800;
 constexpr size_t kExchangeInboxFloats = 2 * size_t{kExchangeMaxBlocks} * kExchangeChunk;  // two parities
 
 /** One GPU's end of the link; `peer_*` are P2P pointers into the other GPU's memory. */

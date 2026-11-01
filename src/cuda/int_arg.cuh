@@ -21,6 +21,13 @@ struct IntArg {
   constexpr IntArg ceil_div(int64_t d) const { return {device, value, divisor * d, raw_bound}; }
   /** The largest value the argument can take. */
   constexpr int64_t bound() const { return (raw_bound + divisor - 1) / divisor; }
+  /** Entry r of a per-row array of such values (device), or the same value for every row. */
+#ifdef __CUDACC__
+  __host__ __device__
+#endif
+  constexpr IntArg row(int64_t r) const {
+    return {device ? device + r : nullptr, value, divisor, raw_bound};
+  }
 
 #ifdef __CUDACC__
   __device__ __forceinline__ int64_t get() const {

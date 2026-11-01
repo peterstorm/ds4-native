@@ -96,14 +96,22 @@ __global__ void hc_post_kernel(const __nv_bfloat16* __restrict__ x, const __nv_b
   }
 }
 
-/** kLoads: uint4 weight loads in flight per lane (narrow launches need them; wide ones prefer occupancy). */
-template <int kLoads>
+/**
+ * kLoads: uint4 weight loads in flight per lane (narrow launches need them; wide ones prefer
+ * occupancy). blockIdx.y is the 8-token column group (x at its tokens' rows, out at its planes,
+ * cuda/mx_gemv.cuh); several groups read the weights through the cache (kCached).
+ */
+template <int kLoads, bool kCached>
 __global__ void __launch_bounds__(256) bf16_gemv_kernel(const __nv_bfloat16* __restrict__ w,
                                                         const float* __restrict__ x, int rows, int k, int tokens,
                                                         int splits, float* __restrict__ out) {
   const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
   const int lane = threadIdx.x & 31;
   if (warp >= rows * splits) return;
+  const int group = blockIdx.y;
+  tokens = min(kMaxGemvTokens, tokens - group * kMaxGemvTokens);
+  x += static_cast<size_t>(group) * kMaxGemvTokens * k;
+  out += static_cast<size_t>(group) * splits * rows * kMaxGemvTokens;
   const int row = warp / splits, split = warp % splits;
   const int span = k / splits;
   const __nv_bfloat16* wr = w + static_cast<size_t>(row) * k + static_cast<size_t>(split) * span;
@@ -113,7 +121,10 @@ __global__ void __launch_bounds__(256) bf16_gemv_kernel(const __nv_bfloat16* __r
     uint4 raw[kLoads];
 #pragma unroll
     for (int i = 0; i < kLoads; i++)
-      if (base0 + i * 256 < span) raw[i] = __ldcs(reinterpret_cast<const uint4*>(wr + base0 + i * 256));
+      if (base0 + i * 256 < span) {
+        const uint4* p = reinterpret_cast<const uint4*>(wr + base0 + i * 256);
+        raw[i] = kCached ? __ldg(p) : __ldcs(p);
+      }
 #pragma unroll
     for (int i = 0; i < kLoads; i++) {
       const int base = base0 + i * 256;
@@ -171,9 +182,13 @@ void hc_post(const __nv_bfloat16* x, const __nv_bfloat16* residual, const HcMixe
 
 void bf16_gemv(const __nv_bfloat16* w, const float* x, int rows, int k, int tokens, int splits, float* out,
                cudaStream_t stream) {
+  if (tokens <= 0) return;
   const int warps = rows * splits, blocks = (warps * 32 + 255) / 256;
-  if (warps < 16384) bf16_gemv_kernel<4><<<blocks, 256, 0, stream>>>(w, x, rows, k, tokens, splits, out);
-  else bf16_gemv_kernel<1><<<blocks, 256, 0, stream>>>(w, x, rows, k, tokens, splits, out);
+  const int groups = (tokens + kMaxGemvTokens - 1) / kMaxGemvTokens;
+  const dim3 grid(blocks, groups);
+  if (groups > 1) bf16_gemv_kernel<1, true><<<grid, 256, 0, stream>>>(w, x, rows, k, tokens, splits, out);
+  else if (warps < 16384) bf16_gemv_kernel<4, false><<<grid, 256, 0, stream>>>(w, x, rows, k, tokens, splits, out);
+  else bf16_gemv_kernel<1, false><<<grid, 256, 0, stream>>>(w, x, rows, k, tokens, splits, out);
 }
 
 }  // namespace ds4n::cuda

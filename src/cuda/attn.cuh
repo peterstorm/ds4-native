@@ -5,6 +5,8 @@
 
 #include <cstdint>
 
+#include "core/model.hpp"
+
 namespace ds4n::cuda {
 
 /** In place on [rows][dim] BF16 (dim % 32 == 0): act_quant then dequantize (FP8, UE8M0 per 32). */
@@ -26,11 +28,11 @@ constexpr int kAttnHeads = 32;      // heads per GPU
 constexpr int kAttnDim = 512;       // head_dim (one shared latent KV)
 constexpr int kAttnSplitRows = 64;  // index slots per split (one CTA)
 
-/** The KV rows a slot index names: window ring rows below kAttnWindow (the ring's slots, model::kRing), then the compressed cache. */
-constexpr int kAttnWindow = 136;
+/** The KV rows a slot index names: window ring rows below kAttnWindow (the ring's slots), then the compressed cache. */
+constexpr int kAttnWindow = model::kRing;
 struct KvSources {
-  const __nv_bfloat16* window;      // [128][512]
-  const __nv_bfloat16* compressed;  // [n][512]: slot index i >= 128 reads row i - 128
+  const __nv_bfloat16* window;      // [kAttnWindow][512]
+  const __nv_bfloat16* compressed;  // [n][512]: slot index i >= kAttnWindow reads row i - kAttnWindow
 };
 
 constexpr int attn_splits(int n_idx) { return (n_idx + kAttnSplitRows - 1) / kAttnSplitRows; }

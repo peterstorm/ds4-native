@@ -27,6 +27,7 @@ add_library(ds4n_core STATIC
   src/core/cache_replay.cpp
   src/core/speculation.cpp
   src/core/moe_groups.cpp
+  src/core/row_index.cpp
 )
 target_include_directories(ds4n_core PUBLIC src)
 target_compile_options(ds4n_core PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -88,7 +89,8 @@ if(DS4N_CUDA)
   add_executable(ds4n-engram-check src/tools/engram_check.cu)
   target_compile_options(ds4n-engram-check PRIVATE ${DS4N_CUDA_FLAGS})
   target_link_libraries(ds4n-engram-check PRIVATE ds4n_cuda ds4n_io)
-  add_library(ds4n_engine_cuda STATIC src/engine/device_layer.cu src/engine/decoder.cu src/engine/expert_residency.cu)
+  add_library(ds4n_engine_cuda STATIC src/engine/device_layer.cu src/engine/decoder.cu src/engine/decoder_sweep.cu
+                                    src/engine/expert_residency.cu)
   target_compile_options(ds4n_engine_cuda PRIVATE ${DS4N_CUDA_FLAGS})
   target_link_libraries(ds4n_engine_cuda PUBLIC ds4n_cuda ds4n_engine)
   add_executable(ds4n-layer-check src/tools/layer_check.cu)
@@ -132,6 +134,7 @@ add_executable(ds4n_tests
   tests/core/test_cache_replay.cpp
   tests/core/test_speculation.cpp
   tests/core/test_moe_groups.cpp
+  tests/core/test_row_index.cpp
 )
 target_link_libraries(ds4n_tests PRIVATE ds4n_core doctest::doctest)
 target_compile_options(ds4n_tests PRIVATE -Wall -Wextra)

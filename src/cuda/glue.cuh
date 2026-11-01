@@ -48,9 +48,10 @@ void hc_post(const __nv_bfloat16* x, const __nv_bfloat16* residual, const HcMixe
 
 /**
  * Partial planes out[s][r][t] = sum over k in split s of float(w[r][k]) * x[t][k]
- * for t < tokens (<= 8): BF16 weights, FP32 activations and accumulation. One
+ * for t < tokens: BF16 weights, FP32 activations and accumulation. One
  * warp per (row, split), fixed lane order and shuffle tree; the consumer adds
- * the `splits` planes in order. k must be a multiple of 256 * splits.
+ * the `splits` planes in order. k must be a multiple of 256 * splits. More than 8 tokens: 8-column
+ * groups of planes (cuda/mx_gemv.cuh), each token's sums the same as in a group of its own.
  */
 void bf16_gemv(const __nv_bfloat16* w, const float* x, int rows, int k, int tokens, int splits, float* out,
                cudaStream_t stream);

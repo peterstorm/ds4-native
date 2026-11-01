@@ -1,10 +1,10 @@
 #pragma once
-// Fused decode glue for up to 8 tokens (a Round's rows): each kernel merges the
+// Fused decode glue for a Round's rows (and a sweep's wave of them): each kernel merges the
 // elementwise stages around one reduction -- split-K plane sums, RMSNorm, RoPE,
 // quant-dequant, act_quant, cache stores -- with the standalone kernels'
 // arithmetic and reduction trees (cuda/device_ops.cuh), so the bits are the
-// same and the oracles still describe them. Token t reads GEMV token column t
-// and its own position (`positions[t]`, device memory). Fragment columns past
+// same and the oracles still describe them. Token t reads GEMV token column t (in its 8-column
+// group, cuda/mx_gemv.cuh) and its own position (`positions[t]`, device memory). Fragment columns past
 // `tokens` keep what an empty fragment holds (zero codes, scale 2^0), which
 // fragment buffers are initialized to.
 //
@@ -28,6 +28,8 @@ struct GroupFragments {
 
 /** Set a fragment buffer to the empty state: zero codes, scale 2^0 in every token column. */
 void clear_fragments(ActFragments act, cudaStream_t stream);
+/** The same for `groups` column groups. */
+void clear_fragments(ActFragments act, int groups, cudaStream_t stream);
 
 /**
  * Each token's KV row: bf16(sum of planes) -> RMSNorm(w, eps) -> RoPE on the last `rope_dim` at
@@ -50,10 +52,11 @@ void unrope_quantize(const __nv_bfloat16* o, int tokens, int heads, int head_dim
                      const int64_t* positions, int heads_per_group, GroupFragments out, cudaStream_t stream);
 
 /**
- * `groups` plane sets, group g at planes + g * splits * rows * 8: per token, x[g * rows + r] =
- * bf16(sum of group g's planes at r), then act_quant of x (groups * rows values) into `act`.
+ * `groups` plane sets, group g at planes + g * group_stride (a Round's: splits * rows * 8): per token,
+ * x[g * rows + r] = bf16(sum of group g's planes at r), then act_quant of x (groups * rows values)
+ * into `act`.
  */
-void group_planes_quantize(const float* planes, int groups, int splits, int rows, int tokens, ActFragments act,
-                           cudaStream_t stream);
+void group_planes_quantize(const float* planes, int groups, size_t group_stride, int splits, int rows, int tokens,
+                           ActFragments act, cudaStream_t stream);
 
 }  // namespace ds4n::cuda

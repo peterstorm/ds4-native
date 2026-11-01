@@ -1,16 +1,25 @@
 #include "core/det_math.hpp"
 #include "cuda/compressor.cuh"
+#include "cuda/mx_gemv.cuh"
 
 namespace ds4n::cuda {
 namespace {
 
 constexpr int kThreads = 256;  // two dimensions per thread, as cuda::rmsnorm strides them
 
-/** Row `row` of the GEMV planes for token column `token`, splits added in order from split 0. */
+/** Row `row` of the GEMV planes for token `token` (cuda/mx_gemv.cuh), splits added in order from split 0. */
 __device__ __forceinline__ float plane_sum(const float* planes, int splits, int rows, int row, int token) {
-  float v = planes[row * 8 + token];
-  for (int s = 1; s < splits; s++) v = __fadd_rn(v, planes[(s * rows + row) * 8 + token]);
+  float v = planes[plane_index(splits, rows, 0, row, token)];
+  for (int s = 1; s < splits; s++) v = __fadd_rn(v, planes[plane_index(splits, rows, s, row, token)]);
   return v;
+}
+
+/** The group softmax of positions p - 1 (kv0, s0) and p (kv, sc) for one dimension, BF16-rounded. */
+__device__ __forceinline__ float pool_pair(float kv0, float s0, float kv, float sc) {
+  const float m = fmaxf(s0, sc);
+  const float e0 = det::exp(__fsub_rn(s0, m)), e1 = det::exp(__fsub_rn(sc, m));
+  const float sum = __fadd_rn(e0, e1);
+  return __bfloat162float(__float2bfloat16_rn(__fadd_rn(__fmul_rn(kv0, __fdiv_rn(e0, sum)), __fmul_rn(kv, __fdiv_rn(e1, sum)))));
 }
 
 /** RMSNorm of x[t], x[t + 256] across the block (cuda::rmsnorm's FMA chain and halving tree), into out. */
@@ -63,14 +72,43 @@ __global__ void __launch_bounds__(kThreads) pool_kernel(const float* __restrict_
   for (int u = 0; u < 2; u++) {
     const int d = t + kThreads * u;
     // Position p - 1's slot, written by this thread earlier or by a previous step.
-    const float s0 = s.score[first * kCompressDim + d], kv0 = s.kv[first * kCompressDim + d];
-    const float m = fmaxf(s0, sc[u]);
-    const float e0 = det::exp(__fsub_rn(s0, m)), e1 = det::exp(__fsub_rn(sc[u], m));
-    const float sum = __fadd_rn(e0, e1);
-    pooled[u] = __bfloat162float(__float2bfloat16_rn(
-        __fadd_rn(__fmul_rn(kv0, __fdiv_rn(e0, sum)), __fmul_rn(kv[u], __fdiv_rn(e1, sum)))));
+    pooled[u] = pool_pair(s.kv[first * kCompressDim + d], s.score[first * kCompressDim + d], kv[u], sc[u]);
   }
   rmsnorm_pair(pooled, norm, eps, latent);
+}
+
+/**
+ * Block per producing row of a wave: row r = first_row + 2i (odd position) pools with row r - 1's
+ * planes -- the values its slot would hold -- or, for r = 0, with the ring slot an earlier wave left.
+ */
+__global__ void __launch_bounds__(kThreads) pool_rows_kernel(const float* __restrict__ planes, int splits, int first_row,
+                                                            const int64_t* __restrict__ pos, PoolSlots s,
+                                                            const __nv_bfloat16* __restrict__ norm, float eps,
+                                                            __nv_bfloat16* __restrict__ latent) {
+  const int t = threadIdx.x, i = blockIdx.x, r = first_row + 2 * i;
+  const int first = static_cast<int>((pos[r] - 1) % kPoolRing);
+  float pooled[2];
+  for (int u = 0; u < 2; u++) {
+    const int d = t + kThreads * u;
+    const float kv = plane_sum(planes, splits, 2 * kCompressDim, d, r);
+    const float sc = plane_sum(planes, splits, 2 * kCompressDim, kCompressDim + d, r);
+    const float kv0 = r > 0 ? plane_sum(planes, splits, 2 * kCompressDim, d, r - 1) : s.kv[first * kCompressDim + d];
+    const float s0 =
+        r > 0 ? plane_sum(planes, splits, 2 * kCompressDim, kCompressDim + d, r - 1) : s.score[first * kCompressDim + d];
+    pooled[u] = pool_pair(kv0, s0, kv, sc);
+  }
+  rmsnorm_pair(pooled, norm, eps, latent + static_cast<size_t>(i) * kCompressDim);
+}
+
+/** Block per row among a wave's last kPoolRing: its slot, as the Rounds leave the ring. */
+__global__ void __launch_bounds__(kThreads) pool_tail_kernel(const float* __restrict__ planes, int splits, int first_row,
+                                                            const int64_t* __restrict__ pos, PoolSlots s) {
+  const int r = first_row + blockIdx.x, slot = static_cast<int>(pos[r] % kPoolRing);
+  for (int u = 0; u < 2; u++) {
+    const int d = threadIdx.x + kThreads * u;
+    s.kv[slot * kCompressDim + d] = plane_sum(planes, splits, 2 * kCompressDim, d, r);
+    s.score[slot * kCompressDim + d] = plane_sum(planes, splits, 2 * kCompressDim, kCompressDim + d, r);
+  }
 }
 
 __global__ void __launch_bounds__(kThreads) project_kernel(const float* __restrict__ planes, int splits, int token,
@@ -80,6 +118,17 @@ __global__ void __launch_bounds__(kThreads) project_kernel(const float* __restri
   for (int u = 0; u < 2; u++)
     x[u] = __bfloat162float(__float2bfloat16_rn(plane_sum(planes, splits, kCompressDim, threadIdx.x + kThreads * u, token)));
   rmsnorm_pair(x, norm, eps, latent);
+}
+
+/** Block per row: project_kernel's arithmetic for row blockIdx.x. */
+__global__ void __launch_bounds__(kThreads) project_rows_kernel(const float* __restrict__ planes, int splits,
+                                                               const __nv_bfloat16* __restrict__ norm, float eps,
+                                                               __nv_bfloat16* __restrict__ latent) {
+  const int r = blockIdx.x;
+  float x[2];
+  for (int u = 0; u < 2; u++)
+    x[u] = __bfloat162float(__float2bfloat16_rn(plane_sum(planes, splits, kCompressDim, threadIdx.x + kThreads * u, r)));
+  rmsnorm_pair(x, norm, eps, latent + static_cast<size_t>(r) * kCompressDim);
 }
 
 }  // namespace
@@ -96,6 +145,19 @@ void compress_pool(const float* planes, int splits, int token, const int64_t* po
 void compress_project(const float* planes, int splits, int token, const __nv_bfloat16* norm, float eps,
                       __nv_bfloat16* latent, cudaStream_t stream) {
   project_kernel<<<1, kThreads, 0, stream>>>(planes, splits, token, norm, eps, latent);
+}
+
+void compress_rows(const float* planes, int splits, int ratio, int rows, int first_row, int produced,
+                   const int64_t* pos, PoolSlots slots, const __nv_bfloat16* norm, float eps, __nv_bfloat16* latent,
+                   cudaStream_t stream) {
+  if (ratio == 1) {
+    if (rows > 0) project_rows_kernel<<<rows, kThreads, 0, stream>>>(planes, splits, norm, eps, latent);
+    return;
+  }
+  if (produced > 0)
+    pool_rows_kernel<<<produced, kThreads, 0, stream>>>(planes, splits, first_row, pos, slots, norm, eps, latent);
+  const int tail = rows < kPoolRing ? rows : kPoolRing;  // after the pools: row 0 may read the slot a tail row rewrites
+  if (tail > 0) pool_tail_kernel<<<tail, kThreads, 0, stream>>>(planes, splits, rows - tail, pos, slots);
 }
 
 }  // namespace ds4n::cuda

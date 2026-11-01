@@ -43,9 +43,21 @@ __device__ void find_bin(const unsigned* hist, unsigned above, unsigned k, unsig
   above_bin = above;
 }
 
+/**
+ * Selections side by side: blockIdx.y is the selection, its values at v + y * stride, its count
+ * count.row(y), its scratch words + y * select_scratch_words() (one selection: y = 0).
+ */
+__device__ __forceinline__ void select_row(const __nv_bfloat16* __restrict__& v, IntArg& count, unsigned* __restrict__& words,
+                                           int64_t stride) {
+  v += static_cast<int64_t>(blockIdx.y) * stride;
+  count = count.row(blockIdx.y);
+  words += static_cast<size_t>(blockIdx.y) * kSelectScratchWords;
+}
+
 template <bool kHighPass>
-__global__ void __launch_bounds__(kThreads) histogram_kernel(const __nv_bfloat16* __restrict__ v, IntArg count, int k_max,
-                                                            unsigned* __restrict__ words) {
+__global__ void __launch_bounds__(kThreads) histogram_kernel(const __nv_bfloat16* __restrict__ v, int64_t stride, IntArg count,
+                                                            int k_max, unsigned* __restrict__ words) {
+  select_row(v, count, words, stride);
   const int64_t n = count.get();
   const int k = static_cast<int>(n < k_max ? n : k_max);
   __shared__ unsigned hist[256];
@@ -109,8 +121,9 @@ __device__ unsigned block_exclusive_scan(unsigned v) {
 }
 
 /** Per block: keys above the threshold and keys equal to it; the last block turns them into output offsets. */
-__global__ void __launch_bounds__(kThreads) count_kernel(const __nv_bfloat16* __restrict__ v, IntArg count,
+__global__ void __launch_bounds__(kThreads) count_kernel(const __nv_bfloat16* __restrict__ v, int64_t stride, IntArg count,
                                                         unsigned* __restrict__ words) {
+  select_row(v, count, words, stride);
   const int64_t n = count.get();
   __shared__ unsigned counts_a[kSelectMaxBlocks], counts_b[kSelectMaxBlocks];
   const unsigned threshold = __ldcg(words + kState + kThreshold);
@@ -147,8 +160,11 @@ __global__ void __launch_bounds__(kThreads) count_kernel(const __nv_bfloat16* __
 }
 
 /** Ordered emission: threads own contiguous sub-ranges of the block's range. */
-__global__ void __launch_bounds__(kThreads) emit_kernel(const __nv_bfloat16* __restrict__ v, IntArg count, int32_t offset,
-                                                       const unsigned* __restrict__ words, int32_t* __restrict__ out) {
+__global__ void __launch_bounds__(kThreads) emit_kernel(const __nv_bfloat16* __restrict__ v, int64_t stride, IntArg count,
+                                                       int32_t offset, unsigned* __restrict__ words, int32_t* __restrict__ out,
+                                                       int64_t out_stride) {
+  select_row(v, count, words, stride);
+  out += static_cast<int64_t>(blockIdx.y) * out_stride;
   const int64_t n = count.get();
   const unsigned threshold = words[kState + kThreshold], take_equal = words[kState + kTakeEqual];
   const Range r = block_range(n);
@@ -175,14 +191,19 @@ __global__ void __launch_bounds__(kThreads) emit_kernel(const __nv_bfloat16* __r
 
 void select_top(const __nv_bfloat16* values, IntArg n, int k_max, int32_t offset, int32_t* out, SelectScratch scratch,
                 cudaStream_t stream) {
-  if (n.bound() <= 0 || k_max <= 0) return;
+  select_top_rows(values, 0, n, 1, k_max, offset, out, 0, scratch, stream);
+}
+
+void select_top_rows(const __nv_bfloat16* values, int64_t value_stride, IntArg n, int rows, int k_max, int32_t offset,
+                     int32_t* out, int64_t out_stride, SelectScratch scratch, cudaStream_t stream) {
+  if (n.bound() <= 0 || k_max <= 0 || rows <= 0) return;
   const int64_t want = (n.bound() + 4095) / 4096;
-  const unsigned blocks = static_cast<unsigned>(want > kSelectMaxBlocks ? kSelectMaxBlocks : want);  // want >= 1 here
-  cudaMemsetAsync(scratch.words, 0, select_scratch_words() * sizeof(unsigned), stream);
-  histogram_kernel<true><<<blocks, kThreads, 0, stream>>>(values, n, k_max, scratch.words);
-  histogram_kernel<false><<<blocks, kThreads, 0, stream>>>(values, n, k_max, scratch.words);
-  count_kernel<<<blocks, kThreads, 0, stream>>>(values, n, scratch.words);
-  emit_kernel<<<blocks, kThreads, 0, stream>>>(values, n, offset, scratch.words, out);
+  const dim3 grid(static_cast<unsigned>(want > kSelectMaxBlocks ? kSelectMaxBlocks : want), rows);  // want >= 1 here
+  cudaMemsetAsync(scratch.words, 0, static_cast<size_t>(rows) * select_scratch_words() * sizeof(unsigned), stream);
+  histogram_kernel<true><<<grid, kThreads, 0, stream>>>(values, value_stride, n, k_max, scratch.words);
+  histogram_kernel<false><<<grid, kThreads, 0, stream>>>(values, value_stride, n, k_max, scratch.words);
+  count_kernel<<<grid, kThreads, 0, stream>>>(values, value_stride, n, scratch.words);
+  emit_kernel<<<grid, kThreads, 0, stream>>>(values, value_stride, n, offset, scratch.words, out, out_stride);
 }
 
 }  // namespace ds4n::cuda

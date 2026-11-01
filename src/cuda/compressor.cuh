@@ -42,4 +42,16 @@ void compress_pool(const float* planes, int splits, int token, const int64_t* po
 void compress_project(const float* planes, int splits, int token, const __nv_bfloat16* norm, float eps,
                       __nv_bfloat16* latent, cudaStream_t stream);
 
+/**
+ * A prompt sweep's wave of `rows` rows (GEMV planes in column groups, positions pos[r]) at once: the
+ * latents of its producing rows, compacted in row order into latent [produced][512] -- what
+ * compress_project / compress_pool give row by row. Ratio 1: every row. Ratio 2: rows first_row,
+ * first_row + 2, ... (odd positions), each pooled with the row before (its planes are what the slot
+ * would hold; for row 0, the slot an earlier wave or Round left); then the ring takes the wave's last
+ * kPoolRing rows, as the Rounds would leave it.
+ */
+void compress_rows(const float* planes, int splits, int ratio, int rows, int first_row, int produced,
+                   const int64_t* pos, PoolSlots slots, const __nv_bfloat16* norm, float eps, __nv_bfloat16* latent,
+                   cudaStream_t stream);
+
 }  // namespace ds4n::cuda

@@ -19,9 +19,12 @@ constexpr int kOLora = 1024;
 constexpr int kOGroups = 8;
 constexpr int kWindow = 128;  // positions a query attends in the window: itself and the 127 before
 constexpr int kMaxRows = 8;   // rows of a Round (decode, DSpark verify, prefill chunks)
-// Window ring slots: a Round writes all its rows' KV before attending, so the ring outlasts the
-// window by a Round (else row r would overwrite position p0 + r - 128, which earlier rows still see).
-constexpr int kRing = kWindow + kMaxRows;
+// Rounds a prompt sweep's attention halves take at once (a wave: one weight pass for all of them).
+constexpr int kWaveRounds = 64;
+// Window ring slots: a wave writes all its rows' KV before any attends, so the ring outlasts the
+// window by a wave (else row r would overwrite position p0 + r - kRing, which earlier rows still see);
+// a Round is a wave of one. Slot numbers only address rows: the values attention reads are the same.
+constexpr int kRing = kWindow + kMaxRows * kWaveRounds;
 constexpr int kTopK = 512;
 constexpr int kHcCopies = 4;
 constexpr int kSinkhornIters = 20;
@@ -177,7 +180,7 @@ constexpr RoundIndex round_index(int64_t p0, int rows) {
   return s;
 }
 
-static_assert(round_index(5, 1).compress_len[2][0] == 3 && round_index(140, 1).ring_slot[0] == 4 &&
+static_assert(round_index(5, 1).compress_len[2][0] == 3 && round_index(kRing + 4, 1).ring_slot[0] == 4 &&
               round_index(7, 1).compress_row[2][0] == 3 && round_index(7, 1).latent_pos[2][0] == 6);
 static_assert(round_index(4, 3).pos[2] == 6 && round_index(4, 3).pos[3] == 0 && round_index(4, 3).compress_len[1][2] == 7);
 

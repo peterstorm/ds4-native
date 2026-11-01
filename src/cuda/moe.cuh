@@ -53,6 +53,14 @@ struct RouterParams {
 void route(const float* logits, int logit_splits, int tokens, const uint8_t* image, RouterParams p, int32_t* experts,
            float* weights, moe::Plan* plan, cudaStream_t stream);
 
+/**
+ * A prompt sweep's wave: route for each 8-token column group of `tokens` tokens at once (logits in
+ * column groups, cuda/mx_gemv.cuh), group g's Plan at plans[g]; experts and weights [tokens][6].
+ * A target layer's router, no image span.
+ */
+void route_groups(const float* logits, int logit_splits, int tokens, RouterParams p, int32_t* experts, float* weights,
+                  moe::Plan* plans, cudaStream_t stream);
+
 /** Per-slot scratch for one GPU's MoE work; every array has kJobSlots slots. */
 struct MoeBuffers {
   float* gate;        // [slot][splits][rows][8] GEMV partial planes

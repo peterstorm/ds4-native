@@ -62,6 +62,15 @@ __global__ void __launch_bounds__(Experts) route_kernel(const float* __restrict_
                                                               RouterParams p, int32_t* __restrict__ experts,
                                                               float* __restrict__ weights, moe::Plan* __restrict__ plan) {
   constexpr int kPerLane = Experts / 32;  // Experts per lane in a routing warp
+  // A sweep's wave routes its 8-token column groups side by side: block g takes tokens 8g .. 8g + 7.
+  const int group = blockIdx.x;
+  logits += static_cast<size_t>(group) * logit_splits * Experts * kMaxTokens;
+  tokens = min(kMaxTokens, tokens - group * kMaxTokens);
+  experts += group * kMaxTokens * TopK;
+  weights += group * kMaxTokens * TopK;
+  plan += group;
+  if (image != nullptr) image += group * kMaxTokens;
+  if (p.near != nullptr) p.near += group * kMaxTokens * moe::kNear;
   __shared__ float scores[kMaxTokens][Experts];
   __shared__ float biased[kMaxTokens][Experts];
   __shared__ unsigned mask[Experts];
@@ -302,6 +311,14 @@ void route(const float* logits, int logit_splits, int tokens, const uint8_t* ima
         <<<1, model::kDraftExperts, 0, stream>>>(logits, logit_splits, tokens, image, p, experts, weights, plan);
   else
     throw std::invalid_argument("route: no kernel for this router shape");
+}
+
+void route_groups(const float* logits, int logit_splits, int tokens, RouterParams p, int32_t* experts, float* weights,
+                  moe::Plan* plans, cudaStream_t stream) {
+  if (p.experts != moe::kExperts || p.top_k != moe::kTopK) throw std::invalid_argument("route_groups: a target layer's router");
+  if (tokens <= 0) return;
+  route_kernel<moe::kExperts, moe::kTopK><<<column_groups(tokens), moe::kExperts, 0, stream>>>(
+      logits, logit_splits, tokens, nullptr, p, experts, weights, plans);
 }
 
 void swiglu_quantize(const moe::Plan* plan, MoeBuffers buf, float limit, cudaStream_t stream) {

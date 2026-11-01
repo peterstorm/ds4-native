@@ -11,17 +11,23 @@ constexpr int kGateThreads = 256;
 constexpr float kDimScale = 0.013975424859373685f;  // 5120^-0.5, as core/engram
 constexpr float kClamp = 1e-6f;
 
-/** Warp per (K block, token): decode 32 values of a row (E4M3 times its E8M0 scale, BF16), then act_quant them. */
-__global__ void quantize_rows_kernel(const uint8_t* __restrict__ rows, int tokens, int first_block, int blocks,
+/**
+ * Warp per (column group, K block, column): decode 32 values of a row (E4M3 times its E8M0 scale,
+ * BF16), then act_quant them.
+ */
+__global__ void quantize_rows_kernel(const uint8_t* __restrict__ rows, int tokens, int groups, int first_block, int blocks,
                                      uint8_t* __restrict__ codes, uint8_t* __restrict__ scales) {
   const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
   const int lane = threadIdx.x & 31;
-  if (warp >= blocks * kMaxTokens) return;
-  const int b = warp / kMaxTokens, n = warp % kMaxTokens;
+  if (warp >= groups * blocks * kMaxTokens) return;
+  const int g = warp / (blocks * kMaxTokens), b = (warp / kMaxTokens) % blocks, n = warp % kMaxTokens;
+  const int t = g * kMaxTokens + n;
+  codes += static_cast<size_t>(g) * blocks * 256;
+  scales += static_cast<size_t>(g) * blocks * kMaxTokens;
   float v = 0.0f;
-  if (n < tokens) {
+  if (t < tokens) {
     const int global = first_block + b, row = global / 8, part = global % 8;
-    const uint8_t* r = rows + (static_cast<size_t>(n) * kEngramCols + row) * kEngramRowBytes;
+    const uint8_t* r = rows + (static_cast<size_t>(t) * kEngramCols + row) * kEngramRowBytes;
     const uint32_t sbyte = r[256 + part];  // E8M0; byte 0 is 2^-127, a subnormal
     const float scale = __uint_as_float(sbyte ? sbyte << 23 : 0x00400000u);
     const __nv_fp8_storage_t code = r[part * 32 + lane];
@@ -30,7 +36,7 @@ __global__ void quantize_rows_kernel(const uint8_t* __restrict__ rows, int token
   }
   float amax = fabsf(v);
   for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, o));
-  const int exp = n < tokens ? act::scale_exponent(amax) : 0;
+  const int exp = t < tokens ? act::scale_exponent(amax) : 0;
   const int q = (lane & 15) >> 2, j = lane & 3, hi = lane >> 4;
   codes[b * 256 + (4 * n + q) * 8 + hi * 4 + j] = act::code(v, act::scale_value(exp));
   if (lane == 0) scales[b * kMaxTokens + n] = static_cast<uint8_t>(exp + 127);
@@ -85,9 +91,10 @@ __global__ void __launch_bounds__(kGateThreads) gate_kernel(const __nv_bfloat16*
 }  // namespace
 
 void engram_quantize_rows(const uint8_t* rows, int tokens, int first_block, ActFragments out, cudaStream_t stream) {
-  const int warps = out.blocks * kMaxTokens;
-  quantize_rows_kernel<<<(warps * 32 + 127) / 128, 128, 0, stream>>>(rows, tokens, first_block, out.blocks, out.codes,
-                                                                      out.scales);
+  const int groups = tokens > kMaxTokens ? column_groups(tokens) : 1;
+  const int64_t warps = static_cast<int64_t>(groups) * out.blocks * kMaxTokens;
+  quantize_rows_kernel<<<static_cast<unsigned>((warps * 32 + 127) / 128), 128, 0, stream>>>(
+      rows, tokens, groups, first_block, out.blocks, out.codes, out.scales);
 }
 
 void engram_gate(const __nv_bfloat16* h, const __nv_bfloat16* kv, const __nv_bfloat16* q_weight,

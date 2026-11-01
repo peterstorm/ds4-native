@@ -106,16 +106,17 @@ __device__ __forceinline__ float fp8_qdq(float v, float amax) {
 
 /**
  * act_quant of one K block of 32 values, by one warp: lane l holds value l of
- * block `b` for token column `n`; writes its E4M3 code into the B-fragment
- * layout and, from lane 0, the block's UE8M0 scale byte.
+ * block `b` for token `n` -- column n % 8 of the fragments' 8-column group n / 8, groups of `blocks`
+ * blocks back to back (cuda/mx_gemv.cuh) -- writes its E4M3 code into the B-fragment layout and, from
+ * lane 0, the block's UE8M0 scale byte.
  */
-__device__ __forceinline__ void act_quantize_lane(float v, int b, int n, uint8_t* __restrict__ codes,
+__device__ __forceinline__ void act_quantize_lane(float v, int b, int n, int blocks, uint8_t* __restrict__ codes,
                                                   uint8_t* __restrict__ scales) {
   const int lane = threadIdx.x & 31;
   const int exp = act::scale_exponent(max32(fabsf(v)));
-  const int q = (lane & 15) >> 2, j = lane & 3, hi = lane >> 4;
-  codes[b * 256 + (4 * n + q) * 8 + hi * 4 + j] = act::code(v, act::scale_value(exp));
-  if (lane == 0) scales[b * kFragmentTokens + n] = static_cast<uint8_t>(exp + 127);
+  const int q = (lane & 15) >> 2, j = lane & 3, hi = lane >> 4, g = n / kFragmentTokens, c = n % kFragmentTokens;
+  codes[(static_cast<size_t>(g) * blocks + b) * 256 + (4 * c + q) * 8 + hi * 4 + j] = act::code(v, act::scale_value(exp));
+  if (lane == 0) scales[(static_cast<size_t>(g) * blocks + b) * kFragmentTokens + c] = static_cast<uint8_t>(exp + 127);
 }
 
 }  // namespace ds4n::cuda::ops

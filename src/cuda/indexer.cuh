@@ -43,6 +43,18 @@ struct IndexQuery {
   float* weights;   // [32]: bf16(weights_proj(x)) / 64, BF16 values
 };
 
+constexpr size_t kQueryCodeBytes = 4 * kIndexBlocks * 256, kQueryScaleBytes = 4 * kIndexBlocks * 8;
+
+/** A wave's queries back to back: row r's IndexQuery at r strides into each array. */
+struct IndexQueries {
+  uint8_t* codes;   // [rows] x kQueryCodeBytes
+  uint8_t* scales;  // [rows] x kQueryScaleBytes
+  float* weights;   // [rows][32]
+  __host__ __device__ IndexQuery at(int r) const {
+    return {codes + r * kQueryCodeBytes, scales + r * kQueryScaleBytes, weights + r * kIndexHeads};
+  }
+};
+
 /**
  * q: [32][128] BF16 after RoPE, FP4 quant-dequantized here and re-quantized as
  * E4M3 activations. `projection`: weights_proj(x) as `splits` FP32 partial
@@ -75,5 +87,32 @@ void candidate_blocks(const __nv_bfloat16* scores, IntArg compress_len, uint8_t*
 /** idx[0 .. k) = the top k = min(512, compress_len) positions ascending, plus offset; idx[k .. 512) = -1. */
 void top_positions(const __nv_bfloat16* scores, IntArg compress_len, int32_t offset, int32_t* idx,
                    SelectScratch scratch, cudaStream_t stream);
+
+// A prompt sweep's wave: the same for `rows` query rows per launch, row r's lengths compress_len.row(r)
+// (a per-row device array), its arrays at r strides; each row's results are what the one-row calls give.
+
+/** prepare_index_query for rows q[r] ([rows][32][128]) and projection token r (planes in column groups). */
+void prepare_index_queries(const __nv_bfloat16* q, const float* projection, int splits, int rows, IndexQueries out,
+                           cudaStream_t stream);
+
+/** index_scores for every row: scores at scores + r * score_stride, masks (or null) at r * mask_stride. */
+void index_scores_rows(const uint8_t* cache, IntArg compress_len, int rows, IndexQueries q, const uint8_t* block_masks,
+                       int64_t mask_stride, __nv_bfloat16* scores, int64_t score_stride, cudaStream_t stream);
+
+/** Per-row selection scratch: select words, block keys and chosen blocks for `rows` rows. */
+struct IndexSelectRows {
+  SelectScratch select;       // rows x select_scratch_words()
+  __nv_bfloat16* block_keys;  // rows x key_stride
+  int64_t key_stride;         // ceil(max_positions / 8)
+  int32_t* chosen_blocks;     // rows x kCandidateBlocks
+};
+
+/** candidate_blocks for every row: masks at block_masks + r * mask_stride. */
+void candidate_blocks_rows(const __nv_bfloat16* scores, int64_t score_stride, IntArg compress_len, int rows,
+                           uint8_t* block_masks, int64_t mask_stride, const IndexSelectRows& scratch, cudaStream_t stream);
+
+/** top_positions for every row: row r's 512 slots at idx + r * idx_stride. */
+void top_positions_rows(const __nv_bfloat16* scores, int64_t score_stride, IntArg compress_len, int rows, int32_t offset,
+                        int32_t* idx, int64_t idx_stride, SelectScratch scratch, cudaStream_t stream);
 
 }  // namespace ds4n::cuda

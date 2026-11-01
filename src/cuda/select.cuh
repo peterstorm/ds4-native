@@ -22,7 +22,8 @@ constexpr int kSelectMaxBlocks = 256;
 struct SelectScratch {
   unsigned* words;  // select_scratch_words() unsigned values
 };
-constexpr size_t select_scratch_words() { return 2 * 256 + 2 * kSelectMaxBlocks + 16; }
+constexpr size_t kSelectScratchWords = 2 * 256 + 2 * kSelectMaxBlocks + 16;
+constexpr size_t select_scratch_words() { return kSelectScratchWords; }
 
 /**
  * out[0 .. k) = indices of the k = min(k_max, n) largest of values[0 .. n),
@@ -31,5 +32,14 @@ constexpr size_t select_scratch_words() { return 2 * 256 + 2 * kSelectMaxBlocks 
  */
 void select_top(const __nv_bfloat16* values, IntArg n, int k_max, int32_t offset, int32_t* out, SelectScratch scratch,
                 cudaStream_t stream);
+
+/**
+ * `rows` selections at once, each as select_top: row r's values at values + r * value_stride, its
+ * count n.row(r) (a per-row device array, or one value), its output at out + r * out_stride, its
+ * scratch the r-th select_scratch_words() of `scratch`. The launch is sized for n's bound, which
+ * gives each row the same result as a launch sized for its own count.
+ */
+void select_top_rows(const __nv_bfloat16* values, int64_t value_stride, IntArg n, int rows, int k_max, int32_t offset,
+                     int32_t* out, int64_t out_stride, SelectScratch scratch, cudaStream_t stream);
 
 }  // namespace ds4n::cuda

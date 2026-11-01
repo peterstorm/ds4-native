@@ -7,11 +7,10 @@ namespace {
 constexpr int kThreads = 256;  // the RMSNorm tree's width (cuda::rmsnorm uses the same)
 constexpr int kMaxDim = 5120;  // longest row a fused kernel stages in shared memory
 
-/** sum_planes' order for token column t: plane 0, then planes 1..splits-1 added in turn; then BF16. */
+/** sum_planes' order for token t: plane 0, then planes 1..splits-1 added in turn; then BF16. */
 __device__ __forceinline__ float plane_sum_bf16(const Planes& in, int i, int t) {
-  float v = in.data[static_cast<size_t>(i) * kMaxTokens + t];
-  for (int s = 1; s < in.splits; s++)
-    v = __fadd_rn(v, in.data[(static_cast<size_t>(s) * in.rows + i) * kMaxTokens + t]);
+  float v = in.data[plane_index(in.splits, in.rows, 0, i, t)];
+  for (int s = 1; s < in.splits; s++) v = __fadd_rn(v, in.data[plane_index(in.splits, in.rows, s, i, t)]);
   return __bfloat162float(__float2bfloat16_rn(v));
 }
 
@@ -26,10 +25,10 @@ __device__ __forceinline__ float normed(float v, const __nv_bfloat16* w, int i, 
   return __bfloat162float(__float2bfloat16_rn(__fmul_rn(__bfloat162float(w[i]), __fmul_rn(v, r))));
 }
 
-__global__ void clear_kernel(ActFragments act) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < act.blocks * 256) act.codes[i] = 0;
-  if (i < act.blocks * kMaxTokens) act.scales[i] = 127;
+__global__ void clear_kernel(ActFragments act, int groups) {
+  const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < static_cast<size_t>(groups) * act.blocks * 256) act.codes[i] = 0;
+  if (i < static_cast<size_t>(groups) * act.blocks * kMaxTokens) act.scales[i] = 127;
 }
 
 /** One block per token. */
@@ -89,24 +88,27 @@ __global__ void __launch_bounds__(kThreads) unrope_quantize_kernel(const __nv_bf
   const int blocks_per_head = head_dim / 32, first = (h % heads_per_group) * blocks_per_head;
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   for (int kb = warp; kb < blocks_per_head; kb += kThreads / 32)
-    ops::act_quantize_lane(vals[kb * 32 + lane], first + kb, tok, act.codes, act.scales);
+    ops::act_quantize_lane(vals[kb * 32 + lane], first + kb, tok, act.blocks, act.codes, act.scales);
 }
 
 /** One warp per (K block, token): blockIdx.y is the token. */
 __global__ void __launch_bounds__(kThreads) group_planes_quantize_kernel(const float* __restrict__ planes, int groups,
-                                                                         int splits, int rows, ActFragments act) {
+                                                                         size_t group_stride, int splits, int rows,
+                                                                         ActFragments act) {
   const int b = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, tok = blockIdx.y;
   if (b >= groups * rows / 32) return;
   const int x = b * 32 + (threadIdx.x & 31), g = x / rows;
-  const Planes in{planes + static_cast<size_t>(g) * splits * rows * kMaxTokens, splits, rows};
-  ops::act_quantize_lane(plane_sum_bf16(in, x - g * rows, tok), b, tok, act.codes, act.scales);
+  const Planes in{planes + static_cast<size_t>(g) * group_stride, splits, rows};
+  ops::act_quantize_lane(plane_sum_bf16(in, x - g * rows, tok), b, tok, act.blocks, act.codes, act.scales);
 }
 
 }  // namespace
 
-void clear_fragments(ActFragments act, cudaStream_t stream) {
-  const int n = act.blocks * 256;
-  clear_kernel<<<(n + 255) / 256, 256, 0, stream>>>(act);
+void clear_fragments(ActFragments act, cudaStream_t stream) { clear_fragments(act, 1, stream); }
+
+void clear_fragments(ActFragments act, int groups, cudaStream_t stream) {
+  const size_t n = static_cast<size_t>(groups) * act.blocks * 256;
+  clear_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, stream>>>(act, groups);
 }
 
 void kv_to_cache(Planes in, int tokens, const __nv_bfloat16* w, float eps, const float* freqs, int rope_dim,
@@ -125,11 +127,11 @@ void unrope_quantize(const __nv_bfloat16* o, int tokens, int heads, int head_dim
                                                                       heads_per_group, out);
 }
 
-void group_planes_quantize(const float* planes, int groups, int splits, int rows, int tokens, ActFragments act,
-                           cudaStream_t stream) {
+void group_planes_quantize(const float* planes, int groups, size_t group_stride, int splits, int rows, int tokens,
+                           ActFragments act, cudaStream_t stream) {
   const int warps = groups * rows / 32;
   group_planes_quantize_kernel<<<dim3((warps * 32 + kThreads - 1) / kThreads, tokens), kThreads, 0, stream>>>(
-      planes, groups, splits, rows, act);
+      planes, groups, group_stride, splits, rows, act);
 }
 
 }  // namespace ds4n::cuda
