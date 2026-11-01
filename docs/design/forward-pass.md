@@ -200,6 +200,30 @@ spends ~100 us in GEMVs (~1.45 TB/s) and ~60 us in glue, at 8-22 % achieved occu
 split-K ways did not help. Folding wide work into a reduction's single block made it slower
 (act_quant of a 5120-row inside RMSNorm's block 8.2 us vs 2.9 for two kernels).
 
+**Prompt sweeps** (`Decoder::prefill`). Rounds one after another walk all 40 layers per 8 tokens;
+a long prompt's Expert working set is far larger than the Slots, and LRU over that cyclic walk
+is its worst case: a 9,129-token prompt read 40,579 Experts from the store (the model has 6,860
+outside VRAM). A sweep takes a chunk of up to 1,152 Rounds (9,216 tokens) layer by layer: every
+Round through layer L before any goes on, so a layer's Experts are read at most once per chunk.
+Between its layer steps a Round's state -- stream, FFN mixes, Round index, window slots, top-k,
+candidate blocks, Engram rows -- lives in a slot of chunk arrays; a chunked layer step loads the
+slot of the Round a device value names into the working buffers and stores it back, so one
+captured graph per (layer, rows, parity) replays for every Round. Exact by the Round argument
+(each row reads only earlier positions, all in the caches by then): `ds4n-model-run` dumps from
+sweeps are byte-identical to the Rounds' and to the sequential exact run.
+
+| Prompt | Rounds of 8 | sweep | store reads |
+|---|---|---|---|
+| 9,129 tokens | 94 tok/s | **198 tok/s** | 40,579 -> 15,768 |
+| 17,965 tokens | 101 tok/s | **202 tok/s** | 73,114 -> 27,062 |
+
+Every graph a sweep needs is captured before any launches: instantiating one while layer steps
+run can wait for the device while a step waits on a Miss whose service waits behind the
+instantiation -- both GPUs then trap at their watchdogs (`DS4N_SWEEP_CHECK=1` syncs after each
+layer and names it). Still open: under LRU the sweep leaves the Slots holding the last layers'
+Experts (decode right after an 8K prompt: 14 tok/s, against 40 after Rounds) and reloads nearly
+every Expert (15.8K reads against ~6.9K outside VRAM).
+
 ## Expert residency
 
 The GPUs resolve their Experts themselves (`cuda/resolve.cuh`): after routing, one block reads

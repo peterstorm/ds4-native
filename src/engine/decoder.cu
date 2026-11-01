@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -10,6 +11,7 @@
 #include "core/mx_tiles.hpp"
 #include "core/store_layout.hpp"
 #include "cuda/attn.cuh"
+#include "cuda/chunk.cuh"
 #include "cuda/compressor.cuh"
 #include "cuda/dspark.cuh"
 #include "cuda/engram.cuh"
@@ -37,6 +39,8 @@ constexpr int kExpertRows = 1152, kExpertDownBlocks = 36, kDimBlocks = kDim / 32
 constexpr size_t kExpertPartBytes = static_cast<size_t>(kExpertRows) * (kDim / 32) * 17;  // one tiled part of a Half
 static_assert(3 * kExpertPartBytes == store::kHalfPayloadBytes, "a Slot holds a Half: gate, up and down parts");
 constexpr int kSplitsMainProj = 4;  // DSpark's feature projection (K = 15360): proposal numerics, not Reference
+constexpr size_t kCandidateSlot = static_cast<size_t>(kMaxRows) * (kMaxCompressed / 8);  // a Round's candidate blocks
+constexpr size_t kEngramSlot = static_cast<size_t>(kMaxRows) * kEngramTableBytes;            // a Round's rows of one table
 
 /** A batched GEMV launch prepared on the device. */
 struct Launch {
@@ -151,8 +155,9 @@ struct Decoder::Gpu {
   cuda::ExchangeLink link{};
   std::map<int, DeviceLayer> layers;
   std::map<int, LayerLaunches> launches;
-  // Captured layer steps by (layer, rows, parity of the first position), and whole Rounds by (rows, parity).
-  std::map<std::tuple<int, int, int>, cudaGraphExec_t> graphs;
+  // Captured layer steps by (layer, rows, parity of the first position, chunked), and whole Rounds by
+  // (rows, parity).
+  std::map<std::tuple<int, int, int, bool>, cudaGraphExec_t> graphs;
   std::map<std::pair<int, int>, cudaGraphExec_t> round_graphs;
   cuda::ExpertDirectory experts{};  // this GPU's view of the Expert cache
   cuda::ResolvedMoe resolved{};
@@ -215,15 +220,37 @@ struct Decoder::Gpu {
   } draft;
   cudaEvent_t staged_seed = nullptr, logits_copied = nullptr;
 
-  /** One layer step for `rows` rows from a position of parity `parity`. */
-  void enqueue_layer(int layer, int rows, int parity);
+  /**
+   * A prompt sweep's Rounds between their layer steps (Decoder::prefill): one slot per Round of the
+   * state a layer step reads and leaves for the next layer. `capacity` 0: no sweeps.
+   */
+  struct Chunk {
+    int capacity = 0;                    // Rounds
+    bf16* h = nullptr;                   // [capacity][8][4][5120]
+    cuda::HcMixes* mix = nullptr;        // [capacity][8]: the FFN mixes the next layer's attention input takes
+    model::RoundIndex* round = nullptr;  // [capacity]
+    int32_t* idx = nullptr;              // [capacity][8][kIdxStride]: the window slots
+    int32_t* topk = nullptr;             // [capacity][8][512]: from the last index source
+    uint8_t* candidates = nullptr;       // [capacity] x kCandidateSlot: from the candidate source
+    uint8_t* engram = nullptr;           // [2][capacity] x kEngramSlot
+    bf16* embeddings = nullptr;          // [capacity * 8][5120]: a chunk's upload
+    int32_t* current = nullptr;          // the Round a chunked layer step works on (device)
+    int32_t* round_numbers = nullptr;    // pinned 0 .. capacity - 1, the sources of `current`
+  } chunk;
+
+  /**
+   * One layer step for `rows` rows from a position of parity `parity`; `chunked`: of the prompt
+   * sweep's Round `*chunk.current`, its state loaded from its slot first and stored back after.
+   */
+  void enqueue_layer(int layer, int rows, int parity, bool chunked = false);
   /** The head over `rows` rows of the stream after the last layer: this GPU's half of the logits into head_out. */
   void enqueue_head(const bf16* final_norm, int rows);
   /** Project `rows` accepted positions (from row `first` of the seed index) into every stage's context ring. */
   void enqueue_seed(int first, int rows);
 };
 
-Decoder::Decoder(std::array<int, 2> devices, std::array<cuda::ExpertDirectory, 2> experts, Launches launches)
+Decoder::Decoder(std::array<int, 2> devices, std::array<cuda::ExpertDirectory, 2> experts, Launches launches,
+                 int chunk_rounds)
     : launches_(launches) {
   const char* loading = std::getenv("CUDA_MODULE_LOADING");
   if (loading == nullptr || std::string(loading) != "EAGER")
@@ -339,6 +366,22 @@ Decoder::Decoder(std::array<int, 2> devices, std::array<cuda::ExpertDirectory, 2
     s.resolved = {a.alloc<cuda::GemvJob>(3 * cuda::kJobSlots), a.alloc<int>(3 * cuda::kJobSlots), a.alloc<int64_t>(4),
                   a.alloc<uint64_t>(1)};
     check(cudaMemset(s.resolved.step, 0, sizeof(uint64_t)), "memset");
+    if (chunk_rounds > 0) {
+      Gpu::Chunk& c = s.chunk;
+      const size_t G = static_cast<size_t>(chunk_rounds);
+      c.capacity = chunk_rounds;
+      c.h = a.alloc<bf16>(G * R * kHcCopies * kDim);
+      c.mix = a.alloc<cuda::HcMixes>(G * R);
+      c.round = a.alloc<model::RoundIndex>(G);
+      c.idx = a.alloc<int32_t>(G * R * kIdxStride);
+      c.topk = a.alloc<int32_t>(G * R * kTopK);
+      c.candidates = a.alloc<uint8_t>(G * kCandidateSlot);
+      c.engram = a.alloc<uint8_t>(2 * G * kEngramSlot);
+      c.embeddings = a.alloc<bf16>(G * R * kDim);
+      c.current = a.alloc<int32_t>(1);
+      check(cudaMallocHost(&c.round_numbers, G * sizeof(int32_t)), "cudaMallocHost");
+      for (size_t i = 0; i < G; i++) c.round_numbers[i] = static_cast<int32_t>(i);
+    }
     gpus_[g] = std::move(gpu);
   }
   for (int g = 0; g < 2; g++) {
@@ -364,6 +407,7 @@ Decoder::~Decoder() {
       }
       for (cudaEvent_t ev : g->branch) cudaEventDestroy(ev);
       cudaFreeHost(g->staging);
+      if (g->chunk.round_numbers) cudaFreeHost(g->chunk.round_numbers);
     }
 }
 
@@ -453,8 +497,21 @@ void Decoder::sync() {
   }
 }
 
-void Decoder::Gpu::enqueue_layer(int layer, int rows, int parity) {
+void Decoder::Gpu::enqueue_layer(int layer, int rows, int parity, bool chunked) {
   const LayerKind kind = model::kind(layer);
+  // A prompt sweep's Round: its slot into the working buffers first (the Round chosen on the device).
+  const size_t stream_row = static_cast<size_t>(kHcCopies) * kDim * sizeof(bf16);
+  if (chunked) {
+    const int32_t* g = chunk.current;
+    cuda::load_slot(h, chunk.h, kMaxRows * stream_row, g, rows * stream_row, stream);
+    cuda::load_slot(mix_ffn, chunk.mix, kMaxRows * sizeof(cuda::HcMixes), g, rows * sizeof(cuda::HcMixes), stream);
+    cuda::load_slot(round, chunk.round, sizeof(model::RoundIndex), g, sizeof(model::RoundIndex), stream);
+    cuda::load_slot(idx, chunk.idx, kMaxRows * kIdxStride * sizeof(int32_t), g, rows * kIdxStride * sizeof(int32_t), stream);
+    if (kind.compress_ratio && !kind.index_source)  // reuses the last index source's top-k
+      cuda::load_slot(topk, chunk.topk, kMaxRows * kTopK * sizeof(int32_t), g, rows * kTopK * sizeof(int32_t), stream);
+    if (kind.uses_candidates)
+      cuda::load_slot(candidates, chunk.candidates, kCandidateSlot, g, rows * (kMaxCompressed / 8), stream);
+  }
   const int ratio = kind.compress_ratio;
   const DeviceLayer& d = layers.at(layer);
   const LayerLaunches& l = launches.at(layer);
@@ -482,8 +539,12 @@ void Decoder::Gpu::enqueue_layer(int layer, int rows, int parity) {
   bf16* h_in = h;
   if (kind.engram) {
     const int table = layer == kEngramLayers[0] ? 0 : 1;
-    check(cudaMemcpyAsync(engram_rows, staging->engram_rows[table], rows * kEngramTableBytes, cudaMemcpyHostToDevice, st),
-          "rows");
+    if (chunked)
+      cuda::load_slot(engram_rows, chunk.engram + table * chunk.capacity * kEngramSlot, kEngramSlot, chunk.current,
+                      rows * kEngramTableBytes, st);
+    else
+      check(cudaMemcpyAsync(engram_rows, staging->engram_rows[table], rows * kEngramTableBytes, cudaMemcpyHostToDevice, st),
+            "rows");
     cuda::engram_quantize_rows(engram_rows, rows, rank * (cuda::kEngramBlocks / kGpus), act_engram, st);
     run(l.engram, st);
     cuda::sum_planes_f32(planes_eg, 1, cuda::kEngramKvRows, rows, packed, st);
@@ -627,6 +688,14 @@ void Decoder::Gpu::enqueue_layer(int layer, int rows, int parity) {
   cuda::exchange_add(link, y, static_cast<size_t>(rows) * kDim, moe_out, st);
   join(2);
   cuda::hc_post(moe_out, h_mid, mix_ffn, kDim, rows, h, st);
+  if (chunked) {  // the Round's state back into its slot
+    const int32_t* g = chunk.current;
+    cuda::store_slot(chunk.h, kMaxRows * stream_row, g, h, rows * stream_row, st);
+    cuda::store_slot(chunk.mix, kMaxRows * sizeof(cuda::HcMixes), g, mix_ffn, rows * sizeof(cuda::HcMixes), st);
+    if (kind.index_source)
+      cuda::store_slot(chunk.topk, kMaxRows * kTopK * sizeof(int32_t), g, topk, rows * kTopK * sizeof(int32_t), st);
+    if (kind.candidate_source) cuda::store_slot(chunk.candidates, kCandidateSlot, g, candidates, rows * (kMaxCompressed / 8), st);
+  }
   check(cudaGetLastError(), "layer step launches");
 }
 
@@ -636,7 +705,7 @@ std::vector<StepTrace> Decoder::decode_layer(int layer, bool trace_step) {
   if (kind.engram && !engram_staged_) throw CudaError("an Engram layer needs the Round's Engram rows (begin_round)");
   const int parity = static_cast<int>(p0_ % 2);
   const bool graphs = launches_ == Launches::Graphs;
-  const std::tuple<int, int, int> key{layer, rows_, parity};
+  const std::tuple<int, int, int, bool> key{layer, rows_, parity, false};
 
   // Capture on both GPUs (instantiation may allocate), then launch on both.
   for (auto& gp : gpus_) {
@@ -981,6 +1050,114 @@ DraftBlock Decoder::draft(int64_t p, int32_t token, std::span<const float> ancho
   std::copy(lead.staging->chain + 1, lead.staging->chain + 1 + kDraftRows, block.tokens.begin());
   std::copy(lead.staging->confidence, lead.staging->confidence + kDraftRows, block.confidence.begin());
   return block;
+}
+
+}  // namespace ds4n::engine
+
+namespace ds4n::engine {
+
+void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<const uint8_t> engram_rows) {
+  Gpu& lead = *gpus_[0];
+  const int capacity = lead.chunk.capacity;
+  if (capacity == 0) throw CudaError("prefill: this decoder was made without chunk capacity");
+  const size_t tokens = embeddings.size() / kDim;
+  if (tokens == 0 || embeddings.size() != tokens * kDim) throw CudaError("prefill: embedding rows of 5120 values");
+  if (p0 < 0 || p0 + static_cast<int64_t>(tokens) > kMaxCompressed)
+    throw CudaError("position outside this executor's compressed capacity");
+  const bool any_engram = lead.layers.contains(kEngramLayers[0]) || lead.layers.contains(kEngramLayers[1]);
+  if (any_engram && engram_rows.size() != tokens * kEngramTokenBytes)
+    throw CudaError("prefill: the Engram layers need every token's 2 x 24 rows of 264 bytes");
+  if (p0 == 0) seeded_ = 0;  // a new Session: DSpark's context starts over
+  const size_t per_chunk = static_cast<size_t>(capacity) * kMaxRows;
+  const bool graphs = launches_ == Launches::Graphs;
+
+  for (size_t first = 0; first < tokens; first += per_chunk) {
+    const size_t n = std::min(per_chunk, tokens - first);
+    const int64_t c0 = p0 + static_cast<int64_t>(first);
+    const int rounds = static_cast<int>((n + kMaxRows - 1) / kMaxRows);
+    const int tail = static_cast<int>(n - static_cast<size_t>(rounds - 1) * kMaxRows);
+    const int parity = static_cast<int>(c0 % 2);  // every Round of 8 starts on the same parity
+    auto rows_of = [&](int g) { return g + 1 == rounds ? tail : kMaxRows; };
+
+    // Each Round's starting state, on the host: its index, window slots, embeddings, Engram rows, identity mixes.
+    std::vector<model::RoundIndex> index(rounds);
+    std::vector<int32_t> idx(static_cast<size_t>(rounds) * kMaxRows * kIdxStride, -1);
+    std::vector<cuda::HcMixes> mixes(static_cast<size_t>(rounds) * kMaxRows);
+    for (auto& m : mixes) m.pre[0] = 1.0f;
+    for (int g = 0; g < rounds; g++) {
+      const int64_t q0 = c0 + static_cast<int64_t>(g) * kMaxRows;
+      index[g] = model::round_index(q0, rows_of(g));
+      for (int r = 0; r < rows_of(g); r++)
+        for (int i = 0; i < kWindow; i++)
+          idx[(static_cast<size_t>(g) * kMaxRows + r) * kIdxStride + i] = window_slot(q0 + r, i);
+    }
+    std::vector<bf16> emb(n * kDim);
+    for (size_t i = 0; i < emb.size(); i++) emb[i] = __float2bfloat16(embeddings[first * kDim + i]);
+    std::vector<uint8_t> engram;
+    if (any_engram) {
+      engram.assign(2 * static_cast<size_t>(rounds) * kEngramSlot, 0);
+      for (size_t t = 0; t < n; t++)
+        for (int table = 0; table < 2; table++)
+          std::memcpy(engram.data() + table * rounds * kEngramSlot + t * kEngramTableBytes,
+                      engram_rows.data() + (first + t) * kEngramTokenBytes + table * kEngramTableBytes, kEngramTableBytes);
+    }
+
+    // Uploads while both GPUs are idle (plain copies may wait on the device).
+    sync();
+    for (auto& gp : gpus_) {
+      Gpu& s = *gp;
+      check(cudaSetDevice(s.device), "cudaSetDevice");
+      Gpu::Chunk& c = s.chunk;
+      check(cudaMemcpy(c.round, index.data(), index.size() * sizeof(index[0]), cudaMemcpyHostToDevice), "chunk index");
+      check(cudaMemcpy(c.idx, idx.data(), idx.size() * sizeof(int32_t), cudaMemcpyHostToDevice), "chunk window");
+      check(cudaMemcpy(c.mix, mixes.data(), mixes.size() * sizeof(mixes[0]), cudaMemcpyHostToDevice), "chunk mixes");
+      check(cudaMemcpy(c.embeddings, emb.data(), emb.size() * sizeof(bf16), cudaMemcpyHostToDevice), "chunk embeddings");
+      for (int table = 0; any_engram && table < 2; table++)
+        check(cudaMemcpy(c.engram + table * c.capacity * kEngramSlot, engram.data() + table * rounds * kEngramSlot,
+                         rounds * kEngramSlot, cudaMemcpyHostToDevice),
+              "chunk Engram rows");
+      cuda::expand_embeddings(c.embeddings, static_cast<int>(n), kDim, c.h, s.stream);
+      check(cudaStreamSynchronize(s.stream), "chunk start");
+    }
+
+    // Every graph the chunk needs, captured while both GPUs are idle: instantiating one while layer
+    // steps run can wait for the device, and a step waiting on a Miss waits on the residency service,
+    // whose copies can wait for the instantiation (both GPUs then trap at their watchdogs).
+    for (auto& gp : gpus_) {
+      Gpu& s = *gp;
+      check(cudaSetDevice(s.device), "cudaSetDevice");
+      for (const auto& [layer, unused] : s.layers)
+        for (const int rows : {kMaxRows, tail}) {
+          const std::tuple<int, int, int, bool> key{layer, rows, parity, true};
+          if (layer < kLayers && graphs && !s.graphs.contains(key))
+            s.graphs[key] = capture(s.stream, [&] { s.enqueue_layer(layer, rows, parity, true); });
+        }
+    }
+
+    // Layer by layer, every Round through the layer before any goes on: a layer's Experts are read
+    // once for the chunk.
+    for (const auto& [layer, unused] : lead.layers) {
+      if (layer >= kLayers) continue;  // DSpark stages run in draft()
+      for (int g = 0; g < rounds; g++)
+        for (auto& gp : gpus_) {
+          Gpu& s = *gp;
+          check(cudaSetDevice(s.device), "cudaSetDevice");
+          check(cudaMemcpyAsync(s.chunk.current, s.chunk.round_numbers + g, sizeof(int32_t), cudaMemcpyHostToDevice,
+                                s.stream),
+                "chunk Round");
+          if (graphs) check(cudaGraphLaunch(s.graphs.at({layer, rows_of(g), parity, true}), s.stream), "cudaGraphLaunch");
+          else s.enqueue_layer(layer, rows_of(g), parity, true);
+        }
+      if (std::getenv("DS4N_SWEEP_CHECK")) {  // diagnostic: name the layer a fault comes from
+        sync();
+        std::fprintf(stderr, "sweep: layer %d done (%d Rounds)\n", layer, rounds);
+      }
+    }
+    // The working buffers hold the chunk's last Round: it is the current one (logits()).
+    rows_ = tail;
+    p0_ = c0 + static_cast<int64_t>(rounds - 1) * kMaxRows;
+    engram_staged_ = any_engram;
+  }
 }
 
 }  // namespace ds4n::engine

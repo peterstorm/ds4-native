@@ -3,12 +3,14 @@
 //
 //   ds4n-model-run --backbone SAFETENSORS --store STORE --gguf MERGED_GGUF --tokens DIR --names a,b
 //                  --out DIR [--oracle DIR] [--force 1] [--steps N] [--slots N] [--ram-records R] [--prior PROFILE]
-//                  [--prior-weight W] [--ram-policy recent|popular] [--ccr LAMBDA] [--prefill R]
+//                  [--prior-weight W] [--ram-policy recent|popular] [--ccr LAMBDA] [--sweep N | --prefill R]
 //                  [--access-log FILE] [--vram-policy lru|picks] [--hints 0|1] [--dspark DIR [--verify-rows N]]
 //
 // For each name, DIR/<name>.tokens is antirez's --dump-tokens output (ids on the first line). The
-// prompt runs from position 0 in Rounds of R rows (--prefill, 1 to 8, default 8: the same logits as
-// one token at a time, see engine/decoder.cuh); the next-token logits at its end go to
+// prompt runs from position 0 as a prompt sweep (engine::Decoder::prefill: chunks of up to N Rounds
+// of 8 rows, each chunk layer by layer; --sweep, default 1152) or, with --sweep 0, as Rounds of R
+// rows one after another (--prefill, 1 to 8, default 8); both give the logits of one token at a time
+// (see engine/decoder.cuh). The next-token logits at its end go to
 // OUT/<name>.logits.json, then a greedy continuation of up to N steps (default 64) with top-20
 // logprobs per step goes to OUT/<name>.logprobs.json, both in antirez's schema. With --oracle,
 // ORACLE/<name>.logits.json and .logprobs.json are compared as they come: KL and top-20 at the
@@ -144,7 +146,7 @@ int main(int argc, char** argv) {
   setenv("CUDA_MODULE_LOADING", "EAGER", 1);  // before any CUDA call: see engine/decoder.cuh
   std::string backbone_path, store_path, gguf_path, tokens_dir, names_arg, out_dir, oracle_dir, prior_path, access_log, dspark_dir;
   bool force = false;
-  int max_steps = 64, prefill_rows = model::kMaxRows, verify_rows = 0;
+  int max_steps = 64, prefill_rows = model::kMaxRows, verify_rows = 0, sweep_rounds = 1152;
   uint32_t slots = 8000, ram_records = 512, prior_weight = 1;
   float ccr = 0.0f;
   engine::RamPolicy ram_policy = engine::RamPolicy::Recent;
@@ -164,6 +166,7 @@ int main(int argc, char** argv) {
     else if (s == "--force") force = std::string(argv[++i]) == "1";
     else if (s == "--steps") max_steps = std::stoi(argv[++i]);
     else if (s == "--prefill") prefill_rows = std::stoi(argv[++i]);
+    else if (s == "--sweep") sweep_rounds = std::stoi(argv[++i]);
     else if (s == "--slots") slots = static_cast<uint32_t>(std::stoul(argv[++i]));
     else if (s == "--ram-records") ram_records = static_cast<uint32_t>(std::stoul(argv[++i]));
     else if (s == "--prior") prior_path = argv[++i];
@@ -190,7 +193,7 @@ int main(int argc, char** argv) {
   if (!dspark_dir.empty() && force) die("--dspark drafts greedy continuations: it cannot be teacher forced");
   if (backbone_path.empty() || store_path.empty() || gguf_path.empty() || tokens_dir.empty() || names_arg.empty() ||
       out_dir.empty() || prefill_rows < 1 || prefill_rows > model::kMaxRows || verify_rows < 0 ||
-      verify_rows > model::kVerifyRows)
+      verify_rows > model::kVerifyRows || sweep_rounds < 0)
     die("usage: ds4n-model-run --backbone B --store S --gguf G --tokens DIR --names a,b --out DIR [--oracle DIR]");
   std::vector<std::string> names;
   for (size_t at = 0; at <= names_arg.size();) {
@@ -217,7 +220,8 @@ int main(int argc, char** argv) {
   const auto t_load = Clock::now();
   auto backbone = engine::open_backbone(backbone_path);
   if (!backbone) die(backbone.error().what);
-  engine::Decoder decoder({0, 1}, {residency->directory(0), residency->directory(1)});
+  engine::Decoder decoder({0, 1}, {residency->directory(0), residency->directory(1)}, engine::Launches::Graphs,
+                         sweep_rounds);
   for (int l = 0; l < model::kLayers; l++) {
     auto w = engine::load_layer(backbone.value(), l);
     if (!w) die(w.error().what);
@@ -275,26 +279,31 @@ int main(int argc, char** argv) {
     const auto oracle_steps = oracle_steps_json ? steps_of(*oracle_steps_json) : std::vector<OracleStep>{};
     if (force && oracle_steps.empty()) die("--force 1 needs " + oracle_dir + "/" + name + ".logprobs.json");
 
-    // One Round of the whole model (tokens at positions p0, p0 + 1, ...): every row's logits
-    // ([rows][vocab]) when asked for; `histories`, when given, gets the Engram history after each row.
+    // The embeddings and Engram rows of tokens fed in order (the Engram history advances with them);
+    // `histories`, when given, gets the history after each token.
     engram::History history;
     std::vector<double> step_ms, host_ms;  // whole Rounds; the host's part before launching (embeddings, Engram rows)
-    auto run_round = [&](int64_t p0, std::span<const int32_t> tokens, bool want_logits,
-                         std::vector<engram::History>* histories = nullptr) -> std::vector<float> {
-      const auto t0 = Clock::now();
-      std::vector<float> embeddings;
-      std::vector<uint8_t> raw_rows;
+    auto inputs = [&](std::span<const int32_t> tokens, std::vector<engram::History>* histories) {
+      std::pair<std::vector<float>, std::vector<uint8_t>> in;
       for (const int32_t token : tokens) {
         const auto emb = embedding(token);
-        embeddings.insert(embeddings.end(), emb.begin(), emb.end());
+        in.first.insert(in.first.end(), emb.begin(), emb.end());
         auto hashed = engram::hash_token(layout.value(), history, static_cast<uint32_t>(token), true);
         if (!hashed) die(hashed.error().what);
         history = hashed.value().next;
         if (histories) histories->push_back(history);
         auto raw = rows.value().read_token(hashed.value().rows);
         if (!raw) die(raw.error().what);
-        raw_rows.insert(raw_rows.end(), raw.value().begin(), raw.value().end());
+        in.second.insert(in.second.end(), raw.value().begin(), raw.value().end());
       }
+      return in;
+    };
+    // One Round of the whole model (tokens at positions p0, p0 + 1, ...): every row's logits
+    // ([rows][vocab]) when asked for.
+    auto run_round = [&](int64_t p0, std::span<const int32_t> tokens, bool want_logits,
+                         std::vector<engram::History>* histories = nullptr) -> std::vector<float> {
+      const auto t0 = Clock::now();
+      const auto [embeddings, raw_rows] = inputs(tokens, histories);
       host_ms.push_back(std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
       decoder.begin_round(p0, embeddings, raw_rows);
       decoder.decode_round();
@@ -308,20 +317,34 @@ int main(int argc, char** argv) {
       return std::vector<float>(all.begin() + r * model::kVocab, all.begin() + (r + 1) * model::kVocab);
     };
 
-    // The prompt in Rounds of --prefill rows, then the next-token logits at its end.
+    // The prompt -- as a prompt sweep (--sweep), else in Rounds of --prefill rows -- then the
+    // next-token logits at its end.
     residency->check();
     const auto before = residency->stats();
     const auto t_prompt = Clock::now();
     std::vector<float> logits;
-    for (size_t p0 = 0; p0 < prompt.size(); p0 += prefill_rows) {
-      const size_t n = std::min<size_t>(prefill_rows, prompt.size() - p0);
-      const auto out = run_round(static_cast<int64_t>(p0), std::span(prompt).subspan(p0, n), p0 + n == prompt.size());
-      if (!out.empty()) logits = row(out, n - 1);
+    std::string how;
+    if (sweep_rounds > 0) {
+      const auto [embeddings, raw_rows] = inputs(prompt, nullptr);
+      const double host_s = std::chrono::duration<double>(Clock::now() - t_prompt).count();
+      decoder.prefill(0, embeddings, raw_rows);
+      const auto all = decoder.logits();
+      logits = row(all, all.size() / model::kVocab - 1);
+      char buf[96];
+      std::snprintf(buf, sizeof buf, "a sweep of up to %d Rounds a chunk (host %.2f s)", sweep_rounds, host_s);
+      how = buf;
+    } else {
+      for (size_t p0 = 0; p0 < prompt.size(); p0 += prefill_rows) {
+        const size_t n = std::min<size_t>(prefill_rows, prompt.size() - p0);
+        const auto out = run_round(static_cast<int64_t>(p0), std::span(prompt).subspan(p0, n), p0 + n == prompt.size());
+        if (!out.empty()) logits = row(out, n - 1);
+      }
+      how = "Rounds of " + std::to_string(prefill_rows);
     }
     const double prompt_s = std::chrono::duration<double>(Clock::now() - t_prompt).count();
     write_text(out_dir + "/" + name + ".logits.json", logits_json(logits, prompt.size()));
-    std::printf("%s: %zu prompt tokens in Rounds of %d in %.2f s (%.1f tok/s, median Round %.2f ms)\n", name.c_str(),
-                prompt.size(), prefill_rows, prompt_s, prompt.size() / prompt_s, median(step_ms));
+    std::printf("%s: %zu prompt tokens in %s in %.2f s (%.1f tok/s)\n", name.c_str(), prompt.size(), how.c_str(), prompt_s,
+                prompt.size() / prompt_s);
     if (oracle_logits) {
       const auto ref = logits_of(*oracle_logits);
       const auto c = compare::compare_logits(ref, logits);

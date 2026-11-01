@@ -29,7 +29,10 @@
 // Lazy module loading breaks the same rule (a kernel's first launch can load its
 // module and wait on the device), so the decoder requires
 // CUDA_MODULE_LOADING=EAGER, set before CUDA initializes. A GPU waiting on a Miss
-// waits on the service thread, which only copies on its own streams.
+// waits on the service thread, which only copies on its own streams -- but its
+// copies can wait behind a graph instantiation, so no graph is instantiated
+// while layer steps run at all: a prompt sweep captures every graph it needs
+// before launching any.
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -82,7 +85,12 @@ enum class Launches { Graphs, Eager };
 class Decoder {
  public:
   /** Two devices with peer access to each other, and each one's view of the Expert cache. */
-  Decoder(std::array<int, 2> devices, std::array<cuda::ExpertDirectory, 2> experts, Launches launches = Launches::Graphs);
+  /**
+   * Two devices with peer access to each other, and each one's view of the Expert cache.
+   * `chunk_rounds`: the Rounds of 8 a prompt sweep (prefill) takes at once; 0 for none.
+   */
+  Decoder(std::array<int, 2> devices, std::array<cuda::ExpertDirectory, 2> experts, Launches launches = Launches::Graphs,
+          int chunk_rounds = 0);
   ~Decoder();
   Decoder(const Decoder&) = delete;
   Decoder& operator=(const Decoder&) = delete;
@@ -112,6 +120,17 @@ class Decoder {
    * returning as soon as it is launched.
    */
   void decode_round();
+
+  /**
+   * A prompt sweep: tokens at positions p0, p0 + 1, ... (`embeddings` [tokens][5120]; `engram_rows`
+   * [tokens] x kEngramTokenBytes, empty when no Engram layer runs) as Rounds of 8 rows, in chunks of up
+   * to chunk_rounds Rounds, each chunk layer by layer: every Round goes through layer L before any
+   * goes through L + 1, so a layer's Experts are read once per chunk instead of once per Round that
+   * meets them after an eviction. The same outputs as the Rounds one after another (causality: a row
+   * reads only earlier positions, all in the caches by then). The last Round stays the current one
+   * (logits()); returns once everything is launched.
+   */
+  void prefill(int64_t p0, std::span<const float> embeddings, std::span<const uint8_t> engram_rows = {});
 
   /** Wait until both GPUs finished everything launched so far. */
   void sync();
