@@ -1,5 +1,8 @@
 #include <cuda/atomic>
 
+#include <stdexcept>
+#include <string>
+
 #include "cuda/exchange.cuh"
 
 namespace ds4n::cuda {
@@ -84,6 +87,8 @@ __global__ void __launch_bounds__(kThreads) exchange_kernel(ExchangeLink link, c
 
 void exchange_add(const ExchangeLink& link, const float* mine, size_t n, __nv_bfloat16* out, cudaStream_t stream) {
   const unsigned blocks = static_cast<unsigned>((n + kExchangeChunk - 1) / kExchangeChunk);
+  if (blocks > static_cast<unsigned>(kExchangeMaxBlocks))
+    throw std::invalid_argument("exchange_add: " + std::to_string(n) + " values are more than the inbox holds");
   if (blocks >= kScatterBlocks) exchange_kernel<true><<<blocks, kThreads, 0, stream>>>(link, mine, n, out);
   else exchange_kernel<false><<<blocks, kThreads, 0, stream>>>(link, mine, n, out);
 }

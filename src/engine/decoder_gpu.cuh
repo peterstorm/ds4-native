@@ -65,8 +65,9 @@ constexpr int kGroupBatch = 512;  // groups a grouped MoE launch works on at onc
 /**
  * A wave's layer work (Decoder::Gpu::enqueue_wave), each phase holding at most one exchange, so the
  * host can launch a phase on both GPUs before either GPU's next phase: however long a launch blocks,
- * the peer's side of every exchange in flight is already launched. EngramMix: an Engram layer's rows,
- * GEMV and exchange. Attention: through the attention output's partial. AttentionSend, then
+ * the peer's side of every exchange in flight is already launched. EngramMix: an Engram layer's KV
+ * from its rows, both GPUs' halves of the GEMV on each GPU (no exchange). Attention: through the
+ * attention output's partial. AttentionSend, then
  * AttentionAdd: that partial's exchange by the copy engines on the sweep's link stream (SweepLink).
  * Ffn: the stream after attention, the FFN mixes and input rows, routing. CombineSend, CombineAdd
  * (after the grouped MoE): the MoE output's exchange, the same way; CombinePost: hc_post into the
@@ -182,6 +183,8 @@ struct LayerLaunches {
 constexpr int kGateUpWarps = kExpertRows / 16 * kSplitsExpert, kDownWarps = kDim / 16;
 constexpr int kIdxStride = kWindow + kTopK;  // one row's attention slots: window, then top-k
 static_assert(kMaxRows == moe::kMaxTokens && kMaxRows == cuda::kMaxTokens, "a Round's rows are GEMV token columns");
+static_assert(static_cast<size_t>(kMaxRows) * cuda::kEngramKvRows <= static_cast<size_t>(cuda::kExchangeMaxBlocks) * cuda::kExchangeChunk,
+              "a Round's largest exchange (its Engram KV) fits the kernel exchange's inbox");
 
 /** What `enqueue` puts on `stream`, captured as an executable graph (nothing runs). */
 template <class Enqueue>
@@ -352,7 +355,7 @@ struct Decoder::Gpu {
    * kGroupBatch groups at a time; the group tables and GEMV jobs of a whole layer (device, and pinned
    * for their uploads), indexed by the group's place in the layer's GroupPlan; the chunk's routing
    * as it reaches the host, a wave at a time (`segment_done[k]` recorded once wave k's attention
-   * halves ran and, on GPU 0, its routing was copied).
+   * halves ran and, on GPU 0, its routing was written to the host).
    */
   struct Grouped {
     cuda::MoeBuffers buf{};
@@ -384,11 +387,14 @@ struct Decoder::Gpu {
     bf16 *x0 = nullptr, *xa = nullptr, *qlora = nullptr, *qr = nullptr, *q = nullptr, *o = nullptr;
     bf16 *kv_engram = nullptr, *latent = nullptr, *latent_c = nullptr, *k_raw = nullptr, *k_idx = nullptr, *q_idx = nullptr;
     bf16* scores = nullptr;
-    float *xa_f = nullptr, *xf_f = nullptr, *hc_scratch = nullptr, *packed = nullptr, *latent_f = nullptr;
+    float *xa_f = nullptr, *xf_f = nullptr, *hc_scratch = nullptr, *latent_f = nullptr;
     float *planes_qa = nullptr, *planes_kv = nullptr, *planes_qb = nullptr, *planes_iq = nullptr, *planes_oa = nullptr;
-    float *planes_ob = nullptr, *planes_bf = nullptr, *planes_proj = nullptr, *planes_eg = nullptr, *planes_wk = nullptr;
+    float *planes_ob = nullptr, *planes_bf = nullptr, *planes_proj = nullptr, *planes_wk = nullptr;
     float* logits = nullptr;
-    cuda::ActFragments act_x{}, act_qr{}, act_o[kLocalGroups]{}, act_lora{}, act_engram{};
+    cuda::ActFragments act_x{}, act_qr{}, act_o[kLocalGroups]{}, act_lora{};
+    // The Engram KV whole on each GPU, by the GPU whose half of wkv's K it is (EngramMix adds them).
+    std::array<cuda::ActFragments, kGpus> act_engram{};
+    std::array<float*, kGpus> planes_eg{};
     cuda::IndexQueries queries{};
     cuda::IndexSelectRows select{};
     cuda::AttnScratch attn{};
@@ -424,6 +430,7 @@ struct Decoder::Gpu {
     int device = 0;
   } sweep_link;
   std::map<int, LayerLaunches> wave_launches;  // per layer, into the wave's buffers (no shared Expert)
+  std::map<int, DeviceFp8> engram_peer;        // per Engram layer: the other GPU's half of wkv (sweeps only)
   WaveClock clock;                             // GPU 0's, when profiling
 
   /**

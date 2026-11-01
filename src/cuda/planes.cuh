@@ -15,6 +15,11 @@ namespace ds4n::cuda {
 
 void sum_planes_f32(const float* planes, int splits, int rows, int tokens, float* out, cudaStream_t stream);
 void sum_planes_bf16(const float* planes, int splits, int rows, int tokens, __nv_bfloat16* out, cudaStream_t stream);
+/**
+ * out[t][r] = bf16(gpu0 + gpu1) of two one-split plane sets: the two GPUs' halves of a K-split
+ * output summed on one GPU as exchange_add sums them across the two (the same bits).
+ */
+void add_planes_bf16(const float* gpu0, const float* gpu1, int rows, int tokens, __nv_bfloat16* out, cudaStream_t stream);
 void bf16_to_f32(const __nv_bfloat16* x, size_t n, float* out, cudaStream_t stream);
 
 /** rows[row][0 .. cols) = src[0 .. cols) (cols a multiple of 8). */

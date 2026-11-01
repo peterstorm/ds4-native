@@ -15,6 +15,14 @@ __global__ void sum_planes_kernel(const float* __restrict__ planes, int splits, 
   else out[static_cast<size_t>(t) * rows + r] = v;
 }
 
+__global__ void add_planes_kernel(const float* __restrict__ gpu0, const float* __restrict__ gpu1, int rows,
+                                  __nv_bfloat16* __restrict__ out) {
+  const int r = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
+  if (r >= rows) return;
+  const size_t at = plane_index(1, rows, 0, r, t);
+  out[static_cast<size_t>(t) * rows + r] = __float2bfloat16_rn(__fadd_rn(gpu0[at], gpu1[at]));
+}
+
 __global__ void bf16_to_f32_kernel(const __nv_bfloat16* __restrict__ x, size_t n, float* __restrict__ out) {
   const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i < n) out[i] = __bfloat162float(x[i]);
@@ -40,6 +48,10 @@ void sum_planes_f32(const float* planes, int splits, int rows, int tokens, float
 void sum_planes_bf16(const float* planes, int splits, int rows, int tokens, __nv_bfloat16* out, cudaStream_t stream) {
   if (tokens > 0)
     sum_planes_kernel<__nv_bfloat16><<<dim3((rows + 255) / 256, tokens), 256, 0, stream>>>(planes, splits, rows, out);
+}
+
+void add_planes_bf16(const float* gpu0, const float* gpu1, int rows, int tokens, __nv_bfloat16* out, cudaStream_t stream) {
+  if (tokens > 0) add_planes_kernel<<<dim3((rows + 255) / 256, tokens), 256, 0, stream>>>(gpu0, gpu1, rows, out);
 }
 
 void bf16_to_f32(const __nv_bfloat16* x, size_t n, float* out, cudaStream_t stream) {

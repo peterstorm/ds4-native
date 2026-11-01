@@ -198,7 +198,13 @@ void Decoder::add_layer(const HostLayer& w) {
         cuda::init_pool(s.pools[w.id], s.stream);
       }
     }
-    if (s.chunk.capacity > 0 && w.id < kLayers) s.prepare_wave_launches(w.id);
+    if (s.chunk.capacity > 0 && w.id < kLayers) {
+      if (kind.engram) {  // a sweep's waves compute the Engram KV whole: the other GPU's half of wkv too
+        const int half = w.engram_wkv.blocks / kGpus;
+        s.engram_peer[w.id] = upload_fp8(slice(w.engram_wkv, 0, w.engram_wkv.rows, (1 - s.rank) * half, half), s.arena);
+      }
+      s.prepare_wave_launches(w.id);
+    }
     check(cudaStreamSynchronize(s.stream), "add_layer");
   }
 }

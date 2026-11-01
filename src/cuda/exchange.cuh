@@ -27,9 +27,9 @@
 namespace ds4n::cuda {
 
 constexpr int kExchangeChunk = 1024;  // floats per block
-// The largest exchange is a prompt sweep's wave of Engram KV: 512 rows x 25600 values (12800 blocks),
-// one exchange so a wave's phase holds at most one (the decoder alternates GPUs per phase).
-constexpr int kExchangeMaxBlocks = 12800;
+// The largest exchange is a Round's Engram KV: 8 rows x 25600 values (200 blocks). A prompt sweep's
+// waves exchange by the copy engines (the decoder's SweepLink), and compute their Engram KV whole.
+constexpr int kExchangeMaxBlocks = 200;
 constexpr size_t kExchangeInboxFloats = 2 * size_t{kExchangeMaxBlocks} * kExchangeChunk;  // two parities
 
 /** One GPU's end of the link; `peer_*` are P2P pointers into the other GPU's memory. */
@@ -43,7 +43,10 @@ struct ExchangeLink {
   uint32_t* sent;        // [kExchangeMaxBlocks], this GPU's exchange count per block (local)
 };
 
-/** out[i] = bf16(partial_gpu0[i] + partial_gpu1[i]) for i < n on this GPU; both GPUs must call it in step. */
+/**
+ * out[i] = bf16(partial_gpu0[i] + partial_gpu1[i]) for i < n on this GPU; both GPUs must call it in
+ * step. Throws std::invalid_argument past kExchangeMaxBlocks blocks (the inbox's size).
+ */
 void exchange_add(const ExchangeLink& link, const float* mine, size_t n, __nv_bfloat16* out, cudaStream_t stream);
 
 }  // namespace ds4n::cuda

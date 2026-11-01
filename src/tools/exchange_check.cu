@@ -80,6 +80,9 @@ int main(int argc, char** argv) {
     else if (s == "--tokens" && i + 1 < argc) tokens = std::stoi(argv[++i]);
     else die("unknown argument " + s);
   }
+  // Rows of 5120 values; the inbox holds a Round's largest exchange (8 Engram rows = 40 of these).
+  constexpr int kMaxTokens = cuda::kExchangeMaxBlocks * cuda::kExchangeChunk / 5120;
+  if (tokens < 1 || tokens > kMaxTokens) die("tokens must be 1.." + std::to_string(kMaxTokens));
   int count = 0;
   ck(cudaGetDeviceCount(&count), "device count");
   if (count < 2) die("needs two GPUs");

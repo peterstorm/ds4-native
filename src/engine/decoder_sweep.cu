@@ -161,7 +161,6 @@ void Decoder::Gpu::allocate_sweep(int chunk_rounds) {
   w.xa_f = a.alloc<float>(W * kDim);
   w.xf_f = a.alloc<float>(W * kDim);
   w.hc_scratch = a.alloc<float>(W * cuda::kHcPartials * 25);
-  w.packed = a.alloc<float>(W * cuda::kEngramKvRows);
   w.latent_f = a.alloc<float>(W * kHeadDim);
   w.planes_qa = a.alloc<float>(WG * kSplitsWqA * kQLora * 8);
   w.planes_kv = a.alloc<float>(WG * kSplitsWkv * kHeadDim * 8);
@@ -171,16 +170,16 @@ void Decoder::Gpu::allocate_sweep(int chunk_rounds) {
   w.planes_ob = a.alloc<float>(WG * kSplitsWoB * kDim * 8);
   w.planes_bf = a.alloc<float>(WG * kSplitsBf16 * 2 * kHeadDim * 8);
   w.planes_proj = a.alloc<float>(WG * kSplitsBf16 * cuda::kIndexHeads * 8);
-  w.planes_eg = a.alloc<float>(WG * cuda::kEngramKvRows * 8);
+  for (float*& planes : w.planes_eg) planes = a.alloc<float>(WG * cuda::kEngramKvRows * 8);
   w.planes_wk = a.alloc<float>(WG * kSplitsWk * cuda::kIndexDim * 8);
   w.logits = a.alloc<float>(WG * kSplitsBf16 * moe::kExperts * 8);
   w.act_x = wave_fragments(a, kDimBlocks);
   w.act_qr = wave_fragments(a, kQLora / 32);
   for (auto& act : w.act_o) act = wave_fragments(a, kGroupWidth / 32);
   w.act_lora = wave_fragments(a, kLocalGroups * kOLora / 32);
-  w.act_engram = wave_fragments(a, cuda::kEngramBlocks / kGpus);
+  for (cuda::ActFragments& act : w.act_engram) act = wave_fragments(a, cuda::kEngramBlocks / kGpus);
   for (const cuda::ActFragments* act : {&w.act_x, &w.act_qr, &w.act_o[0], &w.act_o[1], &w.act_o[2], &w.act_o[3], &w.act_lora,
-                                       &w.act_engram})
+                                       &w.act_engram[0], &w.act_engram[1]})
     cuda::clear_fragments(*act, kWaveRounds, stream);
   w.queries = {a.alloc<uint8_t>(W * cuda::kQueryCodeBytes), a.alloc<uint8_t>(W * cuda::kQueryScaleBytes),
                a.alloc<float>(W * cuda::kIndexHeads)};
@@ -244,8 +243,13 @@ void Decoder::Gpu::prepare_wave_launches(int layer) {
     oa.push_back(wave_job(fp8_job(d.wo_a, gl * kOLora, w.act_o[gl], w.planes_oa + gl * kWaveOaStride, kOLora, kSplitsWoA)));
   l.oa = prepare(arena, oa);
   l.ob = prepare(arena, {wave_job(fp8_job(d.wo_b, 0, w.act_lora, w.planes_ob, kDim, kSplitsWoB))});
-  if (kind.engram)
-    l.engram = prepare(arena, {wave_job(fp8_job(d.engram_wkv, 0, w.act_engram, w.planes_eg, cuda::kEngramKvRows, 1))});
+  if (kind.engram) {  // both GPUs' halves of wkv's K, each into its own planes (EngramMix adds them)
+    std::vector<cuda::GemvJob> engram;
+    for (int g = 0; g < kGpus; g++)
+      engram.push_back(wave_job(fp8_job(g == rank ? d.engram_wkv : engram_peer.at(layer), 0, w.act_engram[g], w.planes_eg[g],
+                                        cuda::kEngramKvRows, 1)));
+    l.engram = prepare(arena, engram);
+  }
 }
 
 void Decoder::Gpu::upload_rows(const model::RowIndex& index) {
@@ -320,12 +324,14 @@ void Decoder::Gpu::enqueue_wave(int layer, const WaveRows& w, WavePhase phase) {
 
   switch (phase) {
     case WavePhase::EngramMix: {
+      // Both GPUs' halves of the KV on each GPU (the peer's from engram_peer), added as the
+      // exchange would: the same bits, without the wave's 52 MB of partials crossing the link.
       const int table = layer == kEngramLayers[0] ? 0 : 1;
       const uint8_t* rows_raw = chunk.engram + table * chunk.capacity * kEngramSlot + r0 * kEngramTableBytes;
-      cuda::engram_quantize_rows(rows_raw, rows, rank * (cuda::kEngramBlocks / kGpus), v.act_engram, st);
+      for (int g = 0; g < kGpus; g++)
+        cuda::engram_quantize_rows(rows_raw, rows, g * (cuda::kEngramBlocks / kGpus), v.act_engram[g], st);
       wide(l.engram);
-      cuda::sum_planes_f32(v.planes_eg, 1, cuda::kEngramKvRows, rows, v.packed, st);
-      cuda::exchange_add(link, v.packed, static_cast<size_t>(rows) * cuda::kEngramKvRows, v.kv_engram, st);
+      cuda::add_planes_bf16(v.planes_eg[0], v.planes_eg[1], cuda::kEngramKvRows, rows, v.kv_engram, st);
       lap(WaveSection::Engram);
       break;
     }
