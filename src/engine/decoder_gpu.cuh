@@ -149,11 +149,6 @@ cudaGraphExec_t capture(cudaStream_t stream, Enqueue&& enqueue) {
 
 using namespace detail;
 
-/**
- * Pinned host staging for one GPU's per-Round uploads (copies from it are truly
- * asynchronous, and graph copy nodes read these fixed addresses when they run).
- * The host rewrites a field only after the copy that read it last finished.
- */
 /** The positions a context seed projects (device-read): per row, its position and its two ring slots. */
 struct SeedIndex {
   int64_t pos[kDraftContext];
@@ -161,6 +156,11 @@ struct SeedIndex {
   int32_t feature_slot[kDraftContext];  // p % kRing: the target feature rings
 };
 
+/**
+ * Pinned host staging for one GPU's per-Round uploads (copies from it are truly
+ * asynchronous, and graph copy nodes read these fixed addresses when they run).
+ * The host rewrites a field only after the copy that read it last finished.
+ */
 struct Staging {
   model::RoundIndex round;
   int32_t idx[kMaxRows][kIdxStride];  // the window slots; the top-k part is filled on the device
@@ -277,8 +277,7 @@ struct Decoder::Gpu {
     int32_t* idx = nullptr;              // [capacity][8][kIdxStride]: the window slots
     int32_t* topk = nullptr;             // [capacity][8][512]: from the last index source
     uint8_t* candidates = nullptr;       // [capacity] x kCandidateSlot: from the candidate source
-    uint8_t* engram = nullptr;           // [2][capacity] x kEngramSlot
-    bf16* embeddings = nullptr;          // [capacity * 8][5120]: a chunk's upload
+    uint8_t* engram = nullptr;           // [2][capacity] x kEngramSlot, pinned host memory both GPUs read
     int32_t* current = nullptr;          // the Round a chunked layer step works on (device)
     int32_t* round_numbers = nullptr;    // pinned 0 .. capacity - 1, the sources of `current`
     // The grouped MoE's hand-offs, by chunk token: the FFN input rows and routing the attention

@@ -132,6 +132,12 @@ Decoder::Decoder(std::array<int, 2> devices, std::array<cuda::ExpertDirectory, 2
     gpus_[g]->link.peer_inbox = gpus_[1 - g]->link.inbox;
     gpus_[g]->link.peer_flags = gpus_[1 - g]->link.flags;
   }
+  if (chunk_rounds > 0) {
+    check(cudaHostAlloc(&sweep_engram_, 2 * static_cast<size_t>(chunk_rounds) * kEngramSlot,
+                        cudaHostAllocPortable | cudaHostAllocMapped),
+          "cudaHostAlloc");
+    for (auto& g : gpus_) g->chunk.engram = sweep_engram_;  // unified addressing: the same pointer on the GPUs
+  }
 }
 
 Decoder::~Decoder() {
@@ -153,6 +159,7 @@ Decoder::~Decoder() {
       cudaFreeHost(g->staging);
       g->free_sweep();
     }
+  if (sweep_engram_) cudaFreeHost(sweep_engram_);
 }
 
 void Decoder::add_layer(const HostLayer& w) {

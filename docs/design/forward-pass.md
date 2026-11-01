@@ -203,8 +203,10 @@ split-K ways did not help. Folding wide work into a reduction's single block mad
 **Prompt sweeps** (`Decoder::prefill`). Rounds one after another walk all 40 layers per 8 tokens;
 a long prompt's Expert working set is far larger than the Slots, and LRU over that cyclic walk
 is its worst case: a 9,129-token prompt read 40,579 Experts from the store (the model has 6,860
-outside VRAM). A sweep takes a chunk of up to 1,152 Rounds (9,216 tokens) layer by layer: every
-Round through layer L before any goes on, so a layer's Experts are read at most once per chunk.
+outside VRAM). A sweep takes a chunk of Rounds (first 1,152 of them, 9,216 tokens; now up to the
+whole 64K context) layer by layer: every Round through layer L before any goes on, so a layer's
+Experts are read at most once per chunk. Below, the per-Round sweep (`--grouped 0`, kept as the
+long-prompt reference) and then the grouped one.
 Between its layer steps a Round's state -- stream, FFN mixes, Round index, window slots, top-k,
 candidate blocks, Engram rows -- lives in a slot of chunk arrays; a chunked layer step loads the
 slot of the Round a device value names into the working buffers and stores it back, so one
@@ -239,41 +241,71 @@ The reads are now at their floor (each Expert outside the decode Slots once per 
 8,500 Slots). What was left is compute: every Round streams its ~35 routed Experts per layer (~0.26
 of ~0.4 ms per Round and layer), ~18 s of a 9K chunk.
 
-**Grouped MoE** (`Decoder::prefill` with an `ExpertPlacer`). A sweep's layer runs in three phases.
-The attention halves (`StepMode::ChunkAttention`: Engram, attention, the FFN input rows and the
-routing, left in chunk arrays by token) run for every Round. The host groups the chunk's routing by
-Expert (`core/moe_groups`: each routed Expert over its tokens ascending, 8 token columns per group,
-then the shared Expert once per Round) and runs the groups 512 at a time: the group's FFN input rows
-gathered and act_quant'ed (`gather_quantize`), gate/up, SwiGLU, down -- each Expert's weights stream
-once per 8 of its tokens, not once per Round that meets it -- and `accumulate_groups` adds each
-column into its token's FP32 partial, group by group. Then the combine halves (`ChunkCombine`: the
-MoE exchange and hc_post per Round). Exact: a GEMV output column depends only on its own input
-column, and a token meets its Experts in ascending id with the shared one last, from 0 -- `combine`'s
-order. `ds4n-moe-check --chunk 1027` (layer 3's real router, 224 Experts in several groups): the
-per-GPU partials differ from the Rounds' in 0 of 5.3 M floats; `ds4n-model-run` dumps are
-byte-identical (the short prompts against the exact run, 9K and 18K tokens against the Rounds').
+**Grouped MoE** (`Decoder::prefill` with an `ExpertPlacer`). A sweep's layer runs in three parts:
+the attention halves for every Round (Engram, attention, the FFN input rows and the routing, left
+in chunk arrays by token -- in waves, below); the grouped MoE; then the combine halves (the MoE
+exchange and hc_post). The host groups the chunk's routing by Expert (`core/moe_groups`: each
+routed Expert over its tokens ascending, 8 token columns per group, then the shared Expert once per
+Round) and runs the groups 512 at a time: the group's FFN input rows gathered and act_quant'ed
+(`gather_quantize`), gate/up, SwiGLU, down -- each Expert's weights stream once per 8 of its
+tokens, not once per Round that meets it -- and `accumulate_groups` adds each column into its
+token's FP32 partial, group by group. Exact: a GEMV output column depends only on its own input
+column, and a token meets its Experts in ascending id with the shared one last, from 0 --
+`combine`'s order. `ds4n-moe-check --chunk 1027` (layer 3's real router, 224 Experts in several
+groups): the per-GPU partials differ from the Rounds' in 0 of 5.3 M floats.
 
-Placement runs beside the attention halves. Each segment of 32 Rounds ends with its routing copied
-to pinned memory (GPU 0) and an event on both GPUs; a placing thread waits for each segment (both
-GPUs past it means both finished the previous layer's Experts, whose scratch Slots may now be
-evicted) and places the Experts its routing newly names (`moe::new_experts`, then
-`ExpertResidency::place`) while the GPUs run the later segments. The scratch Slots are least
-recently used and a layer needs at most 384 of them, so no placement evicts a Slot its own layer
-reads. Placement needs a thread of its own: a layer's 2,284 launches fill CUDA's launch queue, so the
-launching thread blocks until the halves nearly ran (placing from it gained only 5 %).
+Placement runs beside the attention halves. Each wave ends with its routing copied to pinned memory
+(GPU 0) and an event on both GPUs; a placing thread waits for each wave (both GPUs past it means
+both finished the previous layer's Experts, whose scratch Slots may now be evicted) and places the
+Experts its routing names that no earlier wave of the layer placed (`moe::routed_experts`, then
+`ExpertResidency::place`) while the GPUs run the later waves. The scratch Slots are least recently
+used and a layer needs at most 384 of them, so no placement evicts a Slot its own layer reads.
+Placement needs a thread of its own: launching blocks once CUDA's launch queue is full, which would
+hold placement back until the halves nearly ran (placing from the launching thread gained 5 %).
 
-| Prompt | sweep, scratch Slots | grouped MoE | + placement beside the halves |
-|---|---|---|---|
-| 9,129 tokens | 281 tok/s | 385 tok/s | **512 tok/s** |
-| 17,965 tokens | 284 tok/s | 394 tok/s | **524 tok/s** |
+**Waves.** A sweep's attention halves run 64 Rounds (512 rows) at a time: every kernel of the
+Round's layer step over all of the wave's rows. Rows beyond 8 are 8-column groups back to back --
+token t is column t % 8 of group t / 8, in GEMV planes ([group][split][rows][8], `plane_index`) and
+act_quant fragments ([group][blocks]) alike, so a Round's addresses are group 0's -- and
+`gemv_groups` runs each GEMV job once per group, a tile's warps for every group side by side, so the
+weights come from DRAM once per wave. The per-row loops become batched launches: the compressor
+(`compress_rows`: a ratio-2 row pools with the row before from the GEMV planes, which hold what its
+pool slot would; the ring keeps the wave's last 16 rows), index keys and compressed rows for every
+producing row (`core/row_index` compacts them), scoring and both selections for 128 rows per launch
+(`select_top_rows`: the radix passes count integers, so each row's result is independent of the
+grid). Exact by the Round argument stretched to a wave: every row's KV, latents and index keys enter
+the caches before any row of the wave attends; the window ring is 128 + 512 slots (`model::kRing`),
+so the wave's writes never overwrite a position an earlier row of it still reads
+(`test_row_index`), and every other read is bounded by the reading row's position. Slot numbers
+change with the ring's size; the values attention reads do not. A wave's work is four phases
+(EngramMix, Attention, Ffn, Combine), each ending with at most one exchange, launched on both GPUs
+before either's next phase: a launch that blocks on a full queue can never hold up a peer's side of
+an exchange. Waves launch directly (no graphs).
 
-Where a 9K prompt's 17.8 s go (`DS4N_SWEEP_PROFILE=1`): 3.1 s of host work (embeddings, Engram
-rows) before the sweep; per layer, the placing thread waits for the first segment's routing (2.4 s
-in all) and reads ~163 Experts (9.6 s in all, 12.8 GB/s: the drive saturated) beside the attention
-halves (9.3 s); the grouped Experts take 0.4 s, the combine halves 0.9 s. The drive is the bound.
-What is left: the drive idles while a layer's first segment routes and while its Experts and
-combine halves run (~95 ms per layer); the attention halves stream their dense weights (~70 MB per
-GPU and layer) once per Round; the host work runs before the first launch.
+**One chunk per prompt.** A chunk's state is ~85 KB per token (stream, mixes, window slots, top-k,
+candidate blocks, FFN input rows, routing, the MoE partial); the embeddings go straight into the
+streams' copy 0 and are replicated there, and the Engram rows stay in pinned host memory both GPUs
+read at the two Engram layers. So the whole 64K context fits one chunk (5.4 GB per GPU beside 8,500
+Slots, 92.9 of 97.9 GB in use), and the store reads each Expert outside the decode Slots once per
+prompt, whatever its length. Host prep: the embedding table lives in RAM (1.3 GB, read once) and a
+prompt's Engram rows are read 1,024 in flight across tokens (`EngramRows::read_tokens`).
+
+| Prompt | grouped MoE | + placement beside | + host prep | + waves | + one chunk |
+|---|---|---|---|---|---|
+| 9,129 tokens | 385 tok/s | 512 | 587 | 735 | **735 tok/s** (one chunk already) |
+| 17,965 tokens | 394 tok/s | 524 | 607 | 750 | **1,170 tok/s** (store reads 11.3K -> 6.5K) |
+| 35,930 tokens | | | | | **1,641 tok/s** |
+| 60,000 tokens | | | | | **1,814 tok/s** |
+
+(The 36K and 60K prompts repeat the 18K one.) All dumps byte-identical: the short prompts against the
+exact run, 9K and 18K against the Rounds', 36K against the per-Round sweep (`--grouped 0`).
+
+Where they go (`DS4N_SWEEP_PROFILE=1`): the store reads ~7K Experts per prompt (9.5-10.8 s, the drive
+saturated at 12.8 GB/s) beside the attention halves. Up to ~18K tokens the reads are the bound (the
+host waits 0.1-0.2 s for routing); at 60K the attention halves are (26.9 s for attention and Experts,
+the host waiting 4.9 s for routing), mostly the indexer: every row scores and selects over all
+compressed positions before it, quadratic in the prompt. Host prep grows with the prompt (0.7 s at
+9K, 3.7 s at 60K) and still runs before the first launch; the combine halves take ~34 us per token.
 
 ## Expert residency
 

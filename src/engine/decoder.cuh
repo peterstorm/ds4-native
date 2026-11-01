@@ -205,6 +205,9 @@ class Decoder {
   bool engram_staged_ = false;
   int64_t seeded_ = 0;       // DSpark's context holds every position below this one (up to kDraftContext)
   std::vector<float> noise_;  // the noise token's embedding
+  // A prompt sweep's Engram rows ([2][chunk rows] x kEngramTableBytes), pinned host memory both GPUs
+  // read where they need it (the two Engram layers) instead of a copy in VRAM.
+  uint8_t* sweep_engram_ = nullptr;
 };
 
 }  // namespace ds4n::engine

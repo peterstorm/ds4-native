@@ -8,11 +8,12 @@
 //
 // For each name, DIR/<name>.tokens is antirez's --dump-tokens output (ids on the first line). The
 // prompt runs from position 0 as a prompt sweep (engine::Decoder::prefill: chunks of up to N Rounds
-// of 8 rows, each chunk layer by layer; --sweep, default 1152) or, with --sweep 0, as Rounds of R
-// rows one after another (--prefill, 1 to 8, default 8); both give the logits of one token at a time
-// (see engine/decoder.cuh). A sweep's MoE is grouped by Expert across the chunk (--grouped 1, the
-// default: each Expert placed once and run once per 8 of its tokens); --grouped 0 runs each Round's
-// whole layer step. The next-token logits at its end go to
+// of 8 rows, each chunk layer by layer; --sweep, default 8192: the whole 64K context in one chunk)
+// or, with --sweep 0, as Rounds of R rows one after another (--prefill, 1 to 8, default 8); both give
+// the logits of one token at a time (see engine/decoder.cuh). A sweep runs its attention halves in
+// waves of 64 Rounds and groups its MoE by Expert across the chunk (--grouped 1, the default: each
+// Expert placed once and run once per 8 of its tokens); --grouped 0 runs each Round's whole layer
+// step. The next-token logits at its end go to
 // OUT/<name>.logits.json, then a greedy continuation of up to N steps (default 64) with top-20
 // logprobs per step goes to OUT/<name>.logprobs.json, both in antirez's schema. With --oracle,
 // ORACLE/<name>.logits.json and .logprobs.json are compared as they come: KL and top-20 at the
@@ -148,7 +149,8 @@ int main(int argc, char** argv) {
   setenv("CUDA_MODULE_LOADING", "EAGER", 1);  // before any CUDA call: see engine/decoder.cuh
   std::string backbone_path, store_path, gguf_path, tokens_dir, names_arg, out_dir, oracle_dir, prior_path, access_log, dspark_dir;
   bool force = false, grouped = true;
-  int max_steps = 64, prefill_rows = model::kMaxRows, verify_rows = 0, sweep_rounds = 1152;
+  int max_steps = 64, prefill_rows = model::kMaxRows, verify_rows = 0;
+  int sweep_rounds = static_cast<int>(engine::kMaxCompressed / model::kMaxRows);  // the whole context
   uint32_t slots = 8000, ram_records = 512, prior_weight = 1;
   float ccr = 0.0f;
   engine::RamPolicy ram_policy = engine::RamPolicy::Recent;

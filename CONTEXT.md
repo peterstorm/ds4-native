@@ -86,7 +86,16 @@ The rows a verify Round takes: the Anchor and that many minus one drafted tokens
 The time of a Step with zero Misses.
 
 **Cohort**:
-A group of prefill rows whose routed Experts are loaded once per layer and shared.
+A group of prefill rows whose routed Experts are loaded once per layer and shared: a prompt sweep's chunk (up to the whole 64K context).
+
+**Prompt sweep**:
+A Cohort's pass through the model layer by layer: every row through layer L before any goes on, so each layer's Experts are read once per Cohort (`Decoder::prefill`).
+
+**Wave**:
+Up to 64 Rounds of a prompt sweep whose attention halves run as one batch: every kernel over all the Wave's rows, each GEMV's weights read once per Wave. The window ring outlasts the window by a Wave, so the Wave writes its rows' KV before any of them attends.
+
+**Grouped MoE**:
+A prompt sweep's MoE per layer: each routed Expert run once over all the Cohort's tokens it serves, in groups of 8 token columns, accumulated in the Round's combine order (`core/moe_groups`).
 
 **Append**:
 New prompt tokens added to an existing Session (a tool result, a user turn).
@@ -137,3 +146,4 @@ An independent slow implementation (antirez/ds4, Maya's `ref.py`, or the HF refe
 - "cache" was used for the **Expert cache**, the RAM page cache, ZFS ARC and **KV checkpoints** — resolved: say **Expert cache**, page cache, ARC or **KV checkpoint**.
 - "slot" in Project Maya also means a parked conversation — resolved: here **Slot** is VRAM for an **Expert**; parked conversations are **KV checkpoints**.
 - "shard" means split files (GGUF parts, HF safetensors) only — a GPU's share of an **Expert** is a **Half**.
+- "chunk" in the decoder (`Decoder::Gpu::Chunk`, `--sweep` chunks) is a **Cohort** — not an **Expert record** (which prose must not call a chunk); the code keeps the name for now.

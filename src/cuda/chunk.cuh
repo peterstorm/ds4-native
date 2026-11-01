@@ -18,9 +18,9 @@ void load_slot(void* dst, const void* base, size_t slot_bytes, const int32_t* ro
 void store_slot(void* base, size_t slot_bytes, const int32_t* round, const void* src, size_t bytes, cudaStream_t stream);
 
 /**
- * The streams a chunk's Rounds start from: Round g's row r is token 8g + r, its embedding
- * (`embeddings` [tokens][dim] BF16) in all four hc copies of h ([rounds][8][4][dim]).
+ * The streams a chunk starts from: h ([tokens][4][dim], token 8g + r is Round g's row r) holds each
+ * token's embedding in hc copy 0 (uploaded there); copy it into copies 1 .. 3.
  */
-void expand_embeddings(const __nv_bfloat16* embeddings, int tokens, int dim, __nv_bfloat16* h, cudaStream_t stream);
+void replicate_first_copy(__nv_bfloat16* h, int tokens, int dim, cudaStream_t stream);
 
 }  // namespace ds4n::cuda

@@ -59,8 +59,6 @@ void Decoder::Gpu::allocate_sweep(int chunk_rounds) {
   c.idx = a.alloc<int32_t>(N * kIdxStride);
   c.topk = a.alloc<int32_t>(N * kTopK);
   c.candidates = a.alloc<uint8_t>(G * kCandidateSlot);
-  c.engram = a.alloc<uint8_t>(2 * G * kEngramSlot);
-  c.embeddings = a.alloc<bf16>(N * kDim);
   c.current = a.alloc<int32_t>(1);
   check(cudaMallocHost(&c.round_numbers, G * sizeof(int32_t)), "cudaMallocHost");
   for (size_t i = 0; i < G; i++) c.round_numbers[i] = static_cast<int32_t>(i);
@@ -270,7 +268,8 @@ void Decoder::Gpu::enqueue_wave(int layer, const WaveRows& w, WavePhase phase) {
         const model::ProducedRange produced = w.produced[ratio];
         const int n_prod = static_cast<int>(produced.count);
         const int64_t* latent_pos = v.produced_latent_pos[ratio] + produced.begin;
-        const IntArg first_row = IntArg::at(v.produced_compress_row[ratio] + produced.begin, kMaxCompressed - 1);
+        const IntArg first_compressed =  // the compressed row of the wave's first latent
+            IntArg::at(v.produced_compress_row[ratio] + produced.begin, kMaxCompressed - 1);
         if (kind.kv_source) {
           cuda::bf16_gemv(d.compress_w, v.xa_f, d.compress_rows, kDim, rows, kSplitsBf16, v.planes_bf, st);
           cuda::compress_rows(v.planes_bf, kSplitsBf16, ratio, rows, w.first_produced[ratio], n_prod, pos,
@@ -283,7 +282,7 @@ void Decoder::Gpu::enqueue_wave(int layer, const WaveRows& w, WavePhase phase) {
             cuda::sum_planes_bf16(v.planes_wk, kSplitsWk, cuda::kIndexDim, n_prod, v.k_raw, st);
             cuda::rmsnorm(v.k_raw, d.index_k_norm, cuda::kIndexDim, n_prod, kNormEps, v.k_idx, st);
             cuda::rope(v.k_idx, n_prod, 1, cuda::kIndexDim, kRopeDim, d.rope_freqs, latent_pos, false, st);
-            cuda::append_index_keys(v.k_idx, first_row, n_prod, index_cache.at(layer), st);
+            cuda::append_index_keys(v.k_idx, first_compressed, n_prod, index_cache.at(layer), st);
           }
           cuda::planes_rope({v.planes_iq, kSplitsIndexQ, cuda::kIndexHeads * cuda::kIndexDim}, rows, cuda::kIndexHeads,
                             cuda::kIndexDim, kRopeDim, d.rope_freqs, pos, v.q_idx, st);
@@ -310,7 +309,7 @@ void Decoder::Gpu::enqueue_wave(int layer, const WaveRows& w, WavePhase phase) {
                 "latents");
           cuda::rope(v.latent_c, n_prod, 1, kHeadDim, kRopeDim, d.rope_freqs, latent_pos, false, st);
           cuda::fp4_quant_dequant_e4m3(v.latent_c, n_prod, kHeadDim, st);
-          cuda::store_rows(v.latent_c, n_prod, kHeadDim, compressed.at(layer), first_row, st);
+          cuda::store_rows(v.latent_c, n_prod, kHeadDim, compressed.at(layer), first_compressed, st);
         }
         check(cudaMemcpy2DAsync(idx + kWindow, kIdxStride * sizeof(int32_t), topk, kTopK * sizeof(int32_t),
                                 kTopK * sizeof(int32_t), rows, cudaMemcpyDeviceToDevice, st),
@@ -414,17 +413,16 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
     const model::RowIndex row_index = model::row_index(c0, static_cast<int64_t>(n));
     std::vector<bf16> emb(n * kDim);
     for (size_t i = 0; i < emb.size(); i++) emb[i] = __float2bfloat16(embeddings[first * kDim + i]);
-    std::vector<uint8_t> engram;
-    if (any_engram) {
-      engram.assign(2 * static_cast<size_t>(rounds) * kEngramSlot, 0);
+
+    // Uploads while both GPUs are idle (plain copies may wait on the device; the GPUs read the Engram
+    // rows of the previous chunk until it ended). Each token's embedding goes into hc copy 0 of its
+    // stream, then into the other three on the device.
+    sync();
+    if (any_engram)
       for (size_t t = 0; t < n; t++)
         for (int table = 0; table < 2; table++)
-          std::memcpy(engram.data() + table * rounds * kEngramSlot + t * kEngramTableBytes,
+          std::memcpy(sweep_engram_ + table * capacity * kEngramSlot + t * kEngramTableBytes,
                       engram_rows.data() + (first + t) * kEngramTokenBytes + table * kEngramTableBytes, kEngramTableBytes);
-    }
-
-    // Uploads while both GPUs are idle (plain copies may wait on the device).
-    sync();
     for (auto& gp : gpus_) {
       Gpu& s = *gp;
       check(cudaSetDevice(s.device), "cudaSetDevice");
@@ -432,13 +430,11 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
       check(cudaMemcpy(c.round, index.data(), index.size() * sizeof(index[0]), cudaMemcpyHostToDevice), "chunk index");
       check(cudaMemcpy(c.idx, idx.data(), idx.size() * sizeof(int32_t), cudaMemcpyHostToDevice), "chunk window");
       check(cudaMemcpy(c.mix, mixes.data(), mixes.size() * sizeof(mixes[0]), cudaMemcpyHostToDevice), "chunk mixes");
-      check(cudaMemcpy(c.embeddings, emb.data(), emb.size() * sizeof(bf16), cudaMemcpyHostToDevice), "chunk embeddings");
-      for (int table = 0; any_engram && table < 2; table++)
-        check(cudaMemcpy(c.engram + table * c.capacity * kEngramSlot, engram.data() + table * rounds * kEngramSlot,
-                         rounds * kEngramSlot, cudaMemcpyHostToDevice),
-              "chunk Engram rows");
+      check(cudaMemcpy2D(c.h, kHcCopies * kDim * sizeof(bf16), emb.data(), kDim * sizeof(bf16), kDim * sizeof(bf16), n,
+                         cudaMemcpyHostToDevice),
+            "chunk embeddings");
       if (grouped) s.upload_rows(row_index);
-      cuda::expand_embeddings(c.embeddings, static_cast<int>(n), kDim, c.h, s.stream);
+      cuda::replicate_first_copy(c.h, static_cast<int>(n), kDim, s.stream);
       check(cudaStreamSynchronize(s.stream), "chunk start");
     }
 
