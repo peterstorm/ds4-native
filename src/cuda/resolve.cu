@@ -81,6 +81,7 @@ __global__ void __launch_bounds__(kThreads) resolve_kernel(const moe::Plan* __re
       e.layer = layer;
       e.jobs = raw_jobs;
       e.near_count = near_count;
+      e.flags = out.flags != nullptr ? *out.flags : 0;
     }
     __threadfence_system();
     __syncthreads();

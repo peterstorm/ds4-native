@@ -220,9 +220,27 @@ sweeps are byte-identical to the Rounds' and to the sequential exact run.
 Every graph a sweep needs is captured before any launches: instantiating one while layer steps
 run can wait for the device while a step waits on a Miss whose service waits behind the
 instantiation -- both GPUs then trap at their watchdogs (`DS4N_SWEEP_CHECK=1` syncs after each
-layer and names it). Still open: under LRU the sweep leaves the Slots holding the last layers'
-Experts (decode right after an 8K prompt: 14 tok/s, against 40 after Rounds) and reloads nearly
-every Expert (15.8K reads against ~6.9K outside VRAM).
+layer and names it).
+
+**Sweep placement.** Under plain LRU a sweep (layers 0 .. 39 once) leaves the Slots holding the
+last ~22 layers' Experts, so it reloads nearly every Expert as it meets each layer (15.8K reads for
+9K tokens), and decode right after the prompt finds the early layers gone (14 tok/s). A sweep's
+steps are posted flagged (`moe::kSweepStep`, a device value the decoder sets around its launches):
+their Experts in the decode Slots are Hits there, the rest load into 512 scratch Slots (LRU among
+themselves, after the decode Slots in the pool). A key lives in one region at a time. Placement
+only: the dumps stay byte-identical.
+
+| Prompt | sweep, LRU | sweep, scratch Slots | store reads | decode right after |
+|---|---|---|---|---|
+| 9,129 tokens | 198 tok/s | **281 tok/s** | 15,768 -> 6,539 | 14 -> 26 tok/s |
+| 17,965 tokens | 202 tok/s | **284 tok/s** | 27,062 -> 11,312 | 17 -> 38 tok/s |
+
+The reads are now at their floor (each Expert outside the decode Slots once per chunk: ~6.9K at
+8,500 Slots). What is left is compute: every Round streams its ~35 routed Experts per layer (~0.26
+of ~0.4 ms per Round and layer), so a 9K chunk spends ~18 s re-streaming Experts that a grouped
+pass -- each Expert once per layer over all of the chunk's tokens it serves, with the same
+per-column arithmetic -- would stream in ~0.1 s; and 3.2 s of host work (embeddings, Engram rows)
+runs before the first launch.
 
 ## Expert residency
 

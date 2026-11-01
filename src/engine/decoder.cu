@@ -130,6 +130,7 @@ struct Staging {
   SeedIndex seed;
   int32_t chain[kDraftRows + 1];  // the anchor, then the drafted tokens
   float confidence[kDraftRows];
+  int32_t sweep_on, sweep_off;  // 1 and 0: the sources of a prompt sweep's posting flag
 };
 
 struct Decoder::Gpu {
@@ -219,6 +220,7 @@ struct Decoder::Gpu {
     float *confidence_proj = nullptr, *confidences = nullptr;  // [5120 + 256], [kDraftRows]
   } draft;
   cudaEvent_t staged_seed = nullptr, logits_copied = nullptr;
+  int32_t* sweep_flag = nullptr;  // device: moe::kSweepStep while a prompt sweep's steps run
 
   /**
    * A prompt sweep's Rounds between their layer steps (Decoder::prefill): one slot per Round of the
@@ -273,6 +275,8 @@ Decoder::Decoder(std::array<int, 2> devices, std::array<cuda::ExpertDirectory, 2
     for (cudaStream_t& side : s.sides) check(cudaStreamCreateWithFlags(&side, cudaStreamNonBlocking), "cudaStreamCreate");
     for (cudaEvent_t& ev : s.branch) check(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "cudaEventCreate");
     check(cudaMallocHost(&s.staging, sizeof(Staging)), "cudaMallocHost");
+    s.staging->sweep_on = moe::kSweepStep;
+    s.staging->sweep_off = 0;
     s.experts = experts[g];
     for (cudaEvent_t* ev : {&s.staged_round, &s.staged_rows[0], &s.staged_rows[1], &s.staged_seed, &s.logits_copied})
       check(cudaEventCreateWithFlags(ev, cudaEventDisableTiming), "cudaEventCreate");
@@ -366,6 +370,10 @@ Decoder::Decoder(std::array<int, 2> devices, std::array<cuda::ExpertDirectory, 2
     s.resolved = {a.alloc<cuda::GemvJob>(3 * cuda::kJobSlots), a.alloc<int>(3 * cuda::kJobSlots), a.alloc<int64_t>(4),
                   a.alloc<uint64_t>(1)};
     check(cudaMemset(s.resolved.step, 0, sizeof(uint64_t)), "memset");
+    int32_t* sweep_flag = a.alloc<int32_t>(1);  // posted with each step: set while a prompt sweep runs
+    check(cudaMemset(sweep_flag, 0, sizeof(int32_t)), "memset");
+    s.resolved.flags = sweep_flag;
+    s.sweep_flag = sweep_flag;
     if (chunk_rounds > 0) {
       Gpu::Chunk& c = s.chunk;
       const size_t G = static_cast<size_t>(chunk_rounds);
@@ -1134,6 +1142,16 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
         }
     }
 
+    // The sweep's steps are posted as such: their Misses take scratch Slots, not the decode Slots.
+    auto post_as = [&](const int32_t Staging::*value) {
+      for (auto& gp : gpus_) {
+        check(cudaSetDevice(gp->device), "cudaSetDevice");
+        check(cudaMemcpyAsync(gp->sweep_flag, &(gp->staging->*value), sizeof(int32_t), cudaMemcpyHostToDevice, gp->stream),
+              "sweep flag");
+      }
+    };
+    post_as(&Staging::sweep_on);
+
     // Layer by layer, every Round through the layer before any goes on: a layer's Experts are read
     // once for the chunk.
     for (const auto& [layer, unused] : lead.layers) {
@@ -1153,6 +1171,7 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
         std::fprintf(stderr, "sweep: layer %d done (%d Rounds)\n", layer, rounds);
       }
     }
+    post_as(&Staging::sweep_off);
     // The working buffers hold the chunk's last Round: it is the current one (logits()).
     rows_ = tail;
     p0_ = c0 + static_cast<int64_t>(rounds - 1) * kMaxRows;

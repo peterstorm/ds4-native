@@ -54,7 +54,8 @@ struct ExpertResidency::State {
   io::Fd store;
   io::UringReader reader;
   cache::ExpertCache vram, ram;
-  std::array<uint8_t*, 2> pool{};  // per GPU: slots x kHalfPayloadBytes
+  std::optional<cache::ExpertCache> scratch;  // a prompt sweep's Slots (config.sweep_slots), least recently used
+  std::array<uint8_t*, 2> pool{};  // per GPU: (slots + sweep_slots) x kHalfPayloadBytes
   std::array<cudaStream_t, 2> copy{};
   std::vector<std::byte*> allocations;  // pinned RAM tier memory
   std::vector<std::byte*> records;      // per RAM tier Slot: one record (kRecordStride bytes)
@@ -204,12 +205,36 @@ void ExpertResidency::State::serve_step(const moe::PostedStep& step, uint64_t s,
       near.push_back(k);
   }
   if (config.record_accesses) seen.push_back({keys, near});
-  auto placed = vram.plan(keys, config.hints ? std::span<const cache::ExpertKey>(near) : std::span<const cache::ExpertKey>{});
-  if (!placed) fail("Expert cache: " + placed.error().what);
-  counts.hits += placed.value().hits.size();
-  if (placed.value().loads.empty()) return;
+  // Two regions: the decode Slots and the scratch Slots a prompt sweep's Misses take. A key lives in
+  // at most one; where it lives it is a Hit. A sweep step's other keys load into scratch, a decode
+  // step's into the decode Slots, so a sweep never evicts what decode keeps.
+  const bool sweep = scratch.has_value() && (step.flags & moe::kSweepStep) != 0;
+  std::vector<cache::ExpertKey> decode_keys, scratch_keys;
+  for (const cache::ExpertKey k : keys) {
+    const bool in_scratch = scratch && scratch->slot_of(k).has_value();
+    const bool to_scratch = in_scratch || (sweep && !vram.slot_of(k).has_value());
+    (to_scratch ? scratch_keys : decode_keys).push_back(k);
+  }
+  std::vector<cache::Load> loads;
+  if (!decode_keys.empty() || !sweep) {
+    const auto hinted = config.hints && !sweep ? std::span<const cache::ExpertKey>(near) : std::span<const cache::ExpertKey>{};
+    auto placed = vram.plan(decode_keys, hinted);
+    if (!placed) fail("Expert cache: " + placed.error().what);
+    counts.hits += placed.value().hits.size();
+    loads = std::move(placed.value().loads);
+  }
+  if (!scratch_keys.empty()) {
+    auto placed = scratch->plan(scratch_keys);
+    if (!placed) fail("sweep Slots: " + placed.error().what);
+    counts.hits += placed.value().hits.size();
+    for (cache::Load l : placed.value().loads) {
+      l.slot += config.slots;  // the scratch Slots follow the decode Slots in the pool
+      loads.push_back(l);
+    }
+  }
+  if (loads.empty()) return;
   const auto t0 = Clock::now();
-  load(placed.value().loads, counts);
+  load(loads, counts);
   // The table changes only once GPU 1 routed this step too: Cache-conditional routing reads it.
   const auto wait_start = Clock::now();
   while (std::atomic_ref<uint64_t>(mailbox->peer_routed).load(std::memory_order_acquire) < s) {
@@ -217,7 +242,7 @@ void ExpertResidency::State::serve_step(const moe::PostedStep& step, uint64_t s,
     _mm_pause();
   }
   // The copies landed: now the table may name the new Slots (and forget the evicted Experts).
-  for (const auto& l : placed.value().loads) {
+  for (const auto& l : loads) {
     if (l.evicted) std::atomic_ref<int32_t>(table[*l.evicted]).store(-1, std::memory_order_relaxed);
     std::atomic_ref<int32_t>(table[l.key]).store(static_cast<int32_t>(l.slot), std::memory_order_relaxed);
   }
@@ -272,6 +297,8 @@ std::unique_ptr<ExpertResidency> ExpertResidency::open(const ResidencyConfig& co
   if (config.slots < kBatch || config.ram_records < kBatch)
     fail("the Expert cache and the RAM tier each need at least " + std::to_string(kBatch) + " Slots");
   if (config.key_layers < 1 || config.key_layers > store::kLayers) fail("key_layers must be in 1..40");
+  if (config.sweep_slots != 0 && config.sweep_slots < kBatch)
+    fail("the sweep Slots, when any, number at least " + std::to_string(kBatch));
   auto fd = io::open_file(config.store_path, io::Access::ReadDirect);
   if (!fd) fail(fd.error().what);
   io::AlignedBuffer header(store::kHeaderBytes);
@@ -302,10 +329,15 @@ std::unique_ptr<ExpertResidency> ExpertResidency::open(const ResidencyConfig& co
   if (!ram) fail("RAM tier: " + ram.error().what);
   auto s = std::make_unique<State>(config, std::move(fd).value(), std::move(reader).value(), std::move(vram).value(),
                                    std::move(ram).value());
+  if (config.sweep_slots > 0) {
+    auto scratch = cache::ExpertCache::empty(config.sweep_slots, cache::Policy{4096, false});
+    if (!scratch) fail("sweep Slots: " + scratch.error().what);
+    s->scratch = std::move(scratch).value();
+  }
 
   for (int g = 0; g < 2; g++) {
     engine::check(cudaSetDevice(config.devices[g]), "cudaSetDevice");
-    engine::check(cudaMalloc(&s->pool[g], static_cast<size_t>(config.slots) * store::kHalfPayloadBytes), "Slot pool");
+    engine::check(cudaMalloc(&s->pool[g], (static_cast<size_t>(config.slots) + config.sweep_slots) * store::kHalfPayloadBytes), "Slot pool");
     engine::check(cudaStreamCreateWithFlags(&s->copy[g], cudaStreamNonBlocking), "cudaStreamCreate");
   }
   // Portable: both GPUs copy from the same records at pinned speed.

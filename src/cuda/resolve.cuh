@@ -37,6 +37,7 @@ struct ResolvedMoe {
   static constexpr int kDownList = 2 * kJobSlots;  // fixed, so graph launches can point at it
   int64_t* counts;  // [4]: gate/up jobs, gate/up warps, down jobs, down warps
   uint64_t* step;   // this GPU's layer step counter (zero at start)
+  const int32_t* flags = nullptr;  // device: posted with each step (moe::PostedStep::flags); null: 0
 
   IntArg gate_up_jobs(int max_jobs) const { return IntArg::at(counts + 0, 2 * max_jobs); }
   IntArg down_jobs(int max_jobs) const { return IntArg::at(counts + 2, max_jobs); }
