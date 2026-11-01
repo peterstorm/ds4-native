@@ -293,7 +293,9 @@ void Decoder::Gpu::enqueue_wave(int layer, const WaveRows& w, WavePhase phase) {
   // copies are issued before either waits for the other's: send `mine` (ready once `st`'s work so
   // far ran) into the peer's inbox, once the peer added what that inbox held last; then add the
   // peer's partial into `out`, GPU 0's + GPU 1's as the kernel exchange does.
-  auto send = [&](SweepLink::Lane& lane, const SweepLink::Lane& peer, const float* mine) {
+  auto send = [&](SweepLink::Lane SweepLink::*of, const float* mine) {
+    SweepLink::Lane& lane = x.*of;
+    const SweepLink::Lane& peer = x.peer->*of;
     check(cudaEventRecord(lane.ready[p], st), "cudaEventRecord");
     check(cudaStreamWaitEvent(x.stream, lane.ready[p], 0), "cudaStreamWaitEvent");
     check(cudaStreamWaitEvent(x.stream, peer.added[p], 0), "cudaStreamWaitEvent");
@@ -303,10 +305,14 @@ void Decoder::Gpu::enqueue_wave(int layer, const WaveRows& w, WavePhase phase) {
           "partial to the peer");
     check(cudaEventRecord(lane.sent[p], x.stream), "cudaEventRecord");
   };
-  auto add = [&](SweepLink::Lane& lane, const SweepLink::Lane& peer, const float* mine, bf16* out) {
+  auto add = [&](SweepLink::Lane SweepLink::*of, const float* mine, bf16* out) {
+    SweepLink::Lane& lane = x.*of;
+    const SweepLink::Lane& peer = x.peer->*of;
     check(cudaStreamWaitEvent(x.stream, peer.sent[p], 0), "cudaStreamWaitEvent");
-    cuda::add_round_bf16(rank == 0 ? mine : lane.inbox[p], rank == 0 ? lane.inbox[p] : mine, static_cast<size_t>(rows) * kDim,
-                         out, x.stream);
+    std::array<const float*, kGpus> by_rank{};
+    by_rank[rank] = mine;
+    by_rank[1 - rank] = lane.inbox[p];
+    cuda::add_round_bf16(by_rank[0], by_rank[1], static_cast<size_t>(rows) * kDim, out, x.stream);
     clock.lap(WaveSection::Exchange, x.stream);
     check(cudaEventRecord(lane.added[p], x.stream), "cudaEventRecord");
   };
@@ -428,11 +434,11 @@ void Decoder::Gpu::enqueue_wave(int layer, const WaveRows& w, WavePhase phase) {
     }
 
     case WavePhase::AttentionSend:  // while the next wave's Attention runs on `st`
-      send(x.attention, x.peer->attention, v.partial[p]);
+      send(&SweepLink::attention, v.partial[p]);
       break;
 
     case WavePhase::AttentionAdd:
-      add(x.attention, x.peer->attention, v.partial[p], v.attn_out[p]);
+      add(&SweepLink::attention, v.partial[p], v.attn_out[p]);
       break;
 
     case WavePhase::Ffn: {
@@ -457,11 +463,11 @@ void Decoder::Gpu::enqueue_wave(int layer, const WaveRows& w, WavePhase phase) {
     // The MoE output's exchange: ready once `st` ran the grouped MoE and the previous wave's
     // CombinePost (which read moe_out of this parity two waves back).
     case WavePhase::CombineSend:
-      send(x.combine, x.peer->combine, chunk.y + r0 * kDim);
+      send(&SweepLink::combine, chunk.y + r0 * kDim);
       break;
 
     case WavePhase::CombineAdd:
-      add(x.combine, x.peer->combine, chunk.y + r0 * kDim, v.moe_out[p]);
+      add(&SweepLink::combine, chunk.y + r0 * kDim, v.moe_out[p]);
       break;
 
     case WavePhase::CombinePost:
