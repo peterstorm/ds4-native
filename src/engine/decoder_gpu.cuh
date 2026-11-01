@@ -76,6 +76,60 @@ constexpr int kWaveRows = kMaxRows * kWaveRounds;  // 512
 constexpr int kScoreRows = 128;                    // a wave's indexer rows scored at once (scores [128][65536])
 constexpr int kAttnRows = 128;                     // a wave's rows through sparse attention at once
 
+/** The parts of a wave's work the wave clock (DS4N_WAVE_PROFILE) times. */
+enum class WaveSection { Engram, Mixes, Projections, Compressor, IndexKeys, IndexQueries, IndexScores, IndexSelect,
+                         CompressedRows, Attention, OutProjections, Exchange, Ffn, Combine, kCount };
+constexpr std::array<const char*, static_cast<size_t>(WaveSection::kCount)> kWaveSectionNames = {
+    "Engram", "mixes", "q/kv projections", "compressor", "index keys", "index queries", "index scores",
+    "index selection", "compressed rows", "sparse attention", "output projections", "exchanges", "FFN input + routing",
+    "combine"};
+
+/**
+ * GPU time by wave section: events on one GPU's stream around each section of its wave phases,
+ * read once the sweep is done (recording events never waits). Off unless DS4N_WAVE_PROFILE is set.
+ */
+struct WaveClock {
+  bool on = false;
+  std::vector<cudaEvent_t> events;  // a pool, reused
+  size_t used = 0, last = 0;        // events taken; the latest mark
+  std::vector<std::tuple<WaveSection, size_t, size_t>> spans;  // section, start event, end event
+  std::array<double, static_cast<size_t>(WaveSection::kCount)> ms{};
+
+  /** Start timing on `stream`: what follows belongs to the next lap's section. */
+  void mark(cudaStream_t stream) {
+    if (on) last = record(stream);
+  }
+  /** What ran on `stream` since the last mark or lap belongs to `section`. */
+  void lap(WaveSection section, cudaStream_t stream) {
+    if (!on) return;
+    const size_t e = record(stream);
+    spans.emplace_back(section, last, e);
+    last = e;
+  }
+  /** Fold the spans recorded so far into `ms` (waits for the stream). */
+  void collect(cudaStream_t stream) {
+    if (!on) return;
+    check(cudaStreamSynchronize(stream), "wave clock");
+    for (const auto& [section, a, b] : spans) {
+      float t = 0.0f;
+      check(cudaEventElapsedTime(&t, events[a], events[b]), "wave clock");
+      ms[static_cast<size_t>(section)] += t;
+    }
+    spans.clear();
+    used = 0;
+  }
+
+ private:
+  size_t record(cudaStream_t stream) {
+    if (used == events.size()) {
+      events.emplace_back();
+      check(cudaEventCreate(&events.back()), "cudaEventCreate");
+    }
+    check(cudaEventRecord(events[used], stream), "cudaEventRecord");
+    return used++;
+  }
+};
+
 /** A wave's rows of the chunk, and per ratio where its producing rows sit among the chunk's. */
 struct WaveRows {
   int first = 0, rows = 0;                     // chunk rows [first, first + rows), first a Round boundary
@@ -333,6 +387,7 @@ struct Decoder::Gpu {
     moe::Plan* plans = nullptr;  // [kWaveRounds]
   } wave;
   std::map<int, LayerLaunches> wave_launches;  // per layer, into the wave's buffers (no shared Expert)
+  WaveClock clock;                             // GPU 0's, when profiling
 
   /**
    * One layer step for `rows` rows from a position of parity `parity` (`mode` Round), or a prompt

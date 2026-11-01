@@ -53,7 +53,9 @@ struct ResidencyConfig {
   std::string store_path;
   std::array<int, 2> devices{0, 1};  // device of Half 0, Half 1
   uint32_t slots = 0;                // VRAM Slots, at least moe::kMaxJobs
-  uint32_t ram_records = 0;          // RAM tier record buffers (18 MiB pinned each), at least moe::kMaxJobs
+  // RAM tier record buffers (18 MiB pinned each), at least moe::kMaxJobs; 48 more stage a prompt
+  // sweep's store reads, which only read the tier (a sweep's one-off Loads never displace its records).
+  uint32_t ram_records = 0;
   std::vector<uint32_t> prior;       // pick counts per Expert key for the warm start (empty: by key)
   // Experts of layer L are keyed (and read from the store) as layer L % key_layers: a test store
   // holding only the first few layers can serve every layer. 40 for a real store.

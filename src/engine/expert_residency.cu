@@ -93,8 +93,13 @@ struct ExpertResidency::State {
   };
   /** Read records (at most kBatch) in 1 MiB chunks; each chunk bound for VRAM is copied to its GPU as it lands. */
   void read_records(std::span<const RecordRead> records_in);
-  /** Fill the Loads' VRAM Slots (at most kBatch) through the RAM tier, returning when both GPUs' copies landed. */
-  void load(std::span<const cache::Load> loads, ResidencyStats& counts);
+  /**
+   * Fill the Loads' VRAM Slots (at most kBatch), returning when both GPUs' copies landed. Decode
+   * Loads go through the RAM tier (a store read lands in a record the tier's policy chose); a
+   * sweep's only read it: RAM tier records are copied, the rest come from the store through the
+   * staging buffers, so a prompt's one-off Loads never displace what the tier keeps for every prompt.
+   */
+  void load(std::span<const cache::Load> loads, bool sweep, ResidencyStats& counts);
   /** Wait until both GPUs' copy streams drained. */
   void sync_copies();
   /** Drain posted steps in order until stopped. */
@@ -136,22 +141,32 @@ void ExpertResidency::State::copy_record(uint32_t record, uint32_t slot) {
   }
 }
 
-void ExpertResidency::State::load(std::span<const cache::Load> loads, ResidencyStats& counts) {
-  std::vector<cache::ExpertKey> keys;
-  std::map<cache::ExpertKey, uint32_t> slot_of;
-  for (const auto& l : loads) {
-    keys.push_back(l.key);
-    slot_of[l.key] = l.slot;
-  }
-  auto placed = ram.plan(keys);
-  if (!placed) fail("RAM tier: " + placed.error().what);
-  for (const auto& h : placed.value().hits) {
-    copy_record(h.slot, slot_of.at(h.key));
-    counts.ram_hits++;
-  }
-  // Store reads land in the RAM tier buffers they took.
+void ExpertResidency::State::load(std::span<const cache::Load> loads, bool sweep, ResidencyStats& counts) {
   std::vector<RecordRead> from_store;
-  for (const auto& l : placed.value().loads) from_store.push_back({l.key, l.slot, slot_of.at(l.key)});
+  if (sweep) {
+    for (const auto& l : loads)
+      if (const auto record = ram.slot_of(l.key)) {
+        copy_record(*record, l.slot);
+        counts.ram_hits++;
+      } else {
+        from_store.push_back({l.key, config.ram_records + static_cast<uint32_t>(from_store.size()), l.slot});  // staging
+      }
+  } else {
+    std::vector<cache::ExpertKey> keys;
+    std::map<cache::ExpertKey, uint32_t> slot_of;
+    for (const auto& l : loads) {
+      keys.push_back(l.key);
+      slot_of[l.key] = l.slot;
+    }
+    auto placed = ram.plan(keys);
+    if (!placed) fail("RAM tier: " + placed.error().what);
+    for (const auto& h : placed.value().hits) {
+      copy_record(h.slot, slot_of.at(h.key));
+      counts.ram_hits++;
+    }
+    // Store reads land in the RAM tier buffers they took.
+    for (const auto& l : placed.value().loads) from_store.push_back({l.key, l.slot, slot_of.at(l.key)});
+  }
   counts.store_reads += from_store.size();
   read_records(from_store);
   sync_copies();
@@ -221,7 +236,7 @@ void ExpertResidency::State::serve_step(const moe::PostedStep& step, uint64_t s,
                                sweep, counts);
   if (loads.empty()) return;
   const auto t0 = Clock::now();
-  load(loads, counts);
+  load(loads, sweep, counts);
   // The table changes only once GPU 1 routed this step too: Cache-conditional routing reads it.
   const auto wait_start = Clock::now();
   while (std::atomic_ref<uint64_t>(mailbox->peer_routed).load(std::memory_order_acquire) < s) {
@@ -373,9 +388,10 @@ std::unique_ptr<ExpertResidency> ExpertResidency::open(const ResidencyConfig& co
     engine::check(cudaMalloc(&s->pool[g], (static_cast<size_t>(config.slots) + config.sweep_slots) * store::kHalfPayloadBytes), "Slot pool");
     engine::check(cudaStreamCreateWithFlags(&s->copy[g], cudaStreamNonBlocking), "cudaStreamCreate");
   }
-  // Portable: both GPUs copy from the same records at pinned speed.
-  for (uint32_t first = 0; first < config.ram_records; first += kRecordsPerAllocation) {
-    const uint32_t n = std::min(kRecordsPerAllocation, config.ram_records - first);
+  // Portable: both GPUs copy from the same records at pinned speed. The RAM tier's records, then
+  // kBatch staging buffers for a sweep's store reads.
+  for (uint32_t first = 0; first < config.ram_records + kBatch; first += kRecordsPerAllocation) {
+    const uint32_t n = std::min(kRecordsPerAllocation, config.ram_records + kBatch - first);
     void* p = nullptr;
     engine::check(cudaHostAlloc(&p, static_cast<size_t>(n) * store::kRecordStride, cudaHostAllocPortable), "RAM tier");
     s->allocations.push_back(static_cast<std::byte*>(p));
@@ -450,7 +466,7 @@ std::vector<uint32_t> ExpertResidency::place(int layer, std::span<const int32_t>
     const auto loads = s.plan_keys(keys, {}, true, counts);
     if (!loads.empty()) {
       const auto t0 = Clock::now();
-      s.load(loads, counts);
+      s.load(loads, true, counts);
       s.publish(loads);
       counts.exposed_ms += ms_since(t0);
     }

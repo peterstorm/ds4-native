@@ -169,6 +169,7 @@ void Decoder::Gpu::free_sweep() {
                   static_cast<void*>(grouped.pinned_route_weights)})
     if (p) cudaFreeHost(p);
   for (cudaEvent_t ev : grouped.segment_done) cudaEventDestroy(ev);
+  for (cudaEvent_t ev : clock.events) cudaEventDestroy(ev);
 }
 
 void Decoder::Gpu::prepare_wave_launches(int layer) {
@@ -229,6 +230,8 @@ void Decoder::Gpu::enqueue_wave(int layer, const WaveRows& w, WavePhase phase) {
   const int64_t* pos = v.pos + r0;
   bf16* h_in = kind.engram ? v.h_next : h;  // the attention sub-block's input (and residual)
   auto wide = [&](const Launch& launch) { cuda::gemv_groups(launch.jobs, launch.first, launch.n, launch.warps, groups, st); };
+  auto lap = [&](WaveSection s) { clock.lap(s, st); };
+  clock.mark(st);
 
   switch (phase) {
     case WavePhase::EngramMix: {
@@ -238,6 +241,7 @@ void Decoder::Gpu::enqueue_wave(int layer, const WaveRows& w, WavePhase phase) {
       wide(l.engram);
       cuda::sum_planes_f32(v.planes_eg, 1, cuda::kEngramKvRows, rows, v.packed, st);
       cuda::exchange_add(link, v.packed, static_cast<size_t>(rows) * cuda::kEngramKvRows, v.kv_engram, st);
+      lap(WaveSection::Engram);
       break;
     }
 
@@ -252,6 +256,7 @@ void Decoder::Gpu::enqueue_wave(int layer, const WaveRows& w, WavePhase phase) {
       cuda::rmsnorm(v.x0, d.attn_norm, kDim, rows, kNormEps, v.xa, st);
       cuda::quantize_activations(v.xa, rows, v.act_x, st);
       cuda::bf16_to_f32(v.xa, static_cast<size_t>(rows) * kDim, v.xa_f, st);
+      lap(WaveSection::Mixes);
       wide(l.qa_kv);
       cuda::sum_planes_bf16(v.planes_qa, kSplitsWqA, kQLora, rows, v.qlora, st);
       cuda::rmsnorm(v.qlora, d.q_norm, kQLora, rows, kNormEps, v.qr, st);
@@ -261,6 +266,7 @@ void Decoder::Gpu::enqueue_wave(int layer, const WaveRows& w, WavePhase phase) {
       wide(l.qb);
       cuda::planes_rope({v.planes_qb, kSplitsWqB, kLocalHeads * kHeadDim}, rows, kLocalHeads, kHeadDim, kRopeDim, d.rope_freqs,
                         pos, v.q, st);
+      lap(WaveSection::Projections);
 
       int32_t* idx = chunk.idx + r0 * kIdxStride;
       int32_t* topk = chunk.topk + r0 * kTopK;  // an index source's selections; later layers' from the last source
@@ -275,6 +281,7 @@ void Decoder::Gpu::enqueue_wave(int layer, const WaveRows& w, WavePhase phase) {
           cuda::compress_rows(v.planes_bf, kSplitsBf16, ratio, rows, w.first_produced[ratio], n_prod, pos,
                               ratio == 2 ? pools.at(layer) : cuda::PoolSlots{}, d.compress_norm, kNormEps, v.latent, st);
         }
+        lap(WaveSection::Compressor);
         if (kind.index_source) {
           if (kind.kv_source && n_prod > 0) {  // every key the wave completes, before any row scores
             cuda::bf16_to_f32(v.latent, static_cast<size_t>(n_prod) * kHeadDim, v.latent_f, st);
@@ -284,10 +291,12 @@ void Decoder::Gpu::enqueue_wave(int layer, const WaveRows& w, WavePhase phase) {
             cuda::rope(v.k_idx, n_prod, 1, cuda::kIndexDim, kRopeDim, d.rope_freqs, latent_pos, false, st);
             cuda::append_index_keys(v.k_idx, first_compressed, n_prod, index_cache.at(layer), st);
           }
+          lap(WaveSection::IndexKeys);
           cuda::planes_rope({v.planes_iq, kSplitsIndexQ, cuda::kIndexHeads * cuda::kIndexDim}, rows, cuda::kIndexHeads,
                             cuda::kIndexDim, kRopeDim, d.rope_freqs, pos, v.q_idx, st);
           cuda::bf16_gemv(d.index_weights_proj, v.xa_f, cuda::kIndexHeads, kDim, rows, kSplitsBf16, v.planes_proj, st);
           cuda::prepare_index_queries(v.q_idx, v.planes_proj, kSplitsBf16, rows, v.queries, st);
+          lap(WaveSection::IndexQueries);
           constexpr int64_t kMaskBytes = kMaxCompressed / 8;
           for (int s0 = 0; s0 < rows; s0 += kScoreRows) {
             const int n = std::min(kScoreRows, rows - s0);
@@ -297,10 +306,12 @@ void Decoder::Gpu::enqueue_wave(int layer, const WaveRows& w, WavePhase phase) {
                                        v.queries.weights + s0 * cuda::kIndexHeads};
             cuda::index_scores_rows(index_cache.at(kind.cache_owner), len, n, q, kind.uses_candidates ? masks : nullptr, kMaskBytes,
                                     v.scores, kMaxCompressed, st);
+            lap(WaveSection::IndexScores);
             if (kind.candidate_source)
               cuda::candidate_blocks_rows(v.scores, kMaxCompressed, len, n, masks, kMaskBytes, v.select, st);
             cuda::top_positions_rows(v.scores, kMaxCompressed, len, n, kRing, topk + static_cast<size_t>(s0) * kTopK, kTopK,
                                      v.select.select, st);
+            lap(WaveSection::IndexSelect);
           }
         }
         if (kind.kv_source && n_prod > 0) {
@@ -314,6 +325,7 @@ void Decoder::Gpu::enqueue_wave(int layer, const WaveRows& w, WavePhase phase) {
         check(cudaMemcpy2DAsync(idx + kWindow, kIdxStride * sizeof(int32_t), topk, kTopK * sizeof(int32_t),
                                 kTopK * sizeof(int32_t), rows, cudaMemcpyDeviceToDevice, st),
               "topk");
+        lap(WaveSection::CompressedRows);
       }
 
       const int n_idx = ratio ? kWindow + kTopK : kWindow;
@@ -325,13 +337,16 @@ void Decoder::Gpu::enqueue_wave(int layer, const WaveRows& w, WavePhase phase) {
                                 kIdxStride, d.sink, n, kSoftmaxScale, v.attn, v.o + a0 * kHeadsElems, st),
               "sparse_attn");
       }
+      lap(WaveSection::Attention);
       cuda::unrope_quantize(v.o, rows, kLocalHeads, kHeadDim, kRopeDim, d.rope_freqs, pos, kLocalHeads / kLocalGroups,
                             {{v.act_o[0], v.act_o[1], v.act_o[2], v.act_o[3]}}, st);
       wide(l.oa);
       cuda::group_planes_quantize(v.planes_oa, kLocalGroups, kWaveOaStride, kSplitsWoA, kOLora, rows, v.act_lora, st);
       wide(l.ob);
       cuda::sum_planes_f32(v.planes_ob, kSplitsWoB, kDim, rows, v.partial, st);
+      lap(WaveSection::OutProjections);
       cuda::exchange_add(link, v.partial, static_cast<size_t>(rows) * kDim, v.attn_out, st);
+      lap(WaveSection::Exchange);
       break;
     }
 
@@ -349,6 +364,7 @@ void Decoder::Gpu::enqueue_wave(int layer, const WaveRows& w, WavePhase phase) {
       cuda::route_groups(v.logits, kSplitsBf16, rows, router, chunk.route_experts + r0 * moe::kTopK,
                          chunk.route_weights + r0 * moe::kTopK, v.plans, st);
       check(cudaMemcpyAsync(h, v.h_mid, rows * stream_elems * sizeof(bf16), cudaMemcpyDeviceToDevice, st), "stream");
+      lap(WaveSection::Ffn);
       break;
     }
 
@@ -356,6 +372,7 @@ void Decoder::Gpu::enqueue_wave(int layer, const WaveRows& w, WavePhase phase) {
       cuda::exchange_add(link, chunk.y + r0 * kDim, static_cast<size_t>(rows) * kDim, v.moe_out, st);
       cuda::hc_post(v.moe_out, h, mix_ffn, kDim, rows, v.h_mid, st);
       check(cudaMemcpyAsync(h, v.h_mid, rows * stream_elems * sizeof(bf16), cudaMemcpyDeviceToDevice, st), "stream");
+      lap(WaveSection::Combine);
       break;
     }
   }
@@ -380,6 +397,9 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
   const bool grouped = static_cast<bool>(place);
   // DS4N_SWEEP_PROFILE: the time since the last lap, once both GPUs finished, into a phase's bucket.
   const bool profiling = std::getenv("DS4N_SWEEP_PROFILE") != nullptr;
+  // DS4N_WAVE_PROFILE: GPU 0's time by wave section (cudaEvents; the streams are not waited for).
+  lead.clock.on = grouped && std::getenv("DS4N_WAVE_PROFILE") != nullptr;
+  lead.clock.ms = {};
   SweepProfile profile;
   auto mark = std::chrono::steady_clock::now();
   auto lap = [&](double SweepProfile::*bucket) {
@@ -550,6 +570,8 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
         lap(&SweepProfile::steps);  // attention halves and the Experts, placement overlapping the halves
         for (const WaveRows& w : waves) phase(layer, w, WavePhase::Combine);
         lap(&SweepProfile::combine);
+        check(cudaSetDevice(lead.device), "cudaSetDevice");
+        lead.clock.collect(lead.stream);  // bounds the events in flight
       }
       if (std::getenv("DS4N_SWEEP_CHECK")) {  // diagnostic: name the layer a fault comes from
         sync();
@@ -573,6 +595,11 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
     rows_ = tail;
     p0_ = c0 + static_cast<int64_t>(rounds - 1) * kMaxRows;
     engram_staged_ = any_engram;
+  }
+  if (lead.clock.on) {
+    std::fprintf(stderr, "wave clock, %zu tokens (GPU 0, ms):", tokens);
+    for (size_t i = 0; i < lead.clock.ms.size(); i++) std::fprintf(stderr, " %s %.0f;", kWaveSectionNames[i], lead.clock.ms[i]);
+    std::fprintf(stderr, "\n");
   }
   if (profiling && grouped)
     std::fprintf(stderr,
