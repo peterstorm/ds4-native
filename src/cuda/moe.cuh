@@ -63,6 +63,15 @@ void route(const float* logits, int logit_splits, int tokens, const uint8_t* ima
 void route_groups(const float* logits, int logit_splits, int tokens, RouterParams p, int32_t* experts, float* weights,
                   moe::Plan* plans, cudaStream_t stream);
 
+/**
+ * Copies `tokens` tokens' routing (experts and weights, [tokens][6] each) into pinned host memory
+ * by the SMs, as posted PCIe writes: a cudaMemcpyAsync would queue behind the copy engines' work
+ * (a sweep's P2P exchanges, Expert loads) and hold `stream` meanwhile. The host may read it once
+ * an event recorded after this call completed.
+ */
+void publish_routing(const int32_t* experts, const float* weights, int tokens, int32_t* host_experts, float* host_weights,
+                     cudaStream_t stream);
+
 /** Per-slot scratch for one GPU's MoE work; every array has kJobSlots slots. */
 struct MoeBuffers {
   float* gate;        // [slot][splits][rows][8] GEMV partial planes

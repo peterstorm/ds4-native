@@ -300,6 +300,15 @@ __global__ void add_round_kernel(const float* __restrict__ a, const float* __res
   if (i < n) out[i] = __float2bfloat16_rn(__fadd_rn(a[i], b[i]));
 }
 
+__global__ void publish_routing_kernel(const int32_t* __restrict__ experts, const float* __restrict__ weights, size_t n,
+                                       int32_t* __restrict__ host_experts, float* __restrict__ host_weights) {
+  const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) {
+    host_experts[i] = experts[i];
+    host_weights[i] = weights[i];
+  }
+}
+
 }  // namespace
 
 void route(const float* logits, int logit_splits, int tokens, const uint8_t* image, RouterParams p, int32_t* experts,
@@ -320,6 +329,14 @@ void route_groups(const float* logits, int logit_splits, int tokens, RouterParam
   if (tokens <= 0) return;
   route_kernel<moe::kExperts, moe::kTopK><<<column_groups(tokens), moe::kExperts, 0, stream>>>(
       logits, logit_splits, tokens, nullptr, p, experts, weights, plans);
+}
+
+void publish_routing(const int32_t* experts, const float* weights, int tokens, int32_t* host_experts, float* host_weights,
+                     cudaStream_t stream) {
+  const size_t n = static_cast<size_t>(tokens) * moe::kTopK;
+  if (n > 0)
+    publish_routing_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, stream>>>(experts, weights, n, host_experts,
+                                                                                       host_weights);
 }
 
 void swiglu_quantize(const moe::Plan* plan, MoeBuffers buf, float limit, cudaStream_t stream) {

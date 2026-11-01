@@ -663,13 +663,9 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
           Gpu& s = *gp;
           check(cudaSetDevice(s.device), "cudaSetDevice");
           if (s.rank == 0) {
-            const size_t at = static_cast<size_t>(w.first) * moe::kTopK, count = static_cast<size_t>(w.rows) * moe::kTopK;
-            check(cudaMemcpyAsync(s.grouped.pinned_route_experts + at, s.chunk.route_experts + at, count * sizeof(int32_t),
-                                  cudaMemcpyDeviceToHost, s.stream),
-                  "wave routing");
-            check(cudaMemcpyAsync(s.grouped.pinned_route_weights + at, s.chunk.route_weights + at, count * sizeof(float),
-                                  cudaMemcpyDeviceToHost, s.stream),
-                  "wave routing");
+            const size_t at = static_cast<size_t>(w.first) * moe::kTopK;
+            cuda::publish_routing(s.chunk.route_experts + at, s.chunk.route_weights + at, w.rows,
+                                  s.grouped.pinned_route_experts + at, s.grouped.pinned_route_weights + at, s.stream);
           }
           check(cudaEventRecord(s.grouped.segment_done[k], s.stream), "cudaEventRecord");
         }
