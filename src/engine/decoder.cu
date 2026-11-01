@@ -1,12 +1,17 @@
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <future>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <utility>
 
 #include "core/model.hpp"
+#include "core/moe_groups.hpp"
 #include "core/moe_reference.hpp"
 #include "core/mx_tiles.hpp"
 #include "core/store_layout.hpp"
@@ -41,6 +46,13 @@ static_assert(3 * kExpertPartBytes == store::kHalfPayloadBytes, "a Slot holds a 
 constexpr int kSplitsMainProj = 4;  // DSpark's feature projection (K = 15360): proposal numerics, not Reference
 constexpr size_t kCandidateSlot = static_cast<size_t>(kMaxRows) * (kMaxCompressed / 8);  // a Round's candidate blocks
 constexpr size_t kEngramSlot = static_cast<size_t>(kMaxRows) * kEngramTableBytes;            // a Round's rows of one table
+
+/** What a layer step covers (Decoder::Gpu::enqueue_layer). */
+enum class StepMode { Round, Chunk, ChunkAttention, ChunkCombine };
+constexpr int kGroupBatch = 512;  // groups a grouped MoE launch works on at once (the size of its buffers)
+// Rounds whose routing the host takes at once while a sweep's attention halves run (placement starts
+// after the first segment instead of after the layer).
+constexpr int kSegmentRounds = 32;
 
 /** A batched GEMV launch prepared on the device. */
 struct Launch {
@@ -156,9 +168,9 @@ struct Decoder::Gpu {
   cuda::ExchangeLink link{};
   std::map<int, DeviceLayer> layers;
   std::map<int, LayerLaunches> launches;
-  // Captured layer steps by (layer, rows, parity of the first position, chunked), and whole Rounds by
+  // Captured layer steps by (layer, rows, parity of the first position, mode), and whole Rounds by
   // (rows, parity).
-  std::map<std::tuple<int, int, int, bool>, cudaGraphExec_t> graphs;
+  std::map<std::tuple<int, int, int, StepMode>, cudaGraphExec_t> graphs;
   std::map<std::pair<int, int>, cudaGraphExec_t> round_graphs;
   cuda::ExpertDirectory experts{};  // this GPU's view of the Expert cache
   cuda::ResolvedMoe resolved{};
@@ -238,13 +250,43 @@ struct Decoder::Gpu {
     bf16* embeddings = nullptr;          // [capacity * 8][5120]: a chunk's upload
     int32_t* current = nullptr;          // the Round a chunked layer step works on (device)
     int32_t* round_numbers = nullptr;    // pinned 0 .. capacity - 1, the sources of `current`
+    // The grouped MoE's hand-offs, by chunk token: the FFN input rows and routing the attention
+    // half leaves, and the MoE output (this GPU's partial) the combine half exchanges.
+    bf16* xf = nullptr;                  // [capacity * 8][5120]
+    int32_t* route_experts = nullptr;    // [capacity * 8][6]
+    float* route_weights = nullptr;      // [capacity * 8][6]
+    float* y = nullptr;                  // [capacity * 8][5120]
   } chunk;
 
   /**
-   * One layer step for `rows` rows from a position of parity `parity`; `chunked`: of the prompt
-   * sweep's Round `*chunk.current`, its state loaded from its slot first and stored back after.
+   * The grouped MoE's working set (Decoder::prefill): `buf` and the gathered activations for up to
+   * kGroupBatch groups at a time; the group tables and GEMV jobs of a whole layer (device, and pinned
+   * for their uploads), indexed by the group's place in the layer's GroupPlan; the chunk's routing
+   * as it reaches the host, a segment of kSegmentRounds Rounds at a time (`segment_done[k]` recorded
+   * once segment k's attention halves ran and, on GPU 0, its routing was copied).
    */
-  void enqueue_layer(int layer, int rows, int parity, bool chunked = false);
+  struct Grouped {
+    cuda::MoeBuffers buf{};
+    uint8_t *act_codes = nullptr, *act_scales = nullptr;  // [kGroupBatch] x kDimBlocks x (256 | 8)
+    int32_t *token_of = nullptr, *pinned_token_of = nullptr;  // [layer groups][8]
+    float *weight = nullptr, *pinned_weight = nullptr;        // [layer groups][8]
+    cuda::GemvJob *jobs = nullptr, *pinned_jobs = nullptr;    // [3 x layer groups]: per batch gate/up, then down
+    int *first = nullptr, *pinned_first = nullptr;            // their warp prefix sums, per list from 0
+    size_t layer_groups = 0;
+    int32_t* pinned_route_experts = nullptr;  // [capacity * 8][6], GPU 0's
+    float* pinned_route_weights = nullptr;    // [capacity * 8][6]
+    std::vector<cudaEvent_t> segment_done;
+  } grouped;
+
+  /**
+   * One layer step for `rows` rows from a position of parity `parity` (`mode` Round), or a prompt
+   * sweep's Round `*chunk.current` with its state loaded from its slot first and stored back after:
+   * the whole step (Chunk), or the halves around the grouped MoE (ChunkAttention, ChunkCombine).
+   */
+  void enqueue_layer(int layer, int rows, int parity, StepMode mode = StepMode::Round);
+  /** One batch of a layer's grouped MoE: groups [first, first + count) of `plan`, routed ones' Halves at `halves`. */
+  void enqueue_groups(const moe::GroupPlan& plan, size_t first, size_t count, const DeviceLayer& d,
+                      std::span<const uint8_t* const> halves);
   /** The head over `rows` rows of the stream after the last layer: this GPU's half of the logits into head_out. */
   void enqueue_head(const bf16* final_norm, int rows);
   /** Project `rows` accepted positions (from row `first` of the seed index) into every stage's context ring. */
@@ -389,6 +431,39 @@ Decoder::Decoder(std::array<int, 2> devices, std::array<cuda::ExpertDirectory, 2
       c.current = a.alloc<int32_t>(1);
       check(cudaMallocHost(&c.round_numbers, G * sizeof(int32_t)), "cudaMallocHost");
       for (size_t i = 0; i < G; i++) c.round_numbers[i] = static_cast<int32_t>(i);
+      c.xf = a.alloc<bf16>(G * R * kDim);
+      c.route_experts = a.alloc<int32_t>(G * R * moe::kTopK);
+      c.route_weights = a.alloc<float>(G * R * moe::kTopK);
+      c.y = a.alloc<float>(G * R * kDim);
+      // The grouped MoE: a layer has at most 6 routed columns per token, one partial group per Expert,
+      // and one shared group per Round.
+      Gpu::Grouped& gr = s.grouped;
+      gr.layer_groups = G * moe::kTopK + moe::kExperts + G;
+      constexpr size_t B = kGroupBatch;
+      const size_t plane = static_cast<size_t>(kSplitsExpert) * kExpertRows * 8;
+      gr.buf = {a.alloc<float>(B * plane),
+                a.alloc<float>(B * plane),
+                a.alloc<uint8_t>(B * kExpertDownBlocks * 256),
+                a.alloc<uint8_t>(B * kExpertDownBlocks * 8),
+                a.alloc<float>(B * kDim * 8),
+                kExpertRows,
+                kSplitsExpert,
+                kDim};
+      gr.act_codes = a.alloc<uint8_t>(B * kDimBlocks * 256);
+      gr.act_scales = a.alloc<uint8_t>(B * kDimBlocks * 8);
+      const size_t columns = gr.layer_groups * kMaxRows, jobs = 3 * gr.layer_groups;
+      gr.token_of = a.alloc<int32_t>(columns);
+      gr.weight = a.alloc<float>(columns);
+      gr.jobs = a.alloc<cuda::GemvJob>(jobs);
+      gr.first = a.alloc<int>(jobs);
+      check(cudaMallocHost(&gr.pinned_token_of, columns * sizeof(int32_t)), "cudaMallocHost");
+      check(cudaMallocHost(&gr.pinned_weight, columns * sizeof(float)), "cudaMallocHost");
+      check(cudaMallocHost(&gr.pinned_jobs, jobs * sizeof(cuda::GemvJob)), "cudaMallocHost");
+      check(cudaMallocHost(&gr.pinned_first, jobs * sizeof(int)), "cudaMallocHost");
+      check(cudaMallocHost(&gr.pinned_route_experts, G * R * moe::kTopK * sizeof(int32_t)), "cudaMallocHost");
+      check(cudaMallocHost(&gr.pinned_route_weights, G * R * moe::kTopK * sizeof(float)), "cudaMallocHost");
+      gr.segment_done.resize((G + kSegmentRounds - 1) / kSegmentRounds);
+      for (cudaEvent_t& ev : gr.segment_done) check(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "cudaEventCreate");
     }
     gpus_[g] = std::move(gpu);
   }
@@ -415,7 +490,13 @@ Decoder::~Decoder() {
       }
       for (cudaEvent_t ev : g->branch) cudaEventDestroy(ev);
       cudaFreeHost(g->staging);
-      if (g->chunk.round_numbers) cudaFreeHost(g->chunk.round_numbers);
+      const Gpu::Grouped& gr = g->grouped;
+      for (void* p : {static_cast<void*>(g->chunk.round_numbers), static_cast<void*>(gr.pinned_token_of),
+                      static_cast<void*>(gr.pinned_weight), static_cast<void*>(gr.pinned_jobs),
+                      static_cast<void*>(gr.pinned_first), static_cast<void*>(gr.pinned_route_experts),
+                      static_cast<void*>(gr.pinned_route_weights)})
+        if (p) cudaFreeHost(p);
+      for (cudaEvent_t ev : gr.segment_done) cudaEventDestroy(ev);
     }
 }
 
@@ -505,10 +586,24 @@ void Decoder::sync() {
   }
 }
 
-void Decoder::Gpu::enqueue_layer(int layer, int rows, int parity, bool chunked) {
+void Decoder::Gpu::enqueue_layer(int layer, int rows, int parity, StepMode mode) {
   const LayerKind kind = model::kind(layer);
-  // A prompt sweep's Round: its slot into the working buffers first (the Round chosen on the device).
+  const bool chunked = mode != StepMode::Round;
   const size_t stream_row = static_cast<size_t>(kHcCopies) * kDim * sizeof(bf16);
+  // The combine half: the grouped MoE's output for the Round, its exchange and hc_post.
+  if (mode == StepMode::ChunkCombine) {
+    const int32_t* g = chunk.current;
+    const size_t y_row = static_cast<size_t>(kDim) * sizeof(float);
+    cuda::load_slot(h_mid, chunk.h, kMaxRows * stream_row, g, rows * stream_row, stream);
+    cuda::load_slot(mix_ffn, chunk.mix, kMaxRows * sizeof(cuda::HcMixes), g, rows * sizeof(cuda::HcMixes), stream);
+    cuda::load_slot(y, chunk.y, kMaxRows * y_row, g, rows * y_row, stream);
+    cuda::exchange_add(link, y, static_cast<size_t>(rows) * kDim, moe_out, stream);
+    cuda::hc_post(moe_out, h_mid, mix_ffn, kDim, rows, h, stream);
+    cuda::store_slot(chunk.h, kMaxRows * stream_row, g, h, rows * stream_row, stream);
+    check(cudaGetLastError(), "combine half launches");
+    return;
+  }
+  // A prompt sweep's Round: its slot into the working buffers first (the Round chosen on the device).
   if (chunked) {
     const int32_t* g = chunk.current;
     cuda::load_slot(h, chunk.h, kMaxRows * stream_row, g, rows * stream_row, stream);
@@ -667,18 +762,42 @@ void Decoder::Gpu::enqueue_layer(int layer, int rows, int parity, bool chunked) 
   cuda::rmsnorm(x0, d.ffn_norm, kDim, rows, kNormEps, xf, st);
   cuda::quantize_activations(xf, rows, act_xf, st);
   cuda::bf16_to_f32(xf, static_cast<size_t>(rows) * kDim, xf_f, st);
-  // Branch 3: the shared Expert, which needs no routing, beside the router, routing and resolution.
-  fork(3);
-  run(l.shared_gate_up, side(3));
-  cuda::swiglu_quantize_shared(rows, moe, moe::kSwigluLimit, side(3));
-  run(l.shared_down, side(3));
-  branch_done(3);
+  // Branch 3: the shared Expert, which needs no routing, beside the router, routing and resolution
+  // (a sweep's attention half leaves it to the grouped MoE).
+  if (mode != StepMode::ChunkAttention) {
+    fork(3);
+    run(l.shared_gate_up, side(3));
+    cuda::swiglu_quantize_shared(rows, moe, moe::kSwigluLimit, side(3));
+    run(l.shared_down, side(3));
+    branch_done(3);
+  }
   cuda::bf16_gemv(d.router, xf_f, kind.experts, kDim, rows, kSplitsBf16, logits, st);
   const cuda::RouterParams router =
       kind.draft ? cuda::RouterParams{d.router_bias, nullptr, kRouteScale, nullptr, 0, 0.0f, nullptr, kind.experts, kind.top_k}
                  : cuda::RouterParams{d.router_bias, nullptr, kRouteScale, experts.slot_of, layer % experts.key_layers,
                                       experts.route_bonus, route_near, kind.experts, kind.top_k};
   cuda::route(logits, kSplitsBf16, rows, nullptr, router, route_experts, route_weights, plan, st);
+  auto store_index_state = [&] {  // what later layers of a sweep's Round read
+    const int32_t* g = chunk.current;
+    if (kind.index_source)
+      cuda::store_slot(chunk.topk, kMaxRows * kTopK * sizeof(int32_t), g, topk, rows * kTopK * sizeof(int32_t), st);
+    if (kind.candidate_source) cuda::store_slot(chunk.candidates, kCandidateSlot, g, candidates, rows * (kMaxCompressed / 8), st);
+  };
+  if (mode == StepMode::ChunkAttention) {
+    // The grouped MoE takes the FFN input rows and the routing; the combine half takes the stream
+    // after attention and the FFN mixes.
+    join(2);
+    const int32_t* g = chunk.current;
+    const size_t route_row = moe::kTopK * sizeof(int32_t), xf_row = static_cast<size_t>(kDim) * sizeof(bf16);
+    cuda::store_slot(chunk.h, kMaxRows * stream_row, g, h_mid, rows * stream_row, st);
+    cuda::store_slot(chunk.mix, kMaxRows * sizeof(cuda::HcMixes), g, mix_ffn, rows * sizeof(cuda::HcMixes), st);
+    cuda::store_slot(chunk.xf, kMaxRows * xf_row, g, xf, rows * xf_row, st);
+    cuda::store_slot(chunk.route_experts, kMaxRows * route_row, g, route_experts, rows * route_row, st);
+    cuda::store_slot(chunk.route_weights, kMaxRows * route_row, g, route_weights, rows * route_row, st);
+    store_index_state();
+    check(cudaGetLastError(), "attention half launches");
+    return;
+  }
 
   // The routed Experts: resolved on the device (a Miss waits for the Expert cache's service), then
   // gate/up, SwiGLU, down; then the combine in Plan order with the shared Expert, the exchange, hc_post.
@@ -700,9 +819,7 @@ void Decoder::Gpu::enqueue_layer(int layer, int rows, int parity, bool chunked) 
     const int32_t* g = chunk.current;
     cuda::store_slot(chunk.h, kMaxRows * stream_row, g, h, rows * stream_row, st);
     cuda::store_slot(chunk.mix, kMaxRows * sizeof(cuda::HcMixes), g, mix_ffn, rows * sizeof(cuda::HcMixes), st);
-    if (kind.index_source)
-      cuda::store_slot(chunk.topk, kMaxRows * kTopK * sizeof(int32_t), g, topk, rows * kTopK * sizeof(int32_t), st);
-    if (kind.candidate_source) cuda::store_slot(chunk.candidates, kCandidateSlot, g, candidates, rows * (kMaxCompressed / 8), st);
+    store_index_state();
   }
   check(cudaGetLastError(), "layer step launches");
 }
@@ -713,7 +830,7 @@ std::vector<StepTrace> Decoder::decode_layer(int layer, bool trace_step) {
   if (kind.engram && !engram_staged_) throw CudaError("an Engram layer needs the Round's Engram rows (begin_round)");
   const int parity = static_cast<int>(p0_ % 2);
   const bool graphs = launches_ == Launches::Graphs;
-  const std::tuple<int, int, int, bool> key{layer, rows_, parity, false};
+  const std::tuple<int, int, int, StepMode> key{layer, rows_, parity, StepMode::Round};
 
   // Capture on both GPUs (instantiation may allocate), then launch on both.
   for (auto& gp : gpus_) {
@@ -1064,7 +1181,41 @@ DraftBlock Decoder::draft(int64_t p, int32_t token, std::span<const float> ancho
 
 namespace ds4n::engine {
 
-void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<const uint8_t> engram_rows) {
+/**
+ * The segments of a layer's attention halves the host has launched (each with its routing copy and
+ * event), counted for the placing thread: an event it waits on must be this layer's record, not the
+ * previous layer's.
+ */
+struct Decoder::LaunchedSegments {
+  std::mutex m;
+  std::condition_variable cv;
+  size_t count = 0;
+  bool abandoned = false;
+
+  void publish(size_t launched) {
+    {
+      std::lock_guard lock(m);
+      count = launched;
+    }
+    cv.notify_one();
+  }
+  void abandon() {
+    {
+      std::lock_guard lock(m);
+      abandoned = true;
+    }
+    cv.notify_one();
+  }
+  /** Whether segment k was launched (false: the launching thread gave up). */
+  bool wait_for(size_t k) {
+    std::unique_lock lock(m);
+    cv.wait(lock, [&] { return count > k || abandoned; });
+    return count > k;
+  }
+};
+
+void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<const uint8_t> engram_rows,
+                      const ExpertPlacer& place) {
   Gpu& lead = *gpus_[0];
   const int capacity = lead.chunk.capacity;
   if (capacity == 0) throw CudaError("prefill: this decoder was made without chunk capacity");
@@ -1078,6 +1229,20 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
   if (p0 == 0) seeded_ = 0;  // a new Session: DSpark's context starts over
   const size_t per_chunk = static_cast<size_t>(capacity) * kMaxRows;
   const bool graphs = launches_ == Launches::Graphs;
+  const bool grouped = static_cast<bool>(place);
+  const std::vector<StepMode> modes = grouped ? std::vector{StepMode::ChunkAttention, StepMode::ChunkCombine}
+                                        : std::vector{StepMode::Chunk};
+  // DS4N_SWEEP_PROFILE: the time since the last lap, once both GPUs finished, into a phase's bucket.
+  const bool profiling = std::getenv("DS4N_SWEEP_PROFILE") != nullptr;
+  SweepProfile profile;
+  auto mark = std::chrono::steady_clock::now();
+  auto lap = [&](double SweepProfile::*bucket) {
+    if (!profiling) return;
+    sync();
+    const auto now = std::chrono::steady_clock::now();
+    profile.*bucket += std::chrono::duration<double, std::milli>(now - mark).count();
+    mark = now;
+  };
 
   for (size_t first = 0; first < tokens; first += per_chunk) {
     const size_t n = std::min(per_chunk, tokens - first);
@@ -1135,11 +1300,12 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
       Gpu& s = *gp;
       check(cudaSetDevice(s.device), "cudaSetDevice");
       for (const auto& [layer, unused] : s.layers)
-        for (const int rows : {kMaxRows, tail}) {
-          const std::tuple<int, int, int, bool> key{layer, rows, parity, true};
-          if (layer < kLayers && graphs && !s.graphs.contains(key))
-            s.graphs[key] = capture(s.stream, [&] { s.enqueue_layer(layer, rows, parity, true); });
-        }
+        for (const int rows : {kMaxRows, tail})
+          for (const StepMode mode : modes) {
+            const std::tuple<int, int, int, StepMode> key{layer, rows, parity, mode};
+            if (layer < kLayers && graphs && !s.graphs.contains(key))
+              s.graphs[key] = capture(s.stream, [&] { s.enqueue_layer(layer, rows, parity, mode); });
+          }
     }
 
     // The sweep's steps are posted as such: their Misses take scratch Slots, not the decode Slots.
@@ -1151,21 +1317,71 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
       }
     };
     post_as(&Staging::sweep_on);
+    lap(&SweepProfile::setup);
 
-    // Layer by layer, every Round through the layer before any goes on: a layer's Experts are read
-    // once for the chunk.
-    for (const auto& [layer, unused] : lead.layers) {
-      if (layer >= kLayers) continue;  // DSpark stages run in draft()
-      for (int g = 0; g < rounds; g++)
+    // Every Round's step of `layer` in `mode`, on both GPUs. Attention halves end each segment of
+    // kSegmentRounds Rounds with its routing copied to the host (GPU 0) and an event on both GPUs,
+    // published to `launched`.
+    auto launch_rounds = [&](int layer, StepMode mode, LaunchedSegments* launched = nullptr) {
+      for (int g = 0; g < rounds; g++) {
         for (auto& gp : gpus_) {
           Gpu& s = *gp;
           check(cudaSetDevice(s.device), "cudaSetDevice");
           check(cudaMemcpyAsync(s.chunk.current, s.chunk.round_numbers + g, sizeof(int32_t), cudaMemcpyHostToDevice,
                                 s.stream),
                 "chunk Round");
-          if (graphs) check(cudaGraphLaunch(s.graphs.at({layer, rows_of(g), parity, true}), s.stream), "cudaGraphLaunch");
-          else s.enqueue_layer(layer, rows_of(g), parity, true);
+          if (graphs) check(cudaGraphLaunch(s.graphs.at({layer, rows_of(g), parity, mode}), s.stream), "cudaGraphLaunch");
+          else s.enqueue_layer(layer, rows_of(g), parity, mode);
         }
+        if (mode != StepMode::ChunkAttention || ((g + 1) % kSegmentRounds != 0 && g + 1 != rounds)) continue;
+        const int segment = g / kSegmentRounds;
+        const size_t t0 = static_cast<size_t>(segment) * kSegmentRounds * kMaxRows;
+        const size_t t1 = std::min(n, static_cast<size_t>(g + 1) * kMaxRows);
+        for (auto& gp : gpus_) {
+          Gpu& s = *gp;
+          check(cudaSetDevice(s.device), "cudaSetDevice");
+          if (s.rank == 0) {
+            const size_t at = t0 * moe::kTopK, count = (t1 - t0) * moe::kTopK;
+            check(cudaMemcpyAsync(s.grouped.pinned_route_experts + at, s.chunk.route_experts + at, count * sizeof(int32_t),
+                                  cudaMemcpyDeviceToHost, s.stream),
+                  "segment routing");
+            check(cudaMemcpyAsync(s.grouped.pinned_route_weights + at, s.chunk.route_weights + at, count * sizeof(float),
+                                  cudaMemcpyDeviceToHost, s.stream),
+                  "segment routing");
+          }
+          check(cudaEventRecord(s.grouped.segment_done[segment], s.stream), "cudaEventRecord");
+        }
+        if (launched) launched->publish(static_cast<size_t>(segment) + 1);
+      }
+    };
+
+    // Layer by layer, every Round through the layer before any goes on: a layer's Experts are read
+    // once for the chunk.
+    for (const auto& [layer, unused] : lead.layers) {
+      if (layer >= kLayers) continue;  // DSpark stages run in draft()
+      if (!grouped) {
+        launch_rounds(layer, StepMode::Chunk);
+        lap(&SweepProfile::steps);
+      } else {
+        // The Experts are placed on a thread of their own: launching blocks once CUDA's launch queue
+        // is full, which would otherwise hold placement back until the halves nearly ran.
+        LaunchedSegments launched;
+        auto placing = std::async(std::launch::async, [&, layer = layer] {
+          return place_segments(layer, n, place, launched, profiling ? &profile : nullptr);
+        });
+        try {
+          launch_rounds(layer, StepMode::ChunkAttention, &launched);
+        } catch (...) {
+          launched.abandon();
+          placing.wait();
+          throw;
+        }
+        const std::vector<std::optional<uint32_t>> slot_of = placing.get();
+        grouped_moe(layer, n, slot_of);
+        lap(&SweepProfile::steps);  // attention halves and the Experts, placement overlapping the halves
+        launch_rounds(layer, StepMode::ChunkCombine);
+        lap(&SweepProfile::combine);
+      }
       if (std::getenv("DS4N_SWEEP_CHECK")) {  // diagnostic: name the layer a fault comes from
         sync();
         std::fprintf(stderr, "sweep: layer %d done (%d Rounds)\n", layer, rounds);
@@ -1177,6 +1393,164 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
     p0_ = c0 + static_cast<int64_t>(rounds - 1) * kMaxRows;
     engram_staged_ = any_engram;
   }
+  if (profiling && grouped)
+    std::fprintf(stderr,
+                 "sweep profile, %zu tokens (ms, phases waited for): setup %.0f, attention halves + Experts %.0f (the "
+                 "host waited %.0f for routing and placed for %.0f meanwhile), combine halves %.0f\n",
+                 tokens, profile.setup, profile.steps, profile.waiting, profile.placement, profile.combine);
+  else if (profiling)
+    std::fprintf(stderr, "sweep profile, %zu tokens (ms, phases waited for): setup %.0f, layer steps %.0f\n", tokens,
+                 profile.setup, profile.steps);
+}
+
+std::vector<std::optional<uint32_t>> Decoder::place_segments(int layer, size_t tokens, const ExpertPlacer& place,
+                                                             LaunchedSegments& launched, SweepProfile* profile) {
+  using Clock = std::chrono::steady_clock;
+  using Ms = std::chrono::duration<double, std::milli>;
+  const Gpu::Grouped& routing = gpus_[0]->grouped;  // the routing is the same on both GPUs
+
+  // Once a segment of Rounds ran its attention halves on both GPUs (so both finished the previous
+  // layer's Experts, whose scratch Slots placement may now evict), the Experts its routing newly
+  // names are placed while the GPUs go on with the next segments. Only this thread's own CUDA calls
+  // wait here (events, the residency's copies): the launching thread never blocks on it.
+  std::vector<std::optional<uint32_t>> slot_of(moe::kExperts);
+  const size_t segment_tokens = static_cast<size_t>(kSegmentRounds) * kMaxRows;
+  for (size_t t0 = 0, k = 0; t0 < tokens; t0 += segment_tokens, k++) {
+    const auto t_wait = Clock::now();
+    if (!launched.wait_for(k)) throw CudaError("prefill: the attention halves were not all launched");
+    for (auto& gp : gpus_) {
+      check(cudaSetDevice(gp->device), "cudaSetDevice");
+      check(cudaEventSynchronize(gp->grouped.segment_done[k]), "segment routing");
+    }
+    const auto t_place = Clock::now();
+    const size_t t1 = std::min(tokens, t0 + segment_tokens);
+    const auto routed = moe::routed_experts(
+        std::span<const int32_t>(routing.pinned_route_experts + t0 * moe::kTopK, (t1 - t0) * moe::kTopK), moe::kExperts);
+    if (!routed) throw CudaError("prefill: layer " + std::to_string(layer) + ": " + routed.error().what);
+    std::vector<int32_t> wanted;  // not placed by an earlier segment
+    for (const int32_t e : routed.value())
+      if (!slot_of[e]) wanted.push_back(e);
+    for (size_t i = 0; i < wanted.size(); i += moe::kMaxJobs) {
+      const auto batch = std::span(wanted).subspan(i, std::min<size_t>(moe::kMaxJobs, wanted.size() - i));
+      const std::vector<uint32_t> slots = place(layer, batch);
+      if (slots.size() != batch.size()) throw CudaError("prefill: the Expert placer returned the wrong number of Slots");
+      for (size_t j = 0; j < batch.size(); j++) slot_of[batch[j]] = slots[j];
+    }
+    if (profile) {
+      profile->waiting += Ms(t_place - t_wait).count();
+      profile->placement += Ms(Clock::now() - t_place).count();
+    }
+  }
+  return slot_of;
+}
+
+void Decoder::grouped_moe(int layer, size_t tokens, std::span<const std::optional<uint32_t>> slot_of) {
+  const Gpu::Grouped& routing = gpus_[0]->grouped;  // all segments' routing landed (place_segments)
+  auto planned = moe::group_tokens(std::span<const int32_t>(routing.pinned_route_experts, tokens * moe::kTopK),
+                                   std::span<const float>(routing.pinned_route_weights, tokens * moe::kTopK), tokens,
+                                   moe::kExperts);
+  if (!planned) throw CudaError("prefill: layer " + std::to_string(layer) + ": " + planned.error().what);
+  const moe::GroupPlan& plan = planned.value();
+  if (plan.groups.size() > routing.layer_groups) throw CudaError("prefill: more MoE groups than a layer has room for");
+  for (auto& gp : gpus_) {
+    check(cudaSetDevice(gp->device), "cudaSetDevice");
+    check(cudaMemsetAsync(gp->chunk.y, 0, tokens * kDim * sizeof(float), gp->stream), "chunk MoE output");
+  }
+
+  // Groups [begin, end) on both GPUs, kGroupBatch at a time; routed group begin + i in Slot slots[i].
+  auto enqueue = [&](size_t begin, size_t end, std::span<const uint32_t> slots) {
+    for (auto& gp : gpus_) {
+      Gpu& s = *gp;
+      check(cudaSetDevice(s.device), "cudaSetDevice");
+      const DeviceLayer& d = s.layers.at(layer);
+      std::vector<const uint8_t*> halves(slots.size());
+      for (size_t i = 0; i < slots.size(); i++) halves[i] = s.experts.pool + slots[i] * s.experts.slot_bytes;
+      for (size_t at = begin; at < end; at += kGroupBatch) {
+        const size_t count = std::min<size_t>(kGroupBatch, end - at);
+        const std::span<const uint8_t* const> batch_halves =
+            halves.empty() ? std::span<const uint8_t* const>{} : std::span<const uint8_t* const>(halves).subspan(at - begin, count);
+        s.enqueue_groups(plan, at, count, d, batch_halves);
+      }
+    }
+  };
+  // Every routed group's Expert was placed, its copies landed. The scratch Slots are least recently
+  // used and a layer needs at most 384, so no later placement of the layer evicted one.
+  std::vector<uint32_t> group_slots(plan.routed);
+  for (size_t i = 0; i < plan.routed; i++) {
+    const std::optional<uint32_t> slot = slot_of[plan.groups[i].expert];
+    if (!slot) throw CudaError("prefill: a routed Expert was never placed (internal invariant broken)");
+    group_slots[i] = *slot;
+  }
+  enqueue(0, plan.routed, group_slots);
+  enqueue(plan.routed, plan.groups.size(), {});  // the shared Expert, after every routed one (the combine order)
+}
+
+}  // namespace ds4n::engine
+
+namespace ds4n::engine {
+
+void Decoder::Gpu::enqueue_groups(const moe::GroupPlan& plan, size_t first, size_t count, const DeviceLayer& d,
+                                  std::span<const uint8_t* const> halves) {
+  // Tables and jobs at the groups' own places in the layer-wide pinned arrays (no upload's source
+  // is rewritten before it ran), uploaded, then gather + quantize, gate/up, SwiGLU, down, accumulate.
+  Grouped& gr = grouped;
+  const cudaStream_t st = stream;
+  const size_t cols = first * kMaxRows;
+  cuda::GemvJob* jobs = gr.pinned_jobs + 3 * first;
+  int* warps_at = gr.pinned_first + 3 * first;
+  const int split_blocks = cuda::split_blocks_for(kDimBlocks, kSplitsExpert);
+  int gate_up_warps = 0, down_warps = 0;
+  for (size_t i = 0; i < count; i++) {
+    const moe::Group& g = plan.groups[first + i];
+    for (int c = 0; c < kMaxRows; c++) {
+      gr.pinned_token_of[cols + i * kMaxRows + c] = g.token[c];
+      gr.pinned_weight[cols + i * kMaxRows + c] = g.weight[c];
+    }
+    const cuda::ActFragments act{gr.act_codes + i * kDimBlocks * 256, gr.act_scales + i * kDimBlocks * 8, kDimBlocks};
+    const cuda::ActFragments hidden = gr.buf.hidden_of(static_cast<int>(i));
+    float* gate_out = gr.buf.gate_of(static_cast<int>(i));
+    float* up_out = gr.buf.up_of(static_cast<int>(i));
+    float* down_out = gr.buf.down_of(static_cast<int>(i));
+    cuda::GemvJob gate, up, down;
+    if (g.expert == moe::kSharedExpert) {  // the shared Expert's Half: this GPU's dense FP8 rows, as a Round runs it
+      gate = fp8_job(d.shared_gate, 0, act, gate_out, kExpertRows, kSplitsExpert);
+      up = fp8_job(d.shared_up, 0, act, up_out, kExpertRows, kSplitsExpert);
+      down = fp8_job(d.shared_down, 0, hidden, down_out, kDim, 1);
+    } else {  // a routed Expert's Half in its Slot, as resolve_experts lays its jobs out
+      const uint8_t* half = halves[i];
+      gate = {cuda::WeightFormat::Mxfp4, half, act.codes, act.scales, gate_out, kExpertRows, kDimBlocks, kSplitsExpert,
+              split_blocks};
+      up = {cuda::WeightFormat::Mxfp4, half + kExpertPartBytes, act.codes, act.scales, up_out, kExpertRows, kDimBlocks,
+            kSplitsExpert, split_blocks};
+      down = {cuda::WeightFormat::Mxfp4, half + 2 * kExpertPartBytes, hidden.codes, hidden.scales, down_out, kDim,
+              kExpertDownBlocks, 1, kExpertDownBlocks};
+    }
+    jobs[2 * i] = gate;
+    jobs[2 * i + 1] = up;
+    jobs[2 * count + i] = down;
+    warps_at[2 * i] = gate_up_warps;
+    gate_up_warps += cuda::job_warps(gate);
+    warps_at[2 * i + 1] = gate_up_warps;
+    gate_up_warps += cuda::job_warps(up);
+    warps_at[2 * count + i] = down_warps;
+    down_warps += cuda::job_warps(down);
+  }
+  check(cudaMemcpyAsync(gr.token_of + cols, gr.pinned_token_of + cols, count * kMaxRows * sizeof(int32_t),
+                        cudaMemcpyHostToDevice, st),
+        "group tokens");
+  check(cudaMemcpyAsync(gr.weight + cols, gr.pinned_weight + cols, count * kMaxRows * sizeof(float), cudaMemcpyHostToDevice,
+                        st),
+        "group weights");
+  check(cudaMemcpyAsync(gr.jobs + 3 * first, jobs, 3 * count * sizeof(cuda::GemvJob), cudaMemcpyHostToDevice, st),
+        "group jobs");
+  check(cudaMemcpyAsync(gr.first + 3 * first, warps_at, 3 * count * sizeof(int), cudaMemcpyHostToDevice, st), "group jobs");
+  const int n = static_cast<int>(count);
+  cuda::gather_quantize(chunk.xf, kDimBlocks, gr.token_of + cols, n, gr.act_codes, gr.act_scales, st);
+  cuda::gemv(gr.jobs + 3 * first, gr.first + 3 * first, 2 * n, gate_up_warps, st);
+  cuda::swiglu_quantize_groups(gr.token_of + cols, gr.weight + cols, n, gr.buf, moe::kSwigluLimit, st);
+  cuda::gemv(gr.jobs + 3 * first + 2 * count, gr.first + 3 * first + 2 * count, n, down_warps, st);
+  cuda::accumulate_groups(gr.token_of + cols, n, gr.buf, chunk.y, st);
+  check(cudaGetLastError(), "grouped MoE launches");
 }
 
 }  // namespace ds4n::engine

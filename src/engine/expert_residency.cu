@@ -101,6 +101,16 @@ struct ExpertResidency::State {
   void serve();
   /** Posted step `s` through the cache; Loads land, and GPU 1 has routed the step, before the table changes. */
   void serve_step(const moe::PostedStep& step, uint64_t s, ResidencyStats& counts, std::vector<cache::Access>& seen);
+  /** `keys` through the two regions (see the comment inside); the Loads, Slots in pool numbering. */
+  std::vector<cache::Load> plan_keys(std::span<const cache::ExpertKey> keys, std::span<const cache::ExpertKey> hinted,
+                                     bool sweep, ResidencyStats& counts);
+  /** The table names the Loads' Slots and forgets what they evicted (their copies have landed). */
+  void publish(std::span<const cache::Load> loads);
+  /** A resident key's Slot in pool numbering. */
+  uint32_t slot_of(cache::ExpertKey key) const;
+  // Held by the service around each step and by place(): the caches, the reader and the copy
+  // streams have one user at a time.
+  std::mutex placement;
 };
 
 ExpertResidency::State::~State() {
@@ -205,10 +215,30 @@ void ExpertResidency::State::serve_step(const moe::PostedStep& step, uint64_t s,
       near.push_back(k);
   }
   if (config.record_accesses) seen.push_back({keys, near});
+  const bool sweep = (step.flags & moe::kSweepStep) != 0;
+  const auto loads = plan_keys(keys, config.hints && !sweep ? std::span<const cache::ExpertKey>(near)
+                                                            : std::span<const cache::ExpertKey>{},
+                               sweep, counts);
+  if (loads.empty()) return;
+  const auto t0 = Clock::now();
+  load(loads, counts);
+  // The table changes only once GPU 1 routed this step too: Cache-conditional routing reads it.
+  const auto wait_start = Clock::now();
+  while (std::atomic_ref<uint64_t>(mailbox->peer_routed).load(std::memory_order_acquire) < s) {
+    if (Clock::now() - wait_start > std::chrono::seconds(10)) fail("GPU 1 never routed step " + std::to_string(s));
+    _mm_pause();
+  }
+  publish(loads);
+  counts.exposed_ms += ms_since(t0);
+}
+
+std::vector<cache::Load> ExpertResidency::State::plan_keys(std::span<const cache::ExpertKey> keys,
+                                                           std::span<const cache::ExpertKey> hinted, bool sweep,
+                                                           ResidencyStats& counts) {
   // Two regions: the decode Slots and the scratch Slots a prompt sweep's Misses take. A key lives in
-  // at most one; where it lives it is a Hit. A sweep step's other keys load into scratch, a decode
+  // at most one; where it lives it is a Hit. A sweep's other keys load into scratch, a decode
   // step's into the decode Slots, so a sweep never evicts what decode keeps.
-  const bool sweep = scratch.has_value() && (step.flags & moe::kSweepStep) != 0;
+  sweep = sweep && scratch.has_value();
   std::vector<cache::ExpertKey> decode_keys, scratch_keys;
   for (const cache::ExpertKey k : keys) {
     const bool in_scratch = scratch && scratch->slot_of(k).has_value();
@@ -217,7 +247,6 @@ void ExpertResidency::State::serve_step(const moe::PostedStep& step, uint64_t s,
   }
   std::vector<cache::Load> loads;
   if (!decode_keys.empty() || !sweep) {
-    const auto hinted = config.hints && !sweep ? std::span<const cache::ExpertKey>(near) : std::span<const cache::ExpertKey>{};
     auto placed = vram.plan(decode_keys, hinted);
     if (!placed) fail("Expert cache: " + placed.error().what);
     counts.hits += placed.value().hits.size();
@@ -232,21 +261,22 @@ void ExpertResidency::State::serve_step(const moe::PostedStep& step, uint64_t s,
       loads.push_back(l);
     }
   }
-  if (loads.empty()) return;
-  const auto t0 = Clock::now();
-  load(loads, counts);
-  // The table changes only once GPU 1 routed this step too: Cache-conditional routing reads it.
-  const auto wait_start = Clock::now();
-  while (std::atomic_ref<uint64_t>(mailbox->peer_routed).load(std::memory_order_acquire) < s) {
-    if (Clock::now() - wait_start > std::chrono::seconds(10)) fail("GPU 1 never routed step " + std::to_string(s));
-    _mm_pause();
-  }
+  return loads;
+}
+
+void ExpertResidency::State::publish(std::span<const cache::Load> loads) {
   // The copies landed: now the table may name the new Slots (and forget the evicted Experts).
   for (const auto& l : loads) {
     if (l.evicted) std::atomic_ref<int32_t>(table[*l.evicted]).store(-1, std::memory_order_relaxed);
     std::atomic_ref<int32_t>(table[l.key]).store(static_cast<int32_t>(l.slot), std::memory_order_relaxed);
   }
-  counts.exposed_ms += ms_since(t0);
+}
+
+uint32_t ExpertResidency::State::slot_of(cache::ExpertKey key) const {
+  if (const auto s = vram.slot_of(key)) return *s;
+  if (scratch)
+    if (const auto s = scratch->slot_of(key)) return config.slots + *s;
+  fail("an Expert just placed has no Slot (internal invariant broken)");
 }
 
 void ExpertResidency::State::serve() {
@@ -264,7 +294,10 @@ void ExpertResidency::State::serve() {
       std::vector<cache::Access> seen;
       for (uint64_t s = done + 1; s <= posted; s++) {
         const moe::PostedStep step = mailbox->ring[(s - 1) % moe::kMissRing];
-        serve_step(step, s, counts, seen);
+        {
+          std::lock_guard placing(placement);
+          serve_step(step, s, counts, seen);
+        }
         std::atomic_ref<uint64_t>(board->served).store(s, std::memory_order_release);
         done = s;
       }
@@ -400,6 +433,37 @@ std::unique_ptr<ExpertResidency> ExpertResidency::open(const ResidencyConfig& co
 }
 
 cuda::ExpertDirectory ExpertResidency::directory(int rank) const { return s_->directories.at(rank); }
+
+std::vector<uint32_t> ExpertResidency::place(int layer, std::span<const int32_t> experts) {
+  State& s = *s_;
+  if (layer < 0 || layer >= static_cast<int>(store::kLayers)) fail("place: layer out of range");
+  if (experts.empty() || experts.size() > kBatch) fail("place: 1 to 48 Experts at a time");
+  std::vector<cache::ExpertKey> keys;
+  for (const int32_t e : experts) {
+    if (e < 0 || e >= static_cast<int32_t>(store::kExperts)) fail("place: Expert out of range");
+    keys.push_back(s.key_of(layer, e));
+  }
+  ResidencyStats counts;
+  std::vector<uint32_t> slots;
+  {
+    std::lock_guard placing(s.placement);
+    const auto loads = s.plan_keys(keys, {}, true, counts);
+    if (!loads.empty()) {
+      const auto t0 = Clock::now();
+      s.load(loads, counts);
+      s.publish(loads);
+      counts.exposed_ms += ms_since(t0);
+    }
+    for (const cache::ExpertKey k : keys) slots.push_back(s.slot_of(k));
+  }
+  std::lock_guard lock(s.mutex);
+  s.stats.hits += counts.hits;
+  s.stats.ram_hits += counts.ram_hits;
+  s.stats.store_reads += counts.store_reads;
+  s.stats.exposed_ms += counts.exposed_ms;
+  if (s.config.record_accesses) s.accesses.push_back({keys, {}});
+  return slots;
+}
 
 ResidencyStats ExpertResidency::stats() const {
   std::lock_guard lock(s_->mutex);

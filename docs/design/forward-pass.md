@@ -168,7 +168,7 @@ Expert union, ~5 new Experts per layer per added row):
 An added row costs ~31 us per layer, what streaming its new Experts' Halves costs (5 x 9.4 MB at
 1.45 TB/s): Rounds are bound by routed-Expert bandwidth, and by Misses once Experts are not
 resident. Prefill much past this needs an Expert-major path -- route a long chunk, then stream
-each Expert once per layer for every row it serves -- with GEMMs for N > 8.
+each Expert once per layer for every row it serves: the prompt sweep's grouped MoE (below).
 
 Deadlock rules the decoder states and enforces: no host call that can wait on a GPU while its
 peer's side of an exchange is unlaunched -- per-Round uploads through pinned staging, both GPUs'
@@ -236,11 +236,44 @@ only: the dumps stay byte-identical.
 | 17,965 tokens | 202 tok/s | **284 tok/s** | 27,062 -> 11,312 | 17 -> 38 tok/s |
 
 The reads are now at their floor (each Expert outside the decode Slots once per chunk: ~6.9K at
-8,500 Slots). What is left is compute: every Round streams its ~35 routed Experts per layer (~0.26
-of ~0.4 ms per Round and layer), so a 9K chunk spends ~18 s re-streaming Experts that a grouped
-pass -- each Expert once per layer over all of the chunk's tokens it serves, with the same
-per-column arithmetic -- would stream in ~0.1 s; and 3.2 s of host work (embeddings, Engram rows)
-runs before the first launch.
+8,500 Slots). What was left is compute: every Round streams its ~35 routed Experts per layer (~0.26
+of ~0.4 ms per Round and layer), ~18 s of a 9K chunk.
+
+**Grouped MoE** (`Decoder::prefill` with an `ExpertPlacer`). A sweep's layer runs in three phases.
+The attention halves (`StepMode::ChunkAttention`: Engram, attention, the FFN input rows and the
+routing, left in chunk arrays by token) run for every Round. The host groups the chunk's routing by
+Expert (`core/moe_groups`: each routed Expert over its tokens ascending, 8 token columns per group,
+then the shared Expert once per Round) and runs the groups 512 at a time: the group's FFN input rows
+gathered and act_quant'ed (`gather_quantize`), gate/up, SwiGLU, down -- each Expert's weights stream
+once per 8 of its tokens, not once per Round that meets it -- and `accumulate_groups` adds each
+column into its token's FP32 partial, group by group. Then the combine halves (`ChunkCombine`: the
+MoE exchange and hc_post per Round). Exact: a GEMV output column depends only on its own input
+column, and a token meets its Experts in ascending id with the shared one last, from 0 -- `combine`'s
+order. `ds4n-moe-check --chunk 1027` (layer 3's real router, 224 Experts in several groups): the
+per-GPU partials differ from the Rounds' in 0 of 5.3 M floats; `ds4n-model-run` dumps are
+byte-identical (the short prompts against the exact run, 9K and 18K tokens against the Rounds').
+
+Placement runs beside the attention halves. Each segment of 32 Rounds ends with its routing copied
+to pinned memory (GPU 0) and an event on both GPUs; a placing thread waits for each segment (both
+GPUs past it means both finished the previous layer's Experts, whose scratch Slots may now be
+evicted) and places the Experts its routing newly names (`moe::new_experts`, then
+`ExpertResidency::place`) while the GPUs run the later segments. The scratch Slots are least
+recently used and a layer needs at most 384 of them, so no placement evicts a Slot its own layer
+reads. Placement needs a thread of its own: a layer's 2,284 launches fill CUDA's launch queue, so the
+launching thread blocks until the halves nearly ran (placing from it gained only 5 %).
+
+| Prompt | sweep, scratch Slots | grouped MoE | + placement beside the halves |
+|---|---|---|---|
+| 9,129 tokens | 281 tok/s | 385 tok/s | **512 tok/s** |
+| 17,965 tokens | 284 tok/s | 394 tok/s | **524 tok/s** |
+
+Where a 9K prompt's 17.8 s go (`DS4N_SWEEP_PROFILE=1`): 3.1 s of host work (embeddings, Engram
+rows) before the sweep; per layer, the placing thread waits for the first segment's routing (2.4 s
+in all) and reads ~163 Experts (9.6 s in all, 12.8 GB/s: the drive saturated) beside the attention
+halves (9.3 s); the grouped Experts take 0.4 s, the combine halves 0.9 s. The drive is the bound.
+What is left: the drive idles while a layer's first segment routes and while its Experts and
+combine halves run (~95 ms per layer); the attention halves stream their dense weights (~70 MB per
+GPU and layer) once per Round; the host work runs before the first launch.
 
 ## Expert residency
 

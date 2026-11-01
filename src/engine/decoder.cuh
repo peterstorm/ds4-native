@@ -38,8 +38,10 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -82,9 +84,14 @@ struct DraftBlock {
 /** How the decoder issues a layer step's kernels. */
 enum class Launches { Graphs, Eager };
 
+/**
+ * Places up to 48 of a layer's Experts in VRAM Slots for a prompt sweep's grouped MoE and returns
+ * each one's Slot (pool numbering, both GPUs) once its Halves landed: ExpertResidency::place.
+ */
+using ExpertPlacer = std::function<std::vector<uint32_t>(int layer, std::span<const int32_t> experts)>;
+
 class Decoder {
  public:
-  /** Two devices with peer access to each other, and each one's view of the Expert cache. */
   /**
    * Two devices with peer access to each other, and each one's view of the Expert cache.
    * `chunk_rounds`: the Rounds of 8 a prompt sweep (prefill) takes at once; 0 for none.
@@ -129,8 +136,18 @@ class Decoder {
    * meets them after an eviction. The same outputs as the Rounds one after another (causality: a row
    * reads only earlier positions, all in the caches by then). The last Round stays the current one
    * (logits()); returns once everything is launched.
+   *
+   * With `place`, the MoE is grouped: a layer's attention halves run for every Round while the host
+   * places the Experts their routing names, a segment of Rounds at a time as it arrives; then the
+   * host groups the chunk's routing by Expert (core/moe_groups) and runs each Expert once per 8 of
+   * its tokens (its weights read once per 8 tokens, not once per Round), then the combine halves.
+   * The same outputs: a GEMV column depends only on its token, and each token's Experts add in the
+   * Round's order. The host waits on each segment's routing only after every halves' exchange of
+   * the layer is launched; returns once the last layer's combine halves are launched. Without, each
+   * Round runs whole steps.
    */
-  void prefill(int64_t p0, std::span<const float> embeddings, std::span<const uint8_t> engram_rows = {});
+  void prefill(int64_t p0, std::span<const float> embeddings, std::span<const uint8_t> engram_rows = {},
+               const ExpertPlacer& place = {});
 
   /** Wait until both GPUs finished everything launched so far. */
   void sync();
@@ -163,6 +180,24 @@ class Decoder {
 
  private:
   struct Gpu;
+  /**
+   * A prompt sweep's time by phase in ms (DS4N_SWEEP_PROFILE: both GPUs waited for at each phase's
+   * end), and the host's time inside the grouped phase waiting for routing and placing Experts.
+   */
+  struct SweepProfile {
+    double setup = 0, steps = 0, waiting = 0, placement = 0, combine = 0;
+  };
+  struct LaunchedSegments;  // decoder.cu: how many segments of a layer's attention halves are launched
+  /**
+   * On a sweep's placing thread, while the host launches `layer`'s attention halves: as each segment
+   * of Rounds ran its halves, the Experts its routing names that no earlier segment placed, placed.
+   * Returns each Expert's Slot (none: no token routed to it); adds the time waiting for routing and
+   * placing to `profile`.
+   */
+  std::vector<std::optional<uint32_t>> place_segments(int layer, size_t tokens, const ExpertPlacer& place,
+                                                      LaunchedSegments& launched, SweepProfile* profile);
+  /** A sweep's grouped MoE for `layer` over the chunk's first `tokens` tokens, its Experts in `slot_of`. */
+  void grouped_moe(int layer, size_t tokens, std::span<const std::optional<uint32_t>> slot_of);
   std::array<std::unique_ptr<Gpu>, 2> gpus_;
   Launches launches_;
   int rows_ = 0;

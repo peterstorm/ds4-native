@@ -26,6 +26,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -93,6 +94,16 @@ class ExpertResidency {
 
   /** GPU `rank`'s view for the resolve kernel (rank 0 posts the steps). */
   cuda::ExpertDirectory directory(int rank) const;
+
+  /**
+   * Place up to 48 of `layer`'s Experts from the host, for a prompt sweep's grouped MoE: those in
+   * either region are Hits, the rest load as a sweep step's do (into the scratch Slots). Returns
+   * each one's Slot in pool numbering (the pool `directory(rank)` names), once its copies landed.
+   * Call only while no posted step waits on the service and no GPU work reads the Slots this
+   * placement could evict (a sweep's earlier batches excepted: the scratch Slots are least recently
+   * used).
+   */
+  std::vector<uint32_t> place(int layer, std::span<const int32_t> experts);
 
   /** A snapshot of the counters. */
   ResidencyStats stats() const;

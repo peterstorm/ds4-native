@@ -24,6 +24,26 @@ __global__ void quantize_kernel(const __nv_bfloat16* __restrict__ x, int tokens,
   if (lane == 0) scales[b * kMaxTokens + n] = 127;
 }
 
+/** Groups of 8 gathered token rows: warp (group, block, column); the empty columns as quantize_kernel's. */
+__global__ void gather_quantize_kernel(const __nv_bfloat16* __restrict__ x, int blocks, const int32_t* __restrict__ token_of,
+                                       int groups, uint8_t* __restrict__ codes, uint8_t* __restrict__ scales) {
+  const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const int lane = threadIdx.x & 31;
+  if (warp >= groups * blocks * kMaxTokens) return;
+  const int g = warp / (blocks * kMaxTokens), b = (warp / kMaxTokens) % blocks, n = warp % kMaxTokens;
+  uint8_t* group_codes = codes + static_cast<size_t>(g) * blocks * 256;
+  uint8_t* group_scales = scales + static_cast<size_t>(g) * blocks * kMaxTokens;
+  const int32_t t = token_of[g * kMaxTokens + n];
+  if (t >= 0) {
+    ops::act_quantize_lane(__bfloat162float(x[static_cast<size_t>(t) * blocks * 32 + b * 32 + lane]), b, n, group_codes,
+                           group_scales);
+    return;
+  }
+  const int q = (lane & 15) >> 2, j = lane & 3, hi = lane >> 4;
+  group_codes[b * 256 + (4 * n + q) * 8 + hi * 4 + j] = 0;
+  if (lane == 0) group_scales[b * kMaxTokens + n] = 127;
+}
+
 /** The last job whose first warp is <= `warp` (jobs are laid out back to back). */
 __device__ __forceinline__ int find_job(const int* __restrict__ first_warp, int n_jobs, int warp) {
   int lo = 0, hi = n_jobs - 1;
@@ -136,6 +156,12 @@ void reduce_splits(const float* partials, int splits, int rows, float* out, cuda
 void quantize_activations(const __nv_bfloat16* x, int tokens, ActFragments act, cudaStream_t stream) {
   const int warps = act.blocks * kMaxTokens;
   quantize_kernel<<<(warps * 32 + 127) / 128, 128, 0, stream>>>(x, tokens, act.blocks, act.codes, act.scales);
+}
+
+void gather_quantize(const __nv_bfloat16* x, int blocks, const int32_t* token_of, int groups, uint8_t* codes, uint8_t* scales,
+                     cudaStream_t stream) {
+  const int64_t warps = static_cast<int64_t>(groups) * blocks * kMaxTokens;
+  if (warps > 0) gather_quantize_kernel<<<static_cast<unsigned>((warps * 32 + 127) / 128), 128, 0, stream>>>(x, blocks, token_of, groups, codes, scales);
 }
 
 void gemv(const GemvJob* jobs, const int* first_warp, int n_jobs, int total_warps, cudaStream_t stream) {

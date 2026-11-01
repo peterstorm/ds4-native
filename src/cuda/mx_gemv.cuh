@@ -29,6 +29,14 @@ struct ActFragments {
 /** x is [tokens][blocks*32] BF16 (row-major), tokens <= 8. */
 void quantize_activations(const __nv_bfloat16* x, int tokens, ActFragments act, cudaStream_t stream);
 
+/**
+ * Groups of 8 gathered rows of x ([rows][blocks*32] BF16): group g's fragments (codes at g * blocks *
+ * 256, scales at g * blocks * 8) hold row token_of[g * 8 + c] in column c, quantized exactly as
+ * quantize_activations would; columns with token -1 stay empty (zero codes, scale 2^0).
+ */
+void gather_quantize(const __nv_bfloat16* x, int blocks, const int32_t* token_of, int groups, uint8_t* codes, uint8_t* scales,
+                     cudaStream_t stream);
+
 /** How a job's weights are stored: MXFP4 tiles (core/mx_tiles tile_matrix) or FP8 tiles (tile_fp8_matrix). */
 enum class WeightFormat : int32_t { Mxfp4, Fp8 };
 

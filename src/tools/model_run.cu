@@ -3,14 +3,16 @@
 //
 //   ds4n-model-run --backbone SAFETENSORS --store STORE --gguf MERGED_GGUF --tokens DIR --names a,b
 //                  --out DIR [--oracle DIR] [--force 1] [--steps N] [--slots N] [--ram-records R] [--prior PROFILE]
-//                  [--prior-weight W] [--ram-policy recent|popular] [--ccr LAMBDA] [--sweep N | --prefill R]
+//                  [--prior-weight W] [--ram-policy recent|popular] [--ccr LAMBDA] [--sweep N [--grouped 0|1] | --prefill R]
 //                  [--access-log FILE] [--vram-policy lru|picks] [--hints 0|1] [--dspark DIR [--verify-rows N]]
 //
 // For each name, DIR/<name>.tokens is antirez's --dump-tokens output (ids on the first line). The
 // prompt runs from position 0 as a prompt sweep (engine::Decoder::prefill: chunks of up to N Rounds
 // of 8 rows, each chunk layer by layer; --sweep, default 1152) or, with --sweep 0, as Rounds of R
 // rows one after another (--prefill, 1 to 8, default 8); both give the logits of one token at a time
-// (see engine/decoder.cuh). The next-token logits at its end go to
+// (see engine/decoder.cuh). A sweep's MoE is grouped by Expert across the chunk (--grouped 1, the
+// default: each Expert placed once and run once per 8 of its tokens); --grouped 0 runs each Round's
+// whole layer step. The next-token logits at its end go to
 // OUT/<name>.logits.json, then a greedy continuation of up to N steps (default 64) with top-20
 // logprobs per step goes to OUT/<name>.logprobs.json, both in antirez's schema. With --oracle,
 // ORACLE/<name>.logits.json and .logprobs.json are compared as they come: KL and top-20 at the
@@ -145,7 +147,7 @@ int main(int argc, char** argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   setenv("CUDA_MODULE_LOADING", "EAGER", 1);  // before any CUDA call: see engine/decoder.cuh
   std::string backbone_path, store_path, gguf_path, tokens_dir, names_arg, out_dir, oracle_dir, prior_path, access_log, dspark_dir;
-  bool force = false;
+  bool force = false, grouped = true;
   int max_steps = 64, prefill_rows = model::kMaxRows, verify_rows = 0, sweep_rounds = 1152;
   uint32_t slots = 8000, ram_records = 512, prior_weight = 1;
   float ccr = 0.0f;
@@ -167,6 +169,7 @@ int main(int argc, char** argv) {
     else if (s == "--steps") max_steps = std::stoi(argv[++i]);
     else if (s == "--prefill") prefill_rows = std::stoi(argv[++i]);
     else if (s == "--sweep") sweep_rounds = std::stoi(argv[++i]);
+    else if (s == "--grouped") grouped = std::string(argv[++i]) == "1";
     else if (s == "--slots") slots = static_cast<uint32_t>(std::stoul(argv[++i]));
     else if (s == "--ram-records") ram_records = static_cast<uint32_t>(std::stoul(argv[++i]));
     else if (s == "--prior") prior_path = argv[++i];
@@ -327,11 +330,15 @@ int main(int argc, char** argv) {
     if (sweep_rounds > 0) {
       const auto [embeddings, raw_rows] = inputs(prompt, nullptr);
       const double host_s = std::chrono::duration<double>(Clock::now() - t_prompt).count();
-      decoder.prefill(0, embeddings, raw_rows);
+      const engine::ExpertPlacer place = [&](int layer, std::span<const int32_t> experts) {
+        return residency->place(layer, experts);
+      };
+      decoder.prefill(0, embeddings, raw_rows, grouped ? place : engine::ExpertPlacer{});
       const auto all = decoder.logits();
       logits = row(all, all.size() / model::kVocab - 1);
-      char buf[96];
-      std::snprintf(buf, sizeof buf, "a sweep of up to %d Rounds a chunk (host %.2f s)", sweep_rounds, host_s);
+      char buf[128];
+      std::snprintf(buf, sizeof buf, "a sweep of up to %d Rounds a chunk%s (host %.2f s)", sweep_rounds,
+                    grouped ? ", MoE grouped" : "", host_s);
       how = buf;
     } else {
       for (size_t p0 = 0; p0 < prompt.size(); p0 += prefill_rows) {

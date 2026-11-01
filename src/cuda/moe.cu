@@ -171,26 +171,12 @@ __device__ __forceinline__ float swiglu(float gate, float up, float weight, floa
 /**
  * One warp per (slot, 32-row K block of down). Lane t = 4n + q produces token
  * n's hidden values 4q..4q+3 and 16+4q..16+4q+3 of the block: exactly its B
- * fragment bytes, so the codes go out as one 8-byte store per lane.
+ * fragment bytes, so the codes go out as one 8-byte store per lane. `live` and
+ * `weight` are the lane's token column's.
  */
-/** Which slots a SwiGLU launch covers; Shared reads no Plan (it may run while routing writes one). */
-enum class Slots { All, Routed, Shared };
-
-template <Slots S>
-__global__ void __launch_bounds__(128) swiglu_kernel(const moe::Plan* __restrict__ plan, int shared_tokens, MoeBuffers buf,
-                                                     float limit) {
-  const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
-  const int lane = threadIdx.x & 31;
-  const int blocks = buf.rows / 32;
-  constexpr int kSlots = S == Slots::All ? kJobSlots : (S == Slots::Routed ? moe::kMaxJobs : 1);
-  if (warp >= kSlots * blocks) return;
-  const int slot = S == Slots::Shared ? kSharedJob : warp / blocks, b = warp % blocks;
-  const bool shared = slot == kSharedJob;
-  if (!shared && slot >= plan->jobs) return;  // warp-uniform
+__device__ __forceinline__ void swiglu_slot(const MoeBuffers& buf, int slot, int b, int lane, bool live, float weight,
+                                            float limit) {
   const int n = lane >> 2, q = lane & 3;
-  const int tokens = S == Slots::Shared ? shared_tokens : plan->tokens;
-  const bool live = n < tokens && (shared || ((plan->token_mask[slot] >> n) & 1));
-  const float weight = shared ? 1.0f : plan->weight[slot][n];
   const size_t plane = static_cast<size_t>(buf.rows) * kMaxTokens;
   const float* g = buf.gate_of(slot);
   const float* u = buf.up_of(slot);
@@ -226,6 +212,57 @@ __global__ void __launch_bounds__(128) swiglu_kernel(const moe::Plan* __restrict
   const ActFragments frag = buf.hidden_of(slot);
   *reinterpret_cast<uint2*>(frag.codes + b * 256 + lane * 8) = make_uint2(lo, hi);
   if (q == 0) frag.scales[b * kMaxTokens + n] = static_cast<uint8_t>(exp + 127);
+}
+
+/** Which slots a SwiGLU launch covers; Shared reads no Plan (it may run while routing writes one). */
+enum class Slots { All, Routed, Shared };
+
+template <Slots S>
+__global__ void __launch_bounds__(128) swiglu_kernel(const moe::Plan* __restrict__ plan, int shared_tokens, MoeBuffers buf,
+                                                     float limit) {
+  const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const int lane = threadIdx.x & 31;
+  const int blocks = buf.rows / 32;
+  constexpr int kSlots = S == Slots::All ? kJobSlots : (S == Slots::Routed ? moe::kMaxJobs : 1);
+  if (warp >= kSlots * blocks) return;
+  const int slot = S == Slots::Shared ? kSharedJob : warp / blocks, b = warp % blocks;
+  const bool shared = slot == kSharedJob;
+  if (!shared && slot >= plan->jobs) return;  // warp-uniform
+  const int n = lane >> 2;
+  const int tokens = S == Slots::Shared ? shared_tokens : plan->tokens;
+  const bool live = n < tokens && (shared || ((plan->token_mask[slot] >> n) & 1));
+  swiglu_slot(buf, slot, b, lane, live, shared ? 1.0f : plan->weight[slot][n], limit);
+}
+
+/** The grouped pass's SwiGLU: slot g is group g, its columns live where a token sits. */
+__global__ void __launch_bounds__(128) swiglu_groups_kernel(const int32_t* __restrict__ token_of,
+                                                            const float* __restrict__ weight, int groups, MoeBuffers buf,
+                                                            float limit) {
+  const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const int lane = threadIdx.x & 31;
+  const int blocks = buf.rows / 32;
+  if (warp >= groups * blocks) return;
+  const int g = warp / blocks, column = g * kMaxTokens + (lane >> 2);
+  swiglu_slot(buf, g, warp % blocks, lane, token_of[column] >= 0, weight[column], limit);
+}
+
+/**
+ * The grouped pass's combine: one thread per output row, the groups in order -- so each token takes
+ * its Experts' down outputs in the order the groups list them (ascending Expert, the shared last).
+ */
+__global__ void accumulate_groups_kernel(const int32_t* __restrict__ token_of, int groups, MoeBuffers buf,
+                                         float* __restrict__ y) {
+  const int r = blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= buf.dim) return;
+  for (int g = 0; g < groups; g++) {
+    const float* down = buf.down_of(g) + static_cast<size_t>(r) * kMaxTokens;
+    for (int c = 0; c < kMaxTokens; c++) {
+      const int32_t t = token_of[g * kMaxTokens + c];
+      if (t < 0) break;  // columns fill from the left
+      float* out = y + static_cast<size_t>(t) * buf.dim + r;
+      *out = __fadd_rn(*out, down[c]);
+    }
+  }
 }
 
 /** One thread per output row r: all tokens' sums in the fixed slot order. */
@@ -284,6 +321,16 @@ void swiglu_quantize_shared(int tokens, MoeBuffers buf, float limit, cudaStream_
 
 void combine(const moe::Plan* plan, MoeBuffers buf, float* y, cudaStream_t stream) {
   combine_kernel<<<(buf.dim + 127) / 128, 128, 0, stream>>>(plan, buf, y);
+}
+
+void swiglu_quantize_groups(const int32_t* token_of, const float* weight, int groups, MoeBuffers buf, float limit,
+                            cudaStream_t stream) {
+  const int warps = groups * (buf.rows / 32);
+  if (warps > 0) swiglu_groups_kernel<<<(warps * 32 + 127) / 128, 128, 0, stream>>>(token_of, weight, groups, buf, limit);
+}
+
+void accumulate_groups(const int32_t* token_of, int groups, MoeBuffers buf, float* y, cudaStream_t stream) {
+  if (groups > 0) accumulate_groups_kernel<<<(buf.dim + 127) / 128, 128, 0, stream>>>(token_of, groups, buf, y);
 }
 
 void add_round_bf16(const float* a, const float* b, size_t n, __nv_bfloat16* out, cudaStream_t stream) {

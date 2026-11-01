@@ -95,6 +95,22 @@ void swiglu_quantize_shared(int tokens, MoeBuffers buf, float limit, cudaStream_
  */
 void combine(const moe::Plan* plan, MoeBuffers buf, float* y, cudaStream_t stream);
 
+/**
+ * A prompt sweep's grouped MoE (core/moe_groups): `buf` slot g is group g, column c of it serves
+ * chunk token token_of[g * 8 + c] (-1: empty, columns filled from the left) with routing weight
+ * weight[g * 8 + c]. The SwiGLU and quantization of each slot's gate/up planes, exactly as
+ * swiglu_quantize does for a Round's slot.
+ */
+void swiglu_quantize_groups(const int32_t* token_of, const float* weight, int groups, MoeBuffers buf, float limit,
+                            cudaStream_t stream);
+
+/**
+ * y[token][r] += down output of each group's column serving the token, the groups in order (each
+ * token's in ascending Expert, the shared last): from y = 0 this is combine's sum, bit for bit.
+ * y is [chunk tokens][dim].
+ */
+void accumulate_groups(const int32_t* token_of, int groups, MoeBuffers buf, float* y, cudaStream_t stream);
+
 /** out[i] = bf16(a[i] + b[i]): the two GPUs' partials, rounded once. */
 void add_round_bf16(const float* a, const float* b, size_t n, __nv_bfloat16* out, cudaStream_t stream);
 

@@ -6,6 +6,11 @@
 // work is timed per stage, with weights rotated over copies so L2 cannot serve them.
 //
 //   ds4n-moe-check --store STORE --layer L [--backbone SAFETENSORS] [--tokens T] [--splits S] [--router-splits R] [--iters I] [--seed N]
+//                  [--chunk N]
+//
+// --chunk N also runs a prompt sweep's grouped MoE (core/moe_groups: each Expert over all of N tokens
+// it serves, 8 per group) for Half 0 and requires it to match the same tokens run as Rounds of 8, bit
+// for bit.
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -14,12 +19,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <optional>
 #include <random>
 #include <string>
 #include <vector>
 
+#include "core/moe_groups.hpp"
 #include "core/moe_reference.hpp"
 #include "core/mx_reference.hpp"
 #include "core/mx_tiles.hpp"
@@ -221,7 +228,7 @@ struct Agreement {
 int main(int argc, char** argv) {
   std::string store_path, backbone_path;
   uint32_t layer = 3;
-  int tokens = 1, splits = 2, router_splits = 5, iters = 200, sets = 8;
+  int tokens = 1, splits = 2, router_splits = 5, iters = 200, sets = 8, chunk = 0;
   unsigned seed = 7;
   for (int i = 1; i < argc; i++) {
     const std::string s = argv[i];
@@ -234,9 +241,10 @@ int main(int argc, char** argv) {
     else if (s == "--iters") iters = std::stoi(argv[++i]);
     else if (s == "--seed") seed = static_cast<unsigned>(std::stoul(argv[++i]));
     else if (s == "--backbone") backbone_path = argv[++i];
+    else if (s == "--chunk") chunk = std::stoi(argv[++i]);
     else die("unknown argument " + s);
   }
-  if (store_path.empty() || tokens < 1 || tokens > cuda::kMaxTokens || splits < 1 || router_splits < 1 ||
+  if (store_path.empty() || tokens < 1 || tokens > cuda::kMaxTokens || splits < 1 || router_splits < 1 || chunk < 0 ||
       (kDim / 256) % router_splits != 0)
     die("bad arguments (router splits must divide 20)");
   std::mt19937 rng(seed);
@@ -370,14 +378,15 @@ int main(int argc, char** argv) {
                            const uint8_t* s_gate, const uint8_t* s_up, const uint8_t* s_down) {
     using cuda::WeightFormat;
     std::vector<cuda::GemvJob> gate_up, down;
-    for (int j = 0; j < plan.jobs; j++) {
-      const auto hid = buf.hidden_of(j);
-      gate_up.push_back({WeightFormat::Mxfp4, payloads[j], x_act.codes, x_act.scales, buf.gate_of(j), kRows,
+    for (size_t j = 0; j < payloads.size(); j++) {  // routed jobs, one per payload
+      const int slot = static_cast<int>(j);
+      const auto hid = buf.hidden_of(slot);
+      gate_up.push_back({WeightFormat::Mxfp4, payloads[j], x_act.codes, x_act.scales, buf.gate_of(slot), kRows,
                          kGateBlocks, splits, sb});
       gate_up.push_back({WeightFormat::Mxfp4, payloads[j] + store::kHalfPartBytes, x_act.codes, x_act.scales,
-                         buf.up_of(j), kRows, kGateBlocks, splits, sb});
+                         buf.up_of(slot), kRows, kGateBlocks, splits, sb});
       down.push_back({WeightFormat::Mxfp4, payloads[j] + 2 * store::kHalfPartBytes, hid.codes, hid.scales,
-                      buf.down_of(j), kDim, kDownBlocks, 1, kDownBlocks});
+                      buf.down_of(slot), kDim, kDownBlocks, 1, kDownBlocks});
     }
     const int shared_slot = cuda::kSharedJob;
     const auto shid = buf.hidden_of(shared_slot);
@@ -466,6 +475,116 @@ int main(int argc, char** argv) {
   std::printf("MoE output (BF16): %.4f%% bit-identical, max error %.3g of the largest\n", out_agreement.percent(),
               out_agreement.relative());
   if (out_agreement.relative() > 1e-2) die("MoE output disagrees with the oracle");
+
+  // --chunk N: a prompt sweep's grouped MoE (Half 0, core/moe_groups) over N tokens against the same
+  // tokens as Rounds of 8 (route, Plan, the Round's combine), bit for bit.
+  if (chunk > 0) {
+    const int rounds = (chunk + cuda::kMaxTokens - 1) / cuda::kMaxTokens;
+    std::vector<float> cf(static_cast<size_t>(chunk) * kDim);
+    std::vector<__nv_bfloat16> cb(cf.size());
+    for (size_t i = 0; i < cf.size(); i++) {
+      cf[i] = mx::round_bf16(normal(rng) * norm[i % kDim]);
+      cb[i] = __float2bfloat16(cf[i]);
+    }
+    auto* d_cf = upload(cf.data(), cf.size());
+    auto* d_cb = upload(cb.data(), cb.size());
+    auto* d_cexperts = device_alloc<int32_t>(static_cast<size_t>(chunk) * moe::kTopK);
+    auto* d_cweights = device_alloc<float>(static_cast<size_t>(chunk) * moe::kTopK);
+    std::map<int32_t, const uint8_t*> half0;  // Half 0 of each Expert the chunk routes to, read once
+    auto payload_of = [&](int32_t e) {
+      auto [it, fresh] = half0.try_emplace(e, nullptr);
+      if (fresh) {
+        const auto at = store::half_offset({layer, static_cast<uint32_t>(e)}, 0);
+        if (auto r = io::pread_exact(fd.value(), staging.span(), at); !r) die(r.error().what);
+        it->second = upload(reinterpret_cast<const uint8_t*>(staging.span().data()), store::kHalfPayloadBytes);
+      }
+      return it->second;
+    };
+    const SharedHalf& sh = *shared[0];
+    float* y_rounds = device_alloc<float>(static_cast<size_t>(chunk) * kDim);
+    for (int g = 0; g < rounds; g++) {
+      const int rows = std::min(cuda::kMaxTokens, chunk - g * cuda::kMaxTokens);
+      const size_t t0 = static_cast<size_t>(g) * cuda::kMaxTokens;
+      cuda::bf16_gemv(d_router, d_cf + t0 * kDim, moe::kExperts, kDim, rows, router_splits, d_logits, nullptr);
+      cuda::route(d_logits, router_splits, rows, nullptr, router_params, d_cexperts + t0 * moe::kTopK,
+                  d_cweights + t0 * moe::kTopK, d_plan, nullptr);
+      const moe::Plan round_plan = download(d_plan, 1)[0];
+      if (round_plan.jobs < 1) die("chunk routing failed");
+      std::vector<const uint8_t*> payloads;
+      for (int j = 0; j < round_plan.jobs; j++) payloads.push_back(payload_of(round_plan.expert[j]));
+      cuda::quantize_activations(d_cb + t0 * kDim, rows, x_act, nullptr);
+      run_moe(make_launches(bufs[0], payloads, sh.d_gate, sh.d_up, sh.d_down), bufs[0], y_rounds + t0 * kDim, nullptr);
+    }
+    const auto chunk_experts = download(d_cexperts, static_cast<size_t>(chunk) * moe::kTopK);
+    const auto chunk_weights = download(d_cweights, static_cast<size_t>(chunk) * moe::kTopK);
+    auto grouped = moe::group_tokens(chunk_experts, chunk_weights, static_cast<size_t>(chunk), moe::kExperts);
+    if (!grouped) die("group_tokens: " + grouped.error().what);
+    const moe::GroupPlan& groups = grouped.value();
+
+    // The grouped pass, kBatch groups at a time in the plan's order (the shared ones last).
+    constexpr int kBatch = 512;
+    const size_t plane = static_cast<size_t>(splits) * kRows * cuda::kMaxTokens;
+    const cuda::MoeBuffers gb{device_alloc<float>(kBatch * plane),
+                              device_alloc<float>(kBatch * plane),
+                              device_alloc<uint8_t>(static_cast<size_t>(kBatch) * kDownBlocks * 256),
+                              device_alloc<uint8_t>(static_cast<size_t>(kBatch) * kDownBlocks * 8),
+                              device_alloc<float>(static_cast<size_t>(kBatch) * kDim * cuda::kMaxTokens),
+                              kRows,
+                              splits,
+                              kDim};
+    auto* g_codes = device_alloc<uint8_t>(static_cast<size_t>(kBatch) * kGateBlocks * 256);
+    auto* g_scales = device_alloc<uint8_t>(static_cast<size_t>(kBatch) * kGateBlocks * 8);
+    float* y_groups = device_alloc<float>(static_cast<size_t>(chunk) * kDim);
+    ck(cudaMemset(y_groups, 0, static_cast<size_t>(chunk) * kDim * sizeof(float)), "memset");
+    size_t split_experts = 0;
+    for (size_t i = 1; i < groups.routed; i++)  // an Expert counted at its second group
+      split_experts += groups.groups[i].expert == groups.groups[i - 1].expert &&
+                       (i == 1 || groups.groups[i - 2].expert != groups.groups[i].expert);
+    for (size_t at = 0; at < groups.groups.size(); at += kBatch) {
+      const size_t count = std::min<size_t>(kBatch, groups.groups.size() - at);
+      std::vector<int32_t> token_of;
+      std::vector<float> weight;
+      std::vector<cuda::GemvJob> gate_up, down;
+      using cuda::WeightFormat;
+      for (size_t i = 0; i < count; i++) {
+        const moe::Group& g = groups.groups[at + i];
+        token_of.insert(token_of.end(), g.token.begin(), g.token.end());
+        weight.insert(weight.end(), g.weight.begin(), g.weight.end());
+        uint8_t* codes = g_codes + i * kGateBlocks * 256;
+        uint8_t* scales = g_scales + i * kGateBlocks * 8;
+        const int slot = static_cast<int>(i);
+        const auto hid = gb.hidden_of(slot);
+        const bool is_shared = g.expert == moe::kSharedExpert;
+        const WeightFormat format = is_shared ? WeightFormat::Fp8 : WeightFormat::Mxfp4;
+        const uint8_t* payload = is_shared ? nullptr : payload_of(g.expert);
+        gate_up.push_back({format, is_shared ? sh.d_gate : payload, codes, scales, gb.gate_of(slot), kRows, kGateBlocks,
+                           splits, sb});
+        gate_up.push_back({format, is_shared ? sh.d_up : payload + store::kHalfPartBytes, codes, scales, gb.up_of(slot),
+                           kRows, kGateBlocks, splits, sb});
+        down.push_back({format, is_shared ? sh.d_down : payload + 2 * store::kHalfPartBytes, hid.codes, hid.scales,
+                        gb.down_of(slot), kDim, kDownBlocks, 1, kDownBlocks});
+      }
+      const Launch gu = make_launch(gate_up), dn = make_launch(down);
+      const int32_t* d_token_of = upload(token_of.data(), token_of.size());
+      const float* d_weight = upload(weight.data(), weight.size());
+      const int n = static_cast<int>(count);
+      cuda::gather_quantize(d_cb, kGateBlocks, d_token_of, n, g_codes, g_scales, nullptr);
+      cuda::gemv(gu.jobs, gu.first, gu.n, gu.warps, nullptr);
+      cuda::swiglu_quantize_groups(d_token_of, d_weight, n, gb, moe::kSwigluLimit, nullptr);
+      cuda::gemv(dn.jobs, dn.first, dn.n, dn.warps, nullptr);
+      cuda::accumulate_groups(d_token_of, n, gb, y_groups, nullptr);
+    }
+    ck(cudaDeviceSynchronize(), "grouped MoE");
+    const auto want = download(y_rounds, static_cast<size_t>(chunk) * kDim);
+    const auto got = download(y_groups, static_cast<size_t>(chunk) * kDim);
+    size_t differ = 0;
+    for (size_t i = 0; i < want.size(); i++) differ += std::memcmp(&want[i], &got[i], sizeof(float)) != 0;
+    std::printf("grouped MoE over %d tokens (%zu groups: %zu routed over %zu Experts, %zu of them in several groups; "
+                "%zu shared): per-GPU partials %s (%zu of %zu floats differ from the Rounds')\n",
+                chunk, groups.groups.size(), groups.routed, half0.size(), split_experts,
+                groups.groups.size() - groups.routed, differ ? "DIFFER" : "bit-identical", differ, want.size());
+    if (differ) die("the grouped MoE differs from the Rounds'");
+  }
 
   // Timing: one GPU's decode-layer MoE work (Half 0), weights rotated over `sets` copies.
   std::vector<HalfLaunches> set_launches;
