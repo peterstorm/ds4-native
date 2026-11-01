@@ -178,6 +178,30 @@ Result<std::vector<float>, io::IoError> load_bf16_row(const Backbone& b, const s
   return R::ok(std::move(out));
 }
 
+Result<EmbeddingTable, io::IoError> EmbeddingTable::load(const Backbone& b) {
+  using R = Result<EmbeddingTable, io::IoError>;
+  const uint64_t shape[] = {static_cast<uint64_t>(model::kVocab), static_cast<uint64_t>(model::kDim)};
+  const auto t = safetensors::expect(b.header, "embed.weight", D::BF16, shape);
+  if (!t) return R::err({t.error().what});
+  auto bytes = io::read_tensor(b.fd, *t.value());
+  if (!bytes) return R::err(bytes.error());
+  EmbeddingTable table;
+  table.rows_ = model::kVocab;
+  table.cols_ = model::kDim;
+  table.bits_.resize(bytes.value().size() / 2);
+  std::memcpy(table.bits_.data(), bytes.value().data(), bytes.value().size());
+  return R::ok(std::move(table));
+}
+
+Result<std::vector<float>, io::IoError> EmbeddingTable::row(int64_t token) const {
+  using R = Result<std::vector<float>, io::IoError>;
+  if (token < 0 || token >= rows_) return R::err({"embed.weight: row out of range"});
+  std::vector<float> out(static_cast<size_t>(cols_));
+  const uint16_t* bits = bits_.data() + static_cast<size_t>(token) * cols_;
+  for (size_t i = 0; i < out.size(); i++) out[i] = mx::bf16_value(bits[i]);
+  return R::ok(std::move(out));
+}
+
 }  // namespace ds4n::engine
 
 namespace ds4n::engine {

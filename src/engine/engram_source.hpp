@@ -28,12 +28,23 @@ class EngramRows {
   /** The 24 rows `ids` of Engram table `table` (0: layer 1, 1: layer 14), as 24 x 264 bytes. */
   Result<std::vector<uint8_t>, io::IoError> read(int table, std::span<const uint32_t> ids) const;
 
+  /** A token's table rows, as engram::Step::rows. */
+  using TokenRows = std::array<std::array<uint32_t, engram::kCols>, engram::kLayers>;
+
   /**
-   * One token's rows of both tables (`rows` as engram::Step::rows) as table 0's 24 x 264 bytes, then
-   * table 1's: all 48 reads in flight at once (rows are random and may come from disk).
+   * One token's rows of both tables as table 0's 24 x 264 bytes, then table 1's (read_tokens of one
+   * token).
    */
-  Result<std::vector<uint8_t>, io::IoError> read_token(
-      const std::array<std::array<uint32_t, engram::kCols>, engram::kLayers>& rows) const;
+  Result<std::vector<uint8_t>, io::IoError> read_token(const TokenRows& rows) const;
+
+  /**
+   * Every token's rows, token after token (each as read_token lays them out): kBulkDepth reads in
+   * flight at once across tokens, so a prompt's rows come at the drive's random-read rate rather than
+   * 48 at a time.
+   */
+  Result<std::vector<uint8_t>, io::IoError> read_tokens(std::span<const TokenRows> tokens) const;
+
+  static constexpr unsigned kBulkDepth = 1024;
 
  private:
   struct Table {
@@ -42,7 +53,7 @@ class EngramRows {
     uint64_t rows = 0;
   };
   std::vector<io::Fd> fds_;
-  mutable std::optional<io::UringReader> reader_;  // buffered reads, a token's rows in one batch
+  mutable std::optional<io::UringReader> reader_;  // buffered reads, kBulkDepth in flight
   std::array<Table, engram::kLayers> tables_{};
 };
 

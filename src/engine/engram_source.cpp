@@ -1,5 +1,6 @@
 #include "engine/engram_source.hpp"
 
+#include <algorithm>
 #include <cstring>
 
 #include "core/gguf.hpp"
@@ -70,7 +71,7 @@ Result<EngramRows, io::IoError> EngramRows::open(const std::vector<std::string>&
     if (!fd) return Out::err(fd.error());
     r.fds_.push_back(std::move(fd).value());
   }
-  auto reader = io::UringReader::create(2 * engram::kCols, false);
+  auto reader = io::UringReader::create(kBulkDepth, false);
   if (!reader) return Out::err(reader.error());
   r.reader_.emplace(std::move(reader).value());
   for (int t = 0; t < engram::kLayers; t++) {
@@ -101,24 +102,36 @@ Result<std::vector<uint8_t>, io::IoError> EngramRows::read(int table, std::span<
   return Out::ok(std::move(out));
 }
 
-Result<std::vector<uint8_t>, io::IoError> EngramRows::read_token(
-    const std::array<std::array<uint32_t, engram::kCols>, engram::kLayers>& rows) const {
+Result<std::vector<uint8_t>, io::IoError> EngramRows::read_token(const TokenRows& rows) const {
+  return read_tokens(std::span(&rows, 1));
+}
+
+Result<std::vector<uint8_t>, io::IoError> EngramRows::read_tokens(std::span<const TokenRows> tokens) const {
   using Out = Result<std::vector<uint8_t>, io::IoError>;
-  std::vector<uint8_t> out(engram::kLayers * engram::kCols * engram::kRowBytes);
+  constexpr size_t kTokenBytes = static_cast<size_t>(engram::kLayers) * engram::kCols * engram::kRowBytes;
+  std::vector<uint8_t> out(tokens.size() * kTokenBytes);
   std::vector<io::ReadRequest> reads;
-  for (int table = 0; table < engram::kLayers; table++) {
-    const Table& t = tables_[table];
-    if (t.rows == 0) return Out::err({"Engram table " + std::to_string(table) + " is not in the opened shards"});
-    for (int i = 0; i < engram::kCols; i++) {
-      const uint32_t id = rows[table][i];
-      if (id >= t.rows) return Out::err({"Engram row id out of range"});
-      const size_t at = (static_cast<size_t>(table) * engram::kCols + i) * engram::kRowBytes;
-      reads.push_back({fds_[t.shard].get(), t.offset + static_cast<uint64_t>(id) * engram::kRowBytes,
-                       std::as_writable_bytes(std::span(out).subspan(at, engram::kRowBytes)), reads.size()});
+  reads.reserve(tokens.size() * engram::kLayers * engram::kCols);
+  for (size_t n = 0; n < tokens.size(); n++)
+    for (int table = 0; table < engram::kLayers; table++) {
+      const Table& t = tables_[table];
+      if (t.rows == 0) return Out::err({"Engram table " + std::to_string(table) + " is not in the opened shards"});
+      for (int i = 0; i < engram::kCols; i++) {
+        const uint32_t id = tokens[n][table][i];
+        if (id >= t.rows) return Out::err({"Engram row id out of range"});
+        const size_t at = n * kTokenBytes + (static_cast<size_t>(table) * engram::kCols + i) * engram::kRowBytes;
+        reads.push_back({fds_[t.shard].get(), t.offset + static_cast<uint64_t>(id) * engram::kRowBytes,
+                         std::as_writable_bytes(std::span(out).subspan(at, engram::kRowBytes)), reads.size()});
+      }
     }
-  }
-  if (auto s = reader_->submit(reads); !s) return Out::err(s.error());
-  for (size_t done = 0; done < reads.size();) {
+  // Keep the queue full: top it up after every reap.
+  size_t next = 0, done = 0;
+  while (done < reads.size()) {
+    const size_t room = std::min<size_t>(reader_->depth() - reader_->in_flight(), reads.size() - next);
+    if (room > 0) {
+      if (auto s = reader_->submit(std::span(reads).subspan(next, room)); !s) return Out::err(s.error());
+      next += room;
+    }
     auto c = reader_->wait(1);
     if (!c) return Out::err(c.error());
     for (const auto& r : c.value()) {

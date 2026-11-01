@@ -28,6 +28,21 @@ Result<HostLayer, io::IoError> load_layer(const Backbone& b, int layer);
 /** One row of a BF16 matrix (the embedding) as floats. */
 Result<std::vector<float>, io::IoError> load_bf16_row(const Backbone& b, const std::string& name, int64_t row);
 
+/**
+ * The token embedding ([129280][5120] BF16, 1.3 GB) held in RAM, read once: a prompt's rows then
+ * cost a copy each instead of a read (the Backbone's records are large and not cached).
+ */
+class EmbeddingTable {
+ public:
+  static Result<EmbeddingTable, io::IoError> load(const Backbone& b);
+  /** Token `token`'s row as floats (BF16 values); fails for an id outside the vocabulary. */
+  Result<std::vector<float>, io::IoError> row(int64_t token) const;
+
+ private:
+  std::vector<uint16_t> bits_;  // [rows][cols] BF16
+  int64_t rows_ = 0, cols_ = 0;
+};
+
 }  // namespace ds4n::engine
 
 namespace ds4n::engine {

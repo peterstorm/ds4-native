@@ -235,12 +235,13 @@ int main(int argc, char** argv) {
     if (!h) die(h.error().what);
     decoder.add_head(h.value().norm, h.value().head);
   }
-  std::printf("Backbone: 40 layers and the head loaded in %.1f s\n",
+  auto embeddings = engine::EmbeddingTable::load(backbone.value());
+  if (!embeddings) die(embeddings.error().what);
+  std::printf("Backbone: 40 layers, the head and the embedding loaded in %.1f s\n",
               std::chrono::duration<double>(Clock::now() - t_load).count());
   auto embedding = [&](int32_t token) {
-    if (token < 0 || token >= model::kVocab) die("token id out of range: " + std::to_string(token));
-    auto emb = engine::load_bf16_row(backbone.value(), "embed.weight", token);
-    if (!emb) die(emb.error().what);
+    auto emb = embeddings.value().row(token);
+    if (!emb) die("token " + std::to_string(token) + ": " + emb.error().what);
     return std::move(emb).value();
   };
   const bool dspark = !dspark_dir.empty();
@@ -286,8 +287,12 @@ int main(int argc, char** argv) {
     // `histories`, when given, gets the history after each token.
     engram::History history;
     std::vector<double> step_ms, host_ms;  // whole Rounds; the host's part before launching (embeddings, Engram rows)
+    // All the tokens' rows are read at once (EngramRows::read_tokens keeps the drive's queue full).
     auto inputs = [&](std::span<const int32_t> tokens, std::vector<engram::History>* histories) {
       std::pair<std::vector<float>, std::vector<uint8_t>> in;
+      in.first.reserve(tokens.size() * model::kDim);
+      std::vector<engine::EngramRows::TokenRows> wanted;
+      wanted.reserve(tokens.size());
       for (const int32_t token : tokens) {
         const auto emb = embedding(token);
         in.first.insert(in.first.end(), emb.begin(), emb.end());
@@ -295,10 +300,11 @@ int main(int argc, char** argv) {
         if (!hashed) die(hashed.error().what);
         history = hashed.value().next;
         if (histories) histories->push_back(history);
-        auto raw = rows.value().read_token(hashed.value().rows);
-        if (!raw) die(raw.error().what);
-        in.second.insert(in.second.end(), raw.value().begin(), raw.value().end());
+        wanted.push_back(hashed.value().rows);
       }
+      auto raw = rows.value().read_tokens(wanted);
+      if (!raw) die(raw.error().what);
+      in.second = std::move(raw).value();
       return in;
     };
     // One Round of the whole model (tokens at positions p0, p0 + 1, ...): every row's logits
