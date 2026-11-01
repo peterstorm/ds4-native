@@ -415,12 +415,56 @@ at the low point: `--slots 8800 --ram-records 3300` is the measured setting.
 3,300 with the kernel exchanges the 36K and 60K prompts ran 3,497 and 3,745 tok/s: the copy engines
 are worth 9-11 %. All dumps byte-identical (the gates above).
 
-What is left (Nsight Systems at 36K, GPU 0's kernel time before the copy-engine exchanges): the MX
-GEMVs 2.07 s (the tensor pipe 42 % busy), sparse attention 1.22 s, the exchange kernels 1.15 s (now
-the Engram KV's only), `accumulate_tokens` 0.44 s, hc_mixes partials 0.37 s, `planes_rope` 0.29 s,
-`unrope_quantize` 0.28 s, `gather_quantize` 0.27 s. The GPUs' idle time is mostly waiting on the
-drive (Expert copies, Engram rows); up to ~18K tokens the drive, the Slots and the RAM records are
-the bound.
+**Idle time.** With the exchanges off the SMs, Nsight Systems had GPU 0 running kernels for 6.8 of
+a 36K sweep's 9.7 s. Its compute stream's gaps, grouped by the kernels on either side, named three
+causes, each fixed with the bits unchanged:
+- A wave's routing went to pinned memory by two tiny `cudaMemcpyAsync` on the compute stream, queued
+  on the copy engine behind the link stream's 10.5 MB P2P copy: ~470 us a wave (1.1 s), and GPU 1
+  stalled with it through the exchanges. `cuda::publish_routing` writes it from a kernel (posted PCIe
+  writes; the placing thread still reads it after `segment_done[k]`).
+- Between the last wave's routing and the grouped MoE's first launch the host spent ~4.7 ms a layer:
+  `group_tokens` grew 384 vectors, every batch's `token_columns` ran before any launch, and GPU 0 got
+  all its batches before GPU 1 got one. Each batch is now prepared and launched on both GPUs before
+  the next (the host's work runs beside the GPUs' earlier batches), and `group_tokens` is a counting
+  sort.
+- The Engram KV exchange moved 52 MB of partials a wave over the link before Attention could start.
+  The KV depends only on the tokens' rows, so each GPU now computes it whole: its own half of wkv's
+  K and the peer's (uploaded with the layer when sweeps are on, 81 MB a layer), two jobs of one
+  launch, the planes added GPU 0's + GPU 1's (`add_planes_bf16`, the exchange's arithmetic). That
+  needs both halves of a wave's rows quantized from pinned host memory, which read them one 32-byte
+  PCIe request per warp (828 us a half); a block per token now stages its rows by 8-byte loads
+  (70-100 us). The wave clock's Engram section at 36K: 418 -> 140 ms. The kernel exchange now
+  carries only Rounds: its inbox shrank 105 -> 1.6 MB a GPU, and `exchange_add` refuses an exchange
+  past it (it had no bound check).
+
+| Prompt | copy-engine exchanges | + routing by the SMs | + batches on both GPUs | + Engram KV whole |
+|---|---|---|---|---|
+| 9,129 tokens | 1,570 tok/s | 1,556 | 1,594 | **1,606 tok/s** |
+| 17,965 tokens | 2,247 | 2,256 | 2,292 | **2,306 tok/s** |
+| 35,930 tokens | 3,794-3,813 | 3,847-3,867 | 3,884-4,015 | **3,903-3,985 tok/s** |
+| 60,000 tokens | 4,143-4,166 | 4,340-4,380 | 4,286-4,406 | **4,353-4,461 tok/s** |
+
+(Runs vary by ~2 %; gains below that are the kernel's, not the table's.) Tried and dropped: the
+MX GEMV is latency-bound (Nsight Compute at 64 groups: 33 % occupancy from 122 registers and 33 KB
+of staging, stalls on the fixed-latency MMA chain 33 %, the first use of a weight load 21 %, shared
+loads 20 %); software-pipelined weight loads, separate A registers per block, non-volatile MMA asm
+and per-format kernels all landed within +-5 % of codegen noise (pipelining decode's one-group path
+cost it 10 %). Column-major down planes for `accumulate_tokens` gained 6 %: its cost is the `y` rows,
+read and written once per batch a token appears in (~7 a layer). Nsight Compute must not profile
+`ds4n-model-run`: replay saves device memory through host RAM, and with ~95 GB a GPU and 62 GB of
+pinned records it hung the host -- profile kernels through the check tools.
+
+What is left at 36K (Nsight Systems after these fixes): kernels 6.5 of an 8.7 s sweep. The idle
+time moved to the drive: each layer's grouped MoE waits a median 21 ms for its Experts' placement
+(1.1 s in all), and layer 1's waves wait 0.65 s for table 0's Engram rows. The drive serves both:
+2,713 store reads (~51 GB) beside 309K Engram rows, each a 16 KB ZFS record read for 264 bytes
+(~5 GB). Placing a layer's likely Experts ahead of its routing, while the previous layer's grouped
+MoE ran (a forecast from the profile's pick shares, kept clear of the running layer's Slots), was
+tried and dropped: 98 % of the forecast was then routed, yet 36K and 60K stayed within noise and 9K
+lost 7 % -- the loads are bound by the drive's and the links' throughput, not by when they start,
+and each wrong guess is a whole Expert read. The levers left are bytes: the Engram tables on small
+records (they are ~190 GiB, more than the pool has free), more RAM tier records (RAM is the limit),
+and fewer Slots' worth of misses.
 
 ## Expert residency
 
