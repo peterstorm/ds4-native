@@ -63,14 +63,18 @@ enum class StepMode { Round, Chunk };
 constexpr int kGroupBatch = 512;  // groups a grouped MoE launch works on at once (the size of its buffers)
 
 /**
- * A wave's layer work in the order it runs (Decoder::Gpu::enqueue_wave), each phase ending with at
- * most one exchange, so the host can launch a phase on both GPUs before either GPU's next phase:
- * however long a launch blocks, the peer's side of every exchange in flight is already launched.
- * EngramMix: an Engram layer's rows, GEMV and exchange. Attention: through the attention exchange.
- * Ffn: the stream after attention, the FFN mixes and input rows, routing. Combine (after the grouped
- * MoE): the MoE exchange and hc_post.
+ * A wave's layer work (Decoder::Gpu::enqueue_wave), each phase holding at most one exchange, so the
+ * host can launch a phase on both GPUs before either GPU's next phase: however long a launch blocks,
+ * the peer's side of every exchange in flight is already launched. EngramMix: an Engram layer's rows,
+ * GEMV and exchange. Attention: through the attention output's partial. AttentionSend, then
+ * AttentionAdd: that partial's exchange by the copy engines on the sweep's link stream (SweepLink).
+ * Ffn: the stream after attention, the FFN mixes and input rows, routing. CombineSend, CombineAdd
+ * (after the grouped MoE): the MoE output's exchange, the same way; CombinePost: hc_post into the
+ * stream. The host launches wave k's attention exchange before wave k - 1's Ffn, and a layer's
+ * combines between the next layer's waves (wave k + 1's exchange before the next layer's wave k), so
+ * every exchange runs beside other work.
  */
-enum class WavePhase { EngramMix, Attention, Ffn, Combine };
+enum class WavePhase { EngramMix, Attention, AttentionSend, AttentionAdd, Ffn, CombineSend, CombineAdd, CombinePost };
 
 constexpr int kWaveRows = kMaxRows * kWaveRounds;  // 512
 constexpr int kScoreRows = 128;                    // a wave's indexer rows scored at once (scores [128][65536])
@@ -376,21 +380,49 @@ struct Decoder::Gpu {
   struct Wave {
     int64_t *pos = nullptr, *ring_slot = nullptr;  // [capacity * 8]
     std::array<int64_t*, 3> latent_pos{}, compress_len{}, compress_row{}, produced_latent_pos{}, produced_compress_row{};
-    bf16 *h_next = nullptr, *h_mid = nullptr;  // [kWaveRows][4][5120]
-    bf16 *x0 = nullptr, *xa = nullptr, *qlora = nullptr, *qr = nullptr, *q = nullptr, *o = nullptr, *attn_out = nullptr;
+    bf16* h_mid = nullptr;  // [kWaveRows][4][5120]
+    bf16 *x0 = nullptr, *xa = nullptr, *qlora = nullptr, *qr = nullptr, *q = nullptr, *o = nullptr;
     bf16 *kv_engram = nullptr, *latent = nullptr, *latent_c = nullptr, *k_raw = nullptr, *k_idx = nullptr, *q_idx = nullptr;
-    bf16 *scores = nullptr, *moe_out = nullptr;
-    float *xa_f = nullptr, *xf_f = nullptr, *hc_scratch = nullptr, *partial = nullptr, *packed = nullptr, *latent_f = nullptr;
+    bf16* scores = nullptr;
+    float *xa_f = nullptr, *xf_f = nullptr, *hc_scratch = nullptr, *packed = nullptr, *latent_f = nullptr;
     float *planes_qa = nullptr, *planes_kv = nullptr, *planes_qb = nullptr, *planes_iq = nullptr, *planes_oa = nullptr;
     float *planes_ob = nullptr, *planes_bf = nullptr, *planes_proj = nullptr, *planes_eg = nullptr, *planes_wk = nullptr;
     float* logits = nullptr;
     cuda::ActFragments act_x{}, act_qr{}, act_o[kLocalGroups]{}, act_lora{}, act_engram{};
-    cuda::HcMixes* mix_attn = nullptr;
     cuda::IndexQueries queries{};
     cuda::IndexSelectRows select{};
     cuda::AttnScratch attn{};
     moe::Plan* plans = nullptr;  // [kWaveRounds]
+    // What lives from a wave's Attention to its Ffn, across the next wave's Attention: one per wave parity.
+    std::array<bf16*, 2> h_next{};             // [kWaveRows][4][5120]: the stream after Engram
+    std::array<cuda::HcMixes*, 2> mix_attn{};  // [kWaveRows]
+    std::array<float*, 2> partial{};           // [kWaveRows][5120]: the attention output's partial
+    std::array<bf16*, 2> attn_out{};           // [kWaveRows][5120]: its exchange
+    std::array<bf16*, 2> moe_out{};            // [kWaveRows][5120]: the MoE output's exchange (CombinePost)
   } wave;
+
+  /**
+   * A sweep's attention and MoE exchanges by the copy engines, on a stream of their own beside the
+   * compute on `stream`: each GPU copies its partial into the peer's inbox -- no SM spins on the
+   * link, as a kernel exchange's would beside the other kernels -- then adds the two in GPU 0 + GPU 1
+   * order (the kernel exchange's bits). `idle` joins the stream into `stream` at the sweep's end.
+   */
+  struct SweepLink {
+    /**
+     * One kind of exchange, by wave parity: the partial ready on `stream` (`ready`), copied into the
+     * peer's inbox (`sent`), added (`added`: the reader of the sum waits for it, and so does the
+     * peer's next copy into this inbox). Each event is waited on only after its record is issued.
+     */
+    struct Lane {
+      std::array<float*, 2> inbox{};  // [kWaveRows][5120]: the peer's partials
+      std::array<cudaEvent_t, 2> ready{}, sent{}, added{};
+    };
+    cudaStream_t stream = nullptr;
+    Lane attention, combine;
+    cudaEvent_t idle = nullptr;
+    const SweepLink* peer = nullptr;  // the other GPU's (its inboxes, its events)
+    int device = 0;
+  } sweep_link;
   std::map<int, LayerLaunches> wave_launches;  // per layer, into the wave's buffers (no shared Expert)
   WaveClock clock;                             // GPU 0's, when profiling
 

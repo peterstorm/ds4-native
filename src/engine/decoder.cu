@@ -131,6 +131,7 @@ Decoder::Decoder(std::array<int, 2> devices, std::array<cuda::ExpertDirectory, 2
   for (int g = 0; g < 2; g++) {
     gpus_[g]->link.peer_inbox = gpus_[1 - g]->link.inbox;
     gpus_[g]->link.peer_flags = gpus_[1 - g]->link.flags;
+    gpus_[g]->sweep_link.peer = &gpus_[1 - g]->sweep_link;
   }
   if (chunk_rounds > 0) {
     check(cudaHostAlloc(&sweep_engram_, 2 * static_cast<size_t>(chunk_rounds) * kEngramSlot,

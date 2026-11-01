@@ -137,7 +137,12 @@ void Decoder::Gpu::allocate_sweep(int chunk_rounds) {
     for (int64_t** field : {&w.latent_pos[r], &w.compress_len[r], &w.compress_row[r], &w.produced_latent_pos[r],
                             &w.produced_compress_row[r]})
       *field = a.alloc<int64_t>(N);
-  w.h_next = a.alloc<bf16>(W * kHcCopies * kDim);
+  for (int p = 0; p < 2; p++) {  // per wave parity: what a wave's Ffn reads after the next wave's Attention
+    w.h_next[p] = a.alloc<bf16>(W * kHcCopies * kDim);
+    w.mix_attn[p] = a.alloc<cuda::HcMixes>(W);
+    w.partial[p] = a.alloc<float>(W * kDim);
+    w.attn_out[p] = a.alloc<bf16>(W * kDim);
+  }
   w.h_mid = a.alloc<bf16>(W * kHcCopies * kDim);
   w.x0 = a.alloc<bf16>(W * kDim);
   w.xa = a.alloc<bf16>(W * kDim);
@@ -145,7 +150,6 @@ void Decoder::Gpu::allocate_sweep(int chunk_rounds) {
   w.qr = a.alloc<bf16>(W * kQLora);
   w.q = a.alloc<bf16>(W * kLocalHeads * kHeadDim);
   w.o = a.alloc<bf16>(W * kLocalHeads * kHeadDim);
-  w.attn_out = a.alloc<bf16>(W * kDim);
   w.kv_engram = a.alloc<bf16>(W * cuda::kEngramKvRows);
   w.latent = a.alloc<bf16>(W * kHeadDim);
   w.latent_c = a.alloc<bf16>(W * kHeadDim);
@@ -153,11 +157,10 @@ void Decoder::Gpu::allocate_sweep(int chunk_rounds) {
   w.k_idx = a.alloc<bf16>(W * cuda::kIndexDim);
   w.q_idx = a.alloc<bf16>(W * cuda::kIndexHeads * cuda::kIndexDim);
   w.scores = a.alloc<bf16>(static_cast<size_t>(kScoreRows) * kMaxCompressed);
-  w.moe_out = a.alloc<bf16>(W * kDim);
+  for (bf16*& out : w.moe_out) out = a.alloc<bf16>(W * kDim);
   w.xa_f = a.alloc<float>(W * kDim);
   w.xf_f = a.alloc<float>(W * kDim);
   w.hc_scratch = a.alloc<float>(W * cuda::kHcPartials * 25);
-  w.partial = a.alloc<float>(W * kDim);
   w.packed = a.alloc<float>(W * cuda::kEngramKvRows);
   w.latent_f = a.alloc<float>(W * kHeadDim);
   w.planes_qa = a.alloc<float>(WG * kSplitsWqA * kQLora * 8);
@@ -179,7 +182,6 @@ void Decoder::Gpu::allocate_sweep(int chunk_rounds) {
   for (const cuda::ActFragments* act : {&w.act_x, &w.act_qr, &w.act_o[0], &w.act_o[1], &w.act_o[2], &w.act_o[3], &w.act_lora,
                                        &w.act_engram})
     cuda::clear_fragments(*act, kWaveRounds, stream);
-  w.mix_attn = a.alloc<cuda::HcMixes>(W);
   w.queries = {a.alloc<uint8_t>(W * cuda::kQueryCodeBytes), a.alloc<uint8_t>(W * cuda::kQueryScaleBytes),
                a.alloc<float>(W * cuda::kIndexHeads)};
   w.select = {{a.alloc<unsigned>(static_cast<size_t>(kScoreRows) * cuda::kSelectScratchWords)},
@@ -189,6 +191,15 @@ void Decoder::Gpu::allocate_sweep(int chunk_rounds) {
   w.attn = {a.alloc<float>(kAttnRows * splits * kLocalHeads), a.alloc<float>(kAttnRows * splits * kLocalHeads),
             a.alloc<float>(kAttnRows * splits * kLocalHeads * kHeadDim)};
   w.plans = a.alloc<moe::Plan>(WG);
+  SweepLink& x = sweep_link;
+  x.device = device;
+  for (SweepLink::Lane* lane : {&x.attention, &x.combine}) {
+    for (float*& inbox : lane->inbox) inbox = a.alloc<float>(W * kDim);
+    for (auto* events : {&lane->ready, &lane->sent, &lane->added})
+      for (cudaEvent_t& ev : *events) check(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "cudaEventCreate");
+  }
+  check(cudaStreamCreateWithFlags(&x.stream, cudaStreamNonBlocking), "cudaStreamCreate");
+  check(cudaEventCreateWithFlags(&x.idle, cudaEventDisableTiming), "cudaEventCreate");
   check(cudaStreamSynchronize(stream), "sweep buffers");
 }
 
@@ -201,6 +212,13 @@ void Decoder::Gpu::free_sweep() {
     if (p) cudaFreeHost(p);
   for (cudaEvent_t ev : grouped.segment_done) cudaEventDestroy(ev);
   for (cudaEvent_t ev : clock.events) cudaEventDestroy(ev);
+  const SweepLink& x = sweep_link;
+  for (const SweepLink::Lane* lane : {&x.attention, &x.combine})
+    for (const auto* events : {&lane->ready, &lane->sent, &lane->added})
+      for (cudaEvent_t ev : *events)
+        if (ev) cudaEventDestroy(ev);
+  if (x.idle) cudaEventDestroy(x.idle);
+  if (x.stream) cudaStreamDestroy(x.stream);
 }
 
 void Decoder::Gpu::prepare_wave_launches(int layer) {
@@ -259,6 +277,7 @@ void Decoder::Gpu::enqueue_wave(int layer, const WaveRows& w, WavePhase phase) {
   const DeviceLayer& d = layers.at(layer);
   const LayerLaunches& l = wave_launches.at(layer);
   Wave& v = wave;
+  SweepLink& x = sweep_link;
   const cudaStream_t st = stream;
   const int rows = w.rows, groups = cuda::column_groups(rows);
   const size_t r0 = static_cast<size_t>(w.first);
@@ -266,9 +285,31 @@ void Decoder::Gpu::enqueue_wave(int layer, const WaveRows& w, WavePhase phase) {
   bf16* h = chunk.h + r0 * stream_elems;   // the stream between layers; after Ffn, the stream after attention
   cuda::HcMixes* mix_ffn = chunk.mix + r0;  // the previous layer's FFN mixes, then this layer's
   const int64_t* pos = v.pos + r0;
-  bf16* h_in = kind.engram ? v.h_next : h;  // the attention sub-block's input (and residual)
+  const int p = (w.first / kWaveRows) & 1;  // the wave's parity: its buffers outlive the next wave's Attention
+  bf16* h_in = kind.engram ? v.h_next[p] : h;  // the attention sub-block's input (and residual)
   auto wide = [&](const Launch& launch) { cuda::gemv_groups(launch.jobs, launch.first, launch.n, launch.warps, groups, st); };
   auto lap = [&](WaveSection s) { clock.lap(s, st); };
+  // A lane's exchange by the copy engines on the link stream (SweepLink), in two phases so both GPUs'
+  // copies are issued before either waits for the other's: send `mine` (ready once `st`'s work so
+  // far ran) into the peer's inbox, once the peer added what that inbox held last; then add the
+  // peer's partial into `out`, GPU 0's + GPU 1's as the kernel exchange does.
+  auto send = [&](SweepLink::Lane& lane, const SweepLink::Lane& peer, const float* mine) {
+    check(cudaEventRecord(lane.ready[p], st), "cudaEventRecord");
+    check(cudaStreamWaitEvent(x.stream, lane.ready[p], 0), "cudaStreamWaitEvent");
+    check(cudaStreamWaitEvent(x.stream, peer.added[p], 0), "cudaStreamWaitEvent");
+    clock.mark(x.stream);
+    check(cudaMemcpyPeerAsync(peer.inbox[p], x.peer->device, mine, x.device, static_cast<size_t>(rows) * kDim * sizeof(float),
+                              x.stream),
+          "partial to the peer");
+    check(cudaEventRecord(lane.sent[p], x.stream), "cudaEventRecord");
+  };
+  auto add = [&](SweepLink::Lane& lane, const SweepLink::Lane& peer, const float* mine, bf16* out) {
+    check(cudaStreamWaitEvent(x.stream, peer.sent[p], 0), "cudaStreamWaitEvent");
+    cuda::add_round_bf16(rank == 0 ? mine : lane.inbox[p], rank == 0 ? lane.inbox[p] : mine, static_cast<size_t>(rows) * kDim,
+                         out, x.stream);
+    clock.lap(WaveSection::Exchange, x.stream);
+    check(cudaEventRecord(lane.added[p], x.stream), "cudaEventRecord");
+  };
   clock.mark(st);
 
   switch (phase) {
@@ -287,9 +328,9 @@ void Decoder::Gpu::enqueue_wave(int layer, const WaveRows& w, WavePhase phase) {
       if (draft.features[0] != nullptr)  // the target features DSpark drafts from
         for (size_t t = 0; t < kDraftTargetLayers.size(); t++)
           if (layer == kDraftTargetLayers[t]) cuda::capture_features(h, rows, kDim, pos, draft.features[t], kRing, st);
-      if (kind.engram) cuda::engram_gate(h, v.kv_engram, d.engram_q, d.engram_k, kNormEps, rows, v.h_next, st);
+      if (kind.engram) cuda::engram_gate(h, v.kv_engram, d.engram_q, d.engram_k, kNormEps, rows, v.h_next[p], st);
       const cuda::HcParams attn_params{d.hc_attn_fn, d.hc_attn_scale, d.hc_attn_base, kNormEps, kHcEps, kSinkhornIters};
-      cuda::hc_mixes(h_in, attn_params, kDim, rows, v.hc_scratch, v.mix_attn, st);
+      cuda::hc_mixes(h_in, attn_params, kDim, rows, v.hc_scratch, v.mix_attn[p], st);
       cuda::hc_pre(h_in, mix_ffn, kDim, rows, v.x0, st);
       cuda::rmsnorm(v.x0, d.attn_norm, kDim, rows, kNormEps, v.xa, st);
       cuda::quantize_activations(v.xa, rows, v.act_x, st);
@@ -381,18 +422,25 @@ void Decoder::Gpu::enqueue_wave(int layer, const WaveRows& w, WavePhase phase) {
       wide(l.oa);
       cuda::group_planes_quantize(v.planes_oa, kLocalGroups, kWaveOaStride, kSplitsWoA, kOLora, rows, v.act_lora, st);
       wide(l.ob);
-      cuda::sum_planes_f32(v.planes_ob, kSplitsWoB, kDim, rows, v.partial, st);
+      cuda::sum_planes_f32(v.planes_ob, kSplitsWoB, kDim, rows, v.partial[p], st);
       lap(WaveSection::OutProjections);
-      cuda::exchange_add(link, v.partial, static_cast<size_t>(rows) * kDim, v.attn_out, st);
-      lap(WaveSection::Exchange);
       break;
     }
 
+    case WavePhase::AttentionSend:  // while the next wave's Attention runs on `st`
+      send(x.attention, x.peer->attention, v.partial[p]);
+      break;
+
+    case WavePhase::AttentionAdd:
+      add(x.attention, x.peer->attention, v.partial[p], v.attn_out[p]);
+      break;
+
     case WavePhase::Ffn: {
-      cuda::hc_post(v.attn_out, h_in, v.mix_attn, kDim, rows, v.h_mid, st);
+      check(cudaStreamWaitEvent(st, x.attention.added[p], 0), "cudaStreamWaitEvent");
+      cuda::hc_post(v.attn_out[p], h_in, v.mix_attn[p], kDim, rows, v.h_mid, st);
       const cuda::HcParams ffn_params{d.hc_ffn_fn, d.hc_ffn_scale, d.hc_ffn_base, kNormEps, kHcEps, kSinkhornIters};
       cuda::hc_mixes(v.h_mid, ffn_params, kDim, rows, v.hc_scratch, mix_ffn, st);
-      cuda::hc_pre(v.h_mid, v.mix_attn, kDim, rows, v.x0, st);
+      cuda::hc_pre(v.h_mid, v.mix_attn[p], kDim, rows, v.x0, st);
       bf16* xf = chunk.xf + r0 * kDim;  // the grouped MoE's input rows
       cuda::rmsnorm(v.x0, d.ffn_norm, kDim, rows, kNormEps, xf, st);
       cuda::bf16_to_f32(xf, static_cast<size_t>(rows) * kDim, v.xf_f, st);
@@ -406,13 +454,22 @@ void Decoder::Gpu::enqueue_wave(int layer, const WaveRows& w, WavePhase phase) {
       break;
     }
 
-    case WavePhase::Combine: {
-      cuda::exchange_add(link, chunk.y + r0 * kDim, static_cast<size_t>(rows) * kDim, v.moe_out, st);
-      cuda::hc_post(v.moe_out, h, mix_ffn, kDim, rows, v.h_mid, st);
+    // The MoE output's exchange: ready once `st` ran the grouped MoE and the previous wave's
+    // CombinePost (which read moe_out of this parity two waves back).
+    case WavePhase::CombineSend:
+      send(x.combine, x.peer->combine, chunk.y + r0 * kDim);
+      break;
+
+    case WavePhase::CombineAdd:
+      add(x.combine, x.peer->combine, chunk.y + r0 * kDim, v.moe_out[p]);
+      break;
+
+    case WavePhase::CombinePost:
+      check(cudaStreamWaitEvent(st, x.combine.added[p], 0), "cudaStreamWaitEvent");
+      cuda::hc_post(v.moe_out[p], h, mix_ffn, kDim, rows, v.h_mid, st);
       check(cudaMemcpyAsync(h, v.h_mid, rows * stream_elems * sizeof(bf16), cudaMemcpyDeviceToDevice, st), "stream");
       lap(WaveSection::Combine);
       break;
-    }
   }
   check(cudaGetLastError(), "wave launches");
 }
@@ -574,17 +631,27 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
           else s.enqueue_layer(layer, rows_of(g), parity, StepMode::Chunk);
         }
     };
-    // A layer's waves through routing; after each, its routing to the host (GPU 0) and an event on
-    // both GPUs, published to `launched`.
-    auto launch_waves = [&](int layer, Progress& launched) {
+    // A layer's combine of wave k is its MoE output's exchange (CombineSend, CombineAdd on the link
+    // streams) and its hc_post into the stream (CombinePost). Wave k + 1's exchange is launched
+    // before wave k's Post, so the exchanges run back to back while the Posts follow.
+    auto combine_exchange = [&](int layer, size_t k) {
+      phase(layer, waves[k], WavePhase::CombineSend);
+      phase(layer, waves[k], WavePhase::CombineAdd);
+    };
+    auto combine_wave = [&](int layer, size_t k) {  // wave k's Post, wave k + 1's exchange first
+      if (k == 0) combine_exchange(layer, 0);
+      if (k + 1 < waves.size()) combine_exchange(layer, k + 1);
+      phase(layer, waves[k], WavePhase::CombinePost);
+    };
+    // A layer's waves through routing, with the previous layer's combines (`combining`, or -1)
+    // between them: the next layer's wave k needs only wave k combined, so the combine exchanges run
+    // beside its attention. After each wave, its routing to the host (GPU 0) and an event on both
+    // GPUs, published to `launched`.
+    auto launch_waves = [&](int layer, int combining, Progress& launched) {
       const bool engram_layer = model::kind(layer).engram;
-      for (size_t k = 0; k < waves.size(); k++) {
+      // Wave k's Ffn, then its routing to the host (GPU 0) and an event on both GPUs, published.
+      auto finish = [&](size_t k) {
         const WaveRows& w = waves[k];
-        if (engram_layer) {
-          engram_rows_for(layer == kEngramLayers[0] ? 0 : 1, static_cast<size_t>(w.first + w.rows));
-          phase(layer, w, WavePhase::EngramMix);
-        }
-        phase(layer, w, WavePhase::Attention);
         phase(layer, w, WavePhase::Ffn);
         for (auto& gp : gpus_) {
           Gpu& s = *gp;
@@ -601,12 +668,28 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
           check(cudaEventRecord(s.grouped.segment_done[k], s.stream), "cudaEventRecord");
         }
         launched.publish(k + 1);
+      };
+      // Wave k's attention exchange runs on the link streams while wave k + 1's Attention computes:
+      // the host launches wave k - 1's Ffn after wave k's exchange.
+      for (size_t k = 0; k < waves.size(); k++) {
+        const WaveRows& w = waves[k];
+        if (combining >= 0) combine_wave(combining, k);
+        if (engram_layer) {
+          engram_rows_for(layer == kEngramLayers[0] ? 0 : 1, static_cast<size_t>(w.first + w.rows));
+          phase(layer, w, WavePhase::EngramMix);
+        }
+        phase(layer, w, WavePhase::Attention);
+        phase(layer, w, WavePhase::AttentionSend);
+        phase(layer, w, WavePhase::AttentionAdd);
+        if (k > 0) finish(k - 1);
       }
+      if (!waves.empty()) finish(waves.size() - 1);
     };
 
     // Layer by layer, every Round through the layer before any goes on: a layer's Experts are read
     // once for the chunk.
     const int first_layer = lead.layers.begin()->first;
+    int combining = -1;  // the grouped layer whose combines the next layer's waves carry
     for (const auto& [layer, unused] : lead.layers) {
       if (layer >= kLayers) continue;  // DSpark stages run in draft()
       if (!grouped) {
@@ -624,7 +707,7 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
           return place_segments(layer, n, place, launched, profiling ? &profile : nullptr, drive_first);
         });
         try {
-          launch_waves(layer, launched);
+          launch_waves(layer, combining, launched);
         } catch (...) {
           launched.abandon();
           placing.wait();
@@ -632,9 +715,8 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
         }
         const std::vector<std::optional<uint32_t>> slot_of = placing.get();
         grouped_moe(layer, n, slot_of);
-        lap(&SweepProfile::steps);  // attention halves and the Experts, placement overlapping the halves
-        for (const WaveRows& w : waves) phase(layer, w, WavePhase::Combine);
-        lap(&SweepProfile::combine);
+        lap(&SweepProfile::steps);  // the previous layer's combines, attention halves and the Experts
+        combining = layer;
         check(cudaSetDevice(lead.device), "cudaSetDevice");
         lead.clock.collect(lead.stream);  // bounds the events in flight
       }
@@ -642,6 +724,15 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
         sync();
         std::fprintf(stderr, "sweep: layer %d done (%d Rounds)\n", layer, rounds);
       }
+    }
+    if (combining >= 0) {  // the last layer's combines, on their own
+      for (size_t k = 0; k < waves.size(); k++) combine_wave(combining, k);
+      lap(&SweepProfile::combine);
+    }
+    for (auto& gp : gpus_) {  // decode's exchanges (on the GPU's stream) follow the sweep's (on its link stream)
+      check(cudaSetDevice(gp->device), "cudaSetDevice");
+      check(cudaEventRecord(gp->sweep_link.idle, gp->sweep_link.stream), "cudaEventRecord");
+      check(cudaStreamWaitEvent(gp->stream, gp->sweep_link.idle, 0), "cudaStreamWaitEvent");
     }
     post_as(&Staging::sweep_off);
     if (reading.valid()) {
@@ -673,7 +764,7 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
   if (profiling && grouped)
     std::fprintf(stderr,
                  "sweep profile, %zu tokens (ms, phases waited for): setup %.0f, attention halves + Experts %.0f (the "
-                 "host waited %.0f for routing and placed for %.0f meanwhile), combine halves %.0f\n",
+                 "host waited %.0f for routing and placed for %.0f meanwhile), the last layer's combines %.0f\n",
                  tokens, profile.setup, profile.steps, profile.waiting, profile.placement, profile.combine);
   else if (profiling)
     std::fprintf(stderr, "sweep profile, %zu tokens (ms, phases waited for): setup %.0f, layer steps %.0f\n", tokens,
