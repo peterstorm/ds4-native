@@ -76,13 +76,13 @@ constexpr int kWaveRows = kMaxRows * kWaveRounds;  // 512
 constexpr int kScoreRows = 128;                    // a wave's indexer rows scored at once (scores [128][65536])
 constexpr int kAttnRows = 128;                     // a wave's rows through sparse attention at once
 
-/** The parts of a wave's work the wave clock (DS4N_WAVE_PROFILE) times. */
+/** The parts of a sweep's work the wave clock (DS4N_WAVE_PROFILE) times: the waves', then the grouped MoE's. */
 enum class WaveSection { Engram, Mixes, Projections, Compressor, IndexKeys, IndexQueries, IndexScores, IndexSelect,
-                         CompressedRows, Attention, OutProjections, Exchange, Ffn, Combine, kCount };
+                         CompressedRows, Attention, OutProjections, Exchange, Ffn, Combine, Experts, kCount };
 constexpr std::array<const char*, static_cast<size_t>(WaveSection::kCount)> kWaveSectionNames = {
     "Engram", "mixes", "q/kv projections", "compressor", "index keys", "index queries", "index scores",
     "index selection", "compressed rows", "sparse attention", "output projections", "exchanges", "FFN input + routing",
-    "combine"};
+    "combine", "grouped MoE"};
 
 /**
  * GPU time by wave section: events on one GPU's stream around each section of its wave phases,
@@ -144,12 +144,13 @@ struct Launch {
   int n = 0, warps = 0;
 };
 
+/** `jobs` on the device with their warp prefix (group_warps: job_warps for one-group jobs, as gemv runs them). */
 inline Launch prepare(DeviceArena& arena, const std::vector<cuda::GemvJob>& jobs) {
   std::vector<int> first;
   int warps = 0;
   for (const auto& j : jobs) {
     first.push_back(warps);
-    warps += cuda::job_warps(j);
+    warps += cuda::group_warps(j);
   }
   return {arena.upload(jobs.data(), jobs.size()), arena.upload(first.data(), first.size()), static_cast<int>(jobs.size()),
           warps};
@@ -354,8 +355,9 @@ struct Decoder::Gpu {
     uint8_t *act_codes = nullptr, *act_scales = nullptr;  // [kGroupBatch] x kDimBlocks x (256 | 8)
     int32_t *token_of = nullptr, *pinned_token_of = nullptr;  // [layer groups][8]
     float *weight = nullptr, *pinned_weight = nullptr;        // [layer groups][8]
-    cuda::GemvJob *jobs = nullptr, *pinned_jobs = nullptr;    // [3 x layer groups]: per batch gate/up, then down
-    int *first = nullptr, *pinned_first = nullptr;            // their warp prefix sums, per list from 0
+    cuda::GemvJob *jobs = nullptr, *pinned_jobs = nullptr;    // [3 x layer groups]: per batch gate/up, then down, a
+                                                              // job per Expert run (at the run's first group)
+    int *first = nullptr, *pinned_first = nullptr;            // their group_warps prefix sums, per list from 0
     size_t layer_groups = 0;
     int32_t* pinned_route_experts = nullptr;  // [capacity * 8][6], GPU 0's
     float* pinned_route_weights = nullptr;    // [capacity * 8][6]

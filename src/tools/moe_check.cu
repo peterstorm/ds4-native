@@ -88,7 +88,7 @@ Launch make_launch(const std::vector<cuda::GemvJob>& jobs) {
   int warps = 0;
   for (const auto& j : jobs) {
     first.push_back(warps);
-    warps += cuda::job_warps(j);
+    warps += cuda::group_warps(j);  // job_warps for one-group jobs (gemv)
   }
   return {upload(jobs.data(), jobs.size()), upload(first.data(), first.size()), static_cast<int>(jobs.size()), warps};
 }
@@ -540,39 +540,53 @@ int main(int argc, char** argv) {
     for (size_t i = 1; i < groups.routed; i++)  // an Expert counted at its second group
       split_experts += groups.groups[i].expert == groups.groups[i - 1].expert &&
                        (i == 1 || groups.groups[i - 2].expert != groups.groups[i].expert);
+    cudaEvent_t g0, g1;
+    ck(cudaEventCreate(&g0), "event");
+    ck(cudaEventCreate(&g1), "event");
+    float grouped_ms = 0;
     for (size_t at = 0; at < groups.groups.size(); at += kBatch) {
       const size_t count = std::min<size_t>(kBatch, groups.groups.size() - at);
       std::vector<int32_t> token_of;
       std::vector<float> weight;
-      std::vector<cuda::GemvJob> gate_up, down;
-      using cuda::WeightFormat;
       for (size_t i = 0; i < count; i++) {
         const moe::Group& g = groups.groups[at + i];
         token_of.insert(token_of.end(), g.token.begin(), g.token.end());
         weight.insert(weight.end(), g.weight.begin(), g.weight.end());
-        uint8_t* codes = g_codes + i * kGateBlocks * 256;
-        uint8_t* scales = g_scales + i * kGateBlocks * 8;
-        const int slot = static_cast<int>(i);
+      }
+      // A job per run of one Expert's groups, over the run's column groups (as the engine's sweep).
+      std::vector<cuda::GemvJob> gate_up, down;
+      using cuda::WeightFormat;
+      for (const moe::ExpertRun& run : moe::expert_runs(std::span(groups.groups).subspan(at, count))) {
+        const moe::Group& g = groups.groups[at + run.first];
+        const int slot = static_cast<int>(run.first), n_groups = static_cast<int>(run.count);
+        uint8_t* codes = g_codes + run.first * kGateBlocks * 256;
+        uint8_t* scales = g_scales + run.first * kGateBlocks * 8;
         const auto hid = gb.hidden_of(slot);
         const bool is_shared = g.expert == moe::kSharedExpert;
         const WeightFormat format = is_shared ? WeightFormat::Fp8 : WeightFormat::Mxfp4;
         const uint8_t* payload = is_shared ? nullptr : payload_of(g.expert);
         gate_up.push_back({format, is_shared ? sh.d_gate : payload, codes, scales, gb.gate_of(slot), kRows, kGateBlocks,
-                           splits, sb});
+                           splits, sb, n_groups});
         gate_up.push_back({format, is_shared ? sh.d_up : payload + store::kHalfPartBytes, codes, scales, gb.up_of(slot),
-                           kRows, kGateBlocks, splits, sb});
+                           kRows, kGateBlocks, splits, sb, n_groups});
         down.push_back({format, is_shared ? sh.d_down : payload + 2 * store::kHalfPartBytes, hid.codes, hid.scales,
-                        gb.down_of(slot), kDim, kDownBlocks, 1, kDownBlocks});
+                        gb.down_of(slot), kDim, kDownBlocks, 1, kDownBlocks, n_groups});
       }
       const Launch gu = make_launch(gate_up), dn = make_launch(down);
       const int32_t* d_token_of = upload(token_of.data(), token_of.size());
       const float* d_weight = upload(weight.data(), weight.size());
       const int n = static_cast<int>(count);
+      ck(cudaEventRecord(g0), "record");
       cuda::gather_quantize(d_cb, kGateBlocks, d_token_of, n, g_codes, g_scales, nullptr);
-      cuda::gemv(gu.jobs, gu.first, gu.n, gu.warps, nullptr);
+      cuda::gemv_groups(gu.jobs, gu.first, gu.n, gu.warps, n, nullptr);
       cuda::swiglu_quantize_groups(d_token_of, d_weight, n, gb, moe::kSwigluLimit, nullptr);
-      cuda::gemv(dn.jobs, dn.first, dn.n, dn.warps, nullptr);
+      cuda::gemv_groups(dn.jobs, dn.first, dn.n, dn.warps, n, nullptr);
       cuda::accumulate_groups(d_token_of, n, gb, y_groups, nullptr);
+      ck(cudaEventRecord(g1), "record");
+      ck(cudaEventSynchronize(g1), "grouped MoE");
+      float ms = 0;
+      ck(cudaEventElapsedTime(&ms, g0, g1), "elapsed");
+      grouped_ms += ms;
     }
     ck(cudaDeviceSynchronize(), "grouped MoE");
     const auto want = download(y_rounds, static_cast<size_t>(chunk) * kDim);
@@ -580,9 +594,9 @@ int main(int argc, char** argv) {
     size_t differ = 0;
     for (size_t i = 0; i < want.size(); i++) differ += std::memcmp(&want[i], &got[i], sizeof(float)) != 0;
     std::printf("grouped MoE over %d tokens (%zu groups: %zu routed over %zu Experts, %zu of them in several groups; "
-                "%zu shared): per-GPU partials %s (%zu of %zu floats differ from the Rounds')\n",
+                "%zu shared): per-GPU partials %s (%zu of %zu floats differ from the Rounds'), %.2f ms on the GPU\n",
                 chunk, groups.groups.size(), groups.routed, half0.size(), split_experts,
-                groups.groups.size() - groups.routed, differ ? "DIFFER" : "bit-identical", differ, want.size());
+                groups.groups.size() - groups.routed, differ ? "DIFFER" : "bit-identical", differ, want.size(), grouped_ms);
     if (differ) die("the grouped MoE differs from the Rounds'");
   }
 

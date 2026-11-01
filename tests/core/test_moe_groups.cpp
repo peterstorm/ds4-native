@@ -145,6 +145,36 @@ TEST_CASE("routed_experts rejects ids outside the layer") {
   CHECK_FALSE(routed_experts(std::vector<int32_t>{-1}, 8));
 }
 
+TEST_CASE("expert_runs: maximal one-Expert runs that partition any stretch of a plan") {
+  for (unsigned seed = 0; seed < 8; seed++) {
+    const size_t tokens = 30 + seed * 173;
+    const auto r = random_routing(seed, tokens, 384);
+    const auto plan = group_tokens(r.experts, r.weights, tokens, 384).value();
+    const std::span<const Group> all(plan.groups);
+    // The whole plan: one run per routed Expert, then the shared groups as one run.
+    const auto runs = expert_runs(all);
+    std::set<int32_t> routed;
+    for (size_t i = 0; i < plan.routed; i++) routed.insert(plan.groups[i].expert);
+    REQUIRE(runs.size() == routed.size() + 1);
+    CHECK(runs.back() == ExpertRun{plan.routed, plan.groups.size() - plan.routed});
+    // Any stretch (a batch of the sweep's MoE): the runs tile it, each one Expert, neighbours differ.
+    const size_t begin = seed * 7 % plan.groups.size(), end = std::min(plan.groups.size(), begin + 1 + seed * 41);
+    const auto stretch = all.subspan(begin, end - begin);
+    size_t next = 0;
+    const auto parts = expert_runs(stretch);
+    for (size_t k = 0; k < parts.size(); k++) {
+      const ExpertRun& run = parts[k];
+      CHECK(run.first == next);
+      CHECK(run.count > 0);
+      for (size_t i = run.first; i < run.first + run.count; i++) CHECK(stretch[i].expert == stretch[run.first].expert);
+      if (k > 0) CHECK(stretch[run.first].expert != stretch[parts[k - 1].first].expert);
+      next = run.first + run.count;
+    }
+    CHECK(next == stretch.size());
+  }
+  CHECK(expert_runs(std::span<const Group>{}).empty());
+}
+
 TEST_CASE("malformed routing is rejected") {
   const std::vector<int32_t> experts = {0, 1, 2, 3, 4, 5};
   const std::vector<float> weights(6, 1.0f);

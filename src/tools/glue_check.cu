@@ -1,5 +1,5 @@
 // ds4n-glue-check: GPU glue kernels versus the CPU oracles (core/hc_reference),
-// plus timings for the head-sized BF16 GEMV and one hc_mixes call.
+// plus timings for the head-sized BF16 GEMV, the router- and compressor-sized ones, and one hc_mixes call.
 //   ds4n-glue-check [--tokens T]
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -154,19 +154,23 @@ int main(int argc, char** argv) {
   auto dhw = upload(hw);
   auto dxf = upload(xf);
   float* dlog;
-  ck(cudaMalloc(&dlog, static_cast<size_t>(rows) * 8 * 4 * 5), "malloc");  // room for 5 split planes
+  const int groups = (tokens + 7) / 8;
+  ck(cudaMalloc(&dlog, static_cast<size_t>(rows) * 8 * 4 * 5 * groups), "malloc");  // room for 5 split planes a group
   for (int splits : {1, 5}) {
     const int checked_rows = splits == 1 ? rows : 384;
     cuda::bf16_gemv(dhw, dxf, checked_rows, dim, tokens, splits, dlog, nullptr);
-    const auto planes = download(dlog, static_cast<size_t>(checked_rows) * 8 * splits);
+    const auto planes = download(dlog, static_cast<size_t>(checked_rows) * 8 * splits * groups);
+    auto plane = [&](int s, int r, int t) {  // token t is column t % 8 of group t / 8 (cuda/mx_gemv.cuh)
+      return planes[((static_cast<size_t>(t / 8) * splits + s) * checked_rows + r) * 8 + t % 8];
+    };
     size_t same = 0, total = 0;
     for (int r = 0; r < checked_rows; r += (splits == 1 ? 97 : 1))
       for (int t = 0; t < tokens; t++) {
         std::vector<float> wr(dim);
         for (int i = 0; i < dim; i++) wr[i] = __bfloat162float(hw[static_cast<size_t>(r) * dim + i]);
         const float want = reduce::bf16_gemv(wr, std::span(xf).subspan(static_cast<size_t>(t) * dim, dim), splits);
-        float got = planes[static_cast<size_t>(r) * 8 + t];
-        for (int s = 1; s < splits; s++) got += planes[(static_cast<size_t>(s) * checked_rows + r) * 8 + t];
+        float got = plane(0, r, t);
+        for (int s = 1; s < splits; s++) got += plane(s, r, t);
         same += got == want;
         total++;
       }
@@ -183,6 +187,14 @@ int main(int argc, char** argv) {
   ck(cudaEventSynchronize(b), "sync");
   ck(cudaEventElapsedTime(&ms, a, b), "elapsed");
   std::printf("bf16_gemv head half: %.1f us, %.0f GB/s\n", ms / 50 * 1000, hw.size() * 2.0 / (ms / 50 * 1e-3) / 1e9);
+  for (int wave_rows : {384, 1024}) {  // the router's and a compressor's shape (split-K 5)
+    ck(cudaEventRecord(a), "rec");
+    for (int i = 0; i < 50; i++) cuda::bf16_gemv(dhw, dxf, wave_rows, dim, tokens, 5, dlog, nullptr);
+    ck(cudaEventRecord(b), "rec");
+    ck(cudaEventSynchronize(b), "sync");
+    ck(cudaEventElapsedTime(&ms, a, b), "elapsed");
+    std::printf("bf16_gemv/5 %d rows: %.1f us\n", wave_rows, ms / 50 * 1000);
+  }
   ck(cudaEventRecord(a), "rec");
   for (int i = 0; i < 200; i++) cuda::hc_mixes(dh, params, dim, tokens, scratch, dmix, nullptr);
   ck(cudaEventRecord(b), "rec");

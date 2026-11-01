@@ -6,7 +6,8 @@
 // More rows than a Round (a prompt sweep's wave) are 8-column groups back to back: token t is column
 // t % 8 of group t / 8 -- fragments [group][blocks] x (256 | 8) bytes, GEMV planes
 // [group][split][rows][8] -- and gemv_groups runs each job once per group. Each output column is
-// its own MMA chain over K, so a token's bits are the same in any group, a Round's (group 0) too.
+// its own MMA chain over K in order, so a token's bits are the same in any group, a Round's (group
+// 0) too, whichever warp runs it and wherever its fragments are read from.
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -70,6 +71,7 @@ struct GemvJob {
   int blocks;        // multiple of 4
   int splits;        // >= 1
   int split_blocks;  // K blocks per split, multiple of 4; splits * split_blocks >= blocks
+  int groups = 1;    // 8-column groups gemv_groups runs (gemv: 1), back to back as above
 };
 
 using gemv::split_blocks_for;
@@ -84,6 +86,12 @@ struct Planes {
 /** Warps a job occupies: one per (16-row tile, split). */
 constexpr int job_warps(const GemvJob& j) { return j.rows / 16 * j.splits; }
 
+/** Column groups a gemv_groups warp feeds from each weight fragment. */
+constexpr int kGroupsPerWarp = 8;
+
+/** Warps gemv_groups gives a job: one per (16-row tile, split) and 8 of its groups (job_warps for 1 group). */
+constexpr int group_warps(const GemvJob& j) { return job_warps(j) * ((j.groups + kGroupsPerWarp - 1) / kGroupsPerWarp); }
+
 /**
  * Run `n_jobs` GEMVs, MXFP4 and FP8 alike, in one launch (block-scaled
  * mma.sync m16n8k32 kind::mxf8f6f4). `first_warp[j]` is the first warp of
@@ -96,12 +104,17 @@ void gemv(const GemvJob* jobs, const int* first_warp, int n_jobs, int total_warp
 void gemv(const GemvJob* jobs, const int* first_warp, IntArg n_jobs, IntArg total_warps, cudaStream_t stream);
 
 /**
- * Each job once per 8-column group g < `groups`: its activations at act_codes + g * blocks * 256 and
- * act_scales + g * blocks * 8, its planes at out + g * splits * rows * 8 (the jobs, first_warp and
- * total_warps as for one group). A tile's warps for all groups run side by side, so its weights come
- * from DRAM once and from the cache for the other groups.
+ * Each job once per 8-column group g < min(job.groups, `max_groups`): its activations at act_codes +
+ * g * blocks * 256 and act_scales + g * blocks * 8, its planes at out + g * splits * rows * 8;
+ * `first_warp[j]` is the prefix sum of group_warps, `total_warps` their sum. A warp runs one tile and
+ * split for 8 groups, every weight fragment feeding all their MMAs; a block's warps are neighbouring
+ * tiles of one split, reading the groups' activation fragments from shared memory -- when every
+ * job's rows divide by kGroupsBlockRows (else the straddling warps read their own from global
+ * memory: slower, the same bits).
  */
-void gemv_groups(const GemvJob* jobs, const int* first_warp, int n_jobs, int total_warps, int groups, cudaStream_t stream);
+constexpr int kGroupsBlockRows = 128;
+void gemv_groups(const GemvJob* jobs, const int* first_warp, int n_jobs, int total_warps, int max_groups,
+                 cudaStream_t stream);
 
 /** out[r][c] = sum over s = 0..splits-1, in order, of partials[s][r][c]. */
 void reduce_splits(const float* partials, int splits, int rows, float* out, cudaStream_t stream);

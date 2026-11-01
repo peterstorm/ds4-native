@@ -55,4 +55,17 @@ Result<GroupPlan, GroupError> group_tokens(std::span<const int32_t> experts, std
  */
 Result<std::vector<int32_t>, GroupError> routed_experts(std::span<const int32_t> experts, int n_experts);
 
+/** Groups [first, first + count) of a stretch of groups: consecutive groups of one Expert. */
+struct ExpertRun {
+  size_t first = 0, count = 0;
+  friend bool operator==(const ExpertRun&, const ExpertRun&) = default;
+};
+
+/**
+ * `groups` as maximal runs of one Expert, in order (they partition it). A GroupPlan keeps each
+ * Expert's groups together, so a stretch of one meets each Expert in one run, and a run's groups
+ * share the Expert's weights: one GEMV over the run's column groups serves them all.
+ */
+std::vector<ExpertRun> expert_runs(std::span<const Group> groups);
+
 }  // namespace ds4n::moe

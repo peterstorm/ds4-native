@@ -1,15 +1,22 @@
 #pragma once
 // The two-GPU exchange for tensor-parallel partial sums (attention and MoE
-// outputs). Each GPU holds an FP32 partial of the same [tokens][dim] output.
-// One kernel per GPU pushes its partial into the peer's inbox over P2P (posted
-// writes, the fast direction on PCIe), raises a per-block flag with release
-// semantics, waits for the peer's flag on the matching block and writes
-// bf16(GPU 0 + GPU 1). Both GPUs add the same two FP32 values, so their outputs
-// are bit-identical. A side that waits 10 s for its peer traps (a dead or never-launched
-// peer fails loudly instead of hanging). Flags count exchanges per block on the device, so the
+// outputs). Each GPU holds an FP32 partial of the same [tokens][dim] output, and
+// both end with bf16(GPU 0 + GPU 1), the same bits. Block by block, over P2P
+// (posted writes, the fast direction on PCIe), each push followed by the block's
+// flag raised with release semantics:
+//  - Small exchanges (decode, a short Round): both GPUs push their partial into the
+//    peer's inbox and add -- one round trip.
+//  - Large ones (a sweep's waves): a reduce-scatter, then an all-gather. Chunk b
+//    belongs to GPU b % 2; the other GPU pushes its partial of it, the owner adds and
+//    pushes the sums back into the pusher's inbox slot of the chunk (which no partial
+//    uses). 3 bytes cross the link per value instead of 4, for a second round trip.
+// A side that waits 10 s for its peer traps (a dead or never-launched peer fails
+// loudly instead of hanging). Flags count exchanges per block on the device, so the
 // kernel needs no host-side epoch and replays inside CUDA graphs. The inbox is
-// double-buffered by exchange parity: a GPU can push exchange k+2 only after the
-// peer signalled k+1, which it does after it finished reading exchange k.
+// double-buffered by exchange parity: in either protocol a block sends one signal and
+// waits for one per exchange, so a GPU pushes into a slot for exchange k+2 only after
+// its own exchange k+1 finished, which needed the peer's k+1 signal, which the peer
+// sends once it is done with the slot's exchange k.
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -28,7 +35,8 @@ constexpr size_t kExchangeInboxFloats = 2 * size_t{kExchangeMaxBlocks} * kExchan
 /** One GPU's end of the link; `peer_*` are P2P pointers into the other GPU's memory. */
 struct ExchangeLink {
   int rank;              // 0 or 1
-  float* inbox;          // [kExchangeInboxFloats], written by the peer; halves alternate by exchange parity
+  float* inbox;          // [kExchangeInboxFloats], written by the peer (a chunk's FP32 partial if this GPU owns
+                         // it, else the owner's BF16 sums); halves alternate by exchange parity
   float* peer_inbox;
   uint32_t* flags;       // [kExchangeMaxBlocks], written by the peer
   uint32_t* peer_flags;

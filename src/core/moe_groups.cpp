@@ -63,4 +63,12 @@ Result<std::vector<int32_t>, GroupError> routed_experts(std::span<const int32_t>
   return R::ok(std::move(out));
 }
 
+std::vector<ExpertRun> expert_runs(std::span<const Group> groups) {
+  std::vector<ExpertRun> runs;
+  for (size_t i = 0; i < groups.size(); i++)
+    if (i > 0 && groups[i].expert == groups[i - 1].expert) runs.back().count++;
+    else runs.push_back({i, 1});
+  return runs;
+}
+
 }  // namespace ds4n::moe

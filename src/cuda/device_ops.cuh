@@ -1,7 +1,7 @@
 #pragma once
 // Device building blocks shared by the standalone kernels and the fused ones
 // (cuda/fused.cuh), so a stage computes the same bits wherever it runs: the
-// fixed block-sum tree of RMSNorm, the hc_mixes finalize (ordered partial sums,
+// fixed block-sum tree of RMSNorm, the warp butterfly for 32 sums at once, the hc_mixes finalize (ordered partial sums,
 // sigmoid gates, row softmax and Sinkhorn), one RoPE pair, FP8 quant-dequant of
 // a value given its group's amax, and act_quant into the MMA B-fragment layout.
 #include <cuda_bf16.h>
@@ -35,6 +35,26 @@ __device__ __forceinline__ float block_sum(float v, float* shared) {
 __device__ __forceinline__ float max32(float v) {
   for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xFFFFFFFFu, v, o));
   return v;
+}
+
+/**
+ * The warp's xor-butterfly sum (distances 16, 8, 4, 2, 1) of each of a lane's 32 values, by
+ * recursive halving: at distance o every lane keeps the half of its values that its bit o selects
+ * and adds its partner's copy. Those are the butterfly's pairs in its order (and an add commutes),
+ * so value j ends in lane j with the butterfly's bits, after 31 shuffles instead of 32 × 5.
+ */
+__device__ __forceinline__ float butterfly_sums(float (&v)[32], int lane) {
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) {
+    const bool up = lane & o;
+#pragma unroll
+    for (int j = 0; j < o; j++) {
+      const float send = up ? v[j] : v[j + o];
+      const float keep = up ? v[j + o] : v[j];
+      v[j] = __fadd_rn(keep, __shfl_xor_sync(0xFFFFFFFFu, send, o));
+    }
+  }
+  return v[0];
 }
 
 __device__ __forceinline__ float sigmoid_rn(float v) { return __fdiv_rn(1.0f, __fadd_rn(1.0f, det::exp(-v))); }

@@ -12,6 +12,15 @@ cuda::ActFragments wave_fragments(DeviceArena& a, int blocks) {
 /** Floats between wo_a's local groups in a wave's planes (each group's planes for every column group). */
 constexpr size_t kWaveOaStride = static_cast<size_t>(kWaveRounds) * kSplitsWoA * kOLora * 8;
 
+// Every gemv_groups job's rows (the wave's, prepare_wave_launches; the Expert runs', enqueue_groups)
+// fill its blocks: all its warps read the activation fragments a block stages.
+static_assert([] {
+  for (const int rows : {kQLora, kHeadDim, kLocalHeads * kHeadDim, cuda::kIndexHeads * cuda::kIndexDim, kOLora, kDim,
+                         cuda::kEngramKvRows, kExpertRows})
+    if (rows % cuda::kGroupsBlockRows != 0) return false;
+  return true;
+}());
+
 }  // namespace
 
 /**
@@ -177,19 +186,26 @@ void Decoder::Gpu::prepare_wave_launches(int layer) {
   const DeviceLayer& d = layers.at(layer);
   Wave& w = wave;
   LayerLaunches& l = wave_launches[layer];
-  // The Round's jobs, into the wave's buffers: gemv_groups runs each once per column group.
-  l.qa_kv = prepare(arena, {fp8_job(d.wq_a, 0, w.act_x, w.planes_qa, kQLora, kSplitsWqA),
-                            fp8_job(d.wkv, 0, w.act_x, w.planes_kv, kHeadDim, kSplitsWkv)});
-  std::vector<cuda::GemvJob> qb = {fp8_job(d.wq_b, 0, w.act_qr, w.planes_qb, kLocalHeads * kHeadDim, kSplitsWqB)};
+  // The Round's jobs, into the wave's buffers, over a whole wave's column groups (gemv_groups runs a
+  // shorter wave's with its groups as the bound).
+  auto wave_job = [](cuda::GemvJob job) {
+    job.groups = kWaveRounds;
+    return job;
+  };
+  l.qa_kv = prepare(arena, {wave_job(fp8_job(d.wq_a, 0, w.act_x, w.planes_qa, kQLora, kSplitsWqA)),
+                            wave_job(fp8_job(d.wkv, 0, w.act_x, w.planes_kv, kHeadDim, kSplitsWkv))});
+  std::vector<cuda::GemvJob> qb = {wave_job(fp8_job(d.wq_b, 0, w.act_qr, w.planes_qb, kLocalHeads * kHeadDim, kSplitsWqB))};
   if (kind.index_source)
-    qb.push_back(fp8_job(d.index_wq_b, 0, w.act_qr, w.planes_iq, cuda::kIndexHeads * cuda::kIndexDim, kSplitsIndexQ));
+    qb.push_back(
+        wave_job(fp8_job(d.index_wq_b, 0, w.act_qr, w.planes_iq, cuda::kIndexHeads * cuda::kIndexDim, kSplitsIndexQ)));
   l.qb = prepare(arena, qb);
   std::vector<cuda::GemvJob> oa;
   for (int gl = 0; gl < kLocalGroups; gl++)
-    oa.push_back(fp8_job(d.wo_a, gl * kOLora, w.act_o[gl], w.planes_oa + gl * kWaveOaStride, kOLora, kSplitsWoA));
+    oa.push_back(wave_job(fp8_job(d.wo_a, gl * kOLora, w.act_o[gl], w.planes_oa + gl * kWaveOaStride, kOLora, kSplitsWoA)));
   l.oa = prepare(arena, oa);
-  l.ob = prepare(arena, {fp8_job(d.wo_b, 0, w.act_lora, w.planes_ob, kDim, kSplitsWoB)});
-  if (kind.engram) l.engram = prepare(arena, {fp8_job(d.engram_wkv, 0, w.act_engram, w.planes_eg, cuda::kEngramKvRows, 1)});
+  l.ob = prepare(arena, {wave_job(fp8_job(d.wo_b, 0, w.act_lora, w.planes_ob, kDim, kSplitsWoB))});
+  if (kind.engram)
+    l.engram = prepare(arena, {wave_job(fp8_job(d.engram_wkv, 0, w.act_engram, w.planes_eg, cuda::kEngramKvRows, 1))});
 }
 
 void Decoder::Gpu::upload_rows(const model::RowIndex& index) {
@@ -673,12 +689,14 @@ void Decoder::grouped_moe(int layer, size_t tokens, std::span<const std::optiona
       const DeviceLayer& d = s.layers.at(layer);
       std::vector<const uint8_t*> halves(slots.size());
       for (size_t i = 0; i < slots.size(); i++) halves[i] = s.experts.pool + slots[i] * s.experts.slot_bytes;
+      s.clock.mark(s.stream);
       for (size_t at = begin; at < end; at += kGroupBatch) {
         const size_t count = std::min<size_t>(kGroupBatch, end - at);
         const std::span<const uint8_t* const> batch_halves =
             halves.empty() ? std::span<const uint8_t* const>{} : std::span<const uint8_t* const>(halves).subspan(at - begin, count);
         s.enqueue_groups(plan, at, count, d, batch_halves);
       }
+      s.clock.lap(WaveSection::Experts, s.stream);
     }
   };
   // Every routed group's Expert was placed, its copies landed. The scratch Slots are least recently
@@ -700,26 +718,33 @@ void Decoder::Gpu::enqueue_groups(const moe::GroupPlan& plan, size_t first, size
                                   std::span<const uint8_t* const> halves) {
   // Tables and jobs at the groups' own places in the layer-wide pinned arrays (no upload's source
   // is rewritten before it ran), uploaded, then gather + quantize, gate/up, SwiGLU, down, accumulate.
+  // A run of one Expert's groups is one job over the run's column groups (moe::expert_runs): the
+  // groups' fragments and planes lie back to back as gemv_groups reads them.
   Grouped& gr = grouped;
   const cudaStream_t st = stream;
   const size_t cols = first * kMaxRows;
   cuda::GemvJob* jobs = gr.pinned_jobs + 3 * first;
   int* warps_at = gr.pinned_first + 3 * first;
   const int split_blocks = cuda::split_blocks_for(kDimBlocks, kSplitsExpert);
-  int gate_up_warps = 0, down_warps = 0;
   for (size_t i = 0; i < count; i++) {
     const moe::Group& g = plan.groups[first + i];
     for (int c = 0; c < kMaxRows; c++) {
       gr.pinned_token_of[cols + i * kMaxRows + c] = g.token[c];
       gr.pinned_weight[cols + i * kMaxRows + c] = g.weight[c];
     }
+  }
+  const std::vector<moe::ExpertRun> runs = moe::expert_runs(std::span(plan.groups).subspan(first, count));
+  const size_t n_runs = runs.size();
+  int gate_up_warps = 0, down_warps = 0;
+  for (size_t r = 0; r < n_runs; r++) {
+    const int i = static_cast<int>(runs[r].first);  // the run's first group, in the batch
     const cuda::ActFragments act{gr.act_codes + i * kDimBlocks * 256, gr.act_scales + i * kDimBlocks * 8, kDimBlocks};
-    const cuda::ActFragments hidden = gr.buf.hidden_of(static_cast<int>(i));
-    float* gate_out = gr.buf.gate_of(static_cast<int>(i));
-    float* up_out = gr.buf.up_of(static_cast<int>(i));
-    float* down_out = gr.buf.down_of(static_cast<int>(i));
+    const cuda::ActFragments hidden = gr.buf.hidden_of(i);
+    float* gate_out = gr.buf.gate_of(i);
+    float* up_out = gr.buf.up_of(i);
+    float* down_out = gr.buf.down_of(i);
     cuda::GemvJob gate, up, down;
-    if (g.expert == moe::kSharedExpert) {  // the shared Expert's Half: this GPU's dense FP8 rows, as a Round runs it
+    if (plan.groups[first + i].expert == moe::kSharedExpert) {  // the shared Expert's Half: this GPU's dense FP8 rows
       gate = fp8_job(d.shared_gate, 0, act, gate_out, kExpertRows, kSplitsExpert);
       up = fp8_job(d.shared_up, 0, act, up_out, kExpertRows, kSplitsExpert);
       down = fp8_job(d.shared_down, 0, hidden, down_out, kDim, 1);
@@ -732,15 +757,16 @@ void Decoder::Gpu::enqueue_groups(const moe::GroupPlan& plan, size_t first, size
       down = {cuda::WeightFormat::Mxfp4, half + 2 * kExpertPartBytes, hidden.codes, hidden.scales, down_out, kDim,
               kExpertDownBlocks, 1, kExpertDownBlocks};
     }
-    jobs[2 * i] = gate;
-    jobs[2 * i + 1] = up;
-    jobs[2 * count + i] = down;
-    warps_at[2 * i] = gate_up_warps;
-    gate_up_warps += cuda::job_warps(gate);
-    warps_at[2 * i + 1] = gate_up_warps;
-    gate_up_warps += cuda::job_warps(up);
-    warps_at[2 * count + i] = down_warps;
-    down_warps += cuda::job_warps(down);
+    gate.groups = up.groups = down.groups = static_cast<int>(runs[r].count);
+    jobs[2 * r] = gate;
+    jobs[2 * r + 1] = up;
+    jobs[2 * n_runs + r] = down;
+    warps_at[2 * r] = gate_up_warps;
+    gate_up_warps += cuda::group_warps(gate);
+    warps_at[2 * r + 1] = gate_up_warps;
+    gate_up_warps += cuda::group_warps(up);
+    warps_at[2 * n_runs + r] = down_warps;
+    down_warps += cuda::group_warps(down);
   }
   check(cudaMemcpyAsync(gr.token_of + cols, gr.pinned_token_of + cols, count * kMaxRows * sizeof(int32_t),
                         cudaMemcpyHostToDevice, st),
@@ -748,14 +774,14 @@ void Decoder::Gpu::enqueue_groups(const moe::GroupPlan& plan, size_t first, size
   check(cudaMemcpyAsync(gr.weight + cols, gr.pinned_weight + cols, count * kMaxRows * sizeof(float), cudaMemcpyHostToDevice,
                         st),
         "group weights");
-  check(cudaMemcpyAsync(gr.jobs + 3 * first, jobs, 3 * count * sizeof(cuda::GemvJob), cudaMemcpyHostToDevice, st),
+  check(cudaMemcpyAsync(gr.jobs + 3 * first, jobs, 3 * n_runs * sizeof(cuda::GemvJob), cudaMemcpyHostToDevice, st),
         "group jobs");
-  check(cudaMemcpyAsync(gr.first + 3 * first, warps_at, 3 * count * sizeof(int), cudaMemcpyHostToDevice, st), "group jobs");
-  const int n = static_cast<int>(count);
+  check(cudaMemcpyAsync(gr.first + 3 * first, warps_at, 3 * n_runs * sizeof(int), cudaMemcpyHostToDevice, st), "group jobs");
+  const int n = static_cast<int>(count), runs_n = static_cast<int>(n_runs);
   cuda::gather_quantize(chunk.xf, kDimBlocks, gr.token_of + cols, n, gr.act_codes, gr.act_scales, st);
-  cuda::gemv(gr.jobs + 3 * first, gr.first + 3 * first, 2 * n, gate_up_warps, st);
+  cuda::gemv_groups(gr.jobs + 3 * first, gr.first + 3 * first, 2 * runs_n, gate_up_warps, n, st);
   cuda::swiglu_quantize_groups(gr.token_of + cols, gr.weight + cols, n, gr.buf, moe::kSwigluLimit, st);
-  cuda::gemv(gr.jobs + 3 * first + 2 * count, gr.first + 3 * first + 2 * count, n, down_warps, st);
+  cuda::gemv_groups(gr.jobs + 3 * first + 2 * n_runs, gr.first + 3 * first + 2 * n_runs, runs_n, down_warps, n, st);
   cuda::accumulate_groups(gr.token_of + cols, n, gr.buf, chunk.y, st);
   check(cudaGetLastError(), "grouped MoE launches");
 }

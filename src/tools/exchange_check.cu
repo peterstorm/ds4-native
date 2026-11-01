@@ -1,11 +1,13 @@
 // ds4n-exchange-check: the two-GPU exchange. Both GPUs produce changing FP32
 // partials every round, exchange them and check on the device that the output
 // is bf16(p0 + p1) on both, counting any mismatch (a race shows up as a stale
-// inbox). Then times exchanges back to back and as CUDA graph replays.
+// inbox); the sizes alternate with decode-sized exchanges so both protocols share
+// the inbox in turn. Then times exchanges of T tokens back to back and as CUDA graph replays.
 //   ds4n-exchange-check [--rounds N] [--tokens T]
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -113,15 +115,19 @@ int main(int argc, char** argv) {
     ck(cudaDeviceSynchronize(), "sync");
   }
 
-  // Correctness: produce, exchange, verify, advance -- every round, both GPUs in step.
+  // Correctness: produce, exchange, verify, advance -- every round, both GPUs in step. Every third
+  // round is a decode-sized exchange and every third a Round's, so the two protocols (one push, or
+  // scatter and gather by size) follow each other through the same inbox slots and flags.
   const unsigned grid = static_cast<unsigned>((n + 255) / 256);
+  const size_t sizes[3] = {n, std::min<size_t>(n, 5120), std::min<size_t>(n, 8 * 5120)};
   for (int r = 0; r < rounds; r++)
     for (int g = 0; g < 2; g++) {
       Side& s = side[g];
+      const size_t m = sizes[r % 3];
       ck(cudaSetDevice(g), "set device");
-      produce<<<grid, 256, 0, s.stream>>>(g, s.round, n, s.partial);
-      cuda::exchange_add(s.link, s.partial, n, s.out, s.stream);
-      verify<<<grid, 256, 0, s.stream>>>(s.round, n, s.out, s.bad);
+      produce<<<grid, 256, 0, s.stream>>>(g, s.round, m, s.partial);
+      cuda::exchange_add(s.link, s.partial, m, s.out, s.stream);
+      verify<<<grid, 256, 0, s.stream>>>(s.round, m, s.out, s.bad);
       next_round<<<1, 1, 0, s.stream>>>(s.round);
     }
   unsigned long long bad[2];
@@ -134,8 +140,10 @@ int main(int argc, char** argv) {
               tokens > 1 ? "s" : "", rounds, bad[0], bad[1]);
   if (bad[0] || bad[1]) die("exchange produced wrong values");
 
-  // Back to back: bursts of exchanges with no work between them (inbox parity keeps them apart).
+  // Back to back: bursts of exchanges with no work between them (inbox parity keeps them apart),
+  // every fourth decode-sized.
   constexpr int kBurst = 64, kBursts = 200;
+  auto burst_size = [&](int i) { return i % 4 == 3 ? sizes[1] : n; };
   for (int g = 0; g < 2; g++) {
     Side& s = side[g];
     ck(cudaSetDevice(g), "set device");
@@ -151,13 +159,14 @@ int main(int argc, char** argv) {
       Side& s = side[g];
       ck(cudaSetDevice(g), "set device");
       for (int i = 0; i < kBurst; i++)
-        cuda::exchange_add(s.link, s.burst_partial[i % 2], n, s.burst_out + static_cast<size_t>(i) * n, s.stream);
+        cuda::exchange_add(s.link, s.burst_partial[i % 2], burst_size(i), s.burst_out + static_cast<size_t>(i) * n, s.stream);
     }
     for (int g = 0; g < 2; g++) {
       Side& s = side[g];
       ck(cudaSetDevice(g), "set device");
       for (int i = 0; i < kBurst; i++)
-        verify_round<<<grid, 256, 0, s.stream>>>(1000000u + i % 2, n, s.burst_out + static_cast<size_t>(i) * n, s.bad);
+        verify_round<<<grid, 256, 0, s.stream>>>(1000000u + i % 2, burst_size(i), s.burst_out + static_cast<size_t>(i) * n,
+                                                 s.bad);
     }
   }
   for (int g = 0; g < 2; g++) {

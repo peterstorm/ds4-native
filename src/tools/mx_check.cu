@@ -5,14 +5,19 @@
 // then times a decode layer's routed work (6 Experts x gate/up/down, plus the
 // split reductions) over rotating Expert sets so L2 cannot serve it.
 //
-//   ds4n-mx-check --store STORE --layer L [--experts N] [--tokens T] [--iters I] [--splits S]
+//   ds4n-mx-check --store STORE --layer L [--experts N] [--tokens T] [--iters I] [--splits S] [--groups G]
+//
+// --groups G instead checks and times a prompt sweep's grouped GEMVs (gemv_groups: Expert runs, wave jobs)
+// (every group must match the one-group kernel bit for bit; planes past a job's groups stay untouched).
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <random>
 #include <string>
 #include <vector>
@@ -93,12 +98,159 @@ cuda::ActFragments quantize_and_check(const std::vector<__nv_bfloat16>& x, const
   return act;
 }
 
+template <class T>
+T* upload(const std::vector<T>& v) {
+  T* d = device_alloc<T>(v.size());
+  ck(cudaMemcpy(d, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice), "upload");
+  return d;
+}
+
+/** Random FP8 tiles (core/mx_tiles fp8_tile_bytes): finite E4M3 codes, tile scales 2^-7..2^0. */
+uint8_t* random_fp8_tiles(std::mt19937& rng, int rows, int blocks) {
+  const size_t tile = mx::fp8_tile_bytes(blocks);
+  std::vector<uint8_t> bytes(static_cast<size_t>(rows) / 16 * tile);
+  for (size_t t = 0; t < bytes.size() / tile; t++)
+    for (size_t i = 0; i < tile; i++) {
+      uint8_t& b = bytes[t * tile + i];
+      b = static_cast<uint8_t>(rng());
+      if (i >= static_cast<size_t>(blocks) * 512) b = static_cast<uint8_t>(120 + b % 8);  // a scale byte
+      else if ((b & 0x7F) == 0x7F) b ^= 1;                                              // not NaN
+    }
+  return upload(bytes);
+}
+
+/**
+ * --groups G: a prompt sweep's grouped GEMVs over up to G column groups of 8 tokens -- the decode
+ * layer's 18 jobs on the real MXFP4 Halves with their own group counts (Expert runs of the grouped
+ * MoE), then FP8 jobs shaped like wq_b and wo_b set for G + 3 groups but bounded to G (a wave shorter
+ * than its jobs) -- must equal, bit for bit, every group run alone through the decode kernel (a
+ * token's bits are the same in any group, a Round's too), and leave the planes past a job's groups
+ * untouched. Then each launch is timed.
+ */
+void check_groups(const uint8_t* dw, int groups, int splits, int iters) {
+  std::mt19937 rng(7);
+  const int tokens = groups * cuda::kMaxTokens;
+  std::map<int, cuda::ActFragments> acts;  // per K blocks: random activations of all the tokens
+  auto act_of = [&](int blocks) {
+    auto [it, fresh] = acts.try_emplace(blocks);
+    if (fresh) {
+      std::vector<float> f;
+      __nv_bfloat16* dx = upload(random_bf16(rng, static_cast<size_t>(tokens) * blocks * 32, f));
+      it->second = {device_alloc<uint8_t>(static_cast<size_t>(groups) * blocks * 256),
+                    device_alloc<uint8_t>(static_cast<size_t>(groups) * blocks * 8), blocks};
+      cuda::quantize_activations(dx, tokens, it->second, nullptr);
+      ck(cudaDeviceSynchronize(), "quantize");
+      cudaFree(dx);
+    }
+    return it->second;
+  };
+  auto planes = [](const cuda::GemvJob& j) { return static_cast<size_t>(j.splits) * j.rows * 8; };  // floats a group
+  struct Launch {
+    const char* name;
+    std::vector<cuda::GemvJob> jobs;  // group 0's activations, planes for every group (NaN-filled first)
+    double weight_bytes = 0;
+  };
+  std::vector<Launch> launches(3);
+  launches[0].name = "6 Experts x gate/up/down (MXFP4)";
+  for (int j = 0; j < 18; j++) {
+    const Part& p = kParts[j % 3];
+    const int sp = j % 3 == 2 ? 1 : splits;
+    const auto act = act_of(p.blocks);
+    launches[0].jobs.push_back({cuda::WeightFormat::Mxfp4, dw + static_cast<size_t>(j / 3) * store::kHalfPayloadBytes + p.offset,
+                                act.codes, act.scales, nullptr, p.rows, p.blocks, sp, cuda::split_blocks_for(p.blocks, sp),
+                                std::max(1, groups - j / 3 * 5)});  // an Expert's run: its own groups
+    launches[0].weight_bytes += store::kHalfPartBytes;
+  }
+  struct Fp8Shape {
+    const char* name;
+    int rows, blocks, splits;
+  };
+  constexpr Fp8Shape kFp8[2] = {{"wq_b (FP8, 16384 x 1280, 2 splits)", 16384, 40, 2},
+                                {"wo_b (FP8, 5120 x 4096, 4 splits)", 5120, 128, 4}};
+  for (int i = 0; i < 2; i++) {
+    const Fp8Shape& s = kFp8[i];
+    const auto act = act_of(s.blocks);
+    launches[1 + i].name = s.name;
+    launches[1 + i].jobs.push_back({cuda::WeightFormat::Fp8, random_fp8_tiles(rng, s.rows, s.blocks), act.codes, act.scales,
+                                    nullptr, s.rows, s.blocks, s.splits, cuda::split_blocks_for(s.blocks, s.splits),
+                                    groups + 3});  // bounded to `groups` at launch
+    launches[1 + i].weight_bytes = static_cast<double>(mx::fp8_tiled_bytes(s.rows, s.blocks));
+  }
+  for (Launch& l : launches)
+    for (auto& j : l.jobs) {
+      j.out = device_alloc<float>(j.groups * planes(j));
+      ck(cudaMemset(j.out, 0xFF, j.groups * planes(j) * 4), "memset");
+    }
+
+  cudaEvent_t t0, t1;
+  ck(cudaEventCreate(&t0), "event");
+  ck(cudaEventCreate(&t1), "event");
+  for (const Launch& l : launches) {
+    std::vector<int> first, first_one;  // gemv_groups' warps (group_warps), the decode kernel's (job_warps)
+    int total = 0, total_one = 0;
+    for (const auto& j : l.jobs) {
+      first.push_back(total);
+      total += cuda::group_warps(j);
+      first_one.push_back(total_one);
+      total_one += cuda::job_warps(j);
+    }
+    const int n_jobs = static_cast<int>(l.jobs.size());
+    int* dfirst = upload(first);
+    int* dfirst_one = upload(first_one);
+    cuda::GemvJob* djobs = upload(l.jobs);
+    cuda::gemv_groups(djobs, dfirst, n_jobs, total, groups, nullptr);
+    // Every group alone, through the decode kernel, into planes of its own (a job past its groups idle).
+    std::vector<cuda::GemvJob> alone = l.jobs;
+    for (auto& j : alone) j.out = device_alloc<float>(j.groups * planes(j));
+    cuda::GemvJob* djobs_g = device_alloc<cuda::GemvJob>(alone.size());
+    for (int g = 0; g < groups; g++) {
+      std::vector<cuda::GemvJob> at = alone;
+      for (auto& j : at) {
+        const int jg = std::min(g, j.groups - 1);  // a job past its groups recomputes its last one
+        j.act_codes += static_cast<size_t>(jg) * j.blocks * 256;
+        j.act_scales += static_cast<size_t>(jg) * j.blocks * 8;
+        j.out += jg * planes(j);
+      }
+      ck(cudaMemcpy(djobs_g, at.data(), at.size() * sizeof(cuda::GemvJob), cudaMemcpyHostToDevice), "jobs");
+      cuda::gemv(djobs_g, dfirst_one, n_jobs, total_one, nullptr);
+      ck(cudaDeviceSynchronize(), "gemv");
+    }
+    size_t outputs = 0, same = 0, past = 0, untouched = 0;
+    for (size_t j = 0; j < l.jobs.size(); j++) {
+      const cuda::GemvJob& job = l.jobs[j];
+      const size_t live = std::min(job.groups, groups) * planes(job), all = job.groups * planes(job);
+      std::vector<uint32_t> got(all), want(live);
+      ck(cudaMemcpy(got.data(), job.out, all * 4, cudaMemcpyDeviceToHost), "out");
+      ck(cudaMemcpy(want.data(), alone[j].out, live * 4, cudaMemcpyDeviceToHost), "alone");
+      for (size_t i = 0; i < live; i++) same += got[i] == want[i];
+      for (size_t i = live; i < all; i++) untouched += got[i] == 0xFFFFFFFFu;
+      outputs += live;
+      past += all - live;
+    }
+    std::printf("gemv_groups %s, up to %d groups: %zu plane values, %.4f%% bit-identical to one group at a time; "
+                "%zu past the bound, %zu untouched\n",
+                l.name, groups, outputs, 100.0 * same / outputs, past, untouched);
+    if (same != outputs) die("gemv_groups differs from the one-group kernel");
+    if (untouched != past) die("gemv_groups wrote planes past a job's groups");
+    for (int i = 0; i < 3; i++) cuda::gemv_groups(djobs, dfirst, n_jobs, total, groups, nullptr);
+    ck(cudaEventRecord(t0), "record");
+    for (int i = 0; i < iters; i++) cuda::gemv_groups(djobs, dfirst, n_jobs, total, groups, nullptr);
+    ck(cudaEventRecord(t1), "record");
+    ck(cudaEventSynchronize(t1), "sync");
+    float ms = 0;
+    ck(cudaEventElapsedTime(&ms, t0, t1), "elapsed");
+    const double us = ms / iters * 1000;
+    std::printf("  %.1f us a launch: %.0f GB/s of weights once, %.0f GB/s as re-read per group\n", us,
+                l.weight_bytes / (us * 1e-6) / 1e9, l.weight_bytes * groups / (us * 1e-6) / 1e9);
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   std::string store_path;
   uint32_t layer = 0;
-  int n_experts = 64, tokens = 1, iters = 200, splits = 1;
+  int n_experts = 64, tokens = 1, iters = 200, splits = 1, groups = 0;
   for (int i = 1; i < argc; i++) {
     const std::string s = argv[i];
     if (s == "--store" && i + 1 < argc) store_path = argv[++i];
@@ -107,6 +259,7 @@ int main(int argc, char** argv) {
     else if (s == "--tokens" && i + 1 < argc) tokens = std::stoi(argv[++i]);
     else if (s == "--iters" && i + 1 < argc) iters = std::stoi(argv[++i]);
     else if (s == "--splits" && i + 1 < argc) splits = std::stoi(argv[++i]);
+    else if (s == "--groups" && i + 1 < argc) groups = std::stoi(argv[++i]);
     else die("unknown argument " + s);
   }
   if (store_path.empty() || tokens < 1 || tokens > cuda::kMaxTokens || n_experts < 6 || splits < 1) die("bad arguments");
@@ -212,6 +365,10 @@ int main(int argc, char** argv) {
   std::printf("gemv vs oracle (splits %d): %zu outputs, %.4f%% bit-identical, max error %.3g of the job's largest\n",
               splits, checked, 100.0 * exact / checked, max_rel);
   if (max_rel > 1e-5) die("GEMV disagrees with the oracle beyond FP32 reassociation");
+  if (groups > 0) {
+    check_groups(dw, groups, splits, iters);
+    return 0;
+  }
 
   // Bandwidth: rotate Expert sets so each launch streams weights from DRAM.
   cudaEvent_t t0, t1;
