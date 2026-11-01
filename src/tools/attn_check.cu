@@ -156,7 +156,8 @@ int main() {
 
   if (cuda::sparse_attn(dqs, kvs, nullptr, 641, 641, dsink, 1, scale, scratch, dout, nullptr) != cudaErrorInvalidValue)
     die("sparse_attn accepted 641 slots");
-  // Timing: decode (one query row) and a prompt sweep's launch (128), 640 slots each.
+  // Timing: decode (one query row) and a prompt sweep's launch (128), 640 slots each; the best of
+  // three replays (the clocks drift between runs).
   std::vector<int32_t> idx(static_cast<size_t>(qrows) * max_idx);
   for (auto& i : idx) i = pick(rng);
   auto didx = upload(idx);
@@ -174,14 +175,18 @@ int main() {
     ck(cudaStreamEndCapture(st, &graph), "end capture");
     ck(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
     ck(cudaGraphLaunch(exec, st), "warm");
-    ck(cudaEventRecord(a, st), "rec");
-    ck(cudaGraphLaunch(exec, st), "graph");
-    ck(cudaEventRecord(b, st), "rec");
-    ck(cudaEventSynchronize(b), "sync");
-    float ms;
-    ck(cudaEventElapsedTime(&ms, a, b), "elapsed");
+    double best = 1e30;
+    for (int round = 0; round < 3; round++) {
+      ck(cudaEventRecord(a, st), "rec");
+      ck(cudaGraphLaunch(exec, st), "graph");
+      ck(cudaEventRecord(b, st), "rec");
+      ck(cudaEventSynchronize(b), "sync");
+      float ms;
+      ck(cudaEventElapsedTime(&ms, a, b), "elapsed");
+      best = std::min(best, ms / 200.0);
+    }
     std::printf("sparse_attn %d row%s x 640 slots: %.1f us per layer (x40 = %.2f ms)\n", rows_timed,
-                rows_timed > 1 ? "s" : "", ms / 200 * 1000, ms / 200 * 40);
+                rows_timed > 1 ? "s" : "", best * 1000, best * 40);
   }
   return 0;
 }

@@ -66,8 +66,22 @@ __device__ __forceinline__ void mma_bf16(float (&d)[4], const uint32_t (&a)[4], 
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
-__device__ __forceinline__ uint32_t pack_bf16(__nv_bfloat16 lo, __nv_bfloat16 hi) {
-  return static_cast<uint32_t>(__bfloat16_as_ushort(lo)) | (static_cast<uint32_t>(__bfloat16_as_ushort(hi)) << 16);
+/**
+ * Four 8x8 BF16 tiles from shared memory into MMA fragment registers, lane l naming row l % 8 of
+ * tile l / 8 (each row 16-byte aligned); register i of lane l holds tile i's row l / 4, columns
+ * 2 (l % 4) and + 1 -- exactly what 32-bit loads at those places would give.
+ */
+__device__ __forceinline__ void ldmatrix_x4(uint32_t (&r)[4], const __nv_bfloat16* row) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+               : "r"(static_cast<unsigned>(__cvta_generic_to_shared(row))));
+}
+
+/** The same with each tile transposed: register i of lane l holds tile i's rows 2 (l % 4) and + 1 (low half first) of column l / 4. */
+__device__ __forceinline__ void ldmatrix_x4_trans(uint32_t (&r)[4], const __nv_bfloat16* row) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+               : "r"(static_cast<unsigned>(__cvta_generic_to_shared(row))));
 }
 
 /**
@@ -125,17 +139,22 @@ __global__ void __launch_bounds__(kSplitThreads) split_kernel(const __nv_bfloat1
   }
   __syncthreads();
 
-  // S = Q K^T: warp w owns head tile (w & 1) and row tile (w >> 1); k16 steps over d in order.
+  // S = Q K^T: warp w owns head tile (w & 1) and row tile (w >> 1); k16 steps over d in order. The
+  // fragments come by ldmatrix: lane l names row l % 8 of tile t = l / 8 -- for Q's A fragment the
+  // tiles (rows +0 / +8) x (k +0 / +8), for K's B fragments k +0, +8, +16, +24 (two k steps).
   const int h0 = (warp & 1) * 16, n_base = (warp >> 1) * 8;
+  const int tile = lane >> 3, tile_row = lane & 7;
+  const __nv_bfloat16* q_rows = qs + (h0 + tile_row + 8 * (tile & 1)) * kKvStride + 8 * (tile >> 1);
+  const __nv_bfloat16* k_rows = kvs + (n_base + tile_row) * kKvStride + 8 * tile;
   float d[4] = {};
 #pragma unroll 4
-  for (int k0 = 0; k0 < kAttnDim; k0 += 16) {
-    const __nv_bfloat16* qa = qs + (h0 + g) * kKvStride + k0 + 2 * qq;
-    const uint32_t a[4] = {*reinterpret_cast<const uint32_t*>(qa), *reinterpret_cast<const uint32_t*>(qa + 8 * kKvStride),
-                           *reinterpret_cast<const uint32_t*>(qa + 8),
-                           *reinterpret_cast<const uint32_t*>(qa + 8 * kKvStride + 8)};
-    const __nv_bfloat16* kr = kvs + (n_base + g) * kKvStride + k0 + 2 * qq;
-    mma_bf16(d, a, *reinterpret_cast<const uint32_t*>(kr), *reinterpret_cast<const uint32_t*>(kr + 8));
+  for (int k0 = 0; k0 < kAttnDim; k0 += 32) {
+    uint32_t a0[4], a1[4], b[4];
+    ldmatrix_x4(a0, q_rows + k0);
+    ldmatrix_x4(a1, q_rows + k0 + 16);
+    ldmatrix_x4(b, k_rows + k0);
+    mma_bf16(d, a0, b[0], b[1]);
+    mma_bf16(d, a1, b[2], b[3]);
   }
   __syncthreads();  // Q is read by every warp: the scores below overwrite it
 #pragma unroll
@@ -179,23 +198,23 @@ __global__ void __launch_bounds__(kSplitThreads) split_kernel(const __nv_bfloat1
   __syncthreads();
 
   // O = P V: warp w owns head tile (w & 1) and d tiles 8 * (w >> 1) .. + 7; k16 steps over the 64 rows.
+  // P's A fragments by ldmatrix as Q's; V's B fragments by ldmatrix.trans, the tiles rows +0, +8,
+  // +16, +24 of a pair of k steps at the d tile's columns.
   uint32_t pa[4][4];
+  const __nv_bfloat16* p_rows = probs + (h0 + tile_row + 8 * (tile & 1)) * kProbStride + 8 * (tile >> 1);
 #pragma unroll
-  for (int s = 0; s < 4; s++) {
-    const __nv_bfloat16* pr = probs + (h0 + g) * kProbStride + 16 * s + 2 * qq;
-    pa[s][0] = *reinterpret_cast<const uint32_t*>(pr);
-    pa[s][1] = *reinterpret_cast<const uint32_t*>(pr + 8 * kProbStride);
-    pa[s][2] = *reinterpret_cast<const uint32_t*>(pr + 8);
-    pa[s][3] = *reinterpret_cast<const uint32_t*>(pr + 8 * kProbStride + 8);
-  }
+  for (int s = 0; s < 4; s++) ldmatrix_x4(pa[s], p_rows + 16 * s);
+  const __nv_bfloat16* v_rows = kvs + (tile_row + 8 * tile) * kKvStride;
   float* out = scratch.o + ((static_cast<size_t>(row) * splits + split) * kAttnHeads) * kAttnDim;
   for (int t = 0; t < 8; t++) {
     const int n0 = (warp >> 1) * 64 + 8 * t;
     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
-    for (int s = 0; s < 4; s++) {
-      const __nv_bfloat16* vr = kvs + (16 * s + 2 * qq) * kKvStride + n0 + g;
-      mma_bf16(acc, pa[s], pack_bf16(vr[0], vr[kKvStride]), pack_bf16(vr[8 * kKvStride], vr[9 * kKvStride]));
+    for (int s = 0; s < 4; s += 2) {
+      uint32_t b[4];
+      ldmatrix_x4_trans(b, v_rows + 16 * s * kKvStride + n0);
+      mma_bf16(acc, pa[s], b[0], b[1]);
+      mma_bf16(acc, pa[s + 1], b[2], b[3]);
     }
     float* o0 = out + static_cast<size_t>(h0 + g) * kAttnDim + n0 + 2 * qq;
     o0[0] = acc[0];
