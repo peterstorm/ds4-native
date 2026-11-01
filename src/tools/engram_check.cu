@@ -2,10 +2,13 @@
 // split into the two GPUs' halves (run here on one GPU and added with the
 // exchange's arithmetic). Real wkv and q/k weights of layer 1 with
 // --backbone; table rows are random until the Engram tables are converted.
+// Then a prompt sweep's wave of rows in pinned host memory: its quantized
+// fragments against each column group's own, and the time.
 //   ds4n-engram-check [--backbone SAFETENSORS] [--tokens T] [--seed S]
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -216,5 +219,52 @@ int main(int argc, char** argv) {
               backbone.empty() ? "random" : "layer 1", tokens, tokens > 1 ? "s" : "", kv_same,
               static_cast<size_t>(tokens) * kRows, out_same, h.size());
   if (kv_same != static_cast<size_t>(tokens) * kRows || out_same != h.size()) die("engram differs from the oracle");
+
+  // A prompt sweep's wave: 509 tokens' rows (63 full column groups and a tail of 5) in pinned host
+  // memory, quantized per half. Each group's fragments must be those of its tokens quantized alone
+  // from device memory (the path checked against the oracle above); timed best of 3.
+  constexpr int kWave = 509, kGroups = (kWave + cuda::kMaxTokens - 1) / cuda::kMaxTokens;
+  const size_t token_bytes = static_cast<size_t>(cuda::kEngramCols) * cuda::kEngramRowBytes;
+  uint8_t* pinned = nullptr;
+  ck(cudaMallocHost(&pinned, kWave * token_bytes), "cudaMallocHost");
+  for (size_t i = 0; i < kWave * token_bytes; i++) {
+    const bool scale_byte = i % cuda::kEngramRowBytes >= 256;
+    uint8_t v = static_cast<uint8_t>(rng());
+    if (!scale_byte && (v & 0x7F) == 0x7F) v = 0x38;
+    pinned[i] = scale_byte ? static_cast<uint8_t>(118 + rng() % 4) : v;
+  }
+  auto* d_wave = upload(pinned, kWave * token_bytes);
+  cudaEvent_t start, stop;
+  ck(cudaEventCreate(&start), "cudaEventCreate");
+  ck(cudaEventCreate(&stop), "cudaEventCreate");
+  size_t frag_same = 0, frag_total = 0;
+  for (int half = 0; half < 2; half++) {
+    const cuda::ActFragments wave{device_alloc<uint8_t>(kGroups * kHalf * 256), device_alloc<uint8_t>(kGroups * kHalf * 8), kHalf};
+    float best = 1e9f;
+    for (int rep = 0; rep < 3; rep++) {
+      ck(cudaEventRecord(start), "cudaEventRecord");
+      cuda::engram_quantize_rows(pinned, kWave, half * kHalf, wave, nullptr);
+      ck(cudaEventRecord(stop), "cudaEventRecord");
+      ck(cudaEventSynchronize(stop), "quantize wave");
+      float ms = 0.0f;
+      ck(cudaEventElapsedTime(&ms, start, stop), "cudaEventElapsedTime");
+      best = std::min(best, ms);
+    }
+    const auto codes = download(wave.codes, static_cast<size_t>(kGroups) * kHalf * 256);
+    const auto scales = download(wave.scales, static_cast<size_t>(kGroups) * kHalf * 8);
+    const cuda::ActFragments one{device_alloc<uint8_t>(kHalf * 256), device_alloc<uint8_t>(kHalf * 8), kHalf};
+    for (int g = 0; g < kGroups; g++) {
+      const int n = std::min(cuda::kMaxTokens, kWave - g * cuda::kMaxTokens);
+      cuda::engram_quantize_rows(d_wave + g * cuda::kMaxTokens * token_bytes, n, half * kHalf, one, nullptr);
+      const auto want_codes = download(one.codes, kHalf * 256), want_scales = download(one.scales, kHalf * 8);
+      for (size_t i = 0; i < want_codes.size(); i++) frag_same += codes[g * kHalf * 256 + i] == want_codes[i];
+      for (size_t i = 0; i < want_scales.size(); i++) frag_same += scales[g * kHalf * 8 + i] == want_scales[i];
+      frag_total += want_codes.size() + want_scales.size();
+    }
+    std::printf("wave of %d tokens from pinned memory, half %d: %.1f us (%.1f GB/s of rows)\n", kWave, half, best * 1e3f,
+                kWave * token_bytes / 2 / (best * 1e-3f) / 1e9f);
+  }
+  std::printf("wave fragments: %zu / %zu bytes as each group's own\n", frag_same, frag_total);
+  if (frag_same != frag_total) die("a wave's fragments differ from its groups'");
   return 0;
 }
