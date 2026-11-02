@@ -55,7 +55,8 @@ constexpr int kExpertRows = 1152, kExpertDownBlocks = 36, kDimBlocks = kDim / 32
 constexpr size_t kExpertPartBytes = static_cast<size_t>(kExpertRows) * (kDim / 32) * 17;  // one tiled part of a Half
 static_assert(3 * kExpertPartBytes == store::kHalfPayloadBytes, "a Slot holds a Half: gate, up and down parts");
 constexpr int kSplitsMainProj = 4;  // DSpark's feature projection (K = 15360): proposal numerics, not Reference
-constexpr size_t kCandidateSlot = static_cast<size_t>(kMaxRows) * (kMaxCompressed / 8);  // a Round's candidate blocks
+constexpr size_t kMaskWords = static_cast<size_t>(cuda::candidate_mask_words(kMaxCompressed));  // a row's candidate mask
+constexpr size_t kCandidateSlot = static_cast<size_t>(kMaxRows) * kMaskWords;                      // a Round's, in words
 constexpr size_t kEngramSlot = static_cast<size_t>(kMaxRows) * kEngramTableBytes;            // a Round's rows of one table
 
 /** What a layer step covers (Decoder::Gpu::enqueue_layer): a Round, or a sweep's Round through its slot. */
@@ -78,7 +79,7 @@ constexpr int kGroupBatch = 512;  // groups a grouped MoE launch works on at onc
 enum class WavePhase { EngramMix, Attention, AttentionSend, AttentionAdd, Ffn, CombineSend, CombineAdd, CombinePost };
 
 constexpr int kWaveRows = kMaxRows * kWaveRounds;  // 512
-constexpr int kScoreRows = 128;                    // a wave's indexer rows scored at once (scores [128][65536])
+constexpr int kScoreRows = 128;                    // a wave's indexer rows scored at once (scores [128][kMaxCompressed])
 constexpr int kAttnRows = 128;                     // a wave's rows through sparse attention at once
 
 /** The parts of a sweep's work the wave clock (DS4N_WAVE_PROFILE) times: the waves', then the grouped MoE's. */
@@ -277,7 +278,7 @@ struct Decoder::Gpu {
   std::map<int, uint8_t*> index_cache;
   std::map<int, cuda::PoolSlots> pools;
   int32_t* topk = nullptr;       // [row][512], from the last index source
-  uint8_t* candidates = nullptr;  // [row][kMaxCompressed / 8], from the candidate source
+  uint32_t* candidates = nullptr;  // [row][kMaskWords], from the candidate source
   cuda::IndexSelectScratch select{};
   // Per-Round scratch, [row][...].
   // RMSNorm rows (the reduction is one block; its quantize and copy stay wide, in their own kernels).
@@ -338,7 +339,7 @@ struct Decoder::Gpu {
     model::RoundIndex* round = nullptr;  // [capacity]
     int32_t* idx = nullptr;              // [capacity][8][kIdxStride]: the window slots
     int32_t* topk = nullptr;             // [capacity][8][512]: from the last index source
-    uint8_t* candidates = nullptr;       // [capacity] x kCandidateSlot: from the candidate source
+    uint32_t* candidates = nullptr;      // [capacity] x kCandidateSlot words: from the candidate source
     uint8_t* engram = nullptr;           // [2][capacity] x kEngramSlot, pinned host memory both GPUs read
     int32_t* current = nullptr;          // the Round a chunked layer step works on (device)
     int32_t* round_numbers = nullptr;    // pinned 0 .. capacity - 1, the sources of `current`

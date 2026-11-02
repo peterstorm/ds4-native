@@ -165,16 +165,18 @@ int main(int argc, char** argv) {
 
   const int64_t blocks = (positions + 7) / 8;
   const int64_t max_blocks = (std::max(positions, timing_positions) + 7) / 8;
-  auto* d_mask = device_alloc<uint8_t>(max_blocks);
+  auto* d_mask = device_alloc<uint32_t>(cuda::candidate_mask_words(std::max(positions, timing_positions)));
+  auto bit = [](const std::vector<uint32_t>& words, int64_t b) { return (words[b >> 5] >> (b & 31)) & 1u; };
   const cuda::IndexSelectScratch scratch{{device_alloc<unsigned>(cuda::select_scratch_words())},
                                          device_alloc<__nv_bfloat16>(max_blocks),
                                          device_alloc<int32_t>(cuda::kCandidateBlocks)};
   cuda::candidate_blocks(d_scores, cuda::IntArg::of(positions), d_mask, scratch, nullptr);
-  const auto gpu_mask = download(d_mask, blocks);
+  const auto gpu_mask = download(d_mask, cuda::candidate_mask_words(positions));
   const auto want_mask = indexer::candidates(scores_f, positions);
   if (!want_mask) die(want_mask.error().what);
   Check candidate_check{"candidate blocks"};
-  for (int64_t b = 0; b < blocks; b++) candidate_check.add((gpu_mask[b] != 0) == (want_mask.value()[b * 8] != 0));
+  for (int64_t b = 0; b < blocks; b++) candidate_check.add(bit(gpu_mask, b) == (want_mask.value()[b * 8] != 0));
+  for (int64_t b = blocks; b < cuda::candidate_mask_words(positions) * 32; b++) candidate_check.add(bit(gpu_mask, b) == 0);
 
   auto* d_idx = device_alloc<int32_t>(cuda::kIndexTopK);
   Check top_check{"top positions (all)"}, masked_check{"top positions (candidates)"},
@@ -224,19 +226,19 @@ int main(int argc, char** argv) {
     cuda::top_positions(d_scores, len, 128, d_idx, scratch.select, nullptr);
   };
   for (int64_t len : {int64_t{0}, int64_t{1}, int64_t{9}, int64_t{300}, int64_t{513}, int64_t{4097}, positions}) {
-    const size_t n_blocks = static_cast<size_t>((len + 7) / 8);
+    const size_t n_words = static_cast<size_t>(cuda::candidate_mask_words(len));
     pipeline(cuda::IntArg::of(len));
     const auto want_s = download(d_scores, static_cast<size_t>(len));
-    const auto want_m = download(d_mask, n_blocks);
+    const auto want_m = download(d_mask, n_words);
     const auto want_i = download(d_idx, cuda::kIndexTopK);
     ck(cudaMemcpy(d_len, &len, sizeof(len), cudaMemcpyHostToDevice), "upload");
     pipeline(cuda::IntArg::at(d_len, capacity));
     const auto got_s = download(d_scores, static_cast<size_t>(len));
-    const auto got_m = download(d_mask, n_blocks);
+    const auto got_m = download(d_mask, n_words);
     const auto got_i = download(d_idx, cuda::kIndexTopK);
     for (int64_t t = 0; t < len; t++)
       device_check.add(__bfloat16_as_ushort(got_s[t]) == __bfloat16_as_ushort(want_s[t]));
-    for (size_t b = 0; b < n_blocks; b++) device_check.add(got_m[b] == want_m[b]);
+    for (size_t w = 0; w < n_words; w++) device_check.add(got_m[w] == want_m[w]);
     for (int i = 0; i < cuda::kIndexTopK; i++) device_check.add(got_i[i] == want_i[i]);
   }
   ck(cudaDeviceSynchronize(), "device lengths");

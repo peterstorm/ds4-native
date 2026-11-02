@@ -1,5 +1,7 @@
 // ds4n-glue-check: GPU glue kernels versus the CPU oracles (core/hc_reference),
-// plus timings for the head-sized BF16 GEMV, the router- and compressor-sized ones, and one hc_mixes call.
+// plus timings for the head-sized BF16 GEMV, the router- and compressor-sized ones, and one hc_mixes call;
+// and a prompt sweep's copy of each token's embedding into its stream's other copies, a whole Cohort
+// and more (a launch's grid y stops at 65,535).
 //   ds4n-glue-check [--tokens T]
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -14,6 +16,7 @@
 #include "core/hc_reference.hpp"
 #include "core/mx_reference.hpp"
 #include "core/reduce.hpp"
+#include "cuda/chunk.cuh"
 #include "cuda/glue.cuh"
 
 using namespace ds4n;
@@ -144,6 +147,27 @@ int main(int argc, char** argv) {
   }
   report("hc_pre", static_cast<size_t>(tokens) * dim, pre_exact, 0);
   report("hc_post", h.size(), post_exact, 0);
+
+  // replicate_first_copy: copy 0 of each token's stream into copies 1-3, for a whole 64K Cohort and
+  // one token more (narrow rows: the grid's y covers the tokens).
+  for (const int cohort : {65536, 65537}) {
+    constexpr int narrow = 64;
+    std::vector<__nv_bfloat16> streams(static_cast<size_t>(cohort) * 4 * narrow, __float2bfloat16(0.0f));
+    for (int t = 0; t < cohort; t++)
+      for (int i = 0; i < narrow; i++) streams[(static_cast<size_t>(t) * 4) * narrow + i] = __float2bfloat16(float((t * 31 + i) % 997));
+    auto ds = upload(streams);
+    cuda::replicate_first_copy(ds, cohort, narrow, nullptr);
+    ck(cudaGetLastError(), "replicate_first_copy launch");
+    const auto got = download(ds, streams.size());
+    size_t same = 0;
+    for (int t = 0; t < cohort; t++)
+      for (int c = 0; c < 4; c++)
+        for (int i = 0; i < narrow; i++)
+          same += __bfloat16_as_ushort(got[(static_cast<size_t>(t) * 4 + c) * narrow + i]) ==
+                  __bfloat16_as_ushort(streams[(static_cast<size_t>(t) * 4) * narrow + i]);
+    report(cohort == 65536 ? "replicate" : "replicate+1", streams.size(), same, 0);
+    ck(cudaFree(ds), "free");
+  }
 
   // BF16 GEMV at head scale (one GPU's vocabulary half) and router scale with split-K.
   const int rows = 64640;

@@ -56,8 +56,17 @@
 
 namespace ds4n::engine {
 
-/** Compressed positions each KV source can hold in this executor (positions p < kMaxCompressed). */
-constexpr int64_t kMaxCompressed = 65536;
+/**
+ * Positions this executor's caches hold (positions p < kMaxCompressed): the context. A ratio-r KV
+ * source holds kMaxCompressed / r compressed rows (~2.7 KB a position on each GPU in all).
+ */
+constexpr int64_t kMaxCompressed = 262144;
+
+/**
+ * Rounds of 8 a prompt sweep takes at once by default (a 64K-token Cohort): its chunk arrays scale
+ * with it (~10 GB a GPU for the whole 256K context), and a longer prompt goes as several.
+ */
+constexpr int kSweepRounds = 8192;
 
 /** Raw bytes of one token's Engram rows: table 0 (layer 1), then table 1 (layer 14), 24 rows of 264 each. */
 constexpr size_t kEngramTableBytes = static_cast<size_t>(24) * 264;

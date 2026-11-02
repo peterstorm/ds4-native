@@ -20,7 +20,7 @@ struct FullModelConfig {
   uint32_t slots = 8000, ram_records = 512;
   std::string prior;               // an Expert pick-count profile warming the Slots (empty: by key)
   RamPolicy ram_policy = RamPolicy::Recent;
-  int sweep_rounds = static_cast<int>(kMaxCompressed / model::kMaxRows);  // a prompt sweep's chunk: the whole context
+  int sweep_rounds = kSweepRounds;  // a prompt sweep's chunk (Rounds of 8)
 };
 
 struct FullModel {

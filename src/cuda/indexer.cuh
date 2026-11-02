@@ -33,6 +33,14 @@ constexpr size_t index_cache_bytes(int64_t positions) {
   return static_cast<size_t>((positions + 15) / 16) * kIndexTileBytes;
 }
 
+/**
+ * 32-bit words of a candidate mask over `positions` positions: a bit per 8-position block, block b
+ * at bit b % 32 of word b / 32 (a whole-context prompt sweep keeps one per row).
+ */
+constexpr int64_t candidate_mask_words(int64_t positions) {
+  return ((positions + kCandidateBlockSize - 1) / kCandidateBlockSize + 31) / 32;
+}
+
 /** fp4_act_quant (block 32, E8M0) of keys [n][128] (BF16, after RoPE) into positions first .. first + n - 1. */
 void append_index_keys(const __nv_bfloat16* keys, IntArg first, int n, uint8_t* cache, cudaStream_t stream);
 
@@ -64,10 +72,10 @@ void prepare_index_query(const __nv_bfloat16* q, const float* projection, int sp
                          cudaStream_t stream);
 
 /**
- * scores[t] (BF16) for t < compress_len. With `block_mask` (one byte per 8
- * positions), positions in unmasked blocks score -inf and skip the MMA.
+ * scores[t] (BF16) for t < compress_len. With `block_mask` (candidate_mask_words), positions in
+ * unmarked blocks score -inf and skip the MMA.
  */
-void index_scores(const uint8_t* cache, IntArg compress_len, const IndexQuery& q, const uint8_t* block_mask,
+void index_scores(const uint8_t* cache, IntArg compress_len, const IndexQuery& q, const uint32_t* block_mask,
                   __nv_bfloat16* scores, cudaStream_t stream);
 
 /** Scratch for the selections: block keys for up to `max_positions` positions, the chosen blocks. */
@@ -78,10 +86,10 @@ struct IndexSelectScratch {
 };
 
 /**
- * Level one: block_mask[b] for b < ceil(compress_len / 8), as indexer::candidates;
+ * Level one: block b's bit of `block_mask` for b < ceil(compress_len / 8), as indexer::candidates;
  * the mask is zeroed up to the bound of compress_len.
  */
-void candidate_blocks(const __nv_bfloat16* scores, IntArg compress_len, uint8_t* block_mask,
+void candidate_blocks(const __nv_bfloat16* scores, IntArg compress_len, uint32_t* block_mask,
                       const IndexSelectScratch& scratch, cudaStream_t stream);
 
 /** idx[0 .. k) = the top k = min(512, compress_len) positions ascending, plus offset; idx[k .. 512) = -1. */
@@ -95,8 +103,8 @@ void top_positions(const __nv_bfloat16* scores, IntArg compress_len, int32_t off
 void prepare_index_queries(const __nv_bfloat16* q, const float* projection, int splits, int rows, IndexQueries out,
                            cudaStream_t stream);
 
-/** index_scores for every row: scores at scores + r * score_stride, masks (or null) at r * mask_stride. */
-void index_scores_rows(const uint8_t* cache, IntArg compress_len, int rows, IndexQueries q, const uint8_t* block_masks,
+/** index_scores for every row: scores at scores + r * score_stride, masks (or null) at r * mask_stride words. */
+void index_scores_rows(const uint8_t* cache, IntArg compress_len, int rows, IndexQueries q, const uint32_t* block_masks,
                        int64_t mask_stride, __nv_bfloat16* scores, int64_t score_stride, cudaStream_t stream);
 
 /** Per-row selection scratch: select words, block keys and chosen blocks for `rows` rows. */
@@ -107,9 +115,9 @@ struct IndexSelectRows {
   int32_t* chosen_blocks;     // rows x kCandidateBlocks
 };
 
-/** candidate_blocks for every row: masks at block_masks + r * mask_stride. */
+/** candidate_blocks for every row: masks at block_masks + r * mask_stride words. */
 void candidate_blocks_rows(const __nv_bfloat16* scores, int64_t score_stride, IntArg compress_len, int rows,
-                           uint8_t* block_masks, int64_t mask_stride, const IndexSelectRows& scratch, cudaStream_t stream);
+                           uint32_t* block_masks, int64_t mask_stride, const IndexSelectRows& scratch, cudaStream_t stream);
 
 /** top_positions for every row: row r's 512 slots at idx + r * idx_stride. */
 void top_positions_rows(const __nv_bfloat16* scores, int64_t score_stride, IntArg compress_len, int rows, int32_t offset,

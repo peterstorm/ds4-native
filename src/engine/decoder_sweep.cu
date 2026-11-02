@@ -84,7 +84,7 @@ void Decoder::Gpu::allocate_sweep(int chunk_rounds) {
   c.round = a.alloc<model::RoundIndex>(G);
   c.idx = a.alloc<int32_t>(N * kIdxStride);
   c.topk = a.alloc<int32_t>(N * kTopK);
-  c.candidates = a.alloc<uint8_t>(G * kCandidateSlot);
+  c.candidates = a.alloc<uint32_t>(G * kCandidateSlot);
   c.current = a.alloc<int32_t>(1);
   check(cudaMallocHost(&c.round_numbers, G * sizeof(int32_t)), "cudaMallocHost");
   for (size_t i = 0; i < G; i++) c.round_numbers[i] = static_cast<int32_t>(i);
@@ -388,18 +388,18 @@ void Decoder::Gpu::enqueue_wave(int layer, const WaveRows& w, WavePhase phase) {
           cuda::bf16_gemv(d.index_weights_proj, v.xa_f, cuda::kIndexHeads, kDim, rows, kSplitsBf16, v.planes_proj, st);
           cuda::prepare_index_queries(v.q_idx, v.planes_proj, kSplitsBf16, rows, v.queries, st);
           lap(WaveSection::IndexQueries);
-          constexpr int64_t kMaskBytes = kMaxCompressed / 8;
+          constexpr int64_t kMaskStride = static_cast<int64_t>(kMaskWords);
           for (int s0 = 0; s0 < rows; s0 += kScoreRows) {
             const int n = std::min(kScoreRows, rows - s0);
             const IntArg len = IntArg::at(v.compress_len[ratio] + r0 + s0, kMaxCompressed);
-            uint8_t* masks = chunk.candidates + (r0 + s0) * kMaskBytes;
+            uint32_t* masks = chunk.candidates + (r0 + s0) * kMaskStride;
             const cuda::IndexQueries q{v.queries.codes + s0 * cuda::kQueryCodeBytes, v.queries.scales + s0 * cuda::kQueryScaleBytes,
                                        v.queries.weights + s0 * cuda::kIndexHeads};
-            cuda::index_scores_rows(index_cache.at(kind.cache_owner), len, n, q, kind.uses_candidates ? masks : nullptr, kMaskBytes,
+            cuda::index_scores_rows(index_cache.at(kind.cache_owner), len, n, q, kind.uses_candidates ? masks : nullptr, kMaskStride,
                                     v.scores, kMaxCompressed, st);
             lap(WaveSection::IndexScores);
             if (kind.candidate_source)
-              cuda::candidate_blocks_rows(v.scores, kMaxCompressed, len, n, masks, kMaskBytes, v.select, st);
+              cuda::candidate_blocks_rows(v.scores, kMaxCompressed, len, n, masks, kMaskStride, v.select, st);
             cuda::top_positions_rows(v.scores, kMaxCompressed, len, n, kRing, topk + static_cast<size_t>(s0) * kTopK, kTopK,
                                      v.select.select, st);
             lap(WaveSection::IndexSelect);
@@ -581,6 +581,7 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
             "chunk embeddings");
       if (grouped) s.upload_rows(row_index);
       cuda::replicate_first_copy(c.h, static_cast<int>(n), kDim, s.stream);
+      check(cudaGetLastError(), "chunk start launches");
       check(cudaStreamSynchronize(s.stream), "chunk start");
     }
 
@@ -624,10 +625,20 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
       waves.push_back(w);
     }
     // One phase of a wave on both GPUs: no GPU starts its next phase before the peer launched this one.
+    // (DS4N_SWEEP_CHECK: each phase's launches checked as they go, naming the layer, wave and phase.)
+    const bool checking = std::getenv("DS4N_SWEEP_CHECK") != nullptr;
     auto phase = [&](int layer, const WaveRows& w, WavePhase p) {
       for (auto& gp : gpus_) {
         check(cudaSetDevice(gp->device), "cudaSetDevice");
-        gp->enqueue_wave(layer, w, p);
+        if (checking) check(cudaGetLastError(), "before the wave phase");
+        try {
+          gp->enqueue_wave(layer, w, p);
+        } catch (const CudaError& e) {
+          if (!checking) throw;
+          throw CudaError(std::string(e.what()) + " (layer " + std::to_string(layer) + ", wave rows " +
+                          std::to_string(w.first) + "+" + std::to_string(w.rows) + ", phase " +
+                          std::to_string(static_cast<int>(p)) + ", chunk from " + std::to_string(c0) + ")");
+        }
       }
     };
     // Every Round's step of `layer`, on both GPUs (per-Round sweeps).

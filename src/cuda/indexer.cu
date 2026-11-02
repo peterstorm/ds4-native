@@ -12,6 +12,9 @@ constexpr uint16_t kPosInfBits = 0x7F80;  // BF16 +inf
 
 __device__ __forceinline__ float round_bf16(float v) { return __bfloat162float(__float2bfloat16_rn(v)); }
 
+/** Whether block b's bit is set in a candidate mask (candidate_mask_words). */
+__device__ __forceinline__ bool marked(const uint32_t* mask, int64_t b) { return (mask[b >> 5] >> (b & 31)) & 1u; }
+
 /** core/mx_tiles code_offset / scale_offset for 4-block (128-value) rows. */
 __device__ __forceinline__ int code_offset(int r, int b, int q) {
   return (b >> 1) * 512 + ((r & 7) * 4 + q) * 16 + ((b & 1) * 2 + (r >> 3)) * 4;
@@ -99,7 +102,7 @@ __global__ void prepare_kernel(const __nv_bfloat16* __restrict__ q, const float*
  * the query row (its length, query, mask and scores at row strides).
  */
 __global__ void __launch_bounds__(128) score_kernel(const uint8_t* __restrict__ cache, IntArg length, IndexQueries queries,
-                                                    const uint8_t* __restrict__ block_mask, int64_t mask_stride,
+                                                    const uint32_t* __restrict__ block_mask, int64_t mask_stride,
                                                     __nv_bfloat16* __restrict__ scores, int64_t score_stride) {
   const int row = blockIdx.y;
   const IndexQuery q = queries.at(row);
@@ -111,8 +114,8 @@ __global__ void __launch_bounds__(128) score_kernel(const uint8_t* __restrict__ 
   const int64_t p0 = tile * 16;
   if (p0 >= len) return;
   const int64_t blocks = (len + kCandidateBlockSize - 1) / kCandidateBlockSize;
-  const bool live0 = block_mask == nullptr || block_mask[p0 / 8] != 0;
-  const bool live1 = block_mask == nullptr || (p0 / 8 + 1 < blocks && block_mask[p0 / 8 + 1] != 0);
+  const bool live0 = block_mask == nullptr || marked(block_mask, p0 / 8);
+  const bool live1 = block_mask == nullptr || (p0 / 8 + 1 < blocks && marked(block_mask, p0 / 8 + 1));
   const int qq = lane & 3;
   float part_a = 0.0f, part_b = 0.0f;
   if (live0 || live1) {
@@ -175,16 +178,21 @@ __global__ void block_keys_kernel(const __nv_bfloat16* __restrict__ scores, int6
   keys[b] = __float2bfloat16_rn(best);  // exact: a BF16 value
 }
 
-/** Mark the chosen blocks, except those with no reachable position (-inf). blockIdx.y: the row. */
+/**
+ * Mark the chosen blocks, except those with no reachable position (-inf): their bits, set by
+ * atomicOr since chosen blocks share words (the order bits are set in cannot matter). blockIdx.y: the row.
+ */
 __global__ void mark_blocks_kernel(const int32_t* __restrict__ chosen, IntArg blocks, const __nv_bfloat16* __restrict__ keys,
-                                   int64_t key_stride, uint8_t* __restrict__ mask, int64_t mask_stride) {
+                                   int64_t key_stride, uint32_t* __restrict__ mask, int64_t mask_stride) {
   chosen += blockIdx.y * static_cast<int64_t>(kCandidateBlocks);
   keys += blockIdx.y * key_stride;
   mask += blockIdx.y * mask_stride;
   const int64_t n = blocks.row(blockIdx.y).get();
   const int k = static_cast<int>(n < kCandidateBlocks ? n : kCandidateBlocks);
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < k) mask[chosen[i]] = __bfloat16_as_ushort(keys[chosen[i]]) != kNegInfBits;
+  if (i >= k) return;
+  const int32_t b = chosen[i];
+  if (__bfloat16_as_ushort(keys[b]) != kNegInfBits) atomicOr(&mask[b >> 5], 1u << (b & 31));
 }
 
 }  // namespace
@@ -206,12 +214,12 @@ void prepare_index_queries(const __nv_bfloat16* q, const float* projection, int 
     prepare_kernel<<<dim3(kIndexHeads * kIndexBlocks * 32 / 128, rows), 128, 0, stream>>>(q, projection, splits, 0, out);
 }
 
-void index_scores(const uint8_t* cache, IntArg compress_len, const IndexQuery& q, const uint8_t* block_mask,
+void index_scores(const uint8_t* cache, IntArg compress_len, const IndexQuery& q, const uint32_t* block_mask,
                   __nv_bfloat16* scores, cudaStream_t stream) {
   index_scores_rows(cache, compress_len, 1, IndexQueries{q.codes, q.scales, q.weights}, block_mask, 0, scores, 0, stream);
 }
 
-void index_scores_rows(const uint8_t* cache, IntArg compress_len, int rows, IndexQueries q, const uint8_t* block_masks,
+void index_scores_rows(const uint8_t* cache, IntArg compress_len, int rows, IndexQueries q, const uint32_t* block_masks,
                        int64_t mask_stride, __nv_bfloat16* scores, int64_t score_stride, cudaStream_t stream) {
   const int64_t tiles = (compress_len.bound() + 15) / 16;
   if (tiles <= 0 || rows <= 0) return;
@@ -219,7 +227,7 @@ void index_scores_rows(const uint8_t* cache, IntArg compress_len, int rows, Inde
       cache, compress_len, q, block_masks, mask_stride, scores, score_stride);
 }
 
-void candidate_blocks(const __nv_bfloat16* scores, IntArg compress_len, uint8_t* block_mask,
+void candidate_blocks(const __nv_bfloat16* scores, IntArg compress_len, uint32_t* block_mask,
                       const IndexSelectScratch& scratch, cudaStream_t stream) {
   const IntArg blocks = compress_len.ceil_div(kCandidateBlockSize);
   candidate_blocks_rows(scores, 0, compress_len, 1, block_mask, 0,
@@ -227,13 +235,14 @@ void candidate_blocks(const __nv_bfloat16* scores, IntArg compress_len, uint8_t*
 }
 
 void candidate_blocks_rows(const __nv_bfloat16* scores, int64_t score_stride, IntArg compress_len, int rows,
-                           uint8_t* block_masks, int64_t mask_stride, const IndexSelectRows& scratch, cudaStream_t stream) {
+                           uint32_t* block_masks, int64_t mask_stride, const IndexSelectRows& scratch, cudaStream_t stream) {
   const IntArg blocks = compress_len.ceil_div(kCandidateBlockSize);
   if (blocks.bound() <= 0 || rows <= 0) return;
   block_keys_kernel<<<dim3(static_cast<unsigned>((blocks.bound() + 255) / 256), rows), 256, 0, stream>>>(
       scores, score_stride, compress_len, scratch.block_keys, scratch.key_stride);
-  cudaMemset2DAsync(block_masks, mask_stride > 0 ? static_cast<size_t>(mask_stride) : static_cast<size_t>(blocks.bound()), 0,
-                    static_cast<size_t>(blocks.bound()), rows, stream);
+  const size_t words = static_cast<size_t>(candidate_mask_words(compress_len.bound()));
+  cudaMemset2DAsync(block_masks, (mask_stride > 0 ? static_cast<size_t>(mask_stride) : words) * sizeof(uint32_t), 0,
+                    words * sizeof(uint32_t), rows, stream);
   select_top_rows(scratch.block_keys, scratch.key_stride, blocks, rows, kCandidateBlocks, 0, scratch.chosen_blocks,
                   kCandidateBlocks, scratch.select, stream);
   const int64_t k_bound = blocks.bound() < kCandidateBlocks ? blocks.bound() : kCandidateBlocks;

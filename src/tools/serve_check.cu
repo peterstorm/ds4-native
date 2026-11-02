@@ -6,12 +6,14 @@
 //
 //   ds4n-serve-check --backbone B --store S --gguf G --tokens FILE --system FILE [--dspark DIR]
 //                    [--expect LOGPROBS] [--slots N] [--ram-records R] [--prior P] [--ram-policy P]
-//                    [--timing FILE]
+//                    [--timing FILE] [--long FILE,FILE,... [--long-tokens N]]
 //
 // FILE (--tokens) is an antirez --dump-tokens prompt (ids on the first line); --system a long one
 // whose first 3,000 tokens stand for a system prompt that several conversations share. --expect
 // compares the greedy reply with a ds4n-model-run dump of the same prompt (its steps' selected ids).
 // --timing FILE: a long prompt to time a prompt's tail read as a sweep against Rounds of 8.
+// --long: prompts concatenated into one of --long-tokens (default 240,000), read cold (several
+// prompt-sweep chunks) and resumed by an agent's next step, each against a cold read.
 //
 // Each scenario runs its requests on one Conversation back to back -- so they resume in place, take
 // checkpoints back and restore Rewind points as a server's would -- then every prompt again cold.
@@ -121,7 +123,8 @@ void scenario(const std::string& name, engine::Conversation& warm, engine::Conve
 int main(int argc, char** argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   engine::FullModelConfig mc;
-  std::string tokens_path, system_path, expect_path, timing_path;
+  std::string tokens_path, system_path, expect_path, timing_path, long_paths;
+  size_t long_tokens = 240000;
   for (int i = 1; i < argc; i++) {
     const std::string a = argv[i];
     if (i + 1 >= argc) die("missing value for " + a);
@@ -138,6 +141,8 @@ int main(int argc, char** argv) {
     else if (a == "--system") system_path = v;
     else if (a == "--expect") expect_path = v;
     else if (a == "--timing") timing_path = v;
+    else if (a == "--long") long_paths = v;
+    else if (a == "--long-tokens") long_tokens = std::stoul(v);
     else die("unknown argument " + a);
   }
   if (mc.backbone.empty() || mc.store.empty() || mc.gguf.empty() || tokens_path.empty() || system_path.empty())
@@ -227,6 +232,27 @@ int main(int argc, char** argv) {
     }
     return true;
   });
+
+  // A context past the 64K sweep chunk: read cold in several chunks, then an agent's next step resumed on it.
+  if (!long_paths.empty()) {
+    std::vector<int32_t> long_prompt;
+    for (size_t at = 0; at <= long_paths.size() && long_prompt.size() < long_tokens;) {
+      const size_t comma = std::min(long_paths.find(',', at), long_paths.size());
+      for (const int32_t t : read_tokens(long_paths.substr(at, comma - at))) long_prompt.push_back(t);
+      at = comma + 1;
+    }
+    if (long_prompt.size() < long_tokens) die("--long: the prompts hold fewer than --long-tokens tokens");
+    long_prompt.resize(long_tokens);
+    scenario("long context", conv, cold, [&](std::vector<Request>& r) {
+      switch (r.size()) {
+        case 0: r.push_back({std::to_string(long_tokens) + "-token prompt", long_prompt, 32, greedy, spec, std::nullopt, {}}); break;
+        case 1: r.push_back({"its agent's next step", concat(long_prompt, r[0].warm.tokens, tool), 24, greedy, spec,
+                             long_prompt.size() + r[0].warm.tokens.size() - 1, {}}); break;
+        default: return false;
+      }
+      return true;
+    });
+  }
 
   // A sweep and Rounds of 8 over the same prompt; DSpark and plain steps; sampled with a seed.
   {

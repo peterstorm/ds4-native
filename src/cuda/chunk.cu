@@ -31,11 +31,16 @@ __global__ void store_slot_kernel(uint8_t* __restrict__ base, size_t slot_bytes,
   copy_bytes(base + static_cast<size_t>(*round) * slot_bytes, src, bytes);
 }
 
-__global__ void replicate_kernel(__nv_bfloat16* __restrict__ h, int dim) {
-  __nv_bfloat16* stream = h + static_cast<size_t>(blockIdx.y) * 4 * dim;  // token blockIdx.y
-  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < dim; i += gridDim.x * blockDim.x)
-    for (int c = 1; c < 4; c++) stream[c * dim + i] = stream[i];
+/** Tokens blockIdx.y, + gridDim.y, ...: a grid's y is at most 65,535 and a Cohort holds 65,536 tokens. */
+__global__ void replicate_kernel(__nv_bfloat16* __restrict__ h, int tokens, int dim) {
+  for (int t = blockIdx.y; t < tokens; t += gridDim.y) {
+    __nv_bfloat16* stream = h + static_cast<size_t>(t) * 4 * dim;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < dim; i += gridDim.x * blockDim.x)
+      for (int c = 1; c < 4; c++) stream[c * dim + i] = stream[i];
+  }
 }
+
+constexpr int kMaxGridY = 65535;
 
 }  // namespace
 
@@ -48,7 +53,9 @@ void store_slot(void* base, size_t slot_bytes, const int32_t* round, const void*
 }
 
 void replicate_first_copy(__nv_bfloat16* h, int tokens, int dim, cudaStream_t stream) {
-  if (tokens > 0) replicate_kernel<<<dim3((dim + kThreads - 1) / kThreads, tokens), kThreads, 0, stream>>>(h, dim);
+  if (tokens <= 0) return;
+  const dim3 grid((dim + kThreads - 1) / kThreads, tokens < kMaxGridY ? tokens : kMaxGridY);
+  replicate_kernel<<<grid, kThreads, 0, stream>>>(h, tokens, dim);
 }
 
 }  // namespace ds4n::cuda

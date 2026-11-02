@@ -50,7 +50,7 @@ Decoder::Decoder(std::array<int, 2> devices, std::array<cuda::ExpertDirectory, 2
     s.mix_ffn = a.alloc<cuda::HcMixes>(R);
     s.round = a.alloc<model::RoundIndex>(1);
     s.topk = a.alloc<int32_t>(R * kTopK);
-    s.candidates = a.alloc<uint8_t>(R * kMaxCompressed / 8);
+    s.candidates = a.alloc<uint32_t>(R * kMaskWords);
     s.select = {{a.alloc<unsigned>(cuda::select_scratch_words())}, a.alloc<bf16>(kMaxCompressed / 8),
                 a.alloc<int32_t>(cuda::kCandidateBlocks)};
 
@@ -191,8 +191,8 @@ void Decoder::add_layer(const HostLayer& w) {
     s.window[w.id] = s.arena.alloc<bf16>(static_cast<size_t>(kRing) * kHeadDim);
     check(cudaMemset(s.window[w.id], 0, static_cast<size_t>(kRing) * kHeadDim * 2), "memset");
     if (kind.kv_source) {
-      s.compressed[w.id] = s.arena.alloc<bf16>(static_cast<size_t>(kMaxCompressed) * kHeadDim);
-      s.index_cache[w.id] = s.arena.alloc<uint8_t>(cuda::index_cache_bytes(kMaxCompressed));
+      s.compressed[w.id] = s.arena.alloc<bf16>(static_cast<size_t>(kMaxCompressed / kind.compress_ratio) * kHeadDim);
+      s.index_cache[w.id] = s.arena.alloc<uint8_t>(cuda::index_cache_bytes(kMaxCompressed / kind.compress_ratio));
       if (kind.compress_ratio == 2) {
         s.pools[w.id] = {s.arena.alloc<float>(cuda::kPoolRing * kHeadDim), s.arena.alloc<float>(cuda::kPoolRing * kHeadDim)};
         cuda::init_pool(s.pools[w.id], s.stream);
@@ -373,7 +373,7 @@ void Decoder::Gpu::enqueue_layer(int layer, int rows, int parity, StepMode mode)
     if (kind.compress_ratio && !kind.index_source)  // reuses the last index source's top-k
       cuda::load_slot(topk, chunk.topk, kMaxRows * kTopK * sizeof(int32_t), g, rows * kTopK * sizeof(int32_t), stream);
     if (kind.uses_candidates)
-      cuda::load_slot(candidates, chunk.candidates, kCandidateSlot, g, rows * (kMaxCompressed / 8), stream);
+      cuda::load_slot(candidates, chunk.candidates, kCandidateSlot * sizeof(uint32_t), g, rows * kMaskWords * sizeof(uint32_t), stream);
   }
   const int ratio = kind.compress_ratio;
   const DeviceLayer& d = layers.at(layer);
@@ -472,7 +472,7 @@ void Decoder::Gpu::enqueue_layer(int layer, int rows, int parity, StepMode mode)
       cuda::bf16_gemv(d.index_weights_proj, xa_f, cuda::kIndexHeads, kDim, rows, kSplitsBf16, planes_proj, st);
       for (int r = 0; r < rows; r++) {
         bf16* scores_r = scores + static_cast<size_t>(r) * kMaxCompressed;
-        uint8_t* candidates_r = candidates + static_cast<size_t>(r) * kMaxCompressed / 8;
+        uint32_t* candidates_r = candidates + static_cast<size_t>(r) * kMaskWords;
         cuda::prepare_index_query(q_idx + static_cast<size_t>(r) * cuda::kIndexHeads * cuda::kIndexDim, planes_proj,
                                   kSplitsBf16, r, iq[r], st);
         cuda::index_scores(index_cache.at(kind.cache_owner), compress_len(r), iq[r],
@@ -539,7 +539,8 @@ void Decoder::Gpu::enqueue_layer(int layer, int rows, int parity, StepMode mode)
     const int32_t* g = chunk.current;
     if (kind.index_source)
       cuda::store_slot(chunk.topk, kMaxRows * kTopK * sizeof(int32_t), g, topk, rows * kTopK * sizeof(int32_t), st);
-    if (kind.candidate_source) cuda::store_slot(chunk.candidates, kCandidateSlot, g, candidates, rows * (kMaxCompressed / 8), st);
+    if (kind.candidate_source)
+      cuda::store_slot(chunk.candidates, kCandidateSlot * sizeof(uint32_t), g, candidates, rows * kMaskWords * sizeof(uint32_t), st);
   };
 
   // The routed Experts: resolved on the device (a Miss waits for the Expert cache's service), then

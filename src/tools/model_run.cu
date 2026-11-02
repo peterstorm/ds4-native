@@ -8,7 +8,7 @@
 //
 // For each name, DIR/<name>.tokens is antirez's --dump-tokens output (ids on the first line). The
 // prompt runs from position 0 as a prompt sweep (engine::Decoder::prefill: chunks of up to N Rounds
-// of 8 rows, each chunk layer by layer; --sweep, default 8192: the whole 64K context in one chunk)
+// of 8 rows, each chunk layer by layer; --sweep, default 8192: a 64K-token chunk)
 // or, with --sweep 0, as Rounds of R rows one after another (--prefill, 1 to 8, default 8); both give
 // the logits of one token at a time (see engine/decoder.cuh). A sweep runs its attention halves in
 // waves of 64 Rounds and groups its MoE by Expert across the chunk (--grouped 1, the default: each
@@ -151,7 +151,7 @@ int main(int argc, char** argv) {
   std::string backbone_path, store_path, gguf_path, tokens_dir, names_arg, out_dir, oracle_dir, prior_path, access_log, dspark_dir;
   bool force = false, grouped = true;
   int max_steps = 64, prefill_rows = model::kMaxRows, verify_rows = 0;
-  int sweep_rounds = static_cast<int>(engine::kMaxCompressed / model::kMaxRows);  // the whole context
+  int sweep_rounds = engine::kSweepRounds;  // a 64K-token chunk
   uint32_t slots = 8000, ram_records = 512, prior_weight = 1;
   float ccr = 0.0f;
   engine::RamPolicy ram_policy = engine::RamPolicy::Recent;
