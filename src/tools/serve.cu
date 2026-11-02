@@ -5,12 +5,15 @@
 //
 //   ds4n-serve --serve --backbone B --store S --gguf G [--dspark DIR] [--slots N] [--ram-records R]
 //              [--prior PROFILE] [--ram-policy recent|popular] [--rewind-points N] [--sweep-min N]
-//              [--stops 1,128803]
+//              [--checkpoint-gb G] [--keep-min N] [--split-min N] [--stops 1,128803]
 //
-// One conversation at a time (READY ... stop: no multi, no PAUSE): a request's prompt resumes where
-// it shares the Session's tokens (engine/conversation), so an agent's tool loop and a chat's next
-// turn read only their new tokens; a different conversation reads its prompt again. Stdout carries
-// the protocol only; everything else goes to stderr (the server's log).
+// One request at a time (READY ... stop: no multi, no PAUSE), from any of the conversations it keeps
+// (engine/conversation): an agent's tool loop and a chat's next turn read only their new tokens; a
+// conversation another one took the GPUs from comes back from its KV checkpoint in host memory
+// (--checkpoint-gb of them, the least recently used dropped first); a subagent's first prompt
+// resumes where it leaves the system prompt it shares with its parent. Stdout carries the protocol
+// only (NOTE lines tell the server's log what happened to the conversations); everything else goes
+// to stderr (the server's log).
 #include <unistd.h>
 
 #include <cerrno>
@@ -145,6 +148,9 @@ int main(int argc, char** argv) {
     else if (a == "--ram-policy") mc.ram_policy = v == "popular" ? engine::RamPolicy::Popular : engine::RamPolicy::Recent;
     else if (a == "--rewind-points") cc.rewind_points = static_cast<uint32_t>(std::stoul(v));
     else if (a == "--sweep-min") cc.sweep_min = std::stoul(v);
+    else if (a == "--checkpoint-gb") cc.checkpoint_budget = static_cast<uint64_t>(std::stod(v) * 1e9);
+    else if (a == "--keep-min") cc.rewind.keep_min = std::stoul(v);
+    else if (a == "--split-min") cc.rewind.split_min = std::stoul(v);
     else if (a == "--stops") stops = v;
     // Maya's server adds these for its own engines: the context is the executor's, and the two GPUs
     // split every layer (tensor parallel), not the layers.
@@ -172,11 +178,12 @@ int main(int argc, char** argv) {
     die(std::string("warm-up: ") + e.what());
   }
 
-  char info[256];
+  char info[320];
   std::snprintf(info, sizeof info,
                 "INFO engine=ds4-native engine_kind=ds4-native context=%lld vram_slots=%u ram_records=%u dspark=%d "
-                "rewind_points=%u logit_bias=1\n",
-                static_cast<long long>(engine::kMaxCompressed), mc.slots, mc.ram_records, m.dspark ? 1 : 0, cc.rewind_points);
+                "rewind_points=%u checkpoint_gb=%.1f logit_bias=1\n",
+                static_cast<long long>(engine::kMaxCompressed), mc.slots, mc.ram_records, m.dspark ? 1 : 0, cc.rewind_points,
+                static_cast<double>(cc.checkpoint_budget) / 1e9);
   out(info);
   out(wire::ready_line(engine::kMaxCompressed));
   std::fprintf(stderr, "ds4n-serve: ready (GEN <max_new> [keys] <ids>; STOP, WRAP, QUIT)\n");
@@ -185,7 +192,12 @@ int main(int argc, char** argv) {
   in.start();
   const engine::ReplyEvents events{[](int32_t t) { out(wire::token_line(t)); },
                                    [](const wire::Progress& p) { out(wire::progress_line(p)); },
-                                   [](const wire::Stat& s) { out(wire::stat_line(s)); }, &in.stop, &in.wrap};
+                                   [](const wire::Stat& s) { out(wire::stat_line(s)); },
+                                   [](const std::string& n) {
+                                     std::fprintf(stderr, "ds4n-serve: %s\n", n.c_str());
+                                     out("NOTE sessions: " + n + "\n");
+                                   },
+                                   &in.stop, &in.wrap};
   while (const std::optional<Input::Line> line = in.next()) {
     if (!*line) {
       out("ERR " + line->error().what + "\n");

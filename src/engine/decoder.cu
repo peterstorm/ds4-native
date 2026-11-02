@@ -296,6 +296,62 @@ void Decoder::transfer(const WindowSnapshot& w, bool to_host) {
   }
 }
 
+std::vector<std::pair<std::byte*, size_t>> Decoder::Gpu::checkpoint_regions(int64_t committed) {
+  std::vector<std::pair<std::byte*, size_t>> out;
+  for (const auto& [layer, rows] : compressed) {
+    const int64_t n = committed / model::kind(layer).compress_ratio;  // the rows positions below `committed` completed
+    out.emplace_back(reinterpret_cast<std::byte*>(rows), static_cast<size_t>(n) * kHeadDim * sizeof(bf16));
+    out.emplace_back(reinterpret_cast<std::byte*>(index_cache.at(layer)), cuda::index_cache_bytes(n));
+  }
+  for (const auto& region : rings()) out.push_back(region);
+  return out;
+}
+
+size_t Decoder::checkpoint_bytes(int64_t committed) {
+  size_t n = 0;
+  for (const auto& [at, bytes] : gpus_[0]->checkpoint_regions(committed)) n += bytes;
+  return kGpus * n;
+}
+
+StoredCaches Decoder::checkpoint(int64_t committed) {
+  if (committed < 0 || committed > kMaxCompressed) throw CudaError("checkpoint: position outside the caches");
+  sync();
+  StoredCaches c;
+  c.committed = committed;
+  for (auto& gp : gpus_) {
+    Gpu& s = *gp;
+    check(cudaSetDevice(s.device), "cudaSetDevice");
+    const auto regions = s.checkpoint_regions(committed);
+    size_t total = 0;
+    for (const auto& [at, n] : regions) total += n;
+    std::vector<std::byte>& host = c.gpu[s.rank];
+    host.resize(total);
+    size_t off = 0;
+    for (const auto& [at, n] : regions) {
+      check(cudaMemcpy(host.data() + off, at, n, cudaMemcpyDeviceToHost), "checkpoint");
+      off += n;
+    }
+  }
+  return c;
+}
+
+void Decoder::take_back(const StoredCaches& c, bool with_rings) {
+  sync();
+  for (auto& gp : gpus_) {
+    Gpu& s = *gp;
+    check(cudaSetDevice(s.device), "cudaSetDevice");
+    auto regions = s.checkpoint_regions(c.committed);
+    if (!with_rings) regions.resize(regions.size() - s.rings().size());
+    size_t off = 0;
+    for (const auto& [at, n] : regions) {
+      if (off + n > c.gpu[s.rank].size()) throw CudaError("take_back: the checkpoint was made for other caches");
+      check(cudaMemcpy(at, c.gpu[s.rank].data() + off, n, cudaMemcpyHostToDevice), "take back");
+      off += n;
+    }
+  }
+  seeded_ = 0;
+}
+
 void Decoder::save(WindowSnapshot& into) { transfer(into, true); }
 
 void Decoder::restore(const WindowSnapshot& from) {

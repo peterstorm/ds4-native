@@ -116,6 +116,17 @@ class WindowSnapshot {
 };
 
 /**
+ * A KV checkpoint's caches on the host, both GPUs': the compressed and index rows below `committed`,
+ * then the rings (Decoder::checkpoint, Decoder::take_back). Pageable memory: it is copied only while
+ * the GPUs are idle.
+ */
+struct StoredCaches {
+  int64_t committed = 0;
+  std::array<std::vector<std::byte>, 2> gpu;
+  size_t bytes() const { return gpu[0].size() + gpu[1].size(); }
+};
+
+/**
  * Places up to 48 of a layer's Experts in VRAM Slots for a prompt sweep's grouped MoE and returns
  * each one's Slot (pool numbering, both GPUs) once its Halves landed: ExpertResidency::place.
  */
@@ -209,6 +220,21 @@ class Decoder {
    * the feature rings).
    */
   void restore(const WindowSnapshot& from);
+
+  /** Host bytes (both GPUs) a KV checkpoint of positions [0, committed) takes: its compressed and index rows and the rings. */
+  size_t checkpoint_bytes(int64_t committed);
+
+  /**
+   * A KV checkpoint (core/rewind): both GPUs' compressed and index rows below `committed` and their
+   * rings, copied to the host once everything launched so far ran (it waits).
+   */
+  StoredCaches checkpoint(int64_t committed);
+
+  /**
+   * `c`'s rows back on both GPUs (it waits), and with `rings` its rings too (else a Rewind point's
+   * follow). DSpark's context starts over.
+   */
+  void take_back(const StoredCaches& c, bool rings);
 
   /** Upload the final norm and the head (BF16 values [129280][5120]); each GPU keeps its half of the vocabulary. */
   void add_head(const std::vector<float>& norm, const std::vector<float>& head);

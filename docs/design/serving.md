@@ -32,14 +32,31 @@ prompt — microseconds against a 10–30 ms decode step. Nothing in it touches 
 `ERR non-finite logits (...)`, which the server answers by running the request again from token 0
 (the engine forgets the Session); any other failure ends the engine and the server restarts it.
 
-## One conversation, resumed (`core/rewind`)
+## The caches
 
-A **Session** is the caches plus the tokens they hold. Each prompt **Resumes** at the longest prefix
-it shares with them — an agent's next step shares the whole previous prompt and the reply — cut back
-to where the caches still hold, Exactly, what a resume reads:
+One live context of 65,536 positions (`kMaxCompressed`, a compile-time executor constant), the same
+bits on both GPUs (each computes the whole latent). Per GPU, allocated at load:
+
+| | bytes |
+|---|---:|
+| compressed KV: 4 KV sources × 65,536 rows × 512 BF16 (ratio 2 for layers 2, 8, 14 uses half) | 256 MiB |
+| index keys: 4 sources, MXFP4 tiles of 16 positions (1,088 B) | 17 MiB |
+| window rings: 40 layers + 3 DSpark stages × 640 slots × 512 BF16 | 27 MiB |
+| DSpark feature rings (3 × 640 × 5120 BF16), ratio-2 pools | 19 MiB |
+| **total** | **~320 MiB** |
+
+A Session's state costs ~2.7 KB a token per GPU (compressed rows 2.5 KB, index keys 0.2 KB) plus 46
+MB of rings. Beside the Experts (~80 GB a GPU) the KV is noise: the context limit is the constant,
+not memory (another 64K would cost ~170 MB a GPU, about 18 Slots).
+
+## Where a prompt resumes (`core/rewind`)
+
+Each prompt **Resumes** at the longest prefix it shares with tokens whose caches the engine holds,
+cut back to where those caches still hold, Exactly, what a resume reads:
 
 - Every read is bounded by the reading row's position, and the compressed and index caches are
-  written once per position: they never limit a resume.
+  written once per position: below a position they hold what the tokens before it make — **the same
+  bits for every conversation with those tokens**. They never limit a resume.
 - The **window ring** (640 slots by position; a row reads the 127 before it) and DSpark's **feature
   rings** (the same slots; a draft reads the 128 before its anchor) hold a position until a write 640
   positions later. A resume at p is Exact while the **Frontier** — one past the highest position
@@ -47,21 +64,41 @@ to where the caches still hold, Exactly, what a resume reads:
 - A **ratio-2 pool** (16 slots) is read only by an odd position, pooling with the one before: an odd p
   also needs the Frontier at most 15 past it, else the resume goes back one (even) position.
 
-`rewind::plan` takes the best of the live state and the **Rewind points**, never past the prompt's
-last token (its logits are the first pick's). A Rewind point is taken at every prompt's end
-(`Decoder::save`: the 40 window rings, 3 pools and 3 feature rings, 46 MB per GPU copied into
-pinned memory on the GPU's stream; 4 kept, the oldest replaced): a chat's next turn re-renders the previous reply without
-its reasoning and so shares the previous prompt only up to its last token — far below a long reply's
-Frontier, but 1 below the point's. Restoring one (`Decoder::restore`) puts the rings back; DSpark's
-context is seeded again from the restored feature rings. A resume drops every point past it.
+So a resume needs KV holding the prompt's prefix and rings near the resume point, and the two may
+come from different places. `rewind::Sessions` keeps three kinds of state:
 
-The Session holds tokens, not conversations: a prompt from another conversation shares little and
-is read again (see *Limits*).
+- **The live Session** — the GPUs' caches and their tokens.
+- **Rewind points** — the rings (40 window rings, 3 pools, 3 feature rings; 46 MB a GPU) copied into
+  pinned memory at one position, with the tokens they were written for. Since the KV below a
+  position is the same for every conversation sharing its tokens, a point serves *any* KV holding
+  them. One is taken at every prompt's end (a chat's next turn re-renders the previous reply without
+  its reasoning, sharing the previous prompt but its last token) and one where a prompt **leaves
+  tokens another state shares** (a subagent leaving its parent's system prompt): the next prompt
+  sharing them — the next subagent, a new pi session — resumes there. 8 kept, least recently used
+  replaced.
+- **KV checkpoints** — a conversation set aside whole: both GPUs' compressed and index rows below its
+  position and its rings, in host RAM (~5.5 KB a token plus 92 MB, both GPUs; a 4.5K-token
+  conversation is 0.12 GB, set aside in ~25 ms, taken back in 8 ms). A Session is set aside when a
+  plan discards at least 1,024 of its tokens (`--keep-min`) — unless a checkpoint already holds it,
+  or the plan rewinds it to its own last prompt's end (a chat's next turn). Earlier states of a
+  conversation give way to its later ones; the least recently used go past the budget
+  (`--checkpoint-gb`, 6 GB on the desktop). Taking one back copies it, so a plan may borrow just its
+  prefix.
 
-`rewind::Session` is a value: `plan`, `resumed`, `wrote`, `marked` and `next_buffer` take it and
-return the next one. Its tests run the transitions against an independent model of the rings
-(every slot remembering the position and token prefix that wrote it): every planned resume reads
-only the Session's own writes, over random prompts, cuts, sweeps and verify Rounds.
+`rewind::plan` takes the KV from the live Session or a checkpoint, and the rings from that state or
+any Rewind point whose tokens it shares — whichever feeds fewest tokens, never past the prompt's
+last token (its logits are the first pick's); ties go to the live Session and to a state's own
+rings. When the prompt shares at least `--split-min` (2,048) tokens more with some state than it can
+resume at, the plan **splits** the read there for a Rewind point. A conversation that differs from
+another only in its last 16 tokens is that one's re-rendered turn (the two cannot be told apart).
+
+`rewind::Sessions` is a value; `plan`, `set_aside`, `within`, `resumed`, `wrote`, `marked`,
+`next_buffer` and `forgot_live` take it and return the next one. Its tests drive it against an
+independent model of the engine (every ring slot and KV row remembering the position and token
+prefix that wrote it; checkpoints and points as copies): over interleaved conversations under a
+shared system prompt — agents' next steps, re-rendered turns, deep cuts, verify Rounds, a squeezed
+budget — every planned resume reads only its own prompt's writes, and a prompt continuing a kept
+conversation resumes at its end.
 
 ## A request (`engine/conversation`)
 
@@ -79,8 +116,9 @@ only the Session's own writes, over random prompts, cuts, sweeps and verify Roun
    | 512 | 1854 | 4142 |
 
    A sweep costs ~0.9 s plus ~0.6 ms a token (each layer's routed Experts placed once); Rounds
-   ~11 ms a token at this context.
-3. A Rewind point at the prompt's end.
+   ~11 ms a token at this context. A split plan reads in two pieces with a Rewind point between.
+3. A Rewind point at the prompt's end. (Before 1: the plan's set-aside, take-back and restore, each
+   reported to the server as a `NOTE sessions: …` line.)
 4. The **Reply** (`core/reply`): pick, write `T`, apply its rules — an end-of-turn token (EOS, and
    `<｜User｜>` 128803, as the server stops on both) ends it "stop"; max_new or the context "length";
    STOP "cancel". With a thinking budget (`think_budget`/`think_end`, sent by the server), a reasoning
@@ -97,15 +135,19 @@ only the Session's own writes, over random prompts, cuts, sweeps and verify Roun
 
 ## Exactness (`ds4n-serve-check`)
 
-On the whole model, every check compares the prompt-end logits bit for bit and the reply token for
-token with a cold run (read from position 0), 2026-11-02:
+On the whole model, each scenario runs its requests back to back on one Conversation (so they
+resume in place, take checkpoints back and restore points as the server's would), then every prompt
+again cold (from position 0); each compares the prompt-end logits bit for bit and the reply token
+for token, 2026-11-02:
 
 | Check | Result |
 |---|---|
 | greedy reply against a `ds4n-model-run` free-running dump of the same prompt (48 tokens) | equal |
 | an agent's tool loop (prompt + reply + tool result), resumed in place | equal, reused 95 of 144 |
-| a chat's next turn after a 700-token reply, from the Rewind point | equal, reused 47 of 95 |
 | resumes 1, 2, 15, 16, 17, 40, 41 tokens back into the reply (odd cuts past the pool go back one) | equal |
+| subagents under a 3,000-token system prompt: parent; first subagent (parent set aside, a point where it leaves the system prompt); second subagent | equal; the second reused 3,000 |
+| the parent's next step, then the first subagent's (each taken back from its checkpoint) | equal, reused 4,547 of 4,596 and 4,531 of 4,580 |
+| a chat's next turn after a 700-token reply and another conversation (the checkpoint's KV, its prompt's Rewind point) | equal, reused 3,047 of 3,095 |
 | the same prompt in Rounds of 8 against a sweep | equal |
 | DSpark against plain steps, greedy (96 tokens) | equal |
 | DSpark against plain steps, sampled (T 0.8, top-p 0.95, seed 1234) | equal |
@@ -118,7 +160,8 @@ and exports the tokenizer in Maya's form (Maya's `tools/ds4/pack.py write_tokeni
 checkpoint's `tokenizer.json`); `--launch` writes the server's config and starts the container
 (`ds4-native-dev:2`, Maya's `.venv`, `--security-opt seccomp=unconfined` for io_uring) on :8000 with
 the shared inference key; `--stop` stops it. Settings: 8,500 Slots (8,800 does not fit beside
-DSpark), 3,000 RAM tier records, Maya's Expert profile, `--ram-policy popular`, `--sweep-min 96`.
+DSpark), 3,000 RAM tier records, Maya's Expert profile, `--ram-policy popular`, `--sweep-min 96`,
+6 GB of checkpoints and 8 Rewind points (with the server loaded ~13 GB of the 91 stay free).
 The server runs with `--fit-max-tokens`: a request whose max_tokens does not fit the 64K context
 beside its prompt gets the room there is.
 
@@ -128,9 +171,8 @@ Expert cache learned the new domain (VRAM Hits 94–97 %, Misses read from the N
 
 ## Limits
 
-- **One conversation at a time.** Switching conversations reads the other's prompt again (~700
-  tok/s for a cold 7K prompt, a few thousand tok/s for long ones). Maya's conversation slots park a
-  whole Session (its compressed and index caches, ~1 KB a token); the same here would be KV
-  checkpoints in pinned RAM.
+- **One request at a time.** Conversations take turns on the GPUs (each switch sets one aside and
+  takes one back, ~35 ms for 4.5K tokens); no PAUSE / fair slices, no batching several at once
+  (Maya's `multi=`): parallel subagents queue in the server.
+- **Checkpoints live in RAM only**: they do not outlast the engine (Maya's also go to a folder).
 - **64K context** (kMaxCompressed), text only.
-- No PAUSE / fair slices, no several conversations at once (Maya's `multi=`).

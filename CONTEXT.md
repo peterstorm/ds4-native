@@ -108,16 +108,20 @@ New prompt tokens added to an existing Session (a tool result, a user turn).
 One conversation's KV state plus its token history.
 
 **KV checkpoint**:
-A persisted Session state that can be restored instead of re-prefilled.
+A Session set aside whole in host RAM — both GPUs' compressed and index rows below its position and its rings — when another conversation takes the GPUs, and taken back (copied, so it can also lend just its prefix) when a prompt continues it (`Decoder::checkpoint`, `take_back`; `rewind::Checkpoint`). Least recently used go first past the budget.
+_Avoid_: slot (Maya's word for it, and ours for VRAM), parked session (prose only)
 
 **Resume**:
-Starting a prompt at a position of the Session's tokens instead of 0: the prompt's longest shared prefix, cut back to a position the caches still hold Exactly (the window and feature rings at most 512 positions written past it, an odd position's ratio-2 pool at most 15; `core/rewind`). The compressed and index caches are written once per position, so they never limit it.
+Starting a prompt at a position instead of 0: the prompt's longest prefix shared with KV the engine holds (the live Session's or a KV checkpoint's), cut back to a position some ring state still answers Exactly (the window and feature rings at most 512 positions written past it, an odd position's ratio-2 pool at most 15; `core/rewind`). The compressed and index caches are written once per position — below a position, the same bits for every conversation with those tokens — so they never limit it.
+
+**Split**:
+Reading a prompt in two pieces with a Rewind point between, where it leaves tokens another kept state shares (a subagent leaving its parent's system prompt), so the next prompt sharing them Resumes there.
 
 **Frontier**:
 One past the highest position a Session's caches were written at, a verify Round's discarded rows included; how far it runs ahead of a position decides whether a Resume there is Exact.
 
 **Rewind point**:
-The window rings, ratio-2 pools and DSpark feature rings of a Session at one position (a prompt's end), copied to pinned host memory: restored, the Session Resumes near that position after decoding moved far past it (a chat's next turn drops the previous reply's reasoning and shares the previous prompt but its last token). Not a KV checkpoint: it holds no compressed or index cache, so it serves only the Session it was taken from.
+The window rings, ratio-2 pools and DSpark feature rings at one position, with the tokens they were written for, copied to pinned host memory (a prompt's end, or a Split): restored over any KV that holds those tokens, a prompt Resumes near that position — a chat's next turn (which drops the previous reply's reasoning and shares the previous prompt but its last token), a subagent under a system prompt another state shares. Not a KV checkpoint: it holds no compressed or index rows.
 _Avoid_: snapshot (the code's WindowSnapshot is a Rewind point's buffer), slot (Maya's word, and ours for VRAM)
 
 **Reply**:
@@ -151,9 +155,9 @@ An independent slow implementation (antirez/ds4, Maya's `ref.py`, or the HF refe
 - A **Slot** holds at most one **Expert**; the **Ledger** fixes how many **Slots** each GPU has
 - A **Miss** is served from the **RAM tier** if present there, otherwise from the **Expert store**
 - A **Round** contains one to eight rows of one **Session**; a **Step** is a one-row **Round**; a **Round**'s **Routing plan** is the union of its rows' Experts
-- A **KV checkpoint** belongs to exactly one **Session** prefix
-- A **Rewind point** belongs to one **Session**, valid while no **Resume** went below its position
-- A **Resume** comes from the live **Session** or one of its **Rewind points**, whichever reads fewer of the prompt's tokens
+- A **KV checkpoint** holds one **Session** at one position; a later checkpoint of the same conversation replaces it
+- A **Rewind point** belongs to no Session: it serves any KV holding its tokens
+- A **Resume** takes KV from the live **Session** or a **KV checkpoint**, and rings from that state or a **Rewind point** — whichever reads fewest of the prompt's tokens
 - **Cache-conditional routing** makes outputs depend on **Expert cache** contents; with λ = 0 every policy is **Exact**
 
 ## Example Dialogue

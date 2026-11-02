@@ -39,11 +39,17 @@ Inputs inputs(const FullModel& m, std::span<const int32_t> tokens, engram::Histo
   return in;
 }
 
-/** A transition of the Session the shell drives correctly by construction (an error is a bug here). */
-rewind::Session committed(rewind::Session s, std::span<const int32_t> fed, size_t kept) {
+/** A transition of the Sessions the shell drives correctly by construction (an error is a bug here). */
+rewind::Sessions committed(rewind::Sessions s, std::span<const int32_t> fed, size_t kept) {
   auto next = rewind::wrote(std::move(s), fed, kept);
   if (!next) throw std::logic_error("Conversation: " + next.error().what);
   return std::move(next).value();
+}
+
+std::string gb(uint64_t bytes) {
+  char b[32];
+  std::snprintf(b, sizeof b, "%.2f GB", static_cast<double>(bytes) / 1e9);
+  return b;
 }
 
 std::vector<float> last_row(const std::vector<float>& all) {
@@ -79,20 +85,21 @@ Conversation::Fed Conversation::sweep(int64_t p0, std::span<const int32_t> token
   return {last_row(m_.decoder->logits()), {in.after.back()}};
 }
 
-bool Conversation::read_prompt(std::span<const int32_t> prompt, size_t from, const ReplyEvents& ev, double t0_ms) {
+bool Conversation::read_prompt(std::span<const int32_t> prompt, size_t from, size_t end, const ReplyEvents& ev,
+                               double t0_ms) {
   const size_t total = prompt.size();
-  if (total - from >= config_.sweep_min) {
-    Fed f = sweep(static_cast<int64_t>(from), prompt.subspan(from), history_);
-    session_ = committed(std::move(session_), prompt.subspan(from), total - from);
+  if (end - from >= config_.sweep_min) {
+    Fed f = sweep(static_cast<int64_t>(from), prompt.subspan(from, end - from), history_);
+    sessions_ = committed(std::move(sessions_), prompt.subspan(from, end - from), end - from);
     history_ = f.after.back();
-    prompt_logits_ = std::move(f.logits);
+    if (end == total) prompt_logits_ = std::move(f.logits);
     return true;
   }
-  for (size_t at = from; at < total;) {
+  for (size_t at = from; at < end;) {
     if (ev.stop && ev.stop->load()) return false;
-    const size_t n = std::min<size_t>(model::kMaxRows, total - at);
+    const size_t n = std::min<size_t>(model::kMaxRows, end - at);
     Fed f = round(static_cast<int64_t>(at), prompt.subspan(at, n), history_);
-    session_ = committed(std::move(session_), prompt.subspan(at, n), n);
+    sessions_ = committed(std::move(sessions_), prompt.subspan(at, n), n);
     history_ = f.after.back();
     at += n;
     if (at == total) prompt_logits_ = last_row(f.logits);
@@ -101,34 +108,77 @@ bool Conversation::read_prompt(std::span<const int32_t> prompt, size_t from, con
   return true;
 }
 
+void Conversation::mark(bool prompt_end) {
+  if (snapshots_.empty()) return;
+  const uint32_t b = rewind::next_buffer(sessions_, static_cast<uint32_t>(snapshots_.size()));
+  m_.decoder->save(snapshots_[b]);
+  sessions_ = rewind::marked(std::move(sessions_), b, prompt_end);
+}
+
+void Conversation::drop(const std::vector<uint64_t>& ids) {
+  for (const uint64_t id : ids) stored_.erase(id);
+}
+
+void Conversation::carry_out(const rewind::Plan& p, const ReplyEvents& ev) {
+  if (p.set_aside) {  // the live Session, whole, into host memory: another conversation takes the GPUs
+    const int64_t n = sessions_.written().committed;
+    const uint64_t bytes = m_.decoder->checkpoint_bytes(n);
+    if (bytes <= config_.checkpoint_budget) {
+      const auto t0 = Clock::now();
+      const uint64_t id = next_id_++;
+      stored_.emplace(id, m_.decoder->checkpoint(n));
+      auto [next, superseded] = rewind::set_aside(std::move(sessions_), id, bytes, p);
+      sessions_ = std::move(next);
+      drop(superseded);
+      ev.note("set aside a " + std::to_string(n) + "-token conversation (" + gb(bytes) + ", " +
+              std::to_string(static_cast<int>(ms_since(t0))) + " ms); " + std::to_string(sessions_.checkpoints().size()) + " kept");
+    }
+  }
+  if (p.take) {
+    const auto t0 = Clock::now();
+    const StoredCaches& c = stored_.at(*p.take);
+    m_.decoder->take_back(c, !p.point);
+    ev.note("took back a " + std::to_string(c.committed) + "-token conversation (" + gb(c.bytes()) + ", " +
+            std::to_string(static_cast<int>(ms_since(t0))) + " ms)");
+  }
+  if (p.point) m_.decoder->restore(snapshots_[*p.point]);
+  sessions_ = rewind::resumed(std::move(sessions_), p);
+  auto [kept, dropped] = rewind::within(std::move(sessions_), config_.checkpoint_budget);
+  sessions_ = std::move(kept);
+  drop(dropped);
+}
+
 wire::Done Conversation::run(const wire::Generate& g, const ReplyEvents& ev) {
   if (g.prompt.empty() || static_cast<int64_t>(g.prompt.size()) >= kMaxCompressed)
     throw std::invalid_argument("a prompt of 1 to " + std::to_string(kMaxCompressed - 1) + " tokens");
   try {
     const double t0 = now_ms();
-    const rewind::Resume r = rewind::plan(session_, g.prompt).value();
-    if (r.point) m_.decoder->restore(snapshots_[r.point->buffer]);
-    session_ = rewind::resumed(std::move(session_), r);
-    const size_t from = static_cast<size_t>(r.from);
+    const rewind::Plan p = rewind::plan(sessions_, g.prompt, config_.rewind).value();
+    carry_out(p, ev);
+    const size_t from = static_cast<size_t>(p.from), total = g.prompt.size();
     auto h = engram::history_at(m_.layout, g.prompt, from);
     if (!h) throw std::runtime_error("Engram: " + h.error().what);
     history_ = h.value();
-    ev.progress({from, g.prompt.size(), from, 0.0});
-    if (!read_prompt(g.prompt, from, ev, t0))
-      return {0, g.prompt.size(), now_ms() - t0, 0.0, reply::Finish::Cancel, 0, 0, from};
-    ev.progress({g.prompt.size(), g.prompt.size(), from, now_ms() - t0});
-    // A Rewind point at the prompt's end: the next turn of a chat shares this prompt but its reply.
-    if (!snapshots_.empty()) {
-      const uint32_t b = rewind::next_buffer(session_, static_cast<uint32_t>(snapshots_.size()));
-      m_.decoder->save(snapshots_[b]);
-      session_ = rewind::marked(std::move(session_), b);
+    ev.progress({from, total, from, 0.0});
+    // Where the prompt leaves tokens other conversations share, a Rewind point: the next prompt that
+    // shares them (a subagent's, under the same system prompt) resumes there.
+    size_t at = from;
+    if (p.split) {
+      const size_t split = static_cast<size_t>(*p.split);
+      if (!read_prompt(g.prompt, at, split, ev, t0)) return {0, total, now_ms() - t0, 0.0, reply::Finish::Cancel, 0, 0, from};
+      mark(false);
+      at = split;
     }
-    std::fprintf(stderr, "ds4n-serve: prompt %zu tokens = %zu reused%s + %zu read in %.0f ms (%.1f tok/s)\n", g.prompt.size(),
-                 from, r.point ? " (from a Rewind point)" : "", g.prompt.size() - from, now_ms() - t0,
-                 1000.0 * static_cast<double>(g.prompt.size() - from) / std::max(now_ms() - t0, 1e-9));
+    if (!read_prompt(g.prompt, at, total, ev, t0)) return {0, total, now_ms() - t0, 0.0, reply::Finish::Cancel, 0, 0, from};
+    ev.progress({total, total, from, now_ms() - t0});
+    mark(true);  // the next turn of a chat shares this prompt but its reply
+    std::fprintf(stderr, "ds4n-serve: prompt %zu tokens = %zu reused%s%s + %zu read%s in %.0f ms (%.1f tok/s)\n", total, from,
+                 p.take ? " (a checkpoint's)" : "", p.point ? " (a Rewind point's rings)" : "", total - from,
+                 p.split ? (" (a Rewind point at " + std::to_string(*p.split) + ")").c_str() : "", now_ms() - t0,
+                 1000.0 * static_cast<double>(total - from) / std::max(now_ms() - t0, 1e-9));
     return reply(g, ev, from, now_ms() - t0);
   } catch (...) {
-    forget();  // the caches' state is unknown: start over
+    forget_live();  // the caches' state is unknown: the next prompt reads from a kept state or 0
     throw;
   }
 }
@@ -186,7 +236,7 @@ wire::Done Conversation::reply(const wire::Generate& g, const ReplyEvents& ev, s
       const std::vector<int32_t> fed = {anchor};
       Fed f = round(p, fed, history_);
       if (drafting) policy = spec::after_plain(policy, ms_since(t_round));
-      session_ = committed(std::move(session_), fed, 1);
+      sessions_ = committed(std::move(sessions_), fed, 1);
       history_ = f.after.back();
       p += 1;
       anchor = next_of(f.logits);
@@ -213,7 +263,7 @@ wire::Done Conversation::reply(const wire::Generate& g, const ReplyEvents& ev, s
       tok = next_of(row(i));
       going = write(tok, p + i + 1);
     }
-    session_ = committed(std::move(session_), fed, static_cast<size_t>(i) + 1);  // rows 0 .. i are committed
+    sessions_ = committed(std::move(sessions_), fed, static_cast<size_t>(i) + 1);  // rows 0 .. i are committed
     history_ = f.after[static_cast<size_t>(i)];
     p += i + 1;
     anchor = tok;
@@ -244,7 +294,8 @@ void Conversation::warm_up() {
     }
   if (m_.dspark) m_.decoder->draft(p, prompt[1], m_.embedding(prompt[1]));
   m_.decoder->sync();
-  forget();
+  sessions_ = {};  // nothing the throwaway prompt left is kept
+  stored_.clear();
 }
 
 }  // namespace ds4n::engine

@@ -464,6 +464,11 @@ struct Decoder::Gpu {
    * window rings, the ratio-2 pools, DSpark's feature rings.
    */
   std::vector<std::pair<std::byte*, size_t>> rings();
+  /**
+   * What a KV checkpoint of positions [0, committed) copies, in a fixed order: each KV source's
+   * compressed rows and index-key tiles below its compressed length, then rings().
+   */
+  std::vector<std::pair<std::byte*, size_t>> checkpoint_regions(int64_t committed);
 };
 
 }  // namespace ds4n::engine
