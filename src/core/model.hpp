@@ -25,6 +25,10 @@ constexpr int kWaveRounds = 64;
 // window by a wave (else row r would overwrite position p0 + r - kRing, which earlier rows still see);
 // a Round is a wave of one. Slot numbers only address rows: the values attention reads are the same.
 constexpr int kRing = kWindow + kMaxRows * kWaveRounds;
+// Positions a ratio-2 KV source's group state remembers, by position, not two slots by parity: a
+// Round whose later rows are discarded (DSpark verification) leaves the slot an accepted row filled
+// for its successor intact, as rejected rows write only their own positions' slots (fewer than 16).
+constexpr int kPoolRing = 16;
 constexpr int kTopK = 512;
 constexpr int kHcCopies = 4;
 constexpr int kSinkhornIters = 20;

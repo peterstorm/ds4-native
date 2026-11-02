@@ -219,7 +219,7 @@ void Decoder::begin_round(int64_t p0, std::span<const float> embeddings, std::sp
     throw CudaError("begin_round: Engram rows must be each row's 2 x 24 rows of 264 bytes");
   rows_ = static_cast<int>(rows);
   p0_ = p0;
-  if (p0 == 0) seeded_ = 0;  // a new Session: DSpark's context starts over
+  if (p0 < seeded_) seeded_ = 0;  // a resume below DSpark's context (a new Session at 0): it is seeded again
   const model::RoundIndex round = model::round_index(p0, rows_);
   engram_staged_ = !engram_rows.empty();
   for (auto& gp : gpus_) {
@@ -254,6 +254,53 @@ void Decoder::sync() {
     check(cudaSetDevice(gp->device), "cudaSetDevice");
     check(cudaStreamSynchronize(gp->stream), "sync");
   }
+}
+
+std::vector<std::pair<std::byte*, size_t>> Decoder::Gpu::rings() {
+  std::vector<std::pair<std::byte*, size_t>> out;
+  for (const auto& [layer, ring] : window)
+    if (layer < kLayers) out.emplace_back(reinterpret_cast<std::byte*>(ring), static_cast<size_t>(kRing) * kHeadDim * sizeof(bf16));
+  for (const auto& [layer, pool] : pools)
+    for (float* half : {pool.kv, pool.score})
+      out.emplace_back(reinterpret_cast<std::byte*>(half), static_cast<size_t>(kPoolRing) * kHeadDim * sizeof(float));
+  if (draft.features[0] != nullptr)
+    for (bf16* f : draft.features) out.emplace_back(reinterpret_cast<std::byte*>(f), static_cast<size_t>(kRing) * kDim * sizeof(bf16));
+  return out;
+}
+
+WindowSnapshot::~WindowSnapshot() {
+  for (std::byte* h : host_)
+    if (h) cudaFreeHost(h);
+}
+
+WindowSnapshot Decoder::window_snapshot() {
+  WindowSnapshot w;
+  for (const auto& [at, n] : gpus_[0]->rings()) w.bytes_ += n;
+  for (std::byte*& h : w.host_) check(cudaHostAlloc(&h, w.bytes_, cudaHostAllocPortable), "cudaHostAlloc");
+  return w;
+}
+
+void Decoder::transfer(const WindowSnapshot& w, bool to_host) {
+  for (auto& gp : gpus_) {
+    Gpu& s = *gp;
+    check(cudaSetDevice(s.device), "cudaSetDevice");
+    size_t at = 0;
+    for (const auto& [ring, n] : s.rings()) {
+      if (at + n > w.bytes_) throw CudaError("the window snapshot was made for other rings");
+      std::byte* host = w.host_[s.rank] + at;
+      check(to_host ? cudaMemcpyAsync(host, ring, n, cudaMemcpyDeviceToHost, s.stream)
+                    : cudaMemcpyAsync(ring, host, n, cudaMemcpyHostToDevice, s.stream),
+            "window snapshot");
+      at += n;
+    }
+  }
+}
+
+void Decoder::save(WindowSnapshot& into) { transfer(into, true); }
+
+void Decoder::restore(const WindowSnapshot& from) {
+  transfer(from, false);
+  seeded_ = 0;
 }
 
 void Decoder::Gpu::enqueue_layer(int layer, int rows, int parity, StepMode mode) {

@@ -28,6 +28,10 @@ add_library(ds4n_core STATIC
   src/core/speculation.cpp
   src/core/moe_groups.cpp
   src/core/row_index.cpp
+  src/core/rewind.cpp
+  src/core/sampler.cpp
+  src/core/reply.cpp
+  src/core/wire.cpp
 )
 target_include_directories(ds4n_core PUBLIC src)
 target_compile_options(ds4n_core PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -90,7 +94,7 @@ if(DS4N_CUDA)
   target_compile_options(ds4n-engram-check PRIVATE ${DS4N_CUDA_FLAGS})
   target_link_libraries(ds4n-engram-check PRIVATE ds4n_cuda ds4n_io)
   add_library(ds4n_engine_cuda STATIC src/engine/device_layer.cu src/engine/decoder.cu src/engine/decoder_sweep.cu
-                                    src/engine/expert_residency.cu)
+                                    src/engine/expert_residency.cu src/engine/full_model.cu src/engine/conversation.cu)
   target_compile_options(ds4n_engine_cuda PRIVATE ${DS4N_CUDA_FLAGS})
   target_link_libraries(ds4n_engine_cuda PUBLIC ds4n_cuda ds4n_engine)
   add_executable(ds4n-layer-check src/tools/layer_check.cu)
@@ -99,6 +103,12 @@ if(DS4N_CUDA)
   add_executable(ds4n-model-run src/tools/model_run.cu)
   target_compile_options(ds4n-model-run PRIVATE ${DS4N_CUDA_FLAGS})
   target_link_libraries(ds4n-model-run PRIVATE ds4n_engine_cuda)
+  add_executable(ds4n-serve src/tools/serve.cu)
+  target_compile_options(ds4n-serve PRIVATE ${DS4N_CUDA_FLAGS})
+  target_link_libraries(ds4n-serve PRIVATE ds4n_engine_cuda)
+  add_executable(ds4n-serve-check src/tools/serve_check.cu)
+  target_compile_options(ds4n-serve-check PRIVATE ${DS4N_CUDA_FLAGS})
+  target_link_libraries(ds4n-serve-check PRIVATE ds4n_engine_cuda)
   add_executable(ds4n-exchange-check src/tools/exchange_check.cu)
   target_compile_options(ds4n-exchange-check PRIVATE ${DS4N_CUDA_FLAGS})
   target_link_libraries(ds4n-exchange-check PRIVATE ds4n_cuda)
@@ -135,6 +145,10 @@ add_executable(ds4n_tests
   tests/core/test_speculation.cpp
   tests/core/test_moe_groups.cpp
   tests/core/test_row_index.cpp
+  tests/core/test_rewind.cpp
+  tests/core/test_sampler.cpp
+  tests/core/test_reply.cpp
+  tests/core/test_wire.cpp
 )
 target_link_libraries(ds4n_tests PRIVATE ds4n_core doctest::doctest)
 target_compile_options(ds4n_tests PRIVATE -Wall -Wextra)

@@ -1,0 +1,250 @@
+#include "engine/conversation.cuh"
+
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <stdexcept>
+
+#include "core/reply.hpp"
+#include "core/sampler.hpp"
+
+namespace ds4n::engine {
+
+namespace {
+
+using Clock = std::chrono::steady_clock;
+
+double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
+double now_ms() { return std::chrono::duration<double, std::milli>(Clock::now().time_since_epoch()).count(); }
+
+/** The tokens' embeddings ([n][5120]) and Engram row ids, hashed in order after `h`, with the History after each. */
+struct Inputs {
+  std::vector<float> embeddings;
+  std::vector<EngramTokenRows> rows;
+  std::vector<engram::History> after;
+};
+
+Inputs inputs(const FullModel& m, std::span<const int32_t> tokens, engram::History h) {
+  Inputs in;
+  in.embeddings.reserve(tokens.size() * model::kDim);
+  for (const int32_t t : tokens) {
+    const std::vector<float> e = m.embedding(t);
+    in.embeddings.insert(in.embeddings.end(), e.begin(), e.end());
+    auto step = engram::hash_token(m.layout, h, static_cast<uint32_t>(t), true);
+    if (!step) throw std::runtime_error("Engram: " + step.error().what);
+    h = step.value().next;
+    in.rows.push_back(step.value().rows);
+    in.after.push_back(h);
+  }
+  return in;
+}
+
+/** A transition of the Session the shell drives correctly by construction (an error is a bug here). */
+rewind::Session committed(rewind::Session s, std::span<const int32_t> fed, size_t kept) {
+  auto next = rewind::wrote(std::move(s), fed, kept);
+  if (!next) throw std::logic_error("Conversation: " + next.error().what);
+  return std::move(next).value();
+}
+
+std::vector<float> last_row(const std::vector<float>& all) {
+  return {all.end() - model::kVocab, all.end()};
+}
+
+/** A token is non-finite trouble for the server (serve/server.py retries the request from token 0 on "non-finite"). */
+[[noreturn]] void non_finite(const std::string& what) { throw std::runtime_error("non-finite logits (" + what + ")"); }
+
+}  // namespace
+
+Conversation::Conversation(FullModel& model, ConversationConfig config) : m_(model), config_(std::move(config)) {
+  for (uint32_t i = 0; i < config_.rewind_points; i++) snapshots_.push_back(m_.decoder->window_snapshot());
+}
+
+Conversation::Fed Conversation::round(int64_t p0, std::span<const int32_t> tokens, engram::History h) {
+  Inputs in = inputs(m_, tokens, h);
+  auto raw = m_.rows.read_tokens(in.rows);
+  if (!raw) throw std::runtime_error("Engram rows: " + raw.error().what);
+  m_.decoder->begin_round(p0, in.embeddings, raw.value());
+  m_.decoder->decode_round();
+  return {m_.decoder->logits(), std::move(in.after)};
+}
+
+Conversation::Fed Conversation::sweep(int64_t p0, std::span<const int32_t> tokens, engram::History h) {
+  Inputs in = inputs(m_, tokens, h);
+  const ExpertPlacer place = [&](int layer, std::span<const int32_t> experts) { return m_.residency->place(layer, experts); };
+  const EngramReader read = [&](int table, std::span<const uint32_t> ids, std::span<uint8_t> out) {
+    if (auto r = m_.rows.read_rows(table, ids, out); !r) throw std::runtime_error(r.error().what);
+  };
+  m_.residency->check();
+  m_.decoder->prefill(p0, in.embeddings, in.rows, read, place);
+  return {last_row(m_.decoder->logits()), {in.after.back()}};
+}
+
+bool Conversation::read_prompt(std::span<const int32_t> prompt, size_t from, const ReplyEvents& ev, double t0_ms) {
+  const size_t total = prompt.size();
+  if (total - from >= config_.sweep_min) {
+    Fed f = sweep(static_cast<int64_t>(from), prompt.subspan(from), history_);
+    session_ = committed(std::move(session_), prompt.subspan(from), total - from);
+    history_ = f.after.back();
+    prompt_logits_ = std::move(f.logits);
+    return true;
+  }
+  for (size_t at = from; at < total;) {
+    if (ev.stop && ev.stop->load()) return false;
+    const size_t n = std::min<size_t>(model::kMaxRows, total - at);
+    Fed f = round(static_cast<int64_t>(at), prompt.subspan(at, n), history_);
+    session_ = committed(std::move(session_), prompt.subspan(at, n), n);
+    history_ = f.after.back();
+    at += n;
+    if (at == total) prompt_logits_ = last_row(f.logits);
+    ev.progress({at, total, from, now_ms() - t0_ms});
+  }
+  return true;
+}
+
+wire::Done Conversation::run(const wire::Generate& g, const ReplyEvents& ev) {
+  if (g.prompt.empty() || static_cast<int64_t>(g.prompt.size()) >= kMaxCompressed)
+    throw std::invalid_argument("a prompt of 1 to " + std::to_string(kMaxCompressed - 1) + " tokens");
+  try {
+    const double t0 = now_ms();
+    const rewind::Resume r = rewind::plan(session_, g.prompt).value();
+    if (r.point) m_.decoder->restore(snapshots_[r.point->buffer]);
+    session_ = rewind::resumed(std::move(session_), r);
+    const size_t from = static_cast<size_t>(r.from);
+    auto h = engram::history_at(m_.layout, g.prompt, from);
+    if (!h) throw std::runtime_error("Engram: " + h.error().what);
+    history_ = h.value();
+    ev.progress({from, g.prompt.size(), from, 0.0});
+    if (!read_prompt(g.prompt, from, ev, t0))
+      return {0, g.prompt.size(), now_ms() - t0, 0.0, reply::Finish::Cancel, 0, 0, from};
+    ev.progress({g.prompt.size(), g.prompt.size(), from, now_ms() - t0});
+    // A Rewind point at the prompt's end: the next turn of a chat shares this prompt but its reply.
+    if (!snapshots_.empty()) {
+      const uint32_t b = rewind::next_buffer(session_, static_cast<uint32_t>(snapshots_.size()));
+      m_.decoder->save(snapshots_[b]);
+      session_ = rewind::marked(std::move(session_), b);
+    }
+    std::fprintf(stderr, "ds4n-serve: prompt %zu tokens = %zu reused%s + %zu read in %.0f ms (%.1f tok/s)\n", g.prompt.size(),
+                 from, r.point ? " (from a Rewind point)" : "", g.prompt.size() - from, now_ms() - t0,
+                 1000.0 * static_cast<double>(g.prompt.size() - from) / std::max(now_ms() - t0, 1e-9));
+    return reply(g, ev, from, now_ms() - t0);
+  } catch (...) {
+    forget();  // the caches' state is unknown: start over
+    throw;
+  }
+}
+
+wire::Done Conversation::reply(const wire::Generate& g, const ReplyEvents& ev, size_t reused, double prompt_ms) {
+  const auto t1 = Clock::now();
+  const ResidencyStats before = m_.residency->stats();
+  const reply::Limits limits{g.max_new, config_.stops, g.think};
+  reply::Reply r = reply::start(limits);
+  std::optional<int32_t> forced;
+  std::optional<reply::Finish> finish;
+  std::vector<int32_t> seen = g.prompt;  // what the penalties count: the prompt, then every written token
+  int64_t kept = 0, offered = 0;
+  const bool drafting = m_.dspark && g.spec.value_or(true);
+  spec::Policy& policy = g.sampling.greedy_pick() ? greedy_policy_ : sampled_policy_;
+
+  auto pick = [&](std::span<const float> row) {
+    const size_t last_n = static_cast<size_t>(g.sampling.settings().penalties.last_n);
+    const std::span<const int32_t> recent = std::span(seen).last(std::min(seen.size(), last_n));
+    auto t = sample::pick(row, g.sampling, recent, static_cast<uint64_t>(r.written));
+    if (!t) non_finite(t.error().what);
+    return t.value();
+  };
+  auto stat = [&] {
+    const ResidencyStats now = m_.residency->stats();
+    const double hits = static_cast<double>(now.hits - before.hits);
+    const double needed = hits + static_cast<double>((now.ram_hits - before.ram_hits) + (now.store_reads - before.store_reads));
+    ev.stat({r.written, ms_since(t1), needed > 0 ? hits / needed : 1.0,
+             offered > 0 ? static_cast<double>(kept) / static_cast<double>(offered) : -1.0});
+  };
+  // Writes `tok`, to be fed at position `at`: whether the reply goes on.
+  auto write = [&](int32_t tok, int64_t at) {
+    ev.token(tok);
+    seen.push_back(tok);
+    const reply::Next n = reply::after(r, limits, tok, ev.wrap && ev.wrap->load(), at < kMaxCompressed);
+    r = n.reply;
+    forced = n.forced;
+    finish = n.finish;
+    if (r.written % 8 == 0) stat();
+    return !finish;
+  };
+  auto next_of = [&](std::span<const float> row) { return forced ? *forced : pick(row); };
+
+  int64_t p = static_cast<int64_t>(g.prompt.size());  // where the anchor is fed
+  int32_t anchor = next_of(prompt_logits_);
+  bool going = write(anchor, p);
+  while (going) {
+    if (ev.stop && ev.stop->load()) {
+      finish = reply::Finish::Cancel;
+      break;
+    }
+    const bool draft = drafting && !forced && spec::drafts(policy) && p + model::kVerifyRows <= kMaxCompressed;
+    if (!draft) {
+      const auto t_round = Clock::now();
+      const std::vector<int32_t> fed = {anchor};
+      Fed f = round(p, fed, history_);
+      if (drafting) policy = spec::after_plain(policy, ms_since(t_round));
+      session_ = committed(std::move(session_), fed, 1);
+      history_ = f.after.back();
+      p += 1;
+      anchor = next_of(f.logits);
+      going = write(anchor, p);
+      continue;
+    }
+    // DSpark: a block after the anchor, the anchor and some of the block verified in one Round.
+    const auto t_draft = Clock::now();
+    const DraftBlock block = m_.decoder->draft(p, anchor, m_.embedding(anchor));
+    const double draft_ms = ms_since(t_draft);
+    const int64_t left = std::max<int64_t>(1, limits.max_new - r.written);
+    const int n = static_cast<int>(std::min<int64_t>({spec::choose_rows(policy, block.confidence), left, kMaxCompressed - p}));
+    std::vector<int32_t> fed = {anchor};
+    fed.insert(fed.end(), block.tokens.begin(), block.tokens.begin() + (n - 1));
+    const auto t_round = Clock::now();
+    Fed f = round(p, fed, history_);
+    const double round_ms = ms_since(t_round);
+    auto row = [&](int i) { return std::span<const float>(f.logits).subspan(static_cast<size_t>(i) * model::kVocab, model::kVocab); };
+    int i = 0;
+    int32_t tok = next_of(row(0));
+    going = write(tok, p + 1);
+    while (going && i + 1 < n && tok == fed[static_cast<size_t>(i) + 1]) {  // row i + 1 read the token picked here
+      i++;
+      tok = next_of(row(i));
+      going = write(tok, p + i + 1);
+    }
+    session_ = committed(std::move(session_), fed, static_cast<size_t>(i) + 1);  // rows 0 .. i are committed
+    history_ = f.after[static_cast<size_t>(i)];
+    p += i + 1;
+    anchor = tok;
+    kept += i;
+    offered += n - 1;
+    policy = spec::after_draft(policy, block.confidence, n, i + 1, draft_ms, round_ms);
+  }
+  stat();
+  const double decode_ms = ms_since(t1);
+  std::fprintf(stderr, "ds4n-serve: %lld written in %.0f ms (%.2f tok/s), %s; drafts %lld of %lld kept\n",
+               static_cast<long long>(r.written), decode_ms, 1000.0 * static_cast<double>(r.written) / std::max(decode_ms, 1e-9),
+               reply::name(finish.value_or(reply::Finish::Cancel)), static_cast<long long>(kept), static_cast<long long>(offered));
+  return {r.written, g.prompt.size(), prompt_ms, decode_ms, finish.value_or(reply::Finish::Cancel), kept, offered, reused};
+}
+
+void Conversation::warm_up() {
+  // A throwaway prompt through a sweep, then a Round of every width at both parities, then a draft.
+  std::vector<int32_t> prompt;
+  for (int i = 0; i < 600; i++) prompt.push_back(i == 0 ? 0 : (i * 7919 + 13) % 120000);
+  wire::Generate g{1, sample::Sampling::greedy(), std::nullopt, false, prompt};
+  run(g, {});
+  int64_t p = static_cast<int64_t>(prompt.size());
+  for (int rows = 1; rows <= model::kMaxRows; rows++)
+    for (int parity = 0; parity < 2; parity++) {
+      if (p % 2 != parity) p++;
+      round(p, std::span(prompt).subspan(1, static_cast<size_t>(rows)), history_);
+      p += rows;
+    }
+  if (m_.dspark) m_.decoder->draft(p, prompt[1], m_.embedding(prompt[1]));
+  m_.decoder->sync();
+  forget();
+}
+
+}  // namespace ds4n::engine

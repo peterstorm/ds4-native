@@ -1,0 +1,88 @@
+#include "engine/full_model.cuh"
+
+#include <chrono>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <stdexcept>
+
+#include "core/expert_cache.hpp"
+#include "io/file.hpp"
+
+namespace ds4n::engine {
+
+namespace {
+
+using Clock = std::chrono::steady_clock;
+
+double seconds_since(Clock::time_point t) { return std::chrono::duration<double>(Clock::now() - t).count(); }
+
+template <class T, class E>
+T take(Result<T, E> r, const std::string& what) {
+  if (!r) throw std::runtime_error(what + ": " + r.error().what);
+  return std::move(r).value();
+}
+
+}  // namespace
+
+std::vector<float> FullModel::embedding(int32_t token) const {
+  return take(embeddings.row(token), "token " + std::to_string(token));
+}
+
+FullModel load_full_model(const FullModelConfig& c) {
+  setenv("CUDA_MODULE_LOADING", "EAGER", 1);  // before any CUDA call: see engine/decoder.cuh
+  FullModel m;
+  std::vector<uint32_t> prior;
+  if (!c.prior.empty()) {
+    std::ifstream f(c.prior, std::ios::binary);
+    const std::vector<char> raw{std::istreambuf_iterator<char>(f), {}};
+    if (!f && !f.eof()) throw std::runtime_error("cannot read " + c.prior);
+    prior = take(cache::ExpertCache::prior_from_profile(std::as_bytes(std::span(raw)), cache::Policy{}, 1), c.prior);
+  }
+  ResidencyConfig rc;
+  rc.store_path = c.store;
+  rc.slots = c.slots;
+  rc.ram_records = c.ram_records;
+  rc.prior = std::move(prior);
+  rc.ram_policy = c.ram_policy;
+  m.residency = ExpertResidency::open(rc);
+  std::fprintf(stderr, "ds4n: Expert cache: %u Slots warm in %.1f s, RAM tier %u records\n", c.slots,
+               m.residency->stats().warm_ms / 1e3, c.ram_records);
+
+  const auto t_load = Clock::now();
+  const Backbone backbone = take(open_backbone(c.backbone), c.backbone);
+  m.decoder = std::make_unique<Decoder>(std::array<int, 2>{0, 1},
+                                        std::array<cuda::ExpertDirectory, 2>{m.residency->directory(0), m.residency->directory(1)},
+                                        Launches::Graphs, c.sweep_rounds);
+  for (int l = 0; l < model::kLayers; l++) m.decoder->add_layer(take(load_layer(backbone, l), "layer " + std::to_string(l)));
+  {
+    const HostHead h = take(load_head(backbone), "head");
+    m.decoder->add_head(h.norm, h.head);
+  }
+  m.embeddings = take(EmbeddingTable::load(backbone), "embedding");
+  std::fprintf(stderr, "ds4n: Backbone: 40 layers, the head and the embedding loaded in %.1f s\n", seconds_since(t_load));
+
+  if (!c.dspark.empty()) {
+    const auto t_draft = Clock::now();
+    std::vector<Backbone> shards;
+    for (const auto& entry : std::filesystem::directory_iterator(c.dspark))
+      if (entry.path().extension() == ".safetensors") shards.push_back(take(open_backbone(entry.path().string()), entry.path().string()));
+    m.decoder->add_draft(take(load_draft(shards), "DSpark"), m.embedding(model::kNoiseToken));
+    for (int stage = 0; stage < model::kDraftStages; stage++)
+      for (int e = 0; e < model::kDraftExperts; e++)
+        m.decoder->add_draft_expert(stage, e, take(load_draft_expert(shards, stage, e), "DSpark Expert"));
+    m.dspark = true;
+    std::fprintf(stderr, "ds4n: DSpark: %d stages and %d Experts loaded in %.1f s\n", model::kDraftStages,
+                 model::kDraftStages * model::kDraftExperts, seconds_since(t_draft));
+  }
+
+  m.layout = take(load_engram_layout(c.gguf), c.gguf);
+  m.rows = take(EngramRows::open({c.gguf}), c.gguf);
+  const gguf::Header header = take(io::read_gguf_header(c.gguf), c.gguf);
+  const uint64_t* eos = gguf::find_uint(header, "tokenizer.ggml.eos_token_id");
+  if (eos == nullptr) throw std::runtime_error(c.gguf + ": no tokenizer.ggml.eos_token_id");
+  m.eos = static_cast<int32_t>(*eos);
+  return m;
+}
+
+}  // namespace ds4n::engine

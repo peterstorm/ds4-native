@@ -43,6 +43,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 #include "core/engram.hpp"
@@ -86,6 +87,35 @@ struct DraftBlock {
 enum class Launches { Graphs, Eager };
 
 /**
+ * A Rewind point's rings (core/rewind): both GPUs' window rings of the target's layers, their
+ * ratio-2 pools and DSpark's target feature rings, in pinned host memory -- what a Session cannot
+ * rebuild below a position once decoding moved past it (the compressed and index caches are written
+ * once per position). Made once (Decoder::window_snapshot), filled by Decoder::save and put back by
+ * Decoder::restore, after which the Session resumes where it was saved, or up to rewind::kSlack
+ * below. Move-only; it owns its pinned memory.
+ */
+class WindowSnapshot {
+ public:
+  WindowSnapshot() = default;
+  WindowSnapshot(WindowSnapshot&& o) noexcept : host_(std::exchange(o.host_, {})), bytes_(o.bytes_) {}
+  WindowSnapshot& operator=(WindowSnapshot&& o) noexcept {
+    std::swap(host_, o.host_);
+    std::swap(bytes_, o.bytes_);
+    return *this;
+  }
+  WindowSnapshot(const WindowSnapshot&) = delete;
+  WindowSnapshot& operator=(const WindowSnapshot&) = delete;
+  ~WindowSnapshot();
+  /** Bytes per GPU. */
+  size_t bytes() const { return bytes_; }
+
+ private:
+  friend class Decoder;
+  std::array<std::byte*, 2> host_{};  // per GPU
+  size_t bytes_ = 0;
+};
+
+/**
  * Places up to 48 of a layer's Experts in VRAM Slots for a prompt sweep's grouped MoE and returns
  * each one's Slot (pool numbering, both GPUs) once its Halves landed: ExpertResidency::place.
  */
@@ -121,7 +151,8 @@ class Decoder {
    * Engram rows ([rows] x kEngramTokenBytes, or empty when no Engram layer runs). p0 = 0 starts a
    * new Session: every cache read is bounded by the reading row's position (window slots, compressed
    * and index rows below its compressed length, a ratio-2 pool slot written before it is read), so a
-   * previous Session's rows are never read.
+   * previous Session's rows are never read. A p0 below the last Round's resumes the Session there
+   * (exact where core/rewind says so).
    */
   void begin_round(int64_t p0, std::span<const float> embeddings, std::span<const uint8_t> engram_rows = {});
 
@@ -165,6 +196,19 @@ class Decoder {
 
   /** Wait until both GPUs finished everything launched so far. */
   void sync();
+
+  /** A snapshot sized for this decoder's rings (after every add_layer and add_draft); its contents unset. */
+  WindowSnapshot window_snapshot();
+
+  /** Copy the rings into `into`, after everything launched so far (returns once the copies are launched). */
+  void save(WindowSnapshot& into);
+
+  /**
+   * Put `from`'s rings back (launched after everything so far): below the position it was saved at,
+   * the caches hold what they held then. DSpark's context starts over (draft() seeds it again from
+   * the feature rings).
+   */
+  void restore(const WindowSnapshot& from);
 
   /** Upload the final norm and the head (BF16 values [129280][5120]); each GPU keeps its half of the vocabulary. */
   void add_head(const std::vector<float>& norm, const std::vector<float>& head);
@@ -225,6 +269,8 @@ class Decoder {
                            EngramReads& progress);
   /** A sweep's grouped MoE for `layer` over the chunk's first `tokens` tokens, its Experts in `slot_of`. */
   void grouped_moe(int layer, size_t tokens, std::span<const std::optional<uint32_t>> slot_of);
+  /** Copy every GPU's rings into `w` (`to_host`) or back from it, after everything launched so far. */
+  void transfer(const WindowSnapshot& w, bool to_host);
   std::array<std::unique_ptr<Gpu>, 2> gpus_;
   Launches launches_;
   int rows_ = 0;

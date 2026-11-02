@@ -102,6 +102,26 @@ TEST_CASE("property: incremental hashing equals the reference's whole-sequence f
   }
 }
 
+TEST_CASE("property: history_at is the History hashing every token before the position leaves") {
+  const Layout l = small_layout(500, 97);
+  std::mt19937 rng(21);
+  for (int trial = 0; trial < 30; trial++) {
+    std::vector<int32_t> tokens(rng() % 30);
+    for (auto& t : tokens) t = static_cast<int32_t>(rng() % 500);
+    History h;
+    for (size_t p = 0; p <= tokens.size(); p++) {
+      const auto at = history_at(l, tokens, p);
+      REQUIRE(at.is_ok());
+      CHECK(at.value() == h);
+      if (p < tokens.size()) h = hash_token(l, h, static_cast<uint32_t>(tokens[p]), true).value().next;
+    }
+  }
+  const std::vector<int32_t> some = {1, 2};
+  CHECK_FALSE(history_at(l, some, 3).is_ok());               // past the tokens
+  CHECK_FALSE(history_at(l, std::vector<int32_t>{-4}, 1).is_ok());  // not a token
+  CHECK_FALSE(history_at(l, std::vector<int32_t>{900}, 1).is_ok()); // outside the vocabulary
+}
+
 TEST_CASE("property: first_occurrence points every position at its row's first position") {
   std::mt19937 rng(5);
   for (int trial = 0; trial < 40; trial++) {

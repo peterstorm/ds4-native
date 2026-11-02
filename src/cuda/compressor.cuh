@@ -10,16 +10,12 @@
 
 #include <cstdint>
 
+#include "core/model.hpp"
+
 namespace ds4n::cuda {
 
 constexpr int kCompressDim = 512;
-
-/**
- * Positions the ratio-2 group state remembers. A ring by position, not two slots by parity: a Round
- * whose later rows are discarded (DSpark verification) leaves the slot an accepted row filled for
- * its successor intact, as rejected rows write only their own positions' slots (fewer than 16).
- */
-constexpr int kPoolRing = 16;
+constexpr int kPoolRing = model::kPoolRing;  // positions the ratio-2 group state remembers
 
 /** The ratio-2 group state: kv and score [kPoolRing][512] FP32, position p at slot p % kPoolRing. */
 struct PoolSlots {

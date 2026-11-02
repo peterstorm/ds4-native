@@ -69,6 +69,19 @@ Result<Step, LayoutError> hash_token(const Layout& l, const History& h, uint32_t
   return R::ok(s);
 }
 
+Result<History, LayoutError> history_at(const Layout& l, std::span<const int32_t> tokens, size_t p) {
+  using R = Result<History, LayoutError>;
+  if (p > tokens.size()) return R::err({"the History's position is past the tokens"});
+  History h;
+  for (size_t i = p - std::min<size_t>(p, kNgram - 1); i < p; i++) {
+    if (tokens[i] < 0) return R::err({"token id outside the vocabulary"});
+    auto step = hash_token(l, h, static_cast<uint32_t>(tokens[i]), true);
+    if (!step) return R::err(step.error());
+    h = step.value().next;
+  }
+  return R::ok(h);
+}
+
 std::array<float, kRowValues> decode_row(std::span<const std::byte, kRowBytes> row) {
   std::array<float, kRowValues> out{};
   for (int i = 0; i < kRowValues; i++) {

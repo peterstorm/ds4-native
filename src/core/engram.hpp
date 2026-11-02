@@ -56,6 +56,13 @@ struct Step {
 /** Hash one token (`alive` false for image tokens, which are dead and break n-grams). */
 Result<Step, LayoutError> hash_token(const Layout& l, const History& h, uint32_t token, bool alive);
 
+/**
+ * The History before position p of a sequence of live tokens (`tokens`, from the sequence start,
+ * at least p of them): what hashing tokens 0 .. p - 1 in order leaves. A History holds only the
+ * last 3 compressed ids, so only those tokens are hashed. A Session resuming at p starts from it.
+ */
+Result<History, LayoutError> history_at(const Layout& l, std::span<const int32_t> tokens, size_t p);
+
 /** One table row: 256 E4M3 values times their E8M0 scale per 32, rounded to BF16 (as floats). */
 std::array<float, kRowValues> decode_row(std::span<const std::byte, kRowBytes> row);
 

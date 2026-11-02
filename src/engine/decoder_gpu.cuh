@@ -459,6 +459,11 @@ struct Decoder::Gpu {
   void enqueue_head(const bf16* final_norm, int rows);
   /** Project `rows` accepted positions (from row `first` of the seed index) into every stage's context ring. */
   void enqueue_seed(int first, int rows);
+  /**
+   * The rings a WindowSnapshot copies, in a fixed order (device address, bytes): the target layers'
+   * window rings, the ratio-2 pools, DSpark's feature rings.
+   */
+  std::vector<std::pair<std::byte*, size_t>> rings();
 };
 
 }  // namespace ds4n::engine

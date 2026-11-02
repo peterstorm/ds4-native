@@ -498,7 +498,7 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
   const bool any_engram = lead.layers.contains(kEngramLayers[0]) || lead.layers.contains(kEngramLayers[1]);
   if (any_engram && (engram.size() != tokens || !read_engram))
     throw CudaError("prefill: the Engram layers need every token's row ids and a reader");
-  if (p0 == 0) seeded_ = 0;  // a new Session: DSpark's context starts over
+  if (p0 < seeded_) seeded_ = 0;  // a resume below DSpark's context (a new Session at 0): it is seeded again
   const size_t per_chunk = static_cast<size_t>(capacity) * kMaxRows;
   const bool graphs = launches_ == Launches::Graphs;
   const bool grouped = static_cast<bool>(place);

@@ -110,6 +110,22 @@ One conversation's KV state plus its token history.
 **KV checkpoint**:
 A persisted Session state that can be restored instead of re-prefilled.
 
+**Resume**:
+Starting a prompt at a position of the Session's tokens instead of 0: the prompt's longest shared prefix, cut back to a position the caches still hold Exactly (the window and feature rings at most 512 positions written past it, an odd position's ratio-2 pool at most 15; `core/rewind`). The compressed and index caches are written once per position, so they never limit it.
+
+**Frontier**:
+One past the highest position a Session's caches were written at, a verify Round's discarded rows included; how far it runs ahead of a position decides whether a Resume there is Exact.
+
+**Rewind point**:
+The window rings, ratio-2 pools and DSpark feature rings of a Session at one position (a prompt's end), copied to pinned host memory: restored, the Session Resumes near that position after decoding moved far past it (a chat's next turn drops the previous reply's reasoning and shares the previous prompt but its last token). Not a KV checkpoint: it holds no compressed or index cache, so it serves only the Session it was taken from.
+_Avoid_: snapshot (the code's WindowSnapshot is a Rewind point's buffer), slot (Maya's word, and ours for VRAM)
+
+**Reply**:
+The tokens one request writes after its prompt, under its rules (`core/reply`): it ends at an end-of-turn token ("stop"), at max_new or the context ("length"), or at a STOP ("cancel"); a reasoning block still open after the thinking budget is closed by forcing its end token.
+
+**Draw index**:
+The k-th pick of a Reply samples with draw k of its seed (`core/sampler`), so a verify Round, picking each row with its own index, writes the Reply plain steps would.
+
 **Routing plan**:
 One Step's routing: the distinct routed Experts in ascending id, the tokens each serves and their weights; its order is the combine order (`moe::Plan`).
 _Avoid_: dispatch table, job list
@@ -136,6 +152,8 @@ An independent slow implementation (antirez/ds4, Maya's `ref.py`, or the HF refe
 - A **Miss** is served from the **RAM tier** if present there, otherwise from the **Expert store**
 - A **Round** contains one to eight rows of one **Session**; a **Step** is a one-row **Round**; a **Round**'s **Routing plan** is the union of its rows' Experts
 - A **KV checkpoint** belongs to exactly one **Session** prefix
+- A **Rewind point** belongs to one **Session**, valid while no **Resume** went below its position
+- A **Resume** comes from the live **Session** or one of its **Rewind points**, whichever reads fewer of the prompt's tokens
 - **Cache-conditional routing** makes outputs depend on **Expert cache** contents; with λ = 0 every policy is **Exact**
 
 ## Example Dialogue
