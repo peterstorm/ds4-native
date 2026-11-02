@@ -169,6 +169,14 @@ First pi session (2026-11-02, a coding task, prompts 7K–23K tokens): every ste
 read only its new tokens (20–830; 5K when a tool returned a file), decode 40–115 tok/s while the
 Expert cache learned the new domain (VRAM Hits 94–97 %, Misses read from the NVMe at ~7 GB/s).
 
+pi with subagents (2026-11-02, `72ac68b`; a parent delegating to two workers in turn, ~7K-token
+prompts): every switch read 16–61 tokens. The new session reused 7,152 of 7,198 tokens from the
+previous run's states, each worker ~6,780 of ~6,840 from the previous worker's checkpoint, the
+parent ~7,300–7,450 from its own; setting a 7K-token conversation aside took ~28 ms (0.13 GB),
+taking one back 8 ms. A worker's *first* prompt shares little with its parent: pi starts subagents
+with `--exclude-tools subagent`, so their tool list — near the top of the system prompt — differs
+at once; workers of one kind share their whole system prompt with each other.
+
 ## Limits
 
 - **One request at a time.** Conversations take turns on the GPUs (each switch sets one aside and
