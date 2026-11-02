@@ -486,9 +486,23 @@ time moved to the drive: each layer's grouped MoE waits a median 21 ms for its E
 MoE ran (a forecast from the profile's pick shares, kept clear of the running layer's Slots), was
 tried and dropped: 98 % of the forecast was then routed, yet 36K and 60K stayed within noise and 9K
 lost 7 % -- the loads are bound by the drive's and the links' throughput, not by when they start,
-and each wrong guess is a whole Expert read. The levers left are bytes: the Engram tables on small
-records (they are ~190 GiB, more than the pool has free), more RAM tier records (RAM is the limit),
-and fewer Slots' worth of misses.
+and each wrong guess is a whole Expert read.
+
+**Engram rows on the drive** (fio on the pool, 2026-11-02; the tables are 2 x 94.4 GiB at the end of
+the GGUF, 384M rows of 264 bytes each). A row read costs per I/O, not per byte: 4 KB records read
+rows only 13 % faster than 16 KB alone (139K vs 123K a second) and no faster beside the Experts,
+O_DIRECT is no faster, and more readers do not scale. The pool's cap is
+`zfs_vdev_sync_read_max_active` (10 in-flight sync reads per vdev; at ~80 us, ~125K reads a second):
+at 64 rows alone reach ~250K a second (256: the same, ZFS's own per-read cost). Beside a 1 MiB
+Expert stream, every row costs ~54 KB of its bandwidth (rows 124K a second with the stream at 4.7
+GB/s, 24K with it at 10.0). The repeated benchmark prompts hide this: their ~309K rows fit the 16 GB
+ARC after one run, and 10 vs 64 moves them within noise. A prompt the ARC has not seen pays it: the
+random-token 60K prompt (2.87M distinct rows) takes 29.5-29.8 s at 10 (8 s of launches waiting for
+rows) and 19.7-21.6 s at 64 (2.7-3.6 s waiting) -- the repeated 60K prompt takes ~12.6 s. So for
+fresh prompts the Engram rows, not the Experts, are the drive's largest load, and the lever is
+taking them off the Expert drive (a second NVMe, ideally without ZFS's per-read cost: a raw
+partition does ~1M rows a second), not smaller records. More RAM tier records would cut the
+Experts' share (RAM is the limit today).
 
 ## Expert residency
 
