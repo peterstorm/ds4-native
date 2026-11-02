@@ -293,6 +293,12 @@ prompt, whatever its length. Host prep: the embedding table lives in RAM (1.3 GB
 prompt's Engram rows were read 1,024 in flight across tokens (`EngramRows::read_tokens`; a sweep now
 reads them beside the GPUs, below).
 
+Since the context grew to 262,144 (`acb97b8`, see `serving.md`) a chunk stays 64K tokens
+(`kSweepRounds`): the whole context in one would need ~20 GB a GPU. A longer prompt is read as
+several Cohorts, its Experts read once per Cohort: 240K tokens cold in ~70 s (3,400–3,570 tok/s),
+the same bits whatever the chunk boundaries (`ds4n-serve-check --long`). A full Cohort is 65,536
+tokens, one past CUDA's 65,535 grid y: the replication of copy 0 strides its tokens over the grid.
+
 | Prompt | grouped MoE | + placement beside | + host prep | + waves | + one chunk |
 |---|---|---|---|---|---|
 | 9,129 tokens | 385 tok/s | 512 | 587 | 735 | **735 tok/s** (one chunk already) |

@@ -86,7 +86,7 @@ The rows a verify Round takes: the Anchor and that many minus one drafted tokens
 The time of a Step with zero Misses.
 
 **Cohort**:
-A group of prefill rows whose routed Experts are loaded once per layer and shared: a prompt sweep's chunk (up to the whole 64K context).
+A group of prefill rows whose routed Experts are loaded once per layer and shared: a prompt sweep's chunk (up to 64K tokens; a longer prompt is read as several).
 
 **Prompt sweep**:
 A Cohort's pass through the model layer by layer: every row through layer L before any goes on, so each layer's Experts are read once per Cohort (`Decoder::prefill`).

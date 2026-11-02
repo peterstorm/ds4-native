@@ -19,7 +19,7 @@ prompt — microseconds against a 10–30 ms decode step. Nothing in it touches 
 | Line | Meaning |
 |---|---|
 | `INFO key=value ...` | facts for the server's Monitor (`logit_bias=1`: the engine applies a request's bias) |
-| `READY 65536 stop` | the context (kMaxCompressed), and that STOP is honoured; no `pause`, no `multi=` |
+| `READY 262144 stop` | the context (kMaxCompressed), and that STOP is honoured; no `pause`, no `multi=` |
 | `GEN <max_new> [key=value ...] <id,id,...>` | a request. Keys: `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `penalty_{last_n,repeat,freq,present}`, `logit_bias=id:bias,...`, `think_budget` + `think_end`, `spec=0\|1`; others (Maya's GLM tuning keys, `cvec`) are skipped |
 | `T <id>` | a written token |
 | `PP <read> <total> <ms> <tok/s> <reused>` | prompt progress (at its start and end; per Round when read in Rounds) |
@@ -34,20 +34,29 @@ prompt — microseconds against a 10–30 ms decode step. Nothing in it touches 
 
 ## The caches
 
-One live context of 65,536 positions (`kMaxCompressed`, a compile-time executor constant), the same
-bits on both GPUs (each computes the whole latent). Per GPU, allocated at load:
+One live context of 262,144 positions (`kMaxCompressed`, a compile-time executor constant; 65,536
+until `acb97b8`), the same bits on both GPUs (each computes the whole latent). Per GPU, allocated at
+load:
 
 | | bytes |
 |---|---:|
-| compressed KV: 4 KV sources × 65,536 rows × 512 BF16 (ratio 2 for layers 2, 8, 14 uses half) | 256 MiB |
-| index keys: 4 sources, MXFP4 tiles of 16 positions (1,088 B) | 17 MiB |
+| compressed KV: layer 20 (ratio 1) 262,144 rows, layers 2, 8, 14 (ratio 2) 131,072 rows each, × 512 BF16 | 640 MiB |
+| index keys: the same rows, MXFP4 tiles of 16 positions (1,088 B) | 43 MiB |
 | window rings: 40 layers + 3 DSpark stages × 640 slots × 512 BF16 | 27 MiB |
 | DSpark feature rings (3 × 640 × 5120 BF16), ratio-2 pools | 19 MiB |
-| **total** | **~320 MiB** |
+| **total** | **~730 MiB** |
 
 A Session's state costs ~2.7 KB a token per GPU (compressed rows 2.5 KB, index keys 0.2 KB) plus 46
-MB of rings. Beside the Experts (~80 GB a GPU) the KV is noise: the context limit is the constant,
-not memory (another 64K would cost ~170 MB a GPU, about 18 Slots).
+MB of rings. Beside the Experts (~79 GB a GPU) the KV is small: the context limit is the constant,
+not memory. What does scale with it is the prompt sweep's scratch: a Cohort stays 64K tokens
+(`kSweepRounds`; its arrays would be ~10 GB a GPU for the whole context), so a longer prompt is read
+as several, and each row's candidate mask — a bit per 8-position block, 4 KB at 256K — takes 256 MiB
+for a Cohort. 8,400 Slots fit beside it all with DSpark (96.4 of 97.9 GB a GPU).
+
+At 246K tokens (a needle-in-a-haystack through the server, both facts at 15 % and 80 % depth
+recalled): the prompt read cold in 71 s (3,470 tok/s, four Cohorts), the reply at 37.6 tok/s. A
+decode step's indexer at 262K positions: ~7 µs to score a layer, 22 µs for candidate blocks, 20 µs
+for the top 512 (`ds4n-indexer-check`).
 
 ## Where a prompt resumes (`core/rewind`)
 
@@ -151,6 +160,8 @@ for token, 2026-11-02:
 | the same prompt in Rounds of 8 against a sweep | equal |
 | DSpark against plain steps, greedy (96 tokens) | equal |
 | DSpark against plain steps, sampled (T 0.8, top-p 0.95, seed 1234) | equal |
+| a 240,000-token prompt (four Cohorts) read warm — a checkpoint's 3,000-token prefix, then chunks at 3,000 + 64K k — against cold (chunks at 64K k) | equal |
+| its agent's next step at 240K, resumed in place | equal, reused 240,031 of 240,080 |
 
 ## Running it
 
@@ -159,10 +170,10 @@ The desktop profile is the dotfiles' `scripts/inference/deepseek/ds41-1017-nativ
 and exports the tokenizer in Maya's form (Maya's `tools/ds4/pack.py write_tokenizer` from the HF
 checkpoint's `tokenizer.json`); `--launch` writes the server's config and starts the container
 (`ds4-native-dev:2`, Maya's `.venv`, `--security-opt seccomp=unconfined` for io_uring) on :8000 with
-the shared inference key; `--stop` stops it. Settings: 8,500 Slots (8,800 does not fit beside
-DSpark), 3,000 RAM tier records, Maya's Expert profile, `--ram-policy popular`, `--sweep-min 96`,
+the shared inference key; `--stop` stops it. Settings: 8,400 Slots (8,500 does not fit beside
+DSpark and the 256K caches), 3,000 RAM tier records, Maya's Expert profile, `--ram-policy popular`, `--sweep-min 96`,
 6 GB of checkpoints and 8 Rewind points (with the server loaded ~13 GB of the 91 stay free).
-The server runs with `--fit-max-tokens`: a request whose max_tokens does not fit the 64K context
+The server runs with `--fit-max-tokens`: a request whose max_tokens does not fit the 256K context
 beside its prompt gets the room there is.
 
 First pi session (2026-11-02, a coding task, prompts 7K–23K tokens): every step after the first
@@ -183,4 +194,4 @@ at once; workers of one kind share their whole system prompt with each other.
   takes one back, ~35 ms for 4.5K tokens); no PAUSE / fair slices, no batching several at once
   (Maya's `multi=`): parallel subagents queue in the server.
 - **Checkpoints live in RAM only**: they do not outlast the engine (Maya's also go to a folder).
-- **64K context** (kMaxCompressed), text only.
+- **262,144-token context** (kMaxCompressed), text only.
