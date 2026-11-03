@@ -86,18 +86,23 @@ come from different places. `rewind::Sessions` keeps three kinds of state:
   sharing them — the next subagent, a new pi session — resumes there. 8 kept, least recently used
   replaced.
 - **KV checkpoints** — a conversation set aside whole: both GPUs' compressed and index rows below its
-  position and its rings, in host RAM (~5.5 KB a token plus 92 MB, both GPUs; a 4.5K-token
-  conversation is 0.12 GB, set aside in ~25 ms, taken back in 8 ms). A Session is set aside when a
+  position and its rings, in host RAM, and — when it has run past its last prompt's end — the rings
+  at that end too (its **turn**): its next turn re-renders the reply from early in it, more than 512
+  positions behind its own rings, and the Rewind point taken there may have gone to other
+  conversations by the time it comes back (~5.5 KB a token plus 92 MB, and 92 MB for the turn, both
+  GPUs; a 4.5K-token conversation is 0.21 GB, set aside in ~40 ms, taken back in 8 ms). A Session is
+  set aside when a
   plan discards at least 1,024 of its tokens (`--keep-min`) — unless a checkpoint already holds it,
   or the plan rewinds it to its own last prompt's end (a chat's next turn). Earlier states of a
   conversation give way to its later ones; the least recently used go past the budget
   (`--checkpoint-gb`, 6 GB on the desktop). Taking one back copies it, so a plan may borrow just its
   prefix.
 
-`rewind::plan` takes the KV from the live Session or a checkpoint, and the rings from that state or
-any Rewind point whose tokens it shares — whichever feeds fewest tokens, never past the prompt's
-last token (its logits are the first pick's); ties go to the live Session and to a state's own
-rings. When the prompt shares at least `--split-min` (2,048) tokens more with some state than it can
+`rewind::plan` takes the KV from the live Session or a checkpoint, and the rings from that state, a
+checkpoint's turn, or any Rewind point whose tokens it shares — whichever feeds fewest tokens, never
+past the prompt's last token (its logits are the first pick's); ties go to the live Session and to a
+state's own rings. `rewind::Plan::source` names the pair: `FromLive{OwnRings | PointRings}` or
+`FromCheckpoint{OwnRings | PointRings | TurnRings}`. When the prompt shares at least `--split-min` (2,048) tokens more with some state than it can
 resume at, the plan **splits** the read there for a Rewind point. A conversation that differs from
 another only in its last 16 tokens is that one's re-rendered turn (the two cannot be told apart).
 
@@ -106,8 +111,9 @@ another only in its last 16 tokens is that one's re-rendered turn (the two canno
 independent model of the engine (every ring slot and KV row remembering the position and token
 prefix that wrote it; checkpoints and points as copies): over interleaved conversations under a
 shared system prompt — agents' next steps, re-rendered turns, deep cuts, verify Rounds, a squeezed
-budget — every planned resume reads only its own prompt's writes, and a prompt continuing a kept
-conversation resumes at its end.
+budget — every planned resume reads only its own prompt's writes, a prompt continuing a kept
+conversation resumes at its end, and one re-rendering a kept conversation's reply anywhere resumes
+no earlier than that turn's prompt end.
 
 ## A request (`engine/conversation`)
 
@@ -127,7 +133,10 @@ conversation resumes at its end.
    A sweep costs ~0.9 s plus ~0.6 ms a token (each layer's routed Experts placed once); Rounds
    ~11 ms a token at this context. A split plan reads in two pieces with a Rewind point between.
 3. A Rewind point at the prompt's end. (Before 1: the plan's set-aside, take-back and restore, each
-   reported to the server as a `NOTE sessions: …` line.)
+   reported to the server as a `NOTE sessions: …` line; and when the KV held at least 2,048 more of
+   the prompt than any rings let it resume — `rewind::kv_held` against the plan — `the KV held the
+   prompt's first N tokens, rings resume it from P`, the mark of a re-read no kept rings could
+   spare.)
 4. The **Reply** (`core/reply`): pick, write `T`, apply its rules — an end-of-turn token (EOS, and
    `<｜User｜>` 128803, as the server stops on both) ends it "stop"; max_new or the context "length";
    STOP "cancel". With a thinking budget (`think_budget`/`think_end`, sent by the server), a reasoning
@@ -147,7 +156,7 @@ conversation resumes at its end.
 On the whole model, each scenario runs its requests back to back on one Conversation (so they
 resume in place, take checkpoints back and restore points as the server's would), then every prompt
 again cold (from position 0); each compares the prompt-end logits bit for bit and the reply token
-for token, 2026-11-02:
+for token, 2026-11-03:
 
 | Check | Result |
 |---|---|
@@ -157,6 +166,7 @@ for token, 2026-11-02:
 | subagents under a 3,000-token system prompt: parent; first subagent (parent set aside, a point where it leaves the system prompt); second subagent | equal; the second reused 3,000 |
 | the parent's next step, then the first subagent's (each taken back from its checkpoint) | equal, reused 4,547 of 4,596 and 4,531 of 4,580 |
 | a chat's next turn after a 700-token reply and another conversation (the checkpoint's KV, its prompt's Rewind point) | equal, reused 3,047 of 3,095 |
+| a parent's next step after a 600-token reply and ten subagent turns, its reply re-rendered 10 tokens in (the checkpoint's KV and its turn's rings; its Rewind point long replaced) | equal, reused 4,500 of 5,148 |
 | the same prompt in Rounds of 8 against a sweep | equal |
 | DSpark against plain steps, greedy (96 tokens) | equal |
 | DSpark against plain steps, sampled (T 0.8, top-p 0.95, seed 1234) | equal |
@@ -191,7 +201,7 @@ at once; workers of one kind share their whole system prompt with each other.
 ## Limits
 
 - **One request at a time.** Conversations take turns on the GPUs (each switch sets one aside and
-  takes one back, ~35 ms for 4.5K tokens); no PAUSE / fair slices, no batching several at once
+  takes one back, ~50 ms for 4.5K tokens); no PAUSE / fair slices, no batching several at once
   (Maya's `multi=`): parallel subagents queue in the server.
 - **Checkpoints live in RAM only**: they do not outlast the engine (Maya's also go to a folder).
 - **262,144-token context** (kMaxCompressed), text only.

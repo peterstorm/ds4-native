@@ -108,7 +108,7 @@ New prompt tokens added to an existing Session (a tool result, a user turn).
 One conversation's KV state plus its token history.
 
 **KV checkpoint**:
-A Session set aside whole in host RAM — both GPUs' compressed and index rows below its position and its rings — when another conversation takes the GPUs, and taken back (copied, so it can also lend just its prefix) when a prompt continues it (`Decoder::checkpoint`, `take_back`; `rewind::Checkpoint`). Least recently used go first past the budget.
+A Session set aside whole in host RAM — both GPUs' compressed and index rows below its position and its rings, and, when it ran past its last prompt's end, the rings at that end (its **turn**: its next turn re-renders the reply from early in it, beyond its own rings' reach, after the Rewind point there may be gone) — when another conversation takes the GPUs, and taken back (copied, so it can also lend just its prefix) when a prompt continues it (`Decoder::checkpoint`, `keep_turn`, `take_back`; `rewind::Checkpoint::turn`). Least recently used go first past the budget.
 _Avoid_: slot (Maya's word for it, and ours for VRAM), parked session (prose only)
 
 **Resume**:
@@ -157,7 +157,7 @@ An independent slow implementation (antirez/ds4, Maya's `ref.py`, or the HF refe
 - A **Round** contains one to eight rows of one **Session**; a **Step** is a one-row **Round**; a **Round**'s **Routing plan** is the union of its rows' Experts
 - A **KV checkpoint** holds one **Session** at one position; a later checkpoint of the same conversation replaces it
 - A **Rewind point** belongs to no Session: it serves any KV holding its tokens
-- A **Resume** takes KV from the live **Session** or a **KV checkpoint**, and rings from that state or a **Rewind point** — whichever reads fewest of the prompt's tokens
+- A **Resume** takes KV from the live **Session** or a **KV checkpoint**, and rings from that state, a **KV checkpoint**'s turn, or a **Rewind point** — whichever reads fewest of the prompt's tokens
 - **Cache-conditional routing** makes outputs depend on **Expert cache** contents; with λ = 0 every policy is **Exact**
 
 ## Example Dialogue

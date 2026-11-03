@@ -233,6 +233,28 @@ int main(int argc, char** argv) {
     return true;
   });
 
+  // A parent's next step after its subagent ran more turns than there are Rewind points, its long
+  // reply re-rendered from early on (a tool call's arguments re-serialised): the parent's checkpoint
+  // comes back with the rings it kept at its prompt's end, and only the reply and the result are read.
+  const std::vector<int32_t> agent = concat(system, own(0));
+  scenario("parent's re-rendered turn after its subagent", endless, cold_endless, [&](std::vector<Request>& r) {
+    const size_t k = r.size();
+    if (k == 0) r.push_back({"parent's long reply", agent, 600, greedy, spec, std::nullopt, {}});
+    else if (k == 1) r.push_back({"subagent", concat(head(system, 1000), own(1)), 16, greedy, spec, std::nullopt, {}});
+    else if (k < 11) r.push_back({"subagent's turn " + std::to_string(k), concat(r.back().prompt, r.back().warm.tokens, head(tool, 40)), 16,
+                                  greedy, spec, std::nullopt, {}});
+    else if (k == 11) {
+      std::vector<int32_t> rerendered = r[0].warm.tokens;
+      if (rerendered.size() < 560) {  // the cut must lie past the rings' slack below the reply's end
+        check(false, "parent's long reply: 600 tokens written, not " + std::to_string(rerendered.size()));
+        return false;
+      }
+      rerendered[10] = rerendered[10] == tool[0] ? tool[1] : tool[0];
+      r.push_back({"parent's next step, its reply re-rendered", concat(agent, rerendered, tool), 24, greedy, spec, agent.size(), {}});
+    } else return false;
+    return true;
+  });
+
   // A context past the 64K sweep chunk: read cold in several chunks, then an agent's next step resumed on it.
   if (!long_paths.empty()) {
     std::vector<int32_t> long_prompt;

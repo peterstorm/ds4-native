@@ -132,7 +132,17 @@ class WindowSnapshot {
 struct StoredCaches {
   int64_t committed = 0;
   std::array<std::vector<std::byte>, 2> gpu;
-  size_t bytes() const { return gpu[0].size() + gpu[1].size(); }
+  // The rings at the conversation's last prompt's end (rewind::Checkpoint::turn), laid out as a
+  // WindowSnapshot's: Decoder::keep_turn.
+  std::optional<std::array<std::vector<std::byte>, 2>> turn;
+  size_t bytes() const { return gpu[0].size() + gpu[1].size() + (turn ? (*turn)[0].size() + (*turn)[1].size() : 0); }
+};
+
+/** The rings Decoder::take_back puts back with a checkpoint's rows. */
+enum class StoredRings {
+  Own,   // as the checkpoint was set aside
+  Turn,  // those it kept at its last prompt's end
+  None,  // none: a Rewind point's follow
 };
 
 /**
@@ -239,11 +249,14 @@ class Decoder {
    */
   StoredCaches checkpoint(int64_t committed);
 
+  /** `from`'s rings copied into `c` as its turn, once everything launched so far ran (it waits). */
+  void keep_turn(StoredCaches& c, const WindowSnapshot& from);
+
   /**
-   * `c`'s rows back on both GPUs (it waits), and with `rings` its rings too (else a Rewind point's
-   * follow). DSpark's context starts over.
+   * `c`'s rows back on both GPUs (it waits), with the rings `rings` names (StoredRings::Turn needs
+   * keep_turn's copy). DSpark's context starts over.
    */
-  void take_back(const StoredCaches& c, bool rings);
+  void take_back(const StoredCaches& c, StoredRings rings);
 
   /** Upload the final norm and the head (BF16 values [129280][5120]); each GPU keeps its half of the vocabulary. */
   void add_head(const std::vector<float>& norm, const std::vector<float>& head);

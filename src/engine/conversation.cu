@@ -14,6 +14,9 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+/** A prompt reading again at least this many tokens some state's KV held is named in a note: rings it lacked. */
+constexpr int64_t kHeldNote = 2048;
+
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 double now_ms() { return std::chrono::duration<double, std::milli>(Clock::now().time_since_epoch()).count(); }
 
@@ -58,6 +61,21 @@ std::vector<float> last_row(const std::vector<float>& all) {
 
 /** A token is non-finite trouble for the server (serve/server.py retries the request from token 0 on "non-finite"). */
 [[noreturn]] void non_finite(const std::string& what) { throw std::runtime_error("non-finite logits (" + what + ")"); }
+
+/** The rings the decoder puts back with a checkpoint a plan takes: one overload a kind, so none goes unmapped. */
+StoredRings stored(rewind::OwnRings) { return StoredRings::Own; }
+StoredRings stored(rewind::TurnRings) { return StoredRings::Turn; }
+StoredRings stored(rewind::PointRings) { return StoredRings::None; }  // the point's follow
+StoredRings stored_rings(const rewind::FromCheckpoint& from) {
+  return std::visit([](const auto& rings) { return stored(rings); }, from.rings);
+}
+
+/** Whose rings a plan resumes from, for the prompt's log line. */
+const char* rings_note(const rewind::Plan& p) {
+  if (rewind::point_of(p)) return " (a Rewind point's rings)";
+  const auto* from = std::get_if<rewind::FromCheckpoint>(&p.source);
+  return from && std::holds_alternative<rewind::TurnRings>(from->rings) ? " (its last prompt's end's rings)" : "";
+}
 
 }  // namespace
 
@@ -122,11 +140,15 @@ void Conversation::drop(const std::vector<uint64_t>& ids) {
 void Conversation::carry_out(const rewind::Plan& p, const ReplyEvents& ev) {
   if (p.set_aside) {  // the live Session, whole, into host memory: another conversation takes the GPUs
     const int64_t n = sessions_.written().committed;
-    const uint64_t bytes = m_.decoder->checkpoint_bytes(n);
+    // In the middle of a turn, its last prompt's end's rings go with it: its next step re-renders the reply.
+    const std::optional<uint32_t> turn = sessions_.turn_point();
+    const uint64_t bytes = m_.decoder->checkpoint_bytes(n) + (turn ? 2 * snapshots_[*turn].bytes() : 0);  // both GPUs'
     if (bytes <= config_.checkpoint_budget) {
       const auto t0 = Clock::now();
       const uint64_t id = next_id_++;
-      stored_.emplace(id, m_.decoder->checkpoint(n));
+      StoredCaches c = m_.decoder->checkpoint(n);
+      if (turn) m_.decoder->keep_turn(c, snapshots_[*turn]);
+      stored_.emplace(id, std::move(c));
       auto [next, superseded] = rewind::set_aside(std::move(sessions_), id, bytes, p);
       sessions_ = std::move(next);
       drop(superseded);
@@ -134,14 +156,14 @@ void Conversation::carry_out(const rewind::Plan& p, const ReplyEvents& ev) {
               std::to_string(static_cast<int>(ms_since(t0))) + " ms); " + std::to_string(sessions_.checkpoints().size()) + " kept");
     }
   }
-  if (p.take) {
+  if (const auto* from = std::get_if<rewind::FromCheckpoint>(&p.source)) {
     const auto t0 = Clock::now();
-    const StoredCaches& c = stored_.at(*p.take);
-    m_.decoder->take_back(c, !p.point);
+    const StoredCaches& c = stored_.at(from->id);
+    m_.decoder->take_back(c, stored_rings(*from));
     ev.note("took back a " + std::to_string(c.committed) + "-token conversation (" + gb(c.bytes()) + ", " +
             std::to_string(static_cast<int>(ms_since(t0))) + " ms)");
   }
-  if (p.point) m_.decoder->restore(snapshots_[*p.point]);
+  if (const std::optional<uint32_t> b = rewind::point_of(p)) m_.decoder->restore(snapshots_[*b]);
   sessions_ = rewind::resumed(std::move(sessions_), p);
   auto [kept, dropped] = rewind::within(std::move(sessions_), config_.checkpoint_budget);
   sessions_ = std::move(kept);
@@ -154,6 +176,9 @@ wire::Done Conversation::run(const wire::Generate& g, const ReplyEvents& ev) {
   try {
     const double t0 = now_ms();
     const rewind::Plan p = rewind::plan(sessions_, g.prompt, config_.rewind).value();
+    const int64_t held = rewind::kv_held(sessions_, g.prompt);
+    if (held - p.from >= kHeldNote)
+      ev.note("the KV held the prompt's first " + std::to_string(held) + " tokens, rings resume it from " + std::to_string(p.from));
     carry_out(p, ev);
     const size_t from = static_cast<size_t>(p.from), total = g.prompt.size();
     auto h = engram::history_at(m_.layout, g.prompt, from);
@@ -173,7 +198,7 @@ wire::Done Conversation::run(const wire::Generate& g, const ReplyEvents& ev) {
     ev.progress({total, total, from, now_ms() - t0});
     mark(true);  // the next turn of a chat shares this prompt but its reply
     std::fprintf(stderr, "ds4n-serve: prompt %zu tokens = %zu reused%s%s + %zu read%s in %.0f ms (%.1f tok/s)\n", total, from,
-                 p.take ? " (a checkpoint's)" : "", p.point ? " (a Rewind point's rings)" : "", total - from,
+                 rewind::taken(p) ? " (a checkpoint's)" : "", rings_note(p), total - from,
                  p.split ? (" (a Rewind point at " + std::to_string(*p.split) + ")").c_str() : "", now_ms() - t0,
                  1000.0 * static_cast<double>(total - from) / std::max(now_ms() - t0, 1e-9));
     return reply(g, ev, from, now_ms() - t0);

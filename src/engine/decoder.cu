@@ -335,17 +335,33 @@ StoredCaches Decoder::checkpoint(int64_t committed) {
   return c;
 }
 
-void Decoder::take_back(const StoredCaches& c, bool with_rings) {
+void Decoder::keep_turn(StoredCaches& c, const WindowSnapshot& from) {
+  sync();  // a save() into `from` may still be landing
+  std::array<std::vector<std::byte>, 2> turn;
+  for (size_t g = 0; g < turn.size(); g++) turn[g].assign(from.host_[g], from.host_[g] + from.bytes_);
+  c.turn = std::move(turn);
+}
+
+void Decoder::take_back(const StoredCaches& c, StoredRings rings) {
+  if (rings == StoredRings::Turn && !c.turn) throw CudaError("take_back: the checkpoint kept no turn");
   sync();
   for (auto& gp : gpus_) {
     Gpu& s = *gp;
     check(cudaSetDevice(s.device), "cudaSetDevice");
     auto regions = s.checkpoint_regions(c.committed);
-    if (!with_rings) regions.resize(regions.size() - s.rings().size());
+    if (rings != StoredRings::Own) regions.resize(regions.size() - s.rings().size());
     size_t off = 0;
     for (const auto& [at, n] : regions) {
       if (off + n > c.gpu[s.rank].size()) throw CudaError("take_back: the checkpoint was made for other caches");
       check(cudaMemcpy(at, c.gpu[s.rank].data() + off, n, cudaMemcpyHostToDevice), "take back");
+      off += n;
+    }
+    if (rings != StoredRings::Turn) continue;
+    const std::vector<std::byte>& turn = (*c.turn)[s.rank];
+    off = 0;
+    for (const auto& [ring, n] : s.rings()) {  // a WindowSnapshot's layout (transfer)
+      if (off + n > turn.size()) throw CudaError("take_back: the turn was kept for other rings");
+      check(cudaMemcpy(ring, turn.data() + off, n, cudaMemcpyHostToDevice), "take back a turn");
       off += n;
     }
   }

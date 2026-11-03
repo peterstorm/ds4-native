@@ -52,6 +52,7 @@ struct Engine {
   struct Stored {
     std::vector<Slot> kv;
     Rings rings;
+    std::optional<Rings> turn;  // its last prompt's end's rings, copied from that Rewind point
   };
   std::map<uint64_t, Stored> stored;
   uint64_t next_id = 1;
@@ -100,21 +101,23 @@ struct Engine {
     if (p.set_aside) {
       const uint64_t id = next_id++;
       const int64_t n = s.written().committed;
-      stored[id] = {std::vector<Slot>(kv.begin(), kv.begin() + n), rings};
+      const std::optional<uint32_t> turn = s.turn_point();
+      stored[id] = {std::vector<Slot>(kv.begin(), kv.begin() + n), rings, turn ? std::optional(buffers.at(*turn)) : std::nullopt};
       auto [next, dropped] = rewind::set_aside(std::move(s), id, static_cast<uint64_t>(n), p);
       s = std::move(next);
       for (const uint64_t d : dropped) stored.erase(d);
     }
-    if (p.take) {
-      const Stored& c = stored.at(*p.take);
+    if (const auto* from = std::get_if<FromCheckpoint>(&p.source)) {
+      const Stored& c = stored.at(from->id);
       std::copy(c.kv.begin(), c.kv.end(), kv.begin());
-      if (!p.point) rings = c.rings;
+      if (std::holds_alternative<OwnRings>(from->rings)) rings = c.rings;
+      if (std::holds_alternative<TurnRings>(from->rings)) rings = c.turn.value();
     }
-    if (p.point) rings = buffers.at(*p.point);
+    if (const std::optional<uint32_t> b = point_of(p)) rings = buffers.at(*b);
     s = resumed(std::move(s), p);
     hashes = prefixes(s.tokens());  // a taken-back checkpoint's tokens are the live ones now
     REQUIRE(p.from < static_cast<int64_t>(prompt.size()));
-    INFO("from " << p.from << " take " << p.take.value_or(0) << " point " << (p.point ? int(*p.point) : -1) << " set_aside "
+    INFO("from " << p.from << " take " << taken(p).value_or(0) << " point " << (point_of(p) ? int(*point_of(p)) : -1) << " set_aside "
                  << p.set_aside << " written " << s.written().committed << "/" << s.written().frontier << " " << why(p.from, prefixes(prompt)));
     REQUIRE(exact_at(p.from, prefixes(prompt)));
     REQUIRE(std::equal(s.tokens().begin(), s.tokens().end(), prompt.begin()));
@@ -184,7 +187,7 @@ TEST_CASE("a prompt continuing the live Session reads only its new tokens; one e
   CHECK(plan(e.s, prompt, e.settings).value().from == 299);
   prompt.push_back(7);
   const Plan p = plan(e.s, prompt, e.settings).value();
-  CHECK(p == Plan{false, std::nullopt, std::nullopt, 300, std::nullopt});
+  CHECK(p == Plan{false, FromLive{OwnRings{}}, 300, std::nullopt});
   CHECK_FALSE(plan(e.s, std::vector<int32_t>{}, e.settings).is_ok());
 }
 
@@ -196,7 +199,7 @@ TEST_CASE("a chat's next turn resumes at its prompt's Rewind point, and sets not
   e.reply(rng, 300);  // a long reasoning, in verify Rounds
   // The next turn re-renders the answer without its reasoning: it shares the prompt but its last token.
   const Plan p = e.request(concat(std::vector<int32_t>(prompt.begin(), prompt.end() - 1), tokens(rng, 40)));
-  CHECK(p.point.has_value());
+  CHECK(point_of(p).has_value());
   CHECK(p.from == 4999);
   CHECK_FALSE(p.set_aside);
   CHECK(e.s.checkpoints().empty());
@@ -217,14 +220,51 @@ TEST_CASE("subagents under one system prompt: the first is split where it leaves
   e.reply(rng, 50);
   // The next one resumes at the system prompt's end.
   const Plan second = e.request(concat(system, tokens(rng, 700)));
-  CHECK(second.point.has_value());
+  CHECK(point_of(second).has_value());
   CHECK(second.from == 3000);
   e.reply(rng, 50);
   // The parent's next step takes its checkpoint back and reads only the tool result.
   const std::vector<int32_t> next = concat(parent, parent_reply, tokens(rng, 30));
   const Plan back = e.request(next);
-  CHECK(back.take.has_value());
+  CHECK(taken(back).has_value());
   CHECK(back.from == static_cast<int64_t>(parent.size() + parent_reply.size()));
+}
+
+TEST_CASE("a conversation set aside mid-turn comes back at its prompt's end, though other turns took every Rewind point") {
+  std::mt19937 rng(6);
+  Engine e;
+  const std::vector<int32_t> parent = tokens(rng, 5000);
+  e.request(parent);
+  const std::vector<int32_t> reply = e.reply(rng, 300);  // its turn: a long reasoning and a tool call
+  // A subagent takes the GPUs for more turns than there are Rewind points: the parent is set aside.
+  std::vector<int32_t> child = tokens(rng, 800);
+  for (int turn = 0; turn < 8; turn++) {
+    e.request(child);
+    child = concat(child, e.reply(rng, 20), tokens(rng, 40));
+  }
+  for (const Point& p : e.s.points()) REQUIRE_FALSE(p.tokens.size() == parent.size());  // its own point is gone
+  // The parent's next step re-renders its reply (here from its 6th token) and adds the tool result.
+  std::vector<int32_t> rerendered = reply;
+  rerendered[5] = (rerendered[5] + 1) % 50;
+  const Plan back = e.request(concat(parent, rerendered, tokens(rng, 30)));
+  CHECK(taken(back).has_value());
+  CHECK(std::holds_alternative<TurnRings>(std::get<FromCheckpoint>(back.source).rings));
+  CHECK(back.from == static_cast<int64_t>(parent.size()));
+}
+
+TEST_CASE("kv_held: the longest prefix any state's KV holds, whatever rings resume it") {
+  std::mt19937 rng(7);
+  Engine e;
+  const std::vector<int32_t> prompt = tokens(rng, 3000);
+  e.request(prompt);
+  std::vector<int32_t> reply = e.reply(rng, 400);
+  REQUIRE(reply.size() > 600);
+  reply[50] = (reply[50] + 1) % 50;  // re-rendered from its 51st token: too far below the frontier for its rings
+  const std::vector<int32_t> next = concat(prompt, reply, tokens(rng, 20));
+  CHECK(kv_held(e.s, next) == 3050);
+  CHECK(plan(e.s, next, e.settings).value().from == 3000);  // its prompt's end: 50 of the KV's tokens read again
+  e.request(tokens(rng, 900));  // another conversation: this one set aside, its checkpoint's KV still holds them
+  CHECK(kv_held(e.s, next) == 3050);
 }
 
 TEST_CASE("checkpoints: earlier states of a conversation give way to its later ones, the least recent to the budget") {
@@ -236,7 +276,7 @@ TEST_CASE("checkpoints: earlier states of a conversation give way to its later o
   e.request(tokens(rng, 300));  // another conversation: a set aside
   REQUIRE(e.s.checkpoints().size() == 1);
   const auto a_back = concat(a, tokens(rng, 50));
-  CHECK(e.request(a_back).take.has_value());  // a back (its copy stays), the other set aside
+  CHECK(taken(e.request(a_back)).has_value());  // a back (its copy stays), the other set aside
   REQUIRE(e.s.checkpoints().size() == 2);
   e.request(tokens(rng, 200));  // a third: a (longer now) set aside, replacing its earlier copy
   REQUIRE(e.s.checkpoints().size() == 2);
@@ -272,15 +312,20 @@ TEST_CASE("property: interleaved conversations each resume reading only their ow
     Engine e;
     if (trial % 3 == 2) e.budget = 3000;  // checkpoints squeezed out now and then
     const std::vector<int32_t> system = tokens(rng, 200 + rng() % 2500);
-    std::vector<std::vector<int32_t>> last(4);  // each conversation's tokens so far (its prompt and reply)
+    std::vector<std::vector<int32_t>> last(6);  // each conversation's tokens so far (its prompt and reply)
+    std::vector<size_t> prompt_end(last.size());  // where its last prompt ended, its reply after
     std::string log;
-    for (int step = 0; step < 24; step++) {
-      std::vector<int32_t>& conv = last[rng() % last.size()];
+    for (int step = 0; step < 36; step++) {
+      const size_t i = rng() % last.size();
+      std::vector<int32_t>& conv = last[i];
       std::vector<int32_t> prompt;
-      const int shape = static_cast<int>(rng() % 4);
+      const int shape = static_cast<int>(rng() % 5);
+      const size_t reply_tokens = conv.size() - prompt_end[i];
       if (conv.empty() || shape == 3) prompt = system;                                           // a new one, the system prompt shared
       else if (shape == 0) prompt = conv;                                                        // an agent's next step
       else if (shape == 1) prompt.assign(conv.begin(), conv.end() - 1 - rng() % std::min<size_t>(conv.size(), 30));  // re-rendered
+      else if (shape == 4)  // its reply re-rendered from anywhere in it (a tool call's arguments re-serialised)
+        prompt.assign(conv.begin(), conv.begin() + static_cast<long>(prompt_end[i] + rng() % (reply_tokens + 1)));
       else prompt.assign(conv.begin(), conv.begin() + static_cast<long>(rng() % conv.size()));  // cut deep
       // Each prompt's own part is at least 32 tokens: a conversation differing from another only in its
       // last kTurnRerender tokens is that one's re-rendered turn (core/rewind cannot tell them apart).
@@ -294,9 +339,15 @@ TEST_CASE("property: interleaved conversations each resume reading only their ow
       const size_t live_before = e.s.tokens().size();
       const Plan p = e.request(prompt);
       log += " [c" + std::to_string(&conv - last.data()) + " s" + std::to_string(shape) + " live" + std::to_string(live_before) + " from" +
-             std::to_string(p.from) + (p.take ? " take" : "") + (p.point ? " point" : "") + (p.set_aside ? " aside" : "") + "]";
-      // A prompt continuing a conversation in full resumes there while its state is kept somewhere.
-      if (shape == 0 && !conv.empty() && e.budget == UINT64_MAX) CHECK(p.from + 1 >= static_cast<int64_t>(conv.size()));
+             std::to_string(p.from) + (taken(p) ? " take" : "") + (point_of(p) ? " point" : "") + (p.set_aside ? " aside" : "") + "]";
+      // While its state is kept somewhere, a prompt continuing a conversation in full resumes there, and
+      // one re-rendering its last reply resumes at that reply's prompt's end at worst -- whatever other
+      // conversations ran in between. (One below an odd end: Written cannot tell that its pool slot was
+      // rewritten after the rows a resumed-into reply left past it.)
+      const bool kept = !conv.empty() && e.budget == UINT64_MAX;
+      if (shape == 0 && kept) CHECK(p.from + 1 >= static_cast<int64_t>(conv.size()));
+      if (shape == 4 && kept) CHECK(p.from + 1 >= static_cast<int64_t>(prompt_end[i]));
+      prompt_end[i] = prompt.size();
       conv = concat(prompt, e.reply(rng, static_cast<int>(rng() % 300)));
     }
   }
