@@ -3,6 +3,7 @@
 // with the same Slots, whether every Miss takes a Slot or may bypass the cache (core/cache_replay).
 //
 //   ds4n-cache-study --log FILE --slots N[,N...] [--prior PROFILE] [--prior-weight W] [--skip STEPS] [--tiers R]
+//                    [--sessions P:R,P:R,... [--turn T] [--accept P1,P2,...]]
 //
 // Every policy starts from the engine's warm start: the hottest Experts of the prior (a pick-count
 // profile, as ds4n-model-run --prior), by key without one. --skip counts only the steps after the
@@ -14,6 +15,16 @@
 // (cache::replay_tiers): inclusive as the engine has it (ranked by load count or least recently
 // used), or exclusive -- a victim tier the Slots' evictions are copied down into -- likewise.
 // Counted from the record's first whole Round (cache::rounds_from: a prompt sweep's steps only warm).
+//
+// --sessions P1:R1,P2:R2,... reads the record as Sessions back to back, each P prompt tokens then R
+// reply tokens of one row a Round (ds4n-model-run --sweep 0 --prefill 1), and serves the first k
+// replies (k = 1, 2, 4, 6, ...) on the engine's caches (the first --slots, a victim tier of --tiers
+// records, default 3,000) the two ways core/session_mix has them: taking turns of --turn tokens
+// (default 400; the engine today) or sharing Rounds (concurrent Sessions, not built), plain or with
+// DSpark verify Rounds kept by --accept (each draft's acceptance given the ones before; default an
+// agent's reasoning and code). The time is a model of the engine's measured costs (the constants
+// below): the Rounds' Experts on the GPUs, the drafts, the Loads' waits and the turns' switches.
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -25,6 +36,7 @@
 
 #include "core/cache_replay.hpp"
 #include "core/expert_cache.hpp"
+#include "core/session_mix.hpp"
 
 using namespace ds4n;
 
@@ -90,12 +102,99 @@ void study_tiers(std::span<const cache::Access> steps, const std::vector<uint32_
   std::printf("* the engine's\n");
 }
 
+// The engine's costs, as measured (docs/design/forward-pass.md, served logs). The Rounds table (1-8 rows,
+// all resident) fits 155 us a layer step + 6.2 per routed Expert it runs within 2 %; six agent turns of
+// ~2.6K tokens in one-row Rounds (15,906 tokens, 128.6 s on the GPUs, 87.9 s waiting on 80,873 RAM tier
+// Loads and 30,801 store reads) put the step at 165 us at their context and a store read at 1.8 ms.
+constexpr double kLayerStepUs = 165.0;  // a layer step, its routed Experts aside
+constexpr double kExpertUs = 6.2;       // per routed Expert a layer step runs (its Half streamed on each GPU)
+constexpr double kDraftMs = 2.13;       // a DSpark draft, per Session drafting in a Round
+constexpr double kRamLoadMs = 0.40;     // a Load from the RAM tier (served: 1,842 ms for 4,592)
+constexpr double kStoreReadMs = 1.8;    // a Load from the store
+constexpr double kSwitchMs = 30.0;      // a turn's Session set aside and the next one's taken back (serving.md)
+
+/** The record's replies (a prompt's tokens skipped, then its reply's) served on the engine's caches every way. */
+void study_sessions(std::span<const cache::Access> steps, const std::string& spec, const std::vector<uint32_t>& prior,
+                    uint32_t slots, uint32_t ram_records, uint32_t turn, const std::vector<double>& accept) {
+  std::vector<mix::Traffic> replies;
+  size_t at = 0;
+  for (size_t from = 0; from <= spec.size();) {
+    const size_t comma = std::min(spec.find(',', from), spec.size());
+    const std::string part = spec.substr(from, comma - from);
+    from = comma + 1;
+    const size_t colon = part.find(':');
+    if (colon == std::string::npos) die("--sessions takes PROMPT:REPLY token counts, comma separated");
+    const size_t prompt = std::stoul(part.substr(0, colon)), reply = std::stoul(part.substr(colon + 1));
+    at += prompt * mix::kLayerSteps;
+    if (at + reply * mix::kLayerSteps > steps.size()) die("--sessions: the record holds fewer tokens");
+    auto t = mix::Traffic::of(steps.subspan(at, reply * mix::kLayerSteps));
+    if (!t) die("--sessions: " + t.error().what);
+    replies.push_back(t.value());
+    at += reply * mix::kLayerSteps;
+  }
+  if (at != steps.size()) die("--sessions: the record holds more tokens than the Sessions name");
+  std::printf("%zu Sessions; %u Slots, a victim tier of %u records; turns of %u tokens; DSpark acceptance", replies.size(),
+              slots, ram_records, turn);
+  for (const double p : accept) std::printf(" %.2f", p);
+  std::printf("\n%-24s %5s %7s %6s %9s %9s %7s %7s %7s %9s %9s\n", "way", "rows", "Rounds", "Exp/L", "RAM/tok", "store/tok",
+              "GPU s", "wait s", "draft s", "tok/s", "each");
+
+  std::vector<size_t> counts;
+  for (size_t k = 1; k < replies.size(); k *= 2) counts.push_back(k);
+  counts.push_back(replies.size());
+  for (const size_t k : counts) {
+    const std::span<const mix::Traffic> sessions(replies.data(), k);
+    size_t tokens = 0;
+    for (const auto& s : sessions) tokens += s.tokens();
+    for (const bool shared : {false, true})
+      for (const uint32_t rows : {1u, 2u, 4u}) {
+        if (shared ? k * rows > mix::kRoundRows : rows == 4) continue;  // turns: plain and DSpark at 2
+        const auto kept = mix::kept_tokens(accept, rows);
+        if (!kept) die(kept.error().what);
+        const mix::Sharing sharing = shared ? mix::Sharing{mix::Shared{}} : mix::Sharing{mix::Turns{turn}};
+        const auto m = mix::mix(sessions, sharing, mix::Verify::make(rows, kept.value()).value());
+        if (!m) die(m.error().what);
+        auto [vram, ram] = engine_caches(slots, prior, ram_records, cache::Policy{4096, false});
+        const auto c = cache::replay_tiers(std::move(vram), std::move(ram), m.value().steps, cache::Hints::Use,
+                                           cache::Tiering::Exclusive);
+        if (!c) die(c.error().what);
+        double gpu_us = 0.0, experts = 0.0, draft_ms = 0.0;
+        for (const auto& s : m.value().steps) {
+          gpu_us += kLayerStepUs + kExpertUs * static_cast<double>(s.needed.size());
+          experts += static_cast<double>(s.needed.size());
+        }
+        if (rows > 1)
+          for (const auto& r : m.value().rounds) draft_ms += kDraftMs * r.sessions;
+        uint64_t turns = 0;  // taking turns: every turn after the first sets one Session aside and takes another back
+        if (!shared)
+          for (const auto& s : sessions) turns += (s.tokens() + turn - 1) / turn;
+        const double switch_ms = kSwitchMs * static_cast<double>(turns > 0 ? turns - 1 : 0);
+        const double wait_s = (kRamLoadMs * static_cast<double>(c.value().ram_hits) +
+                               kStoreReadMs * static_cast<double>(c.value().store_reads) + switch_ms) / 1e3;
+        const double total_s = gpu_us / 1e6 + wait_s + draft_ms / 1e3;
+        const double written = static_cast<double>(tokens);
+        char way[32];
+        std::snprintf(way, sizeof way, "%zu %s%s", k, shared ? "shared" : "turns", rows > 1 ? ", DSpark" : "");
+        std::printf("%-24s %5zu %7zu %6.1f %9.2f %9.2f %7.1f %7.1f %7.1f %9.1f %9.1f\n", way, shared ? k * rows : rows,
+                    m.value().rounds.size(), experts / static_cast<double>(m.value().steps.size()),
+                    static_cast<double>(c.value().ram_hits) / written, static_cast<double>(c.value().store_reads) / written,
+                    gpu_us / 1e6, wait_s, draft_ms / 1e3, written / total_s,
+                    written / total_s / static_cast<double>(shared ? k : 1));
+      }
+  }
+  std::printf("rows: a Round's rows; Exp/L: routed Experts a layer step runs; each: a Session's tok/s while it writes\n"
+              "(sharing: all write at once; turns: one at a time, so its own speed)\n");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string log_path, prior_path, slots_arg;
-  uint32_t prior_weight = 1, tier_records = 0;
+  std::string log_path, prior_path, slots_arg, sessions_arg;
+  uint32_t prior_weight = 1, tier_records = 0, turn = 400;
   size_t skip = 0;
+  // Served agent replies (reasoning, then code or findings) kept 63-75 % of the drafts offered at verify
+  // widths around 2.3: the first draft ~3 in 4, later ones less.
+  std::vector<double> accept = {0.75, 0.70, 0.65, 0.55, 0.40};
   for (int i = 1; i < argc; i++) {
     const std::string s = argv[i];
     if (i + 1 >= argc) die("missing value for " + s);
@@ -105,6 +204,17 @@ int main(int argc, char** argv) {
     else if (s == "--prior-weight") prior_weight = static_cast<uint32_t>(std::stoul(argv[++i]));
     else if (s == "--skip") skip = std::stoul(argv[++i]);
     else if (s == "--tiers") tier_records = static_cast<uint32_t>(std::stoul(argv[++i]));
+    else if (s == "--sessions") sessions_arg = argv[++i];
+    else if (s == "--turn") turn = static_cast<uint32_t>(std::stoul(argv[++i]));
+    else if (s == "--accept") {
+      accept.clear();
+      const std::string v = argv[++i];
+      for (size_t at = 0; at <= v.size();) {
+        const size_t comma = std::min(v.find(',', at), v.size());
+        accept.push_back(std::stod(v.substr(at, comma - at)));
+        at = comma + 1;
+      }
+    }
     else die("unknown argument " + s);
   }
   if (log_path.empty() || slots_arg.empty()) die("usage: ds4n-cache-study --log FILE --slots N[,N...]");
@@ -125,6 +235,11 @@ int main(int argc, char** argv) {
     auto p = cache::ExpertCache::prior_from_profile(profile, cache::Policy{}, prior_weight);
     if (!p) die(prior_path + ": " + p.error().what);
     prior = std::move(p).value();
+  }
+  if (!sessions_arg.empty()) {
+    if (turn == 0) die("--turn takes at least one token");
+    study_sessions(steps.value(), sessions_arg, prior, slot_counts.front(), tier_records ? tier_records : 3000, turn, accept);
+    return 0;
   }
   if (tier_records > 0) {
     study_tiers(steps.value(), slot_counts, prior, tier_records);

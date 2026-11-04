@@ -213,10 +213,55 @@ taking one back 8 ms. A worker's *first* prompt shares little with its parent: p
 with `--exclude-tools subagent`, so their tool list — near the top of the system prompt — differs
 at once; workers of one kind share their whole system prompt with each other.
 
+## Concurrent Sessions (studied 2026-11-04, not built)
+
+pi runs up to 4 subagents at once, and with a local parent every one of them asks this engine (pi's
+`local-workloads-use-parent`): Loom's Waves, its Wave gates (five reviewers per Task) and its panels
+fan out that way, and here they take turns. Sharing Rounds -- every Session still writing with rows
+in each Round, up to 8 rows, each with caches of its own (~730 MiB a GPU at the full context, ~78
+Slots) -- would stream each layer's Experts once for all of them. How much that buys depends on how
+much their Experts overlap, so `ds4n-cache-study --sessions` replays recorded agent turns both ways
+(`core/session_mix`: the turns' traffic merged as the engine runs it, or as shared Rounds, each
+Round's layer step needing the union) through the engine's caches, and prices the result with the
+engine's measured costs. The recordings are real turns the engine wrote (2,256-2,400 tokens each,
+reasoning then code, findings or a design), rendered through Maya's own template and tokenizer and
+read back in one-row Rounds (`ds4n-model-run --sweep 0 --prefill 1 --access-log`). Calibration: the
+replay reproduces the engine's Loads of that read to the unit (5.09 RAM tier and 1.94 store a
+token), and the cost model its time (73.4 against 73.5 tok/s); a lone reply comes out at 84-91
+tok/s with DSpark at 2 rows, as served (82-103).
+
+Six different agents (two implementers, two reviewers, an architect, a test writer; TypeScript,
+Rust, Python, Java, Go) -- the least overlap there is:
+
+| Agents | taking turns (today), DSpark | sharing Rounds, best | each agent, sharing |
+|---|---|---|---|
+| 2 | 89-93 tok/s | 119.5 (DSpark, 4 rows each) | 60 |
+| 4 | 79-91 | 103.4 (plain) | 26 |
+| 6 | 79-91 | 102.5 (plain) | 17 |
+
+A Wave gate: Loom's five reviewers (code, silent failures, tests, types, comments) on one diff:
+
+| Reviewers | taking turns (today), DSpark | sharing Rounds, best | each reviewer, sharing |
+|---|---|---|---|
+| 2 | 83-84 tok/s | 110.9 (DSpark, 4 rows each) | 55 |
+| 4 | 87 | 130.6 (plain) | 33 |
+| 5 | 87-88 | 140.6 (plain) | 28 |
+
+(Ranges: turns of 400 and 2,400 tokens; a turn switch costs 30 ms.) The Experts decide it. Sharing
+cuts the GPUs' work per token ~2.7x (a layer step runs the union: 20-30 routed Experts for 4-6 rows,
+against 6 for each row alone), but Loads cost ~0.4 ms each from the RAM tier and 1.8 from the store
+and already take a third of a lone reply. Six different agents keep six working sets in the 8,352
+Slots at once: their Loads rise from ~6 to ~11 a token and sharing gains only 13-34 %. Reviewers of
+one diff route alike: their Loads stay at ~7.3 a token shared or not, and sharing gains 50-61 %.
+Prompt reads are left out on both sides (a sweep would hold a shared Round's other Sessions; taking
+turns, it holds the queue). DSpark gains little in shared Rounds: each Session drafts on its own
+(2.1 ms each), so plain rows win from 4 Sessions up unless drafts are batched too.
+
 ## Limits
 
 - **One request at a time.** Conversations take turns on the GPUs (each switch sets one aside and
   takes one back, ~50 ms for 4.5K tokens); no PAUSE / fair slices, no batching several at once
-  (Maya's `multi=`): parallel subagents queue in the server.
+  (Maya's `multi=`): parallel subagents queue in the server. Sharing Rounds would serve Loom's fan-outs
+  ~1.5x faster (Concurrent Sessions, above).
 - **Checkpoints live in RAM only**: they do not outlast the engine (Maya's also go to a folder).
 - **262,144-token context** (kMaxCompressed), text only.
