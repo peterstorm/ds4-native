@@ -91,6 +91,9 @@ class ExpertCache {
    */
   Result<Plan, CacheError> plan(std::span<const ExpertKey> needed, std::span<const ExpertKey> hinted = {});
 
+  /** Forget `key`: its Slot is free again (Loads take free Slots lowest first). False when it was not resident. */
+  bool drop(ExpertKey key);
+
   uint32_t slots() const { return static_cast<uint32_t>(slot_key_.size()); }
   std::optional<uint32_t> slot_of(ExpertKey key) const;
 

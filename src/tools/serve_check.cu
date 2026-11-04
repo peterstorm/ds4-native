@@ -137,7 +137,11 @@ int main(int argc, char** argv) {
     else if (a == "--slots") mc.slots = static_cast<uint32_t>(std::stoul(v));
     else if (a == "--ram-records") mc.ram_records = static_cast<uint32_t>(std::stoul(v));
     else if (a == "--prior") mc.prior = v;
-    else if (a == "--ram-policy") mc.ram_policy = v == "popular" ? engine::RamPolicy::Popular : engine::RamPolicy::Recent;
+    else if (a == "--ram-policy") {
+      const auto policy = engine::ram_policy_named(v);
+      if (!policy) die("--ram-policy takes recent, popular or victim: " + v);
+      mc.ram_policy = *policy;
+    }
     else if (a == "--tokens") tokens_path = v;
     else if (a == "--system") system_path = v;
     else if (a == "--expect") expect_path = v;

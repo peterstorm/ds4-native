@@ -9,11 +9,13 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <span>
 #include <thread>
 
 #include "core/expert_cache.hpp"
 #include "core/miss_protocol.hpp"
+#include "core/slot_map.hpp"
 #include "core/store_layout.hpp"
 #include "engine/device_layer.cuh"
 #include "io/file.hpp"
@@ -54,9 +56,19 @@ struct ExpertResidency::State {
   io::Fd store;
   io::UringReader reader;
   cache::ExpertCache vram, ram;
+  // The physical Slots behind the decode Slots: under RamPolicy::Victim kBatch of the config's Slots
+  // are spares, so a Load fills one while the Expert it evicts is copied out of another; else none.
+  cache::SlotMap physical;
   std::optional<cache::ExpertCache> scratch;  // a prompt sweep's Slots (config.sweep_slots), least recently used
   std::array<uint8_t*, 2> pool{};  // per GPU: (slots + sweep_slots) x kHalfPayloadBytes
   std::array<cudaStream_t, 2> copy{};
+  // RamPolicy::Victim: per GPU, the stream evicted Halves go down on, and an event per spare (its
+  // SlotMap token): the copy out of it, which a Load into it waits for. Copies down outlast their
+  // step (they run beside the GPUs' next layers); per RAM tier record, the token of the copy down
+  // last into it (-1: none since it was copied up), which a copy out of it waits for.
+  std::array<cudaStream_t, 2> down{};
+  std::array<std::vector<cudaEvent_t>, 2> gone{};
+  std::vector<int32_t> written_by;
   std::vector<std::byte*> allocations;  // pinned RAM tier memory
   std::vector<std::byte*> records;      // per RAM tier Slot: one record (kRecordStride bytes)
   // The protocol pages (host-mapped, both GPUs).
@@ -72,8 +84,13 @@ struct ExpertResidency::State {
   std::vector<cache::Access> accesses;  // with config.record_accesses
   std::string failure;
 
-  State(ResidencyConfig c, io::Fd fd, io::UringReader r, cache::ExpertCache v, cache::ExpertCache m)
-      : config(std::move(c)), store(std::move(fd)), reader(std::move(r)), vram(std::move(v)), ram(std::move(m)) {}
+  State(ResidencyConfig c, io::Fd fd, io::UringReader r, cache::ExpertCache v, cache::ExpertCache m, cache::SlotMap p)
+      : config(std::move(c)),
+        store(std::move(fd)),
+        reader(std::move(r)),
+        vram(std::move(v)),
+        ram(std::move(m)),
+        physical(std::move(p)) {}
   ~State();
 
   uint8_t* slot_ptr(int half, uint32_t slot) const {
@@ -83,7 +100,10 @@ struct ExpertResidency::State {
     return static_cast<cache::ExpertKey>(layer % static_cast<int32_t>(config.key_layers)) * store::kExperts +
            static_cast<cache::ExpertKey>(expert);
   }
-  /** Both Halves of RAM tier record `record` into VRAM Slot `slot`, each on its GPU's copy stream. */
+  /**
+   * Both Halves of RAM tier record `record` into VRAM Slot `slot`, each on its GPU's copy stream,
+   * after the copy down into the record (RamPolicy::Victim) landed.
+   */
   void copy_record(uint32_t record, uint32_t slot);
   /** One record to read from the store: into RAM tier buffer `buffer`, then (if set) VRAM Slot `slot`. */
   struct RecordRead {
@@ -93,14 +113,37 @@ struct ExpertResidency::State {
   };
   /** Read records (at most kBatch) in 1 MiB chunks; each chunk bound for VRAM is copied to its GPU as it lands. */
   void read_records(std::span<const RecordRead> records_in);
+  /** An evicted Expert to copy out of the physical Slot it left into a RAM tier record, then record `token`. */
+  struct Demotion {
+    uint32_t record, freed, token;
+  };
+  /** A decode step's Loads through an exclusive RAM tier (exchange_victims). */
+  struct Exchange {
+    std::vector<cache::Load> placed;     // the Loads, in physical Slots
+    std::vector<RecordRead> from_store;  // through the staging buffers
+    std::vector<cache::ExpertKey> up;    // copied up from the tier: they leave it once landed
+    std::vector<Demotion> down;          // once the Loads' copies landed
+  };
   /**
-   * Fill the Loads' VRAM Slots (at most kBatch), returning when both GPUs' copies landed. Decode
-   * Loads go through the RAM tier (a store read lands in a record the tier's policy chose); a
+   * The decode Loads under RamPolicy::Victim: each fills a spare physical Slot (cache::SlotMap) once
+   * the copy out of it landed; those found in the tier come up from their records, the rest, returned,
+   * come from the store; and the Experts they evict, returned, go down into RAM tier records.
+   */
+  Exchange exchange_victims(std::span<const cache::Load> loads, ResidencyStats& counts);
+  /**
+   * Copy evicted Experts down, on the `down` streams. Issued once the step's Loads landed: copies up
+   * and down at once on both GPUs share the host's DMA bandwidth (~58 GB/s here: 0.65 ms for a Half
+   * each way instead of 0.33), so the copies down run beside the GPUs' next layers instead.
+   */
+  void copy_down(std::span<const Demotion> demotions);
+  /**
+   * Fill the Loads' VRAM Slots (at most kBatch), returning the Loads in physical Slots once both
+   * GPUs' copies landed. Decode Loads go through the RAM tier as its policy has it (RamPolicy); a
    * sweep's only read it: RAM tier records are copied, the rest come from the store through the
    * staging buffers, so a prompt's one-off Loads never displace what the tier keeps for every prompt.
    */
-  void load(std::span<const cache::Load> loads, bool sweep, ResidencyStats& counts);
-  /** Wait until both GPUs' copy streams drained. */
+  std::vector<cache::Load> load(std::span<const cache::Load> loads, bool sweep, ResidencyStats& counts);
+  /** Wait until both GPUs' copies up drained. */
   void sync_copies();
   /** Drain posted steps in order until stopped. */
   void serve();
@@ -121,10 +164,12 @@ struct ExpertResidency::State {
 ExpertResidency::State::~State() {
   for (int h = 0; h < 2; h++) {
     cudaSetDevice(config.devices[h]);
-    if (copy[h]) {
-      cudaStreamSynchronize(copy[h]);
-      cudaStreamDestroy(copy[h]);
-    }
+    for (cudaStream_t st : {copy[h], down[h]})
+      if (st) {
+        cudaStreamSynchronize(st);
+        cudaStreamDestroy(st);
+      }
+    for (cudaEvent_t ev : gone[h]) cudaEventDestroy(ev);
     if (pool[h]) cudaFree(pool[h]);
   }
   for (std::byte* a : allocations) cudaFreeHost(a);
@@ -133,17 +178,79 @@ ExpertResidency::State::~State() {
 }
 
 void ExpertResidency::State::copy_record(uint32_t record, uint32_t slot) {
+  const int32_t token = written_by.empty() ? -1 : written_by[record];
   for (int h = 0; h < 2; h++) {
     engine::check(cudaSetDevice(config.devices[h]), "cudaSetDevice");
+    if (token >= 0) engine::check(cudaStreamWaitEvent(copy[h], gone[h][token], 0), "cudaStreamWaitEvent");
     engine::check(cudaMemcpyAsync(slot_ptr(h, slot), records[record] + h * store::kHalfStride, store::kHalfPayloadBytes,
                           cudaMemcpyHostToDevice, copy[h]),
           "Half upload");
   }
 }
 
-void ExpertResidency::State::load(std::span<const cache::Load> loads, bool sweep, ResidencyStats& counts) {
+ExpertResidency::State::Exchange ExpertResidency::State::exchange_victims(std::span<const cache::Load> loads,
+                                                                         ResidencyStats& counts) {
+  // The tier plans the Loads it holds (Hits: they keep their records until copied up) with the
+  // Experts the Loads evict (Loads: each takes the record of the tier's least recently evicted, which
+  // leaves for good; one the tier holds already needs no copy).
+  std::vector<cache::ExpertKey> keys;
+  for (const auto& l : loads)
+    if (ram.slot_of(l.key)) keys.push_back(l.key);
+  const std::set<cache::ExpertKey> up(keys.begin(), keys.end());
+  for (const auto& l : loads)
+    if (l.evicted && !ram.slot_of(*l.evicted)) keys.push_back(*l.evicted);
+  auto planned = ram.plan(keys);
+  if (!planned) fail("RAM tier: " + planned.error().what);
+  std::map<cache::ExpertKey, uint32_t> record_of;  // an evicted Expert -> the record it goes down into
+  for (const cache::Load& r : planned.value().loads) record_of[r.key] = r.slot;
+
+  Exchange x;
+  for (const cache::Load& l : loads) {
+    const auto turn = physical.rotate(l.slot);
+    if (!turn) fail("Slot map: " + turn.error().what);
+    const auto [fresh, freed, token] = turn.value();
+    // The spare's last copy out landed before the Load fills it; the evicted Expert goes out of the
+    // physical Slot it leaves later (copy_down), which records the token again -- after this wait.
+    for (int h = 0; h < 2; h++) {
+      engine::check(cudaSetDevice(config.devices[h]), "cudaSetDevice");
+      engine::check(cudaStreamWaitEvent(copy[h], gone[h][token], 0), "cudaStreamWaitEvent");
+    }
+    if (const auto it = l.evicted ? record_of.find(*l.evicted) : record_of.end(); it != record_of.end()) {
+      x.down.push_back({it->second, freed, token});
+      written_by[it->second] = static_cast<int32_t>(token);
+      counts.demoted++;
+    }
+    if (up.contains(l.key)) {
+      copy_record(*ram.slot_of(l.key), fresh);
+      counts.ram_hits++;
+      x.up.push_back(l.key);
+    } else {
+      x.from_store.push_back({l.key, config.ram_records + static_cast<uint32_t>(x.from_store.size()), fresh});  // staging
+    }
+    x.placed.push_back({l.key, fresh, l.evicted});
+  }
+  return x;
+}
+
+void ExpertResidency::State::copy_down(std::span<const Demotion> demotions) {
+  for (const Demotion& d : demotions)
+    for (int h = 0; h < 2; h++) {
+      engine::check(cudaSetDevice(config.devices[h]), "cudaSetDevice");
+      engine::check(cudaMemcpyAsync(records[d.record] + h * store::kHalfStride, slot_ptr(h, d.freed), store::kHalfPayloadBytes,
+                                    cudaMemcpyDeviceToHost, down[h]),
+                    "Half down");
+      engine::check(cudaEventRecord(gone[h][d.token], down[h]), "cudaEventRecord");
+    }
+}
+
+std::vector<cache::Load> ExpertResidency::State::load(std::span<const cache::Load> loads, bool sweep,
+                                                     ResidencyStats& counts) {
+  std::vector<cache::Load> placed;   // in physical Slots
   std::vector<RecordRead> from_store;
-  if (sweep) {
+  std::vector<cache::ExpertKey> up;  // RamPolicy::Victim: tier keys copied up, which leave it once landed
+  std::vector<Demotion> demotions;   // RamPolicy::Victim: the evicted Experts, once the Loads landed
+  if (sweep) {  // the scratch Slots: their own numbering in the pool
+    placed.assign(loads.begin(), loads.end());
     for (const auto& l : loads)
       if (const auto record = ram.slot_of(l.key)) {
         copy_record(*record, l.slot);
@@ -151,25 +258,38 @@ void ExpertResidency::State::load(std::span<const cache::Load> loads, bool sweep
       } else {
         from_store.push_back({l.key, config.ram_records + static_cast<uint32_t>(from_store.size()), l.slot});  // staging
       }
+  } else if (config.ram_policy == RamPolicy::Victim) {
+    Exchange x = exchange_victims(loads, counts);
+    placed = std::move(x.placed);
+    from_store = std::move(x.from_store);
+    up = std::move(x.up);
+    demotions = std::move(x.down);
   } else {
     std::vector<cache::ExpertKey> keys;
     std::map<cache::ExpertKey, uint32_t> slot_of;
     for (const auto& l : loads) {
       keys.push_back(l.key);
-      slot_of[l.key] = l.slot;
+      slot_of[l.key] = physical.physical(l.slot);
+      placed.push_back({l.key, slot_of[l.key], l.evicted});
     }
-    auto placed = ram.plan(keys);
-    if (!placed) fail("RAM tier: " + placed.error().what);
-    for (const auto& h : placed.value().hits) {
+    auto tier = ram.plan(keys);
+    if (!tier) fail("RAM tier: " + tier.error().what);
+    for (const auto& h : tier.value().hits) {
       copy_record(h.slot, slot_of.at(h.key));
       counts.ram_hits++;
     }
     // Store reads land in the RAM tier buffers they took.
-    for (const auto& l : placed.value().loads) from_store.push_back({l.key, l.slot, slot_of.at(l.key)});
+    for (const auto& l : tier.value().loads) from_store.push_back({l.key, l.slot, slot_of.at(l.key)});
   }
   counts.store_reads += from_store.size();
   read_records(from_store);
   sync_copies();
+  copy_down(demotions);
+  for (const cache::ExpertKey k : up) {  // copied up after its copy down: the record is free and settled
+    written_by[*ram.slot_of(k)] = -1;
+    ram.drop(k);
+  }
+  return placed;
 }
 
 void ExpertResidency::State::sync_copies() {
@@ -236,14 +356,14 @@ void ExpertResidency::State::serve_step(const moe::PostedStep& step, uint64_t s,
                                sweep, counts);
   if (loads.empty()) return;
   const auto t0 = Clock::now();
-  load(loads, sweep, counts);
+  const auto placed = load(loads, sweep, counts);
   // The table changes only once GPU 1 routed this step too: Cache-conditional routing reads it.
   const auto wait_start = Clock::now();
   while (std::atomic_ref<uint64_t>(mailbox->peer_routed).load(std::memory_order_acquire) < s) {
     if (Clock::now() - wait_start > std::chrono::seconds(10)) fail("GPU 1 never routed step " + std::to_string(s));
     _mm_pause();
   }
-  publish(loads);
+  publish(placed);
   counts.exposed_ms += ms_since(t0);
 }
 
@@ -292,7 +412,7 @@ void ExpertResidency::State::publish(std::span<const cache::Load> loads) {
 }
 
 uint32_t ExpertResidency::State::slot_of(cache::ExpertKey key) const {
-  if (const auto s = vram.slot_of(key)) return *s;
+  if (const auto s = vram.slot_of(key)) return physical.physical(*s);
   if (scratch)
     if (const auto s = scratch->slot_of(key)) return config.slots + *s;
   fail("an Expert just placed has no Slot (internal invariant broken)");
@@ -326,6 +446,7 @@ void ExpertResidency::State::serve() {
       stats.hits += counts.hits;
       stats.ram_hits += counts.ram_hits;
       stats.store_reads += counts.store_reads;
+      stats.demoted += counts.demoted;
       stats.exposed_ms += counts.exposed_ms;
       accesses.insert(accesses.end(), std::make_move_iterator(seen.begin()), std::make_move_iterator(seen.end()));
     }
@@ -346,8 +467,11 @@ ExpertResidency::~ExpertResidency() {
 }
 
 std::unique_ptr<ExpertResidency> ExpertResidency::open(const ResidencyConfig& config) {
-  if (config.slots < kBatch || config.ram_records < kBatch)
-    fail("the Expert cache and the RAM tier each need at least " + std::to_string(kBatch) + " Slots");
+  // Under RamPolicy::Victim kBatch of the Slots are spares (cache::SlotMap): the cache places the rest.
+  const uint32_t spares = config.ram_policy == RamPolicy::Victim ? kBatch : 0;
+  if (config.slots < kBatch + spares || config.ram_records < kBatch)
+    fail("the Expert cache and the RAM tier each need at least " + std::to_string(kBatch) + " Slots (and " +
+         std::to_string(spares) + " spare Slots)");
   if (config.key_layers < 1 || config.key_layers > store::kLayers) fail("key_layers must be in 1..40");
   if (config.sweep_slots != 0 && config.sweep_slots < kBatch)
     fail("the sweep Slots, when any, number at least " + std::to_string(kBatch));
@@ -365,14 +489,17 @@ std::unique_ptr<ExpertResidency> ExpertResidency::open(const ResidencyConfig& co
     prior.assign(cache::kKeys, 0);
     std::fill(prior.begin(), prior.begin() + config.key_layers * store::kExperts, 1u);
   }
-  auto vram = cache::ExpertCache::create(config.slots, prior, config.vram_policy);
+  auto vram = cache::ExpertCache::create(config.slots - spares, prior, config.vram_policy);
   if (!vram) fail("Expert cache: " + vram.error().what);
+  auto places = cache::SlotMap::create(config.slots - spares, spares);
+  if (!places) fail("Slot map: " + places.error().what);
   // The RAM tier: Recent ranks by last load and starts empty; Popular ranks by decayed load count
-  // and, with a prior, starts with the profile's next-hottest Experts after the VRAM set.
+  // and, with a prior, starts with the profile's next-hottest Experts after the VRAM set; Victim
+  // ranks by last eviction and starts as Popular does (the Slots and the tier disjoint from the start).
   const bool popular = config.ram_policy == RamPolicy::Popular;
   const cache::Policy ram_policy{4096, popular};
   std::vector<uint32_t> ram_prior;
-  if (popular && !prior.empty()) {
+  if (config.ram_policy != RamPolicy::Recent && !prior.empty()) {
     ram_prior = prior;
     for (const auto& l : vram.value().warm_start()) ram_prior[l.key] = 0;
   }
@@ -380,7 +507,8 @@ std::unique_ptr<ExpertResidency> ExpertResidency::open(const ResidencyConfig& co
                                : cache::ExpertCache::create(config.ram_records, ram_prior, ram_policy);
   if (!ram) fail("RAM tier: " + ram.error().what);
   auto s = std::make_unique<State>(config, std::move(fd).value(), std::move(reader).value(), std::move(vram).value(),
-                                   std::move(ram).value());
+                                   std::move(ram).value(), std::move(places).value());
+  if (config.ram_policy == RamPolicy::Victim) s->written_by.assign(config.ram_records, -1);
   if (config.sweep_slots > 0) {
     auto scratch = cache::ExpertCache::empty(config.sweep_slots, cache::Policy{4096, false});
     if (!scratch) fail("sweep Slots: " + scratch.error().what);
@@ -391,6 +519,11 @@ std::unique_ptr<ExpertResidency> ExpertResidency::open(const ResidencyConfig& co
     engine::check(cudaSetDevice(config.devices[g]), "cudaSetDevice");
     engine::check(cudaMalloc(&s->pool[g], (static_cast<size_t>(config.slots) + config.sweep_slots) * store::kHalfPayloadBytes), "Slot pool");
     engine::check(cudaStreamCreateWithFlags(&s->copy[g], cudaStreamNonBlocking), "cudaStreamCreate");
+    if (config.ram_policy == RamPolicy::Victim) {
+      engine::check(cudaStreamCreateWithFlags(&s->down[g], cudaStreamNonBlocking), "cudaStreamCreate");
+      s->gone[g].resize(spares);
+      for (cudaEvent_t& ev : s->gone[g]) engine::check(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "cudaEventCreate");
+    }
   }
   // Portable: both GPUs copy from the same records at pinned speed. The RAM tier's records, then
   // kBatch staging buffers for a sweep's store reads.
@@ -410,7 +543,7 @@ std::unique_ptr<ExpertResidency> ExpertResidency::open(const ResidencyConfig& co
   for (size_t i = 0; i < warm.size(); i += kBatch) {
     std::vector<State::RecordRead> batch;
     for (size_t j = i; j < std::min<size_t>(warm.size(), i + kBatch); j++)
-      batch.push_back({warm[j].key, static_cast<uint32_t>(j - i), warm[j].slot});
+      batch.push_back({warm[j].key, static_cast<uint32_t>(j - i), s->physical.physical(warm[j].slot)});
     s->read_records(batch);
     s->sync_copies();
   }
@@ -423,7 +556,7 @@ std::unique_ptr<ExpertResidency> ExpertResidency::open(const ResidencyConfig& co
   }
   s->table = host_mapped<int32_t>(moe::kResidencyKeys);
   std::fill(s->table, s->table + moe::kResidencyKeys, -1);
-  for (const auto& l : warm) s->table[l.key] = static_cast<int32_t>(l.slot);
+  for (const auto& l : warm) s->table[l.key] = static_cast<int32_t>(s->physical.physical(l.slot));
   s->mailbox = host_mapped<moe::Mailbox>(1);
   s->board = host_mapped<moe::Board>(1);
   *s->mailbox = {};
@@ -454,6 +587,13 @@ std::unique_ptr<ExpertResidency> ExpertResidency::open(const ResidencyConfig& co
 
 cuda::ExpertDirectory ExpertResidency::directory(int rank) const { return s_->directories.at(rank); }
 
+std::optional<RamPolicy> ram_policy_named(std::string_view name) {
+  if (name == "recent") return RamPolicy::Recent;
+  if (name == "popular") return RamPolicy::Popular;
+  if (name == "victim") return RamPolicy::Victim;
+  return std::nullopt;
+}
+
 std::vector<uint32_t> ExpertResidency::place(int layer, std::span<const int32_t> experts) {
   State& s = *s_;
   if (layer < 0 || layer >= static_cast<int>(store::kLayers)) fail("place: layer out of range");
@@ -470,8 +610,7 @@ std::vector<uint32_t> ExpertResidency::place(int layer, std::span<const int32_t>
     const auto loads = s.plan_keys(keys, {}, true, counts);
     if (!loads.empty()) {
       const auto t0 = Clock::now();
-      s.load(loads, true, counts);
-      s.publish(loads);
+      s.publish(s.load(loads, true, counts));
       counts.exposed_ms += ms_since(t0);
     }
     for (const cache::ExpertKey k : keys) slots.push_back(s.slot_of(k));

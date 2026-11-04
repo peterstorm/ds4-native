@@ -9,11 +9,14 @@
 //
 // Placement is core/expert_cache twice: the VRAM Slots (warm from construction,
 // least recently used by default, the router's near-misses counting as uses) and
-// the RAM tier's pinned record buffers (empty at first, least recently used). A Slot index means the same Expert on both
+// the RAM tier's pinned record buffers (RamPolicy). A Slot index means the same Expert on both
 // GPUs, GPU r holding Half r. A Load comes from its RAM tier record when there,
-// otherwise from the store in 1 MiB O_DIRECT chunks into a RAM tier buffer, each
-// chunk copied to its GPU as it lands. Only after both GPUs' copies landed does
-// the table name the new Slots and the board mark the step served.
+// otherwise from the store in 1 MiB O_DIRECT chunks into a host buffer, each
+// chunk copied to its GPU as it lands. Under RamPolicy::Victim a Load fills a spare
+// physical Slot (core/slot_map) and the Expert it evicts is copied down from the one
+// it leaves into a RAM tier record once the step's Loads landed, beside the GPUs'
+// next layers. Only after both GPUs' copies up landed does the table name the new
+// Slots and the board mark the step served.
 //
 // Residency changes only while a step with Loads is being served, and both GPUs
 // wait at that step, so they always resolve against the same table state, the
@@ -26,9 +29,11 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "core/cache_replay.hpp"
@@ -45,14 +50,22 @@ struct ResidencyError : std::runtime_error {
  * How the RAM tier chooses its records. Recent: the most recently loaded (least recently used
  * goes), empty at first. Popular: ranked by decayed load count like the VRAM Slots, warmed (with a
  * prior) by the profile's next-hottest Experts after the VRAM set, so a first Miss on a popular
- * Expert is served from RAM.
+ * Expert is served from RAM. Both are inclusive: a decode Load's store read lands in a record, so
+ * the tier holds Experts the Slots hold too. Victim: exclusive -- the Experts the decode Slots
+ * evicted, each copied down from its Slot as it goes (least recently evicted goes first), warmed
+ * like Popular; a Load found there moves up and leaves it, so the Slots and the tier hold distinct
+ * Experts, about one least-recently-used cache of both sizes (cache::replay_tiers: half the store
+ * reads of Popular on long generations, forward-pass.md).
  */
-enum class RamPolicy { Recent, Popular };
+enum class RamPolicy { Recent, Popular, Victim };
+
+/** The policy a command line names: recent, popular or victim. */
+std::optional<RamPolicy> ram_policy_named(std::string_view name);
 
 struct ResidencyConfig {
   std::string store_path;
   std::array<int, 2> devices{0, 1};  // device of Half 0, Half 1
-  uint32_t slots = 0;                // VRAM Slots, at least moe::kMaxJobs
+  uint32_t slots = 0;                // VRAM Slots, at least moe::kMaxJobs (under RamPolicy::Victim, 48 of them spares)
   // RAM tier record buffers (18 MiB pinned each), at least moe::kMaxJobs; 48 more stage a prompt
   // sweep's store reads, which only read the tier (a sweep's one-off Loads never displace its records).
   uint32_t ram_records = 0;
@@ -83,6 +96,7 @@ struct ResidencyConfig {
 /** Counters since open(); a Hit is a needed Expert found in a VRAM Slot. */
 struct ResidencyStats {
   uint64_t layer_steps = 0, hits = 0, ram_hits = 0, store_reads = 0;
+  uint64_t demoted = 0;     // evicted Experts copied down into the RAM tier (RamPolicy::Victim)
   double exposed_ms = 0.0;  // service time of steps with Loads (the GPUs wait that long)
   double warm_ms = 0.0;     // filling the Slots at open()
 };

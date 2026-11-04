@@ -196,7 +196,7 @@ and exports the tokenizer in Maya's form (Maya's `tools/ds4/pack.py write_tokeni
 checkpoint's `tokenizer.json`); `--launch` writes the server's config and starts the container
 (`ds4-native-dev:2`, Maya's `.venv`, `--security-opt seccomp=unconfined` for io_uring) on :8000 with
 the shared inference key; `--stop` stops it. Settings: 8,400 Slots (8,500 does not fit beside
-DSpark and the 256K caches), 3,000 RAM tier records, Maya's Expert profile, `--ram-policy popular`, `--sweep-min 96`,
+DSpark and the 256K caches), 3,000 RAM tier records as a victim tier (`--ram-policy victim`: the Slots' evictions copied down, forward-pass.md; 48 of the Slots spares), Maya's Expert profile, `--sweep-min 96`,
 6 GB of checkpoints and 8 Rewind points (with the server loaded ~13 GB of the 91 stay free).
 The server runs with `--fit-max-tokens`: a request whose max_tokens does not fit the 256K context
 beside its prompt gets the room there is.

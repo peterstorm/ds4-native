@@ -613,8 +613,54 @@ steady state ~10 ms: 99.5 % Hits, ~1.2 store reads per token), history 60.5, gui
 locality grows with a single long context. Misses make the mean step much longer than the median.
 DSpark (dspark.md) takes code to 102 tok/s.
 
-Next: prefetch from a predicted routing (the remaining gap to Belady is foresight); the warm start
-from a profile of the engine's own traffic.
+**Prefetch by co-routing, tried and dropped** (2026-11-04). Experts co-route across layers (a
+token's path through the stack), and the host sees each layer's routing as GPU 0 posts it, so a
+forecast learned online -- P(Expert e' at layer L + d | e at L), counts over the Rounds seen, halved
+every 256 Rounds -- could read the next layers' Experts into a prefetch buffer while the GPUs
+compute, with no change to the Miss protocol. Replayed through the engine's Miss path on DSpark
+decode records (code and history, ~1,500 tokens each): the forecast's likeliest Experts are always
+resident already, and its likeliest *absent* ones caught at most 0.6-0.7 of code's 10.45 store reads
+per Round (lead 1-4 layers, width 2-16, buffers of 256-1,024 records), with more forecast reads than
+they saved. A Miss is an Expert the traffic has not used lately: the co-routing that predicts the hot
+path says little about the cold one.
+
+**The RAM tier: inclusive or exclusive** (`cache::replay_tiers`, `ds4n-cache-study --tiers`). The
+same records show where the store reads go. The tier ranked by load count (`popular`) holds
+Experts the Slots hold too -- every decode Load lands in it -- and serves 1.3 of code's 11.8 Loads per
+Round; least recently used does no better. As a victim tier (`RamPolicy::Victim`: each Expert the
+Slots evict is copied down into a record, a Load found there moves up and leaves it) the two hold
+distinct Experts, about one least-recently-used cache of 11,400 (8,400 Slots + 3,000 records; with
+one key a step, exactly that -- `test_cache_replay`), and the store reads per Round halve:
+
+| Record | store reads per Round, popular | victim | copied down per Round |
+|---|---|---|---|
+| code, DSpark | 10.45 | 5.65 | 11.77 |
+| history, DSpark | 4.70 | 2.31 | 5.39 |
+| code / history / guide, plain | 4.97 | 2.15 | 5.70 |
+
+The copy down is one Half per GPU per Load (9.4 MB) on a stream of its own, and nothing waits for
+it on the host: 48 of the Slots are spares (`cache::SlotMap`), so a Load fills the spare freed
+longest ago while the Expert it evicts leaves from another physical Slot, which joins the spares
+last; a Load into a spare waits (on the GPU's copy stream) for that spare's copy out, and a copy up
+from a record for the copy down into it. The copies down are issued once the step's copies up have
+landed and run beside the GPUs' next layers: the two directions overlap on one GPU (a Half up and
+one down together 0.36 ms, either alone 0.33), but on both GPUs at once the host's DMA bandwidth is
+shared (~58 GB/s here, dual-channel DDR5 behind the I/O die: 0.65 ms for the four), and copying
+down beside the copies up made every Load from the tier cost twice as much -- warm prose without
+drafting 101.9 tok/s against popular's 112.9 (0.64 ms per RAM tier Load against 0.33). Deferred:
+110.0 (0.36 ms); warm code without drafting 63.8 -> 96.0 tok/s.
+
+Served (`ds4n-serve` behind Maya's server, 8,400 Slots, 3,000 records, DSpark; popular, victim,
+popular, victim, a fresh engine each, the same requests): a 768-token code reply, warm, 74-79 ->
+135-136 tok/s (store reads per reply ~3,000 -> ~40); warm prose 105 -> 108-112; prompt reads of 7K /
+14K / 48K real-text tokens 744-778 / 1,391-1,396 / 3,728-3,772 -> 1,091-1,152 / 1,962-2,063 /
+4,714-4,988 tok/s (96-106 -> 58-71 GB read: a sweep finds more of its Experts in a tier that holds
+none the Slots hold); the reply's first 512 tokens after those prompts 57-64 -> 81-87 tok/s. `ds4n-model-run` on the same continuations, the dumps
+byte-identical: code 102.7 -> 119.0 tok/s (median Round 27.8 -> 23.4 ms; store reads 4,557 ->
+2,834, RAM tier 1,463 -> 3,091, 4,923 copied down), history 66.1 -> 79.6 tok/s (store reads 5,797
+-> 3,528; with cheaper Rounds the adaptive verify drafts 630 Rounds instead of 158).
+
+Next: the warm start from a profile of the engine's own traffic.
 
 ## Validation path
 

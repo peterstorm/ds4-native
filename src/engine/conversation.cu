@@ -298,9 +298,15 @@ wire::Done Conversation::reply(const wire::Generate& g, const ReplyEvents& ev, s
   }
   stat();
   const double decode_ms = ms_since(t1);
-  std::fprintf(stderr, "ds4n-serve: %lld written in %.0f ms (%.2f tok/s), %s; drafts %lld of %lld kept\n",
+  const ResidencyStats after = m_.residency->stats();
+  std::fprintf(stderr,
+               "ds4n-serve: %lld written in %.0f ms (%.2f tok/s), %s; drafts %lld of %lld kept; Loads %llu RAM tier + %llu "
+               "store (%.0f ms waited), %llu copied down\n",
                static_cast<long long>(r.written), decode_ms, 1000.0 * static_cast<double>(r.written) / std::max(decode_ms, 1e-9),
-               reply::name(finish.value_or(reply::Finish::Cancel)), static_cast<long long>(kept), static_cast<long long>(offered));
+               reply::name(finish.value_or(reply::Finish::Cancel)), static_cast<long long>(kept), static_cast<long long>(offered),
+               static_cast<unsigned long long>(after.ram_hits - before.ram_hits),
+               static_cast<unsigned long long>(after.store_reads - before.store_reads), after.exposed_ms - before.exposed_ms,
+               static_cast<unsigned long long>(after.demoted - before.demoted));
   return {r.written, g.prompt.size(), prompt_ms, decode_ms, finish.value_or(reply::Finish::Cancel), kept, offered, reused};
 }
 

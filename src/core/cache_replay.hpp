@@ -60,4 +60,33 @@ Result<ReplayCounts, CacheError> replay_optimal(uint32_t slots, std::span<const 
                                                std::span<const Access> steps, Admission admission,
                                                size_t count_from = 0);
 
+/** The longest tail of `steps` that is whole Rounds: from a layer-0 step, layers 0 .. 39 cycling. */
+size_t rounds_from(std::span<const Access> steps);
+
+/** How the RAM tier stands to the VRAM Slots. */
+enum class Tiering {
+  // The Loads pass through it: a RAM tier Hit is copied up, a store read lands in a record its own
+  // policy chose (so it holds Experts the Slots hold too).
+  Inclusive,
+  // A victim tier: an Expert the Slots evict is copied down into it (its policy chooses the record),
+  // and a RAM tier Hit moves up, leaving it -- the two hold distinct Experts.
+  Exclusive,
+};
+
+struct TierCounts {
+  uint64_t steps = 0;
+  uint64_t loads = 0;        // Experts the VRAM Slots missed
+  uint64_t ram_hits = 0;     // of those, served from the RAM tier
+  uint64_t store_reads = 0;  // ... from the store
+  uint64_t demoted = 0;      // evicted Experts copied down (Exclusive)
+  friend bool operator==(const TierCounts&, const TierCounts&) = default;
+};
+
+/**
+ * `steps` through the VRAM Slots (`vram`, with the near-misses as hints when `hints`) and the RAM
+ * tier (`ram`) as `tiering` relates them, counting steps from `count_from` on.
+ */
+Result<TierCounts, CacheError> replay_tiers(ExpertCache vram, ExpertCache ram, std::span<const Access> steps, Hints hints,
+                                           Tiering tiering, size_t count_from = 0);
+
 }  // namespace ds4n::cache

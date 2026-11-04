@@ -239,6 +239,19 @@ TEST_CASE("under a frequency policy a hint gains hint_score") {
   }
 }
 
+TEST_CASE("drop frees a Slot, which the next Load takes lowest first") {
+  auto c = ExpertCache::empty(3, Policy{4096, false}).value();
+  REQUIRE(c.plan(std::vector<ExpertKey>{10, 20, 30}));
+  CHECK(c.drop(20));
+  CHECK_FALSE(c.drop(20));
+  CHECK_FALSE(c.drop(kKeys));
+  CHECK(c.drop(10));
+  check_invariants(c, false);
+  const auto p = c.plan(std::vector<ExpertKey>{40, 50}).value();
+  CHECK(p.loads == std::vector<Load>{{40, 0, std::nullopt}, {50, 1, std::nullopt}});
+  CHECK(c.plan(std::vector<ExpertKey>{60}).value().loads.at(0).evicted == std::optional<ExpertKey>{30});
+}
+
 TEST_CASE("malformed hints are rejected") {
   auto c = ExpertCache::empty(4, Policy{}).value();
   CHECK_FALSE(c.plan(std::vector<ExpertKey>{1}, std::vector<ExpertKey>{2, 2}));

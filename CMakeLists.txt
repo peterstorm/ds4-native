@@ -25,6 +25,7 @@ add_library(ds4n_core STATIC
   src/core/layer_weights.cpp
   src/core/compare.cpp
   src/core/cache_replay.cpp
+  src/core/slot_map.cpp
   src/core/speculation.cpp
   src/core/moe_groups.cpp
   src/core/row_index.cpp
@@ -142,6 +143,7 @@ add_executable(ds4n_tests
   tests/core/test_compare.cpp
   tests/core/test_round.cpp
   tests/core/test_cache_replay.cpp
+  tests/core/test_slot_map.cpp
   tests/core/test_speculation.cpp
   tests/core/test_moe_groups.cpp
   tests/core/test_row_index.cpp
