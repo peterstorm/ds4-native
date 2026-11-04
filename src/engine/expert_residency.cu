@@ -252,7 +252,9 @@ std::vector<cache::Load> ExpertResidency::State::plan_keys(std::span<const cache
                                                            ResidencyStats& counts) {
   // Two regions: the decode Slots and the scratch Slots a prompt sweep's Misses take. A key lives in
   // at most one; where it lives it is a Hit. A sweep's other keys load into scratch, a decode
-  // step's into the decode Slots, so a sweep never evicts what decode keeps.
+  // step's into the decode Slots, so a sweep never evicts what decode keeps -- nor reorders it: a
+  // sweep's Hits in the decode Slots are not uses there, so they keep what decode used last (the
+  // reply after a prompt routes like earlier replies, not like the prompt).
   sweep = sweep && scratch.has_value();
   std::vector<cache::ExpertKey> decode_keys, scratch_keys;
   for (const cache::ExpertKey k : keys) {
@@ -261,7 +263,9 @@ std::vector<cache::Load> ExpertResidency::State::plan_keys(std::span<const cache
     (to_scratch ? scratch_keys : decode_keys).push_back(k);
   }
   std::vector<cache::Load> loads;
-  if (!decode_keys.empty() || !sweep) {
+  if (sweep) {
+    counts.hits += decode_keys.size();  // all resident there
+  } else {
     auto placed = vram.plan(decode_keys, hinted);
     if (!placed) fail("Expert cache: " + placed.error().what);
     counts.hits += placed.value().hits.size();

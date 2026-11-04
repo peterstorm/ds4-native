@@ -241,6 +241,33 @@ The reads are now at their floor (each Expert outside the decode Slots once per 
 8,500 Slots). What was left is compute: every Round streams its ~35 routed Experts per layer (~0.26
 of ~0.4 ms per Round and layer), ~18 s of a 9K chunk.
 
+**A sweep's Hits are not decode's uses** (2026-11-04). A sweep's Hits in the decode Slots used to
+rank there as just used, so after a long prompt -- which routes to nearly every Expert of every
+layer -- the decode Slots' eviction order was the sweep's layer order, and the reply evicted its
+own working set first. Counted as Hits only, they leave the order decode made. Served, the same
+real-text prompts with a fresh engine per arm (two runs each), 512 tokens right after each prompt:
+
+| Prompt | reply, Hits as uses | reply, Hits only | store reads per 512 tokens |
+|---|---|---|---|
+| 7,128 tokens | 55.3 / 56.7 tok/s | 59.7 / 58.9 tok/s | 48-50 -> 39-41 GB |
+| 14,119 tokens | 54.4 / 54.7 | 57.3 / 58.5 | 50-52 -> 44 GB |
+| 48,070 tokens | 54.9 / 54.4 | 58.9 / 57.7 | 48-51 -> 42-45 GB |
+
+Prefill is unchanged (48K: 3,662-3,667 -> 3,719-3,730 tok/s).
+
+**The Handoff, tried and dropped** (2026-11-04). The sweep has just read every Expert the reply
+will miss on (~5 a token from the store, ~45 GB per 512 tokens, against ~5 GB for a warm reply), so
+each layer's decode Slots were re-chosen, once its MoE ran, from the Experts the read's last rows
+picked most, copied from the scratch Slots on each GPU (nothing read again; the layer keeping its
+Slot count). Exact (`ds4n-serve-check`), and worse every way it was tried: re-choosing a layer's
+Slots from its last 512 rows (3,100-3,200 swaps a prompt) took the reply from 55 to 38-39 tok/s and
+its reads from ~49 to 88-93 GB per 512 tokens (128 rows: 41 tok/s, 80-84 GB; 2,048 rows: 38-41,
+81-91 GB); with the Hits-only order above, swapping at most 64 a layer in for each layer's coldest
+residents, at their place in the eviction order (~1,100 swaps), still lost (59 -> 55-58 tok/s, 40-45
+-> 44-52 GB). The prompt's rows route like the text they read, the reply like the model's own
+writing: the Slots earlier replies filled hold the reply's Experts better than the prompt does,
+down to the coldest of them.
+
 **Grouped MoE** (`Decoder::prefill` with an `ExpertPlacer`). A sweep's layer runs in three parts:
 the attention halves for every Round (Engram, attention, the FFN input rows and the routing, left
 in chunk arrays by token -- in waves, below); the grouped MoE; then the combine halves (the MoE

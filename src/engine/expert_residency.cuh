@@ -74,7 +74,8 @@ struct ResidencyConfig {
   bool hints = true;
   // Scratch Slots for a prompt sweep's Misses (least recently used among themselves; posted steps
   // flagged moe::kSweepStep), after the decode Slots in the pool: a sweep never evicts what decode
-  // keeps, and a layer's Experts not in the decode Slots load once per chunk. 0: sweeps load into the
+  // keeps nor ranks its Hits there as uses, and a layer's Experts not in the decode Slots load once
+  // per chunk. 0: sweeps load into the
   // decode Slots. At least moe::kMaxJobs when set; a layer's sweep needs up to 384.
   uint32_t sweep_slots = 512;
 };

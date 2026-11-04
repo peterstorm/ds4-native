@@ -141,7 +141,12 @@ no earlier than that turn's prompt end.
    7.1K tokens 647 → 683 tok/s, 14.1K 1,186 → 1,313, 48K 2,796 → 3,199; decode unchanged.
    `DS4N_DECODER_TAIL=0` turns it off. The gain is smaller than the compute it saves because a
    fresh prompt is bound by the NVMe: a 7K-token one reads ~106 GB of Experts (~9.6 GB/s), and 3,053
-   rows still route to most of the cold ones (102 GB with the tail).
+   rows still route to most of the cold ones (102 GB with the tail). The desktop's ZFS read queue
+   (`zfs_vdev_sync_read_max_active` 10 → 64, the Engram rows' small reads) adds +6 / +14 / +30 % at
+   7K / 12K / 35K tokens of fresh text (48K of the same text: 3,195 → 3,660 tok/s). The sweep leaves
+   the decode Slots and their eviction order as decode left them (its Hits there are not uses):
+   the reply's first 512 tokens after a 7K–48K prompt run 58–60 tok/s, ~40–45 GB read from the store
+   (55 and ~49 GB when the sweep's Hits ranked as uses; forward-pass.md, sweep placement).
 3. A Rewind point at the prompt's end. (Before 1: the plan's set-aside, take-back and restore, each
    reported to the server as a `NOTE sessions: …` line; and when the KV held at least 2,048 more of
    the prompt than any rings let it resume — `rewind::kv_held` against the plan — `the KV held the
