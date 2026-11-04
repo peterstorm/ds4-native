@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <functional>
 #include <numeric>
 
 namespace ds4n::cache {
@@ -123,6 +124,16 @@ Result<Plan, CacheError> ExpertCache::plan(std::span<const ExpertKey> needed, st
   // Hints rank after the Loads were placed, so they never keep a Slot from being evicted this call.
   for (ExpertKey h : hinted) touch(h, policy_.hint_score);
   return R::ok(std::move(plan));
+}
+
+bool ExpertCache::drop(ExpertKey key) {
+  if (key >= kKeys || key_slot_[key] < 0) return false;
+  const auto slot = static_cast<uint32_t>(key_slot_[key]);
+  resident_.erase(rank(key));
+  key_slot_[key] = -1;
+  slot_key_[slot] = kFree;
+  free_.insert(std::upper_bound(free_.begin(), free_.end(), slot, std::greater<>()), slot);  // highest first
+  return true;
 }
 
 }  // namespace ds4n::cache

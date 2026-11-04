@@ -87,6 +87,53 @@ Result<ReplayCounts, CacheError> replay(ExpertCache cache, std::span<const Acces
   return R::ok(c);
 }
 
+size_t rounds_from(std::span<const Access> steps) {
+  constexpr uint32_t kLayers = kKeys / 384;
+  auto layer = [](const Access& a) { return a.needed.front() / 384; };
+  // Walk back while each step's layer is the one before the next step's (39 before 0).
+  size_t start = steps.size();
+  for (size_t i = steps.size(); i-- > 0;) {
+    if (i + 1 < steps.size() && (layer(steps[i]) + 1) % kLayers != layer(steps[i + 1])) break;
+    start = i;
+  }
+  while (start < steps.size() && layer(steps[start]) != 0) start++;
+  return start;
+}
+
+Result<TierCounts, CacheError> replay_tiers(ExpertCache vram, ExpertCache ram, std::span<const Access> steps, Hints hints,
+                                           Tiering tiering, size_t count_from) {
+  using R = Result<TierCounts, CacheError>;
+  TierCounts c;
+  for (size_t i = 0; i < steps.size(); i++) {
+    const Access& a = steps[i];
+    auto placed = vram.plan(a.needed, hints == Hints::Use ? std::span<const ExpertKey>(a.near) : std::span<const ExpertKey>{});
+    if (!placed) return R::err(placed.error());
+    const std::vector<Load>& loads = placed.value().loads;
+    uint64_t ram_hits = 0, demoted = 0;
+    if (tiering == Tiering::Inclusive) {
+      std::vector<ExpertKey> keys;
+      for (const Load& l : loads) keys.push_back(l.key);
+      auto tier = ram.plan(keys);
+      if (!tier) return R::err(tier.error());
+      ram_hits = tier.value().hits.size();
+    } else {
+      for (const Load& l : loads) ram_hits += ram.drop(l.key);  // up: it leaves the tier
+      for (const Load& l : loads) {
+        if (!l.evicted) continue;
+        if (auto t = ram.plan(std::vector<ExpertKey>{*l.evicted}); !t) return R::err(t.error());  // down
+        demoted++;
+      }
+    }
+    if (i < count_from) continue;
+    c.steps++;
+    c.loads += loads.size();
+    c.ram_hits += ram_hits;
+    c.store_reads += loads.size() - ram_hits;
+    c.demoted += demoted;
+  }
+  return R::ok(c);
+}
+
 Result<ReplayCounts, CacheError> replay_optimal(uint32_t slots, std::span<const ExpertKey> initial,
                                                std::span<const Access> steps, Admission admission, size_t count_from) {
   using R = Result<ReplayCounts, CacheError>;

@@ -4,7 +4,7 @@
 // ARGS...` and speaks GEN / T / DONE with it over stdin and stdout.
 //
 //   ds4n-serve --serve --backbone B --store S --gguf G [--dspark DIR] [--slots N] [--ram-records R]
-//              [--prior PROFILE] [--ram-policy recent|popular] [--rewind-points N] [--sweep-min N]
+//              [--prior PROFILE] [--ram-policy recent|popular|victim] [--rewind-points N] [--sweep-min N]
 //              [--checkpoint-gb G] [--keep-min N] [--split-min N] [--stops 1,128803]
 //
 // One request at a time (READY ... stop: no multi, no PAUSE), from any of the conversations it keeps
@@ -145,7 +145,11 @@ int main(int argc, char** argv) {
     else if (a == "--slots") mc.slots = static_cast<uint32_t>(std::stoul(v));
     else if (a == "--ram-records") mc.ram_records = static_cast<uint32_t>(std::stoul(v));
     else if (a == "--prior") mc.prior = v;
-    else if (a == "--ram-policy") mc.ram_policy = v == "popular" ? engine::RamPolicy::Popular : engine::RamPolicy::Recent;
+    else if (a == "--ram-policy") {
+      const auto policy = engine::ram_policy_named(v);
+      if (!policy) die("--ram-policy takes recent, popular or victim: " + v);
+      mc.ram_policy = *policy;
+    }
     else if (a == "--rewind-points") cc.rewind_points = static_cast<uint32_t>(std::stoul(v));
     else if (a == "--sweep-min") cc.sweep_min = std::stoul(v);
     else if (a == "--checkpoint-gb") cc.checkpoint_budget = static_cast<uint64_t>(std::stod(v) * 1e9);

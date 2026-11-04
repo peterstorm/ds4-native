@@ -152,6 +152,64 @@ TEST_CASE("bypass keeps a resident needed sooner than the Miss") {
   CHECK(replay_optimal(1, initial, steps, Admission::Bypass).value() == ReplayCounts{2, 2, 1});
 }
 
+TEST_CASE("rounds_from finds the whole Rounds after a prompt sweep's steps") {
+  auto round = [](ExpertKey e) {
+    std::vector<Access> r;
+    for (ExpertKey l = 0; l < kKeys / 384; l++) r.push_back({{l * 384 + e}, {}});
+    return r;
+  };
+  std::vector<Access> steps;
+  for (ExpertKey l = 0; l < kKeys / 384; l++)  // a sweep: several placements per layer
+    for (ExpertKey batch = 0; batch < 3; batch++) steps.push_back({{l * 384 + batch}, {}});
+  const size_t sweep = steps.size();
+  std::vector<Access> rounds;
+  for (const ExpertKey e : {1u, 2u, 3u}) {
+    const auto r = round(e);
+    rounds.insert(rounds.end(), r.begin(), r.end());
+  }
+  steps.insert(steps.end(), rounds.begin(), rounds.end());
+  CHECK(rounds_from(steps) == sweep);
+  CHECK(rounds_from(rounds) == 0);
+  CHECK(rounds_from(std::span<const Access>{}) == 0);
+  CHECK(rounds_from(std::span(rounds).subspan(5)) == kKeys / 384 - 5);  // mid-Round: from the next layer 0
+}
+
+TEST_CASE("replay_tiers: every Load is served once; inclusive replays the Slots as replay does") {
+  for (unsigned seed = 0; seed < 8; seed++) {
+    const auto steps = random_steps(200 + seed, 3000, 900, 12, 6);
+    for (const Tiering tiering : {Tiering::Inclusive, Tiering::Exclusive}) {
+      const auto c = replay_tiers(ExpertCache::create(100, {}, Policy{4096, false}).value(),
+                                  ExpertCache::empty(60, Policy{4096, false}).value(), steps, Hints::Use, tiering, 100);
+      REQUIRE(c);
+      CHECK(c.value().loads == c.value().ram_hits + c.value().store_reads);
+      CHECK(c.value().steps == steps.size() - 100);
+      const auto slots = replay(ExpertCache::create(100, {}, Policy{4096, false}).value(), steps, Hints::Use, 100).value();
+      CHECK(c.value().loads == slots.needed - slots.hits);  // the tier never changes what the Slots see
+      if (tiering == Tiering::Inclusive) CHECK(c.value().demoted == 0);
+      else CHECK(c.value().demoted <= c.value().loads);
+    }
+  }
+}
+
+TEST_CASE("an exclusive tier is the Slots' next least recently used: two LRU levels miss as one of their sum") {
+  // With least recently used in both, Slots + tier exclusive hold the most recent (Slots + tier) keys
+  // as one LRU cache of that size would, a step's own keys aside: the store reads match its Misses.
+  for (unsigned seed = 0; seed < 8; seed++) {
+    const auto steps = random_steps(300 + seed, 3000, 700, 1);  // one key a step: no step evicts its own
+    const auto two = replay_tiers(ExpertCache::empty(80, Policy{4096, false}).value(),
+                                  ExpertCache::empty(40, Policy{4096, false}).value(), steps, Hints::Ignore,
+                                  Tiering::Exclusive)
+                         .value();
+    const auto one = replay(ExpertCache::empty(120, Policy{4096, false}).value(), steps, Hints::Ignore).value();
+    CHECK(two.store_reads == one.needed - one.hits);
+    const auto inclusive = replay_tiers(ExpertCache::empty(80, Policy{4096, false}).value(),
+                                        ExpertCache::empty(40, Policy{4096, false}).value(), steps, Hints::Ignore,
+                                        Tiering::Inclusive)
+                               .value();
+    CHECK(inclusive.store_reads >= two.store_reads);
+  }
+}
+
 TEST_CASE("bypass is never worse than always admitting") {
   for (unsigned seed = 0; seed < 20; seed++) {
     const auto steps = random_steps(100 + seed, 2000, 600, 12);

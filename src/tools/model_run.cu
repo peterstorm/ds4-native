@@ -3,7 +3,7 @@
 //
 //   ds4n-model-run --backbone SAFETENSORS --store STORE --gguf MERGED_GGUF --tokens DIR --names a,b
 //                  --out DIR [--oracle DIR] [--force 1] [--steps N] [--slots N] [--ram-records R] [--prior PROFILE]
-//                  [--prior-weight W] [--ram-policy recent|popular] [--ccr LAMBDA] [--sweep N [--grouped 0|1] | --prefill R]
+//                  [--prior-weight W] [--ram-policy recent|popular|victim] [--ccr LAMBDA] [--sweep N [--grouped 0|1] | --prefill R]
 //                  [--access-log FILE] [--vram-policy lru|picks] [--hints 0|1] [--dspark DIR [--verify-rows N]]
 //
 // For each name, DIR/<name>.tokens is antirez's --dump-tokens output (ids on the first line). The
@@ -23,7 +23,8 @@
 // --prior PROFILE warms the Expert cache from a pick-count profile (uint32[rows][384], e.g. Maya's
 // expert-profile.bin) instead of by key. --prior-weight W (default 1) scales it against recent picks (see
 // cache::ExpertCache::prior_from_profile). --ram-policy popular ranks the RAM tier by load count and
-// warms it with the profile's next-hottest Experts (default recent: last loaded, empty at first).
+// warms it with the profile's next-hottest Experts (default recent: last loaded, empty at first);
+// victim makes it exclusive, the Slots' evictions copied down into it (engine::RamPolicy).
 // --ccr LAMBDA turns on Cache-conditional routing: resident Experts' selection scores gain LAMBDA (not
 // Exact; 0, the default, keeps routing exact). --access-log FILE writes every layer step's Expert
 // keys, in order, as an access record for ds4n-cache-study (core/cache_replay).
@@ -190,9 +191,9 @@ int main(int argc, char** argv) {
     }
     else if (s == "--ram-policy") {
       const std::string v = argv[++i];
-      if (v == "recent") ram_policy = engine::RamPolicy::Recent;
-      else if (v == "popular") ram_policy = engine::RamPolicy::Popular;
-      else die("--ram-policy takes recent or popular");
+      const auto policy = engine::ram_policy_named(v);
+      if (!policy) die("--ram-policy takes recent, popular or victim: " + v);
+      ram_policy = *policy;
     }
     else die("unknown argument " + s);
   }
@@ -511,11 +512,12 @@ int main(int argc, char** argv) {
     const uint64_t needed = (after.hits + after.ram_hits + after.store_reads) - (before.hits + before.ram_hits + before.store_reads);
     // Step 0 came with the prompt; the continuation decoded the other recorded steps.
     std::printf("%s continuation: %d steps in %.2f s (%.1f tok/s, median Round %.2f ms); Expert Hits %.1f %% over the "
-                "prompt and continuation (%llu RAM tier, %llu store reads)\n",
+                "prompt and continuation (%llu RAM tier, %llu store reads, %llu copied down)\n",
                 name.c_str(), recorded, continuation_s, (recorded - 1) / std::max(continuation_s, 1e-9), median(step_ms),
                 needed ? 100.0 * static_cast<double>(after.hits - before.hits) / static_cast<double>(needed) : 0.0,
                 static_cast<unsigned long long>(after.ram_hits - before.ram_hits),
-                static_cast<unsigned long long>(after.store_reads - before.store_reads));
+                static_cast<unsigned long long>(after.store_reads - before.store_reads),
+                static_cast<unsigned long long>(after.demoted - before.demoted));
     const std::string first_difference = first_disagreement < 0 ? "none" : "step " + std::to_string(first_disagreement);
     if (compared)
       std::printf("%s continuation vs Oracle (%s): greedy choice agrees on %d / %d steps (first difference: %s); "

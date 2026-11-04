@@ -2,18 +2,24 @@
 // Expert cache policies, against Belady's optimal eviction -- the most Hits any policy could get
 // with the same Slots, whether every Miss takes a Slot or may bypass the cache (core/cache_replay).
 //
-//   ds4n-cache-study --log FILE --slots N[,N...] [--prior PROFILE] [--prior-weight W] [--skip STEPS]
+//   ds4n-cache-study --log FILE --slots N[,N...] [--prior PROFILE] [--prior-weight W] [--skip STEPS] [--tiers R]
 //
 // Every policy starts from the engine's warm start: the hottest Experts of the prior (a pick-count
 // profile, as ds4n-model-run --prior), by key without one. --skip counts only the steps after the
 // first STEPS (the steady state; the earlier steps still run). Misses are reported per 40 layer
 // steps, one token's worth in decode. Policies marked with hints rank each step's near-misses (the
 // router's ranks 7-16, recorded when the record was) as just used.
+//
+// --tiers R replays the Slots with a RAM tier of R records each way it can stand to them
+// (cache::replay_tiers): inclusive as the engine has it (ranked by load count or least recently
+// used), or exclusive -- a victim tier the Slots' evictions are copied down into -- likewise.
+// Counted from the record's first whole Round (cache::rounds_from: a prompt sweep's steps only warm).
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <utility>
 #include <iterator>
+#include <tuple>
 #include <string>
 #include <vector>
 
@@ -45,11 +51,50 @@ void report(const char* name, const cache::ReplayCounts& c) {
               c.steps ? 40.0 * static_cast<double>(misses) / static_cast<double>(c.steps) : 0.0);
 }
 
+/** The decode Slots and a RAM tier as the engine makes them (the tier warmed with the prior's next-hottest). */
+std::pair<cache::ExpertCache, cache::ExpertCache> engine_caches(uint32_t slots, const std::vector<uint32_t>& prior,
+                                                                uint32_t ram_records, cache::Policy ram_policy) {
+  auto vram = cache::ExpertCache::create(slots, prior, cache::Policy{4096, false});
+  if (!vram) die(vram.error().what);
+  std::vector<uint32_t> ram_prior = prior;
+  if (!ram_prior.empty())
+    for (const auto& l : vram.value().warm_start()) ram_prior[l.key] = 0;
+  auto ram = ram_prior.empty() ? cache::ExpertCache::empty(ram_records, ram_policy)
+                               : cache::ExpertCache::create(ram_records, ram_prior, ram_policy);
+  if (!ram) die(ram.error().what);
+  return {std::move(vram).value(), std::move(ram).value()};
+}
+
+/** The Slots with a RAM tier each way it can stand to them (see the header). */
+void study_tiers(std::span<const cache::Access> steps, const std::vector<uint32_t>& slot_counts,
+                 const std::vector<uint32_t>& prior, uint32_t ram_records) {
+  const size_t from = cache::rounds_from(steps);
+  if (from == steps.size()) die("the record has no whole Rounds");
+  const double rounds = static_cast<double>(steps.size() - from) / (cache::kKeys / 384);
+  std::printf("%zu layer steps, %.0f whole Rounds counted\n", steps.size(), rounds);
+  for (const uint32_t slots : slot_counts) {
+    std::printf("%u Slots, %u RAM tier records (per Round: Loads, from RAM / store, copied down):\n", slots, ram_records);
+    for (const auto& [name, tiering, policy] :
+         {std::tuple{"inclusive, by load count *", cache::Tiering::Inclusive, cache::Policy{4096, true}},
+          std::tuple{"inclusive, least recent", cache::Tiering::Inclusive, cache::Policy{4096, false}},
+          std::tuple{"exclusive, least recent", cache::Tiering::Exclusive, cache::Policy{4096, false}},
+          std::tuple{"exclusive, by load count", cache::Tiering::Exclusive, cache::Policy{4096, true}}}) {
+      auto [vram, ram] = engine_caches(slots, prior, ram_records, policy);
+      const auto c = cache::replay_tiers(std::move(vram), std::move(ram), steps, cache::Hints::Use, tiering, from);
+      if (!c) die(c.error().what);
+      auto per = [&](uint64_t v) { return static_cast<double>(v) / rounds; };
+      std::printf("  %-28s %5.2f Loads, %5.2f / %5.2f, %5.2f\n", name, per(c.value().loads), per(c.value().ram_hits),
+                  per(c.value().store_reads), per(c.value().demoted));
+    }
+  }
+  std::printf("* the engine's\n");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   std::string log_path, prior_path, slots_arg;
-  uint32_t prior_weight = 1;
+  uint32_t prior_weight = 1, tier_records = 0;
   size_t skip = 0;
   for (int i = 1; i < argc; i++) {
     const std::string s = argv[i];
@@ -59,6 +104,7 @@ int main(int argc, char** argv) {
     else if (s == "--prior") prior_path = argv[++i];
     else if (s == "--prior-weight") prior_weight = static_cast<uint32_t>(std::stoul(argv[++i]));
     else if (s == "--skip") skip = std::stoul(argv[++i]);
+    else if (s == "--tiers") tier_records = static_cast<uint32_t>(std::stoul(argv[++i]));
     else die("unknown argument " + s);
   }
   if (log_path.empty() || slots_arg.empty()) die("usage: ds4n-cache-study --log FILE --slots N[,N...]");
@@ -79,6 +125,10 @@ int main(int argc, char** argv) {
     auto p = cache::ExpertCache::prior_from_profile(profile, cache::Policy{}, prior_weight);
     if (!p) die(prior_path + ": " + p.error().what);
     prior = std::move(p).value();
+  }
+  if (tier_records > 0) {
+    study_tiers(steps.value(), slot_counts, prior, tier_records);
+    return 0;
   }
   std::printf("%zu layer steps (%zu counted)\n", steps.value().size(), steps.value().size() - skip);
 
