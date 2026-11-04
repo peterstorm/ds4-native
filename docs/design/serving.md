@@ -261,7 +261,10 @@ turns, it holds the queue). DSpark gains little in shared Rounds: each Session d
 
 - **One request at a time.** Conversations take turns on the GPUs (each switch sets one aside and
   takes one back, ~50 ms for 4.5K tokens); no PAUSE / fair slices, no batching several at once
-  (Maya's `multi=`): parallel subagents queue in the server. Sharing Rounds would serve Loom's fan-outs
-  ~1.5x faster (Concurrent Sessions, above).
+  (Maya's `multi=`): parallel subagents queue in the server. A request in line used to send nothing
+  until its turn, and behind other agents' long answers Node's fetch cut it after 300 s; the
+  dotfiles' Maya patch (`maya-serve-keepalive.patch`) now sends keep-alives while it waits (three
+  planning requests at once, served 2026-11-04: the third waited 28.6 s, no stream silent over 10 s).
+  Sharing Rounds would serve Loom's fan-outs ~1.5x faster (Concurrent Sessions, above).
 - **Checkpoints live in RAM only**: they do not outlast the engine (Maya's also go to a folder).
 - **262,144-token context** (kMaxCompressed), text only.
