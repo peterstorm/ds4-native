@@ -666,7 +666,7 @@ when T is further ahead) forecasts T's routing by T's own router before T's atte
 (`core/pregate`). Offline (`ds4n-pregate-study`, 512 greedy decode tokens, an LRU of 8,352 Slots
 fed the same routing) its first 6 Experts per row name 79.3 % of the routed Experts and 71.2 % of
 the Misses from the stream entering T, 67.0 / 54.3 % from the one entering T - 1, 60.1 / 48.1 % from
-T - 2. Built on branch `pregate`: GPU 0 runs the forecast on side stream 0 beside attention and posts
+T - 2. Built on a branch since deleted (tip `6ea8694`): GPU 0 runs the forecast on side stream 0 beside attention and posts
 it to a ring in the Miss protocol's mailbox; the service copies up to N of the Experts it names that
 the RAM tier holds and the Slots do not into spare Slots (8 more spares; `SlotMap` take, adopt, give
 back), and a Load of one takes its spare once its copies landed. Exact (the dumps byte-identical),
