@@ -660,6 +660,35 @@ byte-identical: code 102.7 -> 119.0 tok/s (median Round 27.8 -> 23.4 ms; store r
 2,834, RAM tier 1,463 -> 3,091, 4,923 copied down), history 66.1 -> 79.6 tok/s (store reads 5,797
 -> 3,528; with cheaper Rounds the adaptive verify drafts 630 Rounds instead of 158).
 
+**Pre-gating, tried and dropped** (2026-11-04). Layer T routes on rmsnorm(hc_pre(h_mid, T's
+attention mixes' pre), ffn_norm): taking the stream entering T for h_mid (and for the mixes' input
+when T is further ahead) forecasts T's routing by T's own router before T's attention runs
+(`core/pregate`). Offline (`ds4n-pregate-study`, 512 greedy decode tokens, an LRU of 8,352 Slots
+fed the same routing) its first 6 Experts per row name 79.3 % of the routed Experts and 71.2 % of
+the Misses from the stream entering T, 67.0 / 54.3 % from the one entering T - 1, 60.1 / 48.1 % from
+T - 2. Built on branch `pregate`: GPU 0 runs the forecast on side stream 0 beside attention and posts
+it to a ring in the Miss protocol's mailbox; the service copies up to N of the Experts it names that
+the RAM tier holds and the Slots do not into spare Slots (8 more spares; `SlotMap` take, adopt, give
+back), and a Load of one takes its spare once its copies landed. Exact (the dumps byte-identical),
+and slower. `ds4n-model-run`, DSpark, 8,400 Slots, 3,000 victim records, a 768-token code reply warm:
+
+| Pre-gating | warm code | cold code | history |
+|---|---|---|---|
+| none | 187.6 tok/s | 92.9 | 67.5 |
+| forecasts only (posted, read, counted) | 184.8 | 91.8 | 63.9 |
+| from the stream entering T, 2 a forecast | 176.2 | 88.6 | 65.8 |
+| entering T and T - 1, 2 a forecast | 155.9 | 82.4 | 60.5 |
+
+Online the forecasts name 60-80 % of the Loads, as offline, but neither half of a prefetch's payoff
+is there. The lead: a forecast reaches the host 0.10-0.13 ms before its step routes, against 0.33 ms
+for a Half's copy. The aim: of the Experts a forecast names that the tier holds and the Slots do not
+-- the ones a copy ahead could be for -- 50 % of each row's first rank are its step's Loads, 23 % of
+the fourth, 12 % of the sixth, under 8 % past it. An Expert outside the Slots is one the traffic
+seldom routes to, and that is where the router on a stale stream is least sure. Copying first ranks
+only would reach ~7 % of the Loads; wider, the copies ahead (3,141 for 804 taken in the warm code
+reply) spend the host's DMA bandwidth that the step's own copies up and the victim tier's copies
+down share. The lesson of co-routing again: what predicts the hot path says little about the cold one.
+
 Next: the warm start from a profile of the engine's own traffic.
 
 ## Validation path

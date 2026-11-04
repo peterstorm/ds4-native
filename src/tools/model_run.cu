@@ -512,12 +512,12 @@ int main(int argc, char** argv) {
     const uint64_t needed = (after.hits + after.ram_hits + after.store_reads) - (before.hits + before.ram_hits + before.store_reads);
     // Step 0 came with the prompt; the continuation decoded the other recorded steps.
     std::printf("%s continuation: %d steps in %.2f s (%.1f tok/s, median Round %.2f ms); Expert Hits %.1f %% over the "
-                "prompt and continuation (%llu RAM tier, %llu store reads, %llu copied down)\n",
+                "prompt and continuation (%llu RAM tier, %llu store reads, %llu copied down; %.0f ms waited on Loads)\n",
                 name.c_str(), recorded, continuation_s, (recorded - 1) / std::max(continuation_s, 1e-9), median(step_ms),
                 needed ? 100.0 * static_cast<double>(after.hits - before.hits) / static_cast<double>(needed) : 0.0,
                 static_cast<unsigned long long>(after.ram_hits - before.ram_hits),
                 static_cast<unsigned long long>(after.store_reads - before.store_reads),
-                static_cast<unsigned long long>(after.demoted - before.demoted));
+                static_cast<unsigned long long>(after.demoted - before.demoted), after.exposed_ms - before.exposed_ms);
     const std::string first_difference = first_disagreement < 0 ? "none" : "step " + std::to_string(first_disagreement);
     if (compared)
       std::printf("%s continuation vs Oracle (%s): greedy choice agrees on %d / %d steps (first difference: %s); "
