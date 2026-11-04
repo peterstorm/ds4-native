@@ -72,6 +72,10 @@ One forward pass producing one token for one Session.
 **Round**:
 One forward pass over up to 8 rows at consecutive positions of one Session (a prefill chunk, DSpark verification rows, or one decode row), layer by layer; its outputs are exactly those of its rows decoded one at a time. Rows of several Sessions in one Round need per-Session caches (not built).
 
+**Shared Round**:
+A Round holding rows of several Sessions, each writing its own Reply, so each layer's Experts stream once for all of them; the engine instead lets Sessions **take turns** (one request at a time). Studied, not built: `core/session_mix` and `ds4n-cache-study --sessions` replay recorded Sessions both ways (serving.md, Concurrent Sessions).
+_Avoid_: batch (the prompt sweep's Cohort and Wave already batch rows of one Session), multi (Maya's protocol flag, not ours)
+
 **Anchor**:
 The last committed token, which the target has not decoded yet; a Draft starts from it, and a verify Round's first row is it.
 
