@@ -20,7 +20,7 @@ prompt — microseconds against a 10–30 ms decode step. Nothing in it touches 
 |---|---|
 | `INFO key=value ...` | facts for the server's Monitor (`logit_bias=1`: the engine applies a request's bias) |
 | `READY 262144 stop` | the context (kMaxCompressed), and that STOP is honoured; no `pause`, no `multi=` |
-| `GEN <max_new> [key=value ...] <id,id,...>` | a request. Keys: `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `penalty_{last_n,repeat,freq,present}`, `logit_bias=id:bias,...`, `think_budget` + `think_end`, `spec=0\|1`; others (Maya's GLM tuning keys, `cvec`) are skipped |
+| `GEN <max_new> [key=value ...] <id,id,...>` | a request. Keys: `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `penalty_{last_n,repeat,freq,present}`, `logit_bias=id:bias,...`, `think_budget` + `think_end`, `spec=N` (Maya's verify window, `strata_tune {"spec": N}`: 1 the plain token loop, 2 and up draft); others (Maya's GLM tuning keys, `cvec`) are skipped |
 | `T <id>` | a written token |
 | `PP <read> <total> <ms> <tok/s> <reused>` | prompt progress (at its start and end; per Round when read in Rounds) |
 | `STAT tok_s= ms_tok= vram_hit= drafts=` | every 8 tokens |

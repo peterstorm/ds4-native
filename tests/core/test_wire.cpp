@@ -49,6 +49,14 @@ TEST_CASE("a sampled GEN as Maya's server writes it: its keys, unknown ones skip
   CHECK(generate("GEN 4 spec=0 1").spec == false);
 }
 
+TEST_CASE("spec is Maya's verify window: 1 is the plain token loop, 2 and up draft") {
+  // server.py's strata_tune {"spec": N} (1 <= N <= 16) becomes spec=N.
+  CHECK(generate("GEN 4 spec=1 1").spec == false);
+  CHECK(generate("GEN 4 spec=2 1").spec == true);
+  CHECK(generate("GEN 4 spec=6 1").spec == true);
+  CHECK(generate("GEN 4 spec=16 1").spec == true);
+}
+
 TEST_CASE("control lines, and what is refused") {
   CHECK(std::holds_alternative<Stop>(parse("STOP", kVocab, 0).value()));
   CHECK(std::holds_alternative<Stop>(parse("STOP 3", kVocab, 0).value()));

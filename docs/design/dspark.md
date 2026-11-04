@@ -105,3 +105,12 @@ Without Misses the code run would decode at ~300 tok/s.
 With Cache-conditional routing (approximate, λ 0.2), DSpark adaptive: code 135.7 tok/s, history
 95.4, guide 89.5 (plain at λ 0.2: 97.8 / 85.1 / 80.8). The head stays well calibrated on code
 (0.96 predicted, 0.98 accepted at the first position) under either routing.
+
+**A code-tuned head** (2026-11-04): diffbot's `drafter-code-fp8` (MIT, revision `451f7dc`: the three
+`mtp.*` shards in DeepSeek's layout, 90 non-expert tensors fine-tuned for code and agentic tool use,
+the routed Experts DeepSeek's), loaded unchanged with `--dspark`. Served A/B (released, code,
+released, code; a fresh engine each; greedy; the third of three identical requests): code with
+thinking off 78.4 / 77.5 against 76.0 / 75.7 tok/s, with thinking 69.3 / 69.6 against 69.1 / 69.9,
+prose 106.4 / 106.4 against 104.9; drafted tokens kept 81-88 % against 80-86 %; every reply the
+same text. No gain: what bounds code decode here is the store (a 768-token code reply reads ~60 GB,
+~4 Misses a token, even repeated), not the drafts.

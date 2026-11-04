@@ -64,7 +64,7 @@ bool read_key(Keys& k, std::string_view key, std::string_view value) {
   if (key == "think_end") return set_optional(k.think_end);
   if (key == "spec") {
     const auto v = number<int>(value);
-    if (v) k.spec = *v != 0;
+    if (v) k.spec = *v >= 2;
     return v.has_value();
   }
   if (key == "logit_bias") {

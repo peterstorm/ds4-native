@@ -26,7 +26,9 @@ struct Generate {
   int64_t max_new;
   sample::Sampling sampling;
   std::optional<reply::ThinkBudget> think;
-  std::optional<bool> spec;  // spec=0|1: whether this request drafts (none: as the engine was started)
+  // spec=N, Maya's verify window (the anchor and the drafts): whether this request drafts -- 1 (or 0)
+  // is the plain token loop, 2 and up draft (the width stays adaptive); none: as the engine was started.
+  std::optional<bool> spec;
   std::vector<int32_t> prompt;
 };
 
