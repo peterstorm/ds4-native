@@ -143,6 +143,36 @@ constexpr int32_t window_slot(int64_t p, int s) {
 
 static_assert(window_slot(0, kWindow - 1) == 0 && window_slot(0, 0) == -1 && window_slot(200, 0) == (200 - 127) % kRing);
 
+// The decoder half (the 1017 report's Causal Encoder-Decoder): layers 20..39 read layer 20's
+// compressed and index caches, which layer 20 compresses from its input at every position, so a
+// decoder layer's own per-position state is its window ring alone, and a row's output at decoder
+// layer 20 + j reaches back (j + 1) * 127 positions through the windows below it. A prompt read
+// therefore needs the decoder layers only on its tail -- its Decoder tail -- with the tail's
+// windows cut at the tail's first position: from there on, the last row and every position the
+// window rings still hold (the read's last kRing) come out as a read through every layer leaves them.
+constexpr int kFirstDecoderLayer = kCandidateSource;
+constexpr int64_t kDecoderTail = kRing + static_cast<int64_t>(kLayers - 1 - kFirstDecoderLayer) * (kWindow - 1);
+static_assert(kDecoderTail == 3053);
+static_assert([] {
+  for (int l = kFirstDecoderLayer; l < kLayers; l++)
+    if (kind(l).cache_owner != kFirstDecoderLayer || kind(l).engram) return false;
+  for (const int t : kDraftTargetLayers)  // DSpark's features: decoder inputs, inside the bound
+    if (t < kFirstDecoderLayer || t >= kLayers) return false;
+  return kind(kFirstDecoderLayer).kv_source && kind(kFirstDecoderLayer - 1).cache_owner != kFirstDecoderLayer;
+}(), "the decoder half reads layer 20's caches only, and nothing below it reads them");
+
+/** The first position the decoder layers run at, for a read of positions [from, end). */
+constexpr int64_t decoder_tail(int64_t from, int64_t end) { return end - from > kDecoderTail ? end - kDecoderTail : from; }
+
+/** Window slot s at position p for a decoder layer of a read whose tail starts at `tail`: -1 below it. */
+constexpr int32_t decoder_window_slot(int64_t p, int s, int64_t tail) {
+  return p - (kWindow - 1) + s < tail ? -1 : window_slot(p, s);
+}
+
+static_assert(decoder_tail(0, kDecoderTail) == 0 && decoder_tail(0, kDecoderTail + 1) == 1 && decoder_tail(10, 20) == 10);
+static_assert(decoder_window_slot(1000, 0, 900) == -1 && decoder_window_slot(1000, 27, 900) == window_slot(1000, 27) &&
+              decoder_window_slot(5, 0, 0) == -1);
+
 /**
  * Whether position p completes a group of `ratio` (1 or 2) positions, so a KV source compresses a
  * latent there. Only p modulo the ratio matters: for a Round, the parity of its first position

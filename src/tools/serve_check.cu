@@ -1,8 +1,9 @@
 // ds4n-serve-check: ds4n-serve's conversations against cold runs, on the whole model. Every resume
 // must be Exact: a prompt resumed from the live Session, a KV checkpoint taken back or a Rewind
 // point's rings gives the bits a cold prompt (read from position 0) gives -- its prompt-end logits
-// and its reply -- and so do a sweep and Rounds of 8 over the same tokens, and DSpark and plain steps
-// (greedy, and sampled with a seed).
+// and its reply -- and so do a sweep and Rounds of 8 over the same tokens (past the Decoder tail too:
+// the sweep's decoder layers run on its tail only), and DSpark and plain steps (greedy, and sampled
+// with a seed).
 //
 //   ds4n-serve-check --backbone B --store S --gguf G --tokens FILE --system FILE [--dspark DIR]
 //                    [--expect LOGPROBS] [--slots N] [--ram-records R] [--prior P] [--ram-policy P]
@@ -255,6 +256,19 @@ int main(int argc, char** argv) {
     return true;
   });
 
+  // A prompt past the Decoder tail (model::decoder_tail), whose sweep runs the decoder layers on its
+  // last kDecoderTail rows only, then an agent's next step 300 tokens back into it: its resume reads
+  // the window rings the tail left.
+  const std::vector<int32_t> past_tail = head(longp, 6000);
+  scenario("decoder tail", conv, cold, [&](std::vector<Request>& r) {
+    switch (r.size()) {
+      case 0: r.push_back({"a 6000-token prompt", past_tail, 32, greedy, spec, std::nullopt, {}}); break;
+      case 1: r.push_back({"a resume 300 back into it", concat(head(past_tail, 5700), tool), 24, greedy, spec, 5700, {}}); break;
+      default: return false;
+    }
+    return true;
+  });
+
   // A context past the 64K sweep chunk: read cold in several chunks, then an agent's next step resumed on it.
   if (!long_paths.empty()) {
     std::vector<int32_t> long_prompt;
@@ -283,6 +297,13 @@ int main(int argc, char** argv) {
     cold.forget_live();
     const Outcome by_sweep = run(cold, prompt, 32, greedy, spec);
     check(same_bits(by_rounds.logits, by_sweep.logits) && by_rounds.tokens == by_sweep.tokens, "Rounds of 8 against a sweep");
+    // Rounds run every layer on every row; the sweep's decoder layers only its Decoder tail.
+    rounds.forget_live();
+    const Outcome tail_rounds = run(rounds, past_tail, 32, greedy, spec);
+    cold.forget_live();
+    const Outcome tail_sweep = run(cold, past_tail, 32, greedy, spec);
+    check(same_bits(tail_rounds.logits, tail_sweep.logits) && tail_rounds.tokens == tail_sweep.tokens,
+          "a 6000-token prompt in Rounds of 8 against a sweep with its Decoder tail");
     if (m.dspark) {
       cold.forget_live();
       const Outcome plain = run(cold, prompt, 96, greedy, false);

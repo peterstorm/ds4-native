@@ -220,6 +220,12 @@ class Decoder {
    * A chunk's Engram rows are read beside the sweep on a thread of its own, table 0 (layer 1) in token
    * order, then table 1 (layer 14), each distinct row once (engram::first_occurrence); an Engram
    * layer's wave waits only for its own rows.
+   *
+   * Grouped, the decoder layers run only on the read's Decoder tail (model::decoder_tail), from the
+   * first wave its first position falls in, their windows cut there; below it the first decoder
+   * layer (20) only compresses its KV and index keys, which every later row reads. The last Round
+   * and every ring position a later read can reach come out as a read through every layer leaves
+   * them. DS4N_DECODER_TAIL=0 runs every layer on every row.
    */
   void prefill(int64_t p0, std::span<const float> embeddings, std::span<const EngramTokenRows> engram = {},
                const EngramReader& read_engram = {}, const ExpertPlacer& place = {});
@@ -299,13 +305,14 @@ class Decoder {
   /** decoder_sweep.cu: a chunk's Engram reads as the sweep's other threads see them. */
   struct EngramReads;
   /**
-   * On a sweep's placing thread, while the host launches `layer`'s attention halves: as each segment
-   * of Rounds ran its halves (`launched` counts them), the Experts its routing names that no earlier
-   * segment placed, placed -- with `drive_first` (the chunk's first layer), after those reads' table
-   * 0 when it has many rows. Returns each Expert's Slot (none: no token routed to it); adds the time
-   * waiting for routing and placing to `profile`.
+   * On a sweep's placing thread, while the host launches `layer`'s attention halves over the chunk's
+   * tokens [first_row, tokens) (first_row a wave boundary): as each segment of Rounds ran its halves
+   * (`launched` counts the chunk's segments), the Experts its routing names that no earlier segment
+   * placed, placed -- with `drive_first` (the chunk's first layer), after those reads' table 0 when it
+   * has many rows. Returns each Expert's Slot (none: no token routed to it); adds the time waiting for
+   * routing and placing to `profile`.
    */
-  std::vector<std::optional<uint32_t>> place_segments(int layer, size_t tokens, const ExpertPlacer& place,
+  std::vector<std::optional<uint32_t>> place_segments(int layer, size_t first_row, size_t tokens, const ExpertPlacer& place,
                                                       Progress& launched, SweepProfile* profile,
                                                       EngramReads* drive_first = nullptr);
   /**
@@ -315,8 +322,8 @@ class Decoder {
    */
   size_t read_chunk_engram(std::span<const EngramTokenRows> engram, const EngramReader& read_engram,
                            EngramReads& progress);
-  /** A sweep's grouped MoE for `layer` over the chunk's first `tokens` tokens, its Experts in `slot_of`. */
-  void grouped_moe(int layer, size_t tokens, std::span<const std::optional<uint32_t>> slot_of);
+  /** A sweep's grouped MoE for `layer` over the chunk's tokens [first_row, tokens), its Experts in `slot_of`. */
+  void grouped_moe(int layer, size_t first_row, size_t tokens, std::span<const std::optional<uint32_t>> slot_of);
   /** Copy every GPU's rings into `w` (`to_host`) or back from it, after everything launched so far. */
   void transfer(const WindowSnapshot& w, bool to_host);
   std::array<std::unique_ptr<Gpu>, 2> gpus_;

@@ -88,6 +88,7 @@ void Decoder::Gpu::allocate_sweep(int chunk_rounds) {
   c.current = a.alloc<int32_t>(1);
   check(cudaMallocHost(&c.round_numbers, G * sizeof(int32_t)), "cudaMallocHost");
   for (size_t i = 0; i < G; i++) c.round_numbers[i] = static_cast<int32_t>(i);
+  check(cudaMallocHost(&c.window_cut, static_cast<size_t>(kWindow - 1) * kWindow * sizeof(int32_t)), "cudaMallocHost");
   c.xf = a.alloc<bf16>(N * kDim);
   c.route_experts = a.alloc<int32_t>(N * moe::kTopK);
   c.route_weights = a.alloc<float>(N * moe::kTopK);
@@ -203,7 +204,8 @@ void Decoder::Gpu::allocate_sweep(int chunk_rounds) {
 }
 
 void Decoder::Gpu::free_sweep() {
-  for (void* p : {static_cast<void*>(chunk.round_numbers), static_cast<void*>(grouped.pinned_token_of),
+  for (void* p : {static_cast<void*>(chunk.round_numbers), static_cast<void*>(chunk.window_cut),
+                  static_cast<void*>(grouped.pinned_token_of),
                   static_cast<void*>(grouped.pinned_weight), static_cast<void*>(grouped.pinned_jobs),
                   static_cast<void*>(grouped.pinned_first), static_cast<void*>(grouped.pinned_token_slots),
                   static_cast<void*>(grouped.pinned_slots), static_cast<void*>(grouped.pinned_route_experts),
@@ -320,6 +322,42 @@ void Decoder::Gpu::enqueue_wave(int layer, const WaveRows& w, WavePhase phase) {
     clock.lap(WaveSection::Exchange, x.stream);
     check(cudaEventRecord(lane.added[p], x.stream), "cudaEventRecord");
   };
+  // A compressing layer's producing rows in the wave (the rows that complete a group), and a KV
+  // source's work on them from the wave's normed input (v.xa_f): its latents, their index keys, the
+  // latents stored -- what every later row of the layers it serves reads at those positions.
+  struct Producing {
+    int n = 0;
+    const int64_t* latent_pos = nullptr;
+    const int64_t* compress_row = nullptr;
+  } produced;
+  IntArg first_compressed{};  // the compressed row of the wave's first latent
+  if (ratio) {
+    const model::ProducedRange range = w.produced[ratio];
+    produced = {static_cast<int>(range.count), v.produced_latent_pos[ratio] + range.begin,
+                v.produced_compress_row[ratio] + range.begin};
+    first_compressed = IntArg::at(produced.compress_row, kMaxCompressed - 1);
+  }
+  auto compress = [&] {
+    cuda::bf16_gemv(d.compress_w, v.xa_f, d.compress_rows, kDim, rows, kSplitsBf16, v.planes_bf, st);
+    cuda::compress_rows(v.planes_bf, kSplitsBf16, ratio, rows, w.first_produced[ratio], produced.n, pos,
+                        ratio == 2 ? pools.at(layer) : cuda::PoolSlots{}, d.compress_norm, kNormEps, v.latent, st);
+  };
+  auto append_keys = [&] {  // every key the wave completes, before any row scores
+    cuda::bf16_to_f32(v.latent, static_cast<size_t>(produced.n) * kHeadDim, v.latent_f, st);
+    cuda::bf16_gemv(d.index_wk, v.latent_f, cuda::kIndexDim, kHeadDim, produced.n, kSplitsWk, v.planes_wk, st);
+    cuda::sum_planes_bf16(v.planes_wk, kSplitsWk, cuda::kIndexDim, produced.n, v.k_raw, st);
+    cuda::rmsnorm(v.k_raw, d.index_k_norm, cuda::kIndexDim, produced.n, kNormEps, v.k_idx, st);
+    cuda::rope(v.k_idx, produced.n, 1, cuda::kIndexDim, kRopeDim, d.rope_freqs, produced.latent_pos, false, st);
+    cuda::append_index_keys(v.k_idx, first_compressed, produced.n, index_cache.at(layer), st);
+  };
+  auto store_latents = [&] {
+    check(cudaMemcpyAsync(v.latent_c, v.latent, static_cast<size_t>(produced.n) * kHeadDim * sizeof(bf16),
+                          cudaMemcpyDeviceToDevice, st),
+          "latents");
+    cuda::rope(v.latent_c, produced.n, 1, kHeadDim, kRopeDim, d.rope_freqs, produced.latent_pos, false, st);
+    cuda::fp4_quant_dequant_e4m3(v.latent_c, produced.n, kHeadDim, st);
+    cuda::store_rows(v.latent_c, produced.n, kHeadDim, compressed.at(layer), first_compressed, st);
+  };
   clock.mark(st);
 
   switch (phase) {
@@ -362,26 +400,10 @@ void Decoder::Gpu::enqueue_wave(int layer, const WaveRows& w, WavePhase phase) {
       int32_t* idx = chunk.idx + r0 * kIdxStride;
       int32_t* topk = chunk.topk + r0 * kTopK;  // an index source's selections; later layers' from the last source
       if (ratio) {
-        const model::ProducedRange produced = w.produced[ratio];
-        const int n_prod = static_cast<int>(produced.count);
-        const int64_t* latent_pos = v.produced_latent_pos[ratio] + produced.begin;
-        const IntArg first_compressed =  // the compressed row of the wave's first latent
-            IntArg::at(v.produced_compress_row[ratio] + produced.begin, kMaxCompressed - 1);
-        if (kind.kv_source) {
-          cuda::bf16_gemv(d.compress_w, v.xa_f, d.compress_rows, kDim, rows, kSplitsBf16, v.planes_bf, st);
-          cuda::compress_rows(v.planes_bf, kSplitsBf16, ratio, rows, w.first_produced[ratio], n_prod, pos,
-                              ratio == 2 ? pools.at(layer) : cuda::PoolSlots{}, d.compress_norm, kNormEps, v.latent, st);
-        }
+        if (kind.kv_source) compress();
         lap(WaveSection::Compressor);
         if (kind.index_source) {
-          if (kind.kv_source && n_prod > 0) {  // every key the wave completes, before any row scores
-            cuda::bf16_to_f32(v.latent, static_cast<size_t>(n_prod) * kHeadDim, v.latent_f, st);
-            cuda::bf16_gemv(d.index_wk, v.latent_f, cuda::kIndexDim, kHeadDim, n_prod, kSplitsWk, v.planes_wk, st);
-            cuda::sum_planes_bf16(v.planes_wk, kSplitsWk, cuda::kIndexDim, n_prod, v.k_raw, st);
-            cuda::rmsnorm(v.k_raw, d.index_k_norm, cuda::kIndexDim, n_prod, kNormEps, v.k_idx, st);
-            cuda::rope(v.k_idx, n_prod, 1, cuda::kIndexDim, kRopeDim, d.rope_freqs, latent_pos, false, st);
-            cuda::append_index_keys(v.k_idx, first_compressed, n_prod, index_cache.at(layer), st);
-          }
+          if (kind.kv_source && produced.n > 0) append_keys();
           lap(WaveSection::IndexKeys);
           cuda::planes_rope({v.planes_iq, kSplitsIndexQ, cuda::kIndexHeads * cuda::kIndexDim}, rows, cuda::kIndexHeads,
                             cuda::kIndexDim, kRopeDim, d.rope_freqs, pos, v.q_idx, st);
@@ -405,14 +427,7 @@ void Decoder::Gpu::enqueue_wave(int layer, const WaveRows& w, WavePhase phase) {
             lap(WaveSection::IndexSelect);
           }
         }
-        if (kind.kv_source && n_prod > 0) {
-          check(cudaMemcpyAsync(v.latent_c, v.latent, static_cast<size_t>(n_prod) * kHeadDim * sizeof(bf16),
-                                cudaMemcpyDeviceToDevice, st),
-                "latents");
-          cuda::rope(v.latent_c, n_prod, 1, kHeadDim, kRopeDim, d.rope_freqs, latent_pos, false, st);
-          cuda::fp4_quant_dequant_e4m3(v.latent_c, n_prod, kHeadDim, st);
-          cuda::store_rows(v.latent_c, n_prod, kHeadDim, compressed.at(layer), first_compressed, st);
-        }
+        if (kind.kv_source && produced.n > 0) store_latents();
         check(cudaMemcpy2DAsync(idx + kWindow, kIdxStride * sizeof(int32_t), topk, kTopK * sizeof(int32_t),
                                 kTopK * sizeof(int32_t), rows, cudaMemcpyDeviceToDevice, st),
               "topk");
@@ -482,6 +497,26 @@ void Decoder::Gpu::enqueue_wave(int layer, const WaveRows& w, WavePhase phase) {
       check(cudaMemcpyAsync(h, v.h_mid, rows * stream_elems * sizeof(bf16), cudaMemcpyDeviceToDevice, st), "stream");
       lap(WaveSection::Combine);
       break;
+
+    case WavePhase::Compress:
+      // Below the Decoder tail: the KV source's compressed rows and index keys, from the input
+      // Attention norms (the same kernels, so the same bits), and nothing a later row does not read --
+      // no window KV, queries, attention or FFN.
+      if (!kind.kv_source || !kind.index_source || !ratio)
+        throw CudaError("Compress: layer " + std::to_string(layer) + " is not a KV and index source");
+      cuda::hc_pre(h_in, mix_ffn, kDim, rows, v.x0, st);
+      cuda::rmsnorm(v.x0, d.attn_norm, kDim, rows, kNormEps, v.xa, st);
+      cuda::bf16_to_f32(v.xa, static_cast<size_t>(rows) * kDim, v.xa_f, st);
+      lap(WaveSection::Mixes);
+      compress();
+      lap(WaveSection::Compressor);
+      if (produced.n > 0) {
+        append_keys();
+        lap(WaveSection::IndexKeys);
+        store_latents();
+      }
+      lap(WaveSection::CompressedRows);
+      break;
   }
   check(cudaGetLastError(), "wave launches");
 }
@@ -502,6 +537,18 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
   const size_t per_chunk = static_cast<size_t>(capacity) * kMaxRows;
   const bool graphs = launches_ == Launches::Graphs;
   const bool grouped = static_cast<bool>(place);
+  // The Decoder tail (model::decoder_tail): the decoder layers run from the first row of the wave
+  // its first position falls in, on that chunk's wave grid. Grouped sweeps only; DS4N_DECODER_TAIL=0
+  // runs every layer on every row.
+  const char* tail_env = std::getenv("DS4N_DECODER_TAIL");
+  const int64_t read_end = p0 + static_cast<int64_t>(tokens);
+  const int64_t tail =
+      grouped && !(tail_env != nullptr && std::strcmp(tail_env, "0") == 0) ? model::decoder_tail(p0, read_end) : p0;
+  const int64_t decoder_from = [&] {
+    const int64_t chunk_rows = static_cast<int64_t>(per_chunk);
+    const int64_t c = p0 + (tail - p0) / chunk_rows * chunk_rows;  // the chunk the tail starts in
+    return c + (tail - c) / kWaveRows * kWaveRows;
+  }();
   // DS4N_SWEEP_PROFILE: the time since the last lap, once both GPUs finished, into a phase's bucket.
   const bool profiling = std::getenv("DS4N_SWEEP_PROFILE") != nullptr;
   // DS4N_WAVE_PROFILE: GPU 0's time by wave section (cudaEvents; the streams are not waited for).
@@ -624,6 +671,30 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
       }
       waves.push_back(w);
     }
+    // The decoder layers' first wave in this chunk: the one decoder_from falls in (none past the chunk).
+    const size_t decoder_wave = decoder_from >= c0 + static_cast<int64_t>(n) ? waves.size()
+                                : decoder_from <= c0                         ? 0
+                                                                             : static_cast<size_t>((decoder_from - c0) / kWaveRows);
+    // The decoder half's windows stop at decoder_from (model::decoder_window_slot): its first rows'
+    // window slots rewritten before the first decoder layer -- after every encoder layer read them, by
+    // the stream's order -- from pinned memory, as no copy may wait on a GPU mid-sweep.
+    auto cut_windows = [&] {
+      if (decoder_from == p0) return;
+      const int64_t q0 = std::max(c0, decoder_from);
+      const int64_t q1 = std::min(c0 + static_cast<int64_t>(n), decoder_from + kWindow - 1);
+      if (q0 >= q1) return;
+      for (auto& gp : gpus_) {
+        Gpu& s = *gp;
+        for (int64_t q = q0; q < q1; q++)
+          for (int i = 0; i < kWindow; i++)
+            s.chunk.window_cut[static_cast<size_t>(q - q0) * kWindow + i] = model::decoder_window_slot(q, i, decoder_from);
+        check(cudaSetDevice(s.device), "cudaSetDevice");
+        check(cudaMemcpy2DAsync(s.chunk.idx + static_cast<size_t>(q0 - c0) * kIdxStride, kIdxStride * sizeof(int32_t),
+                                s.chunk.window_cut, kWindow * sizeof(int32_t), kWindow * sizeof(int32_t),
+                                static_cast<size_t>(q1 - q0), cudaMemcpyHostToDevice, s.stream),
+              "decoder windows");
+      }
+    };
     // One phase of a wave on both GPUs: no GPU starts its next phase before the peer launched this one.
     // (DS4N_SWEEP_CHECK: each phase's launches checked as they go, naming the layer, wave and phase.)
     const bool checking = std::getenv("DS4N_SWEEP_CHECK") != nullptr;
@@ -661,16 +732,18 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
       phase(layer, waves[k], WavePhase::CombineSend);
       phase(layer, waves[k], WavePhase::CombineAdd);
     };
-    auto combine_wave = [&](int layer, size_t k) {  // wave k's Post, wave k + 1's exchange first
-      if (k == 0) combine_exchange(layer, 0);
+    // Wave k's Post, wave k + 1's exchange first; `from` is the layer's first wave.
+    auto combine_wave = [&](int layer, size_t from, size_t k) {
+      if (k == from) combine_exchange(layer, from);
       if (k + 1 < waves.size()) combine_exchange(layer, k + 1);
       phase(layer, waves[k], WavePhase::CombinePost);
     };
-    // A layer's waves through routing, with the previous layer's combines (`combining`, or -1)
-    // between them: the next layer's wave k needs only wave k combined, so the combine exchanges run
-    // beside its attention. After each wave, its routing to the host (GPU 0) and an event on both
-    // GPUs, published to `launched`.
-    auto launch_waves = [&](int layer, int combining, Progress& launched) {
+    // A layer's waves through routing from wave `wave0` (the decoder layers': decoder_wave), with the
+    // previous layer's combines (`combining`, or -1, from its own first wave `combining_wave`) between
+    // them: the next layer's wave k needs only wave k combined, so the combine exchanges run beside
+    // its attention. After each wave, its routing to the host (GPU 0) and an event on both GPUs,
+    // published to `launched`. Below wave0 the first decoder layer only compresses.
+    auto launch_waves = [&](int layer, int combining, size_t combining_wave, size_t wave0, Progress& launched) {
       const bool engram_layer = model::kind(layer).engram;
       // Wave k's Ffn, then its routing to the host (GPU 0) and an event on both GPUs, published.
       auto finish = [&](size_t k) {
@@ -690,9 +763,13 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
       };
       // Wave k's attention exchange runs on the link streams while wave k + 1's Attention computes:
       // the host launches wave k - 1's Ffn after wave k's exchange.
-      for (size_t k = 0; k < waves.size(); k++) {
+      for (size_t k = layer == kFirstDecoderLayer ? 0 : wave0; k < waves.size(); k++) {
         const WaveRows& w = waves[k];
-        if (combining >= 0) combine_wave(combining, k);
+        if (combining >= 0 && k >= combining_wave) combine_wave(combining, combining_wave, k);
+        if (k < wave0) {
+          phase(layer, w, WavePhase::Compress);
+          continue;
+        }
         if (engram_layer) {
           engram_rows_for(layer == kEngramLayers[0] ? 0 : 1, static_cast<size_t>(w.first + w.rows));
           phase(layer, w, WavePhase::EngramMix);
@@ -700,15 +777,16 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
         phase(layer, w, WavePhase::Attention);
         phase(layer, w, WavePhase::AttentionSend);
         phase(layer, w, WavePhase::AttentionAdd);
-        if (k > 0) finish(k - 1);
+        if (k > wave0) finish(k - 1);
       }
-      if (!waves.empty()) finish(waves.size() - 1);
+      if (wave0 < waves.size()) finish(waves.size() - 1);
     };
 
     // Layer by layer, every Round through the layer before any goes on: a layer's Experts are read
     // once for the chunk.
     const int first_layer = lead.layers.begin()->first;
-    int combining = -1;  // the grouped layer whose combines the next layer's waves carry
+    int combining = -1;         // the grouped layer whose combines the next layer's waves carry
+    size_t combining_wave = 0;  // its first wave
     for (const auto& [layer, unused] : lead.layers) {
       if (layer >= kLayers) continue;  // DSpark stages run in draft()
       if (!grouped) {
@@ -716,26 +794,37 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
         launch_rounds(layer);
         lap(&SweepProfile::steps);
       } else {
-        // The Experts are placed on a thread of their own while the waves' attention halves run:
-        // launching blocks once CUDA's launch queue is full.
-        // The chunk's first layer reads no Engram rows, but its placement shares the drive with the
-        // reader's table 0, which the next layer needs (place_segments: many rows go first).
+        // A decoder layer's attention and MoE run from decoder_wave; below it the first decoder layer
+        // compresses, and the others do not run at all.
+        const size_t wave0 = layer >= kFirstDecoderLayer ? decoder_wave : 0;
+        if (layer > kFirstDecoderLayer && wave0 == waves.size()) continue;
+        if (layer == kFirstDecoderLayer) cut_windows();
         Progress launched;
-        EngramReads* drive_first = any_engram && layer == first_layer ? &engram_reads : nullptr;
-        auto placing = std::async(std::launch::async, [&, layer = layer] {
-          return place_segments(layer, n, place, launched, profiling ? &profile : nullptr, drive_first);
-        });
-        try {
-          launch_waves(layer, combining, launched);
-        } catch (...) {
-          launched.abandon();
-          placing.wait();
-          throw;
+        if (wave0 == waves.size()) {  // the first decoder layer, in a chunk below the tail: its compressions only
+          launch_waves(layer, combining, combining_wave, wave0, launched);
+          combining = -1;
+        } else {
+          // The Experts are placed on a thread of their own while the waves' attention halves run:
+          // launching blocks once CUDA's launch queue is full.
+          // The chunk's first layer reads no Engram rows, but its placement shares the drive with the
+          // reader's table 0, which the next layer needs (place_segments: many rows go first).
+          EngramReads* drive_first = any_engram && layer == first_layer ? &engram_reads : nullptr;
+          auto placing = std::async(std::launch::async, [&, layer = layer] {
+            return place_segments(layer, wave0 * kWaveRows, n, place, launched, profiling ? &profile : nullptr, drive_first);
+          });
+          try {
+            launch_waves(layer, combining, combining_wave, wave0, launched);
+          } catch (...) {
+            launched.abandon();
+            placing.wait();
+            throw;
+          }
+          const std::vector<std::optional<uint32_t>> slot_of = placing.get();
+          grouped_moe(layer, wave0 * kWaveRows, n, slot_of);
+          combining = layer;
+          combining_wave = wave0;
         }
-        const std::vector<std::optional<uint32_t>> slot_of = placing.get();
-        grouped_moe(layer, n, slot_of);
         lap(&SweepProfile::steps);  // the previous layer's combines, attention halves and the Experts
-        combining = layer;
         check(cudaSetDevice(lead.device), "cudaSetDevice");
         lead.clock.collect(lead.stream);  // bounds the events in flight
       }
@@ -745,7 +834,7 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
       }
     }
     if (combining >= 0) {  // the last layer's combines, on their own
-      for (size_t k = 0; k < waves.size(); k++) combine_wave(combining, k);
+      for (size_t k = combining_wave; k < waves.size(); k++) combine_wave(combining, combining_wave, k);
       lap(&SweepProfile::combine);
     }
     for (auto& gp : gpus_) {  // decode's exchanges (on the GPU's stream) follow the sweep's (on its link stream)
@@ -783,8 +872,10 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
   if (profiling && grouped)
     std::fprintf(stderr,
                  "sweep profile, %zu tokens (ms, phases waited for): setup %.0f, attention halves + Experts %.0f (the "
-                 "host waited %.0f for routing and placed for %.0f meanwhile), the last layer's combines %.0f\n",
-                 tokens, profile.setup, profile.steps, profile.waiting, profile.placement, profile.combine);
+                 "host waited %.0f for routing and placed for %.0f meanwhile), the last layer's combines %.0f; decoder "
+                 "layers on %lld of the rows\n",
+                 tokens, profile.setup, profile.steps, profile.waiting, profile.placement, profile.combine,
+                 static_cast<long long>(read_end - decoder_from));
   else if (profiling)
     std::fprintf(stderr, "sweep profile, %zu tokens (ms, phases waited for): setup %.0f, layer steps %.0f\n", tokens,
                  profile.setup, profile.steps);
@@ -831,9 +922,9 @@ size_t Decoder::read_chunk_engram(std::span<const EngramTokenRows> engram, const
   return reads;
 }
 
-std::vector<std::optional<uint32_t>> Decoder::place_segments(int layer, size_t tokens, const ExpertPlacer& place,
-                                                             Progress& launched, SweepProfile* profile,
-                                                             EngramReads* drive_first) {
+std::vector<std::optional<uint32_t>> Decoder::place_segments(int layer, size_t first_row, size_t tokens,
+                                                             const ExpertPlacer& place, Progress& launched,
+                                                             SweepProfile* profile, EngramReads* drive_first) {
   using Clock = std::chrono::steady_clock;
   using Ms = std::chrono::duration<double, std::milli>;
   const Gpu::Grouped& routing = gpus_[0]->grouped;  // the routing is the same on both GPUs
@@ -855,7 +946,7 @@ std::vector<std::optional<uint32_t>> Decoder::place_segments(int layer, size_t t
   // wait here (events, the residency's copies): the launching thread never blocks on it.
   std::vector<std::optional<uint32_t>> slot_of(moe::kExperts);
   const size_t segment_tokens = kWaveRows;  // a segment is a wave
-  for (size_t t0 = 0, k = 0; t0 < tokens; t0 += segment_tokens, k++) {
+  for (size_t t0 = first_row, k = first_row / segment_tokens; t0 < tokens; t0 += segment_tokens, k++) {
     const auto t_wait = Clock::now();
     if (!launched.wait_until(k + 1)) throw CudaError("prefill: the attention halves were not all launched");
     for (auto& gp : gpus_) {
@@ -884,17 +975,18 @@ std::vector<std::optional<uint32_t>> Decoder::place_segments(int layer, size_t t
   return slot_of;
 }
 
-void Decoder::grouped_moe(int layer, size_t tokens, std::span<const std::optional<uint32_t>> slot_of) {
+void Decoder::grouped_moe(int layer, size_t first_row, size_t tokens, std::span<const std::optional<uint32_t>> slot_of) {
   const Gpu::Grouped& routing = gpus_[0]->grouped;  // all segments' routing landed (place_segments)
-  auto planned = moe::group_tokens(std::span<const int32_t>(routing.pinned_route_experts, tokens * moe::kTopK),
-                                   std::span<const float>(routing.pinned_route_weights, tokens * moe::kTopK), tokens,
-                                   moe::kExperts);
+  const size_t rows = tokens - first_row;           // the plan's token t is the chunk's row first_row + t
+  auto planned = moe::group_tokens(
+      std::span<const int32_t>(routing.pinned_route_experts + first_row * moe::kTopK, rows * moe::kTopK),
+      std::span<const float>(routing.pinned_route_weights + first_row * moe::kTopK, rows * moe::kTopK), rows, moe::kExperts);
   if (!planned) throw CudaError("prefill: layer " + std::to_string(layer) + ": " + planned.error().what);
   const moe::GroupPlan& plan = planned.value();
   if (plan.groups.size() > routing.layer_groups) throw CudaError("prefill: more MoE groups than a layer has room for");
   for (auto& gp : gpus_) {
     check(cudaSetDevice(gp->device), "cudaSetDevice");
-    check(cudaMemsetAsync(gp->chunk.y, 0, tokens * kDim * sizeof(float), gp->stream), "chunk MoE output");
+    check(cudaMemsetAsync(gp->chunk.y + first_row * kDim, 0, rows * kDim * sizeof(float), gp->stream), "chunk MoE output");
   }
 
   // Groups [begin, end) on both GPUs, kGroupBatch at a time, each batch launched on both before the
@@ -914,7 +1006,7 @@ void Decoder::grouped_moe(int layer, size_t tokens, std::span<const std::optiona
         check(cudaSetDevice(s.device), "cudaSetDevice");
         std::vector<const uint8_t*> halves(slots.empty() ? 0 : count);
         for (size_t i = 0; i < halves.size(); i++) halves[i] = s.experts.pool + slots[at - begin + i] * s.experts.slot_bytes;
-        s.enqueue_groups(plan, at, count, s.layers.at(layer), halves, columns);
+        s.enqueue_groups(plan, at, count, s.layers.at(layer), halves, columns, first_row);
       }
     }
     for (auto& gp : gpus_) {
@@ -938,7 +1030,7 @@ void Decoder::grouped_moe(int layer, size_t tokens, std::span<const std::optiona
 namespace ds4n::engine {
 
 void Decoder::Gpu::enqueue_groups(const moe::GroupPlan& plan, size_t first, size_t count, const DeviceLayer& d,
-                                  std::span<const uint8_t* const> halves, const moe::TokenColumns& columns) {
+                                  std::span<const uint8_t* const> halves, const moe::TokenColumns& columns, size_t row0) {
   // Tables and jobs at the groups' own places in the layer-wide pinned arrays (no upload's source
   // is rewritten before it ran), uploaded, then gather + quantize, gate/up, SwiGLU, down, accumulate.
   // A run of one Expert's groups is one job over the run's column groups (moe::expert_runs): the
@@ -1010,12 +1102,12 @@ void Decoder::Gpu::enqueue_groups(const moe::GroupPlan& plan, size_t first, size
                         cudaMemcpyHostToDevice, st),
         "group combine");
   const int n = static_cast<int>(count), runs_n = static_cast<int>(n_runs);
-  cuda::gather_quantize(chunk.xf, kDimBlocks, gr.token_of + cols, n, gr.act_codes, gr.act_scales, st);
+  cuda::gather_quantize(chunk.xf + row0 * kDim, kDimBlocks, gr.token_of + cols, n, gr.act_codes, gr.act_scales, st);
   cuda::gemv_groups(gr.jobs + 3 * first, gr.first + 3 * first, 2 * runs_n, gate_up_warps, n, st);
   cuda::swiglu_quantize_groups(gr.token_of + cols, gr.weight + cols, n, gr.buf, moe::kSwigluLimit, st);
   cuda::gemv_groups(gr.jobs + 3 * first + 2 * n_runs, gr.first + 3 * first + 2 * n_runs, runs_n, down_warps, n, st);
-  cuda::accumulate_tokens(gr.token_slots + cols, static_cast<int>(columns.tokens.size()), gr.slots + cols, gr.buf, chunk.y,
-                          st);
+  cuda::accumulate_tokens(gr.token_slots + cols, static_cast<int>(columns.tokens.size()), gr.slots + cols, gr.buf,
+                          chunk.y + row0 * kDim, st);
   check(cudaGetLastError(), "grouped MoE launches");
 }
 

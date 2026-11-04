@@ -74,9 +74,10 @@ constexpr int kGroupBatch = 512;  // groups a grouped MoE launch works on at onc
  * (after the grouped MoE): the MoE output's exchange, the same way; CombinePost: hc_post into the
  * stream. The host launches wave k's attention exchange before wave k - 1's Ffn, and a layer's
  * combines between the next layer's waves (wave k + 1's exchange before the next layer's wave k), so
- * every exchange runs beside other work.
+ * every exchange runs beside other work. Compress: below the Decoder tail (model::decoder_tail), the
+ * first decoder layer's compressed rows and index keys alone, the same kernels Attention runs for them.
  */
-enum class WavePhase { EngramMix, Attention, AttentionSend, AttentionAdd, Ffn, CombineSend, CombineAdd, CombinePost };
+enum class WavePhase { EngramMix, Attention, AttentionSend, AttentionAdd, Ffn, CombineSend, CombineAdd, CombinePost, Compress };
 
 constexpr int kWaveRows = kMaxRows * kWaveRounds;  // 512
 constexpr int kScoreRows = 128;                    // a wave's indexer rows scored at once (scores [128][kMaxCompressed])
@@ -343,6 +344,7 @@ struct Decoder::Gpu {
     uint8_t* engram = nullptr;           // [2][capacity] x kEngramSlot, pinned host memory both GPUs read
     int32_t* current = nullptr;          // the Round a chunked layer step works on (device)
     int32_t* round_numbers = nullptr;    // pinned 0 .. capacity - 1, the sources of `current`
+    int32_t* window_cut = nullptr;       // pinned [kWindow - 1][kWindow]: the Decoder tail's first rows' window slots
     // The grouped MoE's hand-offs, by chunk token: the FFN input rows and routing the attention
     // half leaves, and the MoE output (this GPU's partial) the combine half exchanges.
     bf16* xf = nullptr;                  // [capacity * 8][5120]
@@ -452,10 +454,10 @@ struct Decoder::Gpu {
   void enqueue_wave(int layer, const WaveRows& w, WavePhase phase);
   /**
    * One batch of a layer's grouped MoE: groups [first, first + count) of `plan`, routed ones' Halves
-   * at `halves`, `columns` the batch's moe::token_columns.
+   * at `halves`, `columns` the batch's moe::token_columns; the plan's token t is the chunk's row row0 + t.
    */
   void enqueue_groups(const moe::GroupPlan& plan, size_t first, size_t count, const DeviceLayer& d,
-                      std::span<const uint8_t* const> halves, const moe::TokenColumns& columns);
+                      std::span<const uint8_t* const> halves, const moe::TokenColumns& columns, size_t row0);
   /** The head over `rows` rows of the stream after the last layer: this GPU's half of the logits into head_out. */
   void enqueue_head(const bf16* final_norm, int rows);
   /** Project `rows` accepted positions (from row `first` of the seed index) into every stage's context ring. */

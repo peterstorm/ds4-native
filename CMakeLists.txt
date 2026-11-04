@@ -145,6 +145,7 @@ add_executable(ds4n_tests
   tests/core/test_speculation.cpp
   tests/core/test_moe_groups.cpp
   tests/core/test_row_index.cpp
+  tests/core/test_decoder_tail.cpp
   tests/core/test_rewind.cpp
   tests/core/test_sampler.cpp
   tests/core/test_reply.cpp

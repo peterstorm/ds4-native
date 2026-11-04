@@ -132,6 +132,16 @@ no earlier than that turn's prompt end.
 
    A sweep costs ~0.9 s plus ~0.6 ms a token (each layer's routed Experts placed once); Rounds
    ~11 ms a token at this context. A split plan reads in two pieces with a Rewind point between.
+   A sweep runs the decoder layers (20–39) only on the read's **Decoder tail**, its last 3,053 rows
+   (`model::decoder_tail`: the 640 ring positions plus 19 × 127, the reach of the windows below),
+   their windows cut at the tail's first row; below it layer 20 only compresses its KV and index
+   keys. The last Round and every ring position come out as a read through every layer leaves them
+   (`ds4n-serve-check`: a 6,000-token sweep against Rounds of 8, and a resume 300 tokens back into
+   it). Measured through the server on real text (2026-11-04, same prompts, fresh engine per arm):
+   7.1K tokens 647 → 683 tok/s, 14.1K 1,186 → 1,313, 48K 2,796 → 3,199; decode unchanged.
+   `DS4N_DECODER_TAIL=0` turns it off. The gain is smaller than the compute it saves because a
+   fresh prompt is bound by the NVMe: a 7K-token one reads ~106 GB of Experts (~9.6 GB/s), and 3,053
+   rows still route to most of the cold ones (102 GB with the tail).
 3. A Rewind point at the prompt's end. (Before 1: the plan's set-aside, take-back and restore, each
    reported to the server as a `NOTE sessions: …` line; and when the KV held at least 2,048 more of
    the prompt than any rings let it resume — `rewind::kv_held` against the plan — `the KV held the

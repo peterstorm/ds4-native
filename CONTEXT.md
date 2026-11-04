@@ -94,6 +94,10 @@ A Cohort's pass through the model layer by layer: every row through layer L befo
 **Wave**:
 Up to 64 Rounds of a prompt sweep whose attention halves run as one batch: every kernel over all the Wave's rows, each GEMV's weights read once per Wave. The window ring outlasts the window by a Wave, so the Wave writes its rows' KV before any of them attends.
 
+**Decoder tail**:
+The last `kDecoderTail` (3,053 = 640 + 19 × 127) rows of a prompt read, the only rows a grouped Prompt sweep runs the decoder layers (20–39) on, their windows cut at the tail's first row; below it, layer 20 only compresses its KV and index keys, which every decoder row reads (`model::decoder_tail`). The decoder half's own state is its window rings, and a row's output at layer 20 + j reaches back (j + 1) × 127 positions, so from the tail on the last Round and every ring position a later read can reach come out as a read through every layer leaves them (the 1017 report's CED: "nearly halves prefill computation"). `DS4N_DECODER_TAIL=0` turns it off.
+_Avoid_: YOCO skip, replay trim (DeepSeek's lossy 128-row form)
+
 **Grouped MoE**:
 A prompt sweep's MoE per layer: each routed Expert run once over all the Cohort's tokens it serves, in groups of 8 token columns, accumulated in the Round's combine order (`core/moe_groups`). An Expert's consecutive groups (an **Expert run**) share one GEMV job, each weight read feeding all of them; the accumulation runs per token, its columns in group order.
 
