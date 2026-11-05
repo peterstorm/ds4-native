@@ -24,6 +24,13 @@ subagent resumes where it leaves its parent's system prompt — all Exactly (`ds
 desktop profile is `scripts/inference/deepseek/ds41-1017-native/run-ds41-1017-native.sh` in the
 dotfiles (`--install` builds the pinned commit, `--launch` starts it).
 
+A derivative that re-writes only Backbone tensors serves from its own Backbone beside the same
+Expert store, GGUF and profile: `tools/hf-backbone` fetches it from the derivative's repo like
+DeepSeek's. jcartu's abliterated `WARMIND-1017` (132 tensors: `attn.wo_b` and
+`ffn.shared_experts.w2`, layers 4–36) is one; the profile serves it as `warmind-1017-native` with
+`WEIGHTS=warmind`. Its tensors have DeepSeek's dtypes and shapes, so the same kernels run them;
+Exactness was verified on DeepSeek's weights, not re-run on these.
+
 ## Read first
 
 | Document | What it holds |
@@ -48,6 +55,7 @@ dotfiles (`--install` builds the pinned commit, `--launch` starts it).
 | `/models/ds41/project-maya/` | Project Maya source (donor code, MIT) |
 | `/models/ds41/baseline/` | Baseline pipeline, logs, CSVs, `xferbench` results |
 | `/models/ds41/native/` | Backbone, Expert store, run outputs; `bin/ds4n-serve-<commit>` and `serve/` (tokenizer, server config, log) |
+| `/models/ds41/native/warmind/` | `jcartu/WARMIND-1017@4fbce63` Backbone, its fetch script and `DERIVATIVE.json`; `bun tools/hf-backbone/cli.ts verify ../backbone.safetensors backbone.safetensors DERIVATIVE.json` checks it against DeepSeek's |
 
 Builds run in the CUDA 13.4 image `7b5c335cc647` (`--gpus`, `--ulimit memlock=-1`).
 One GPU-owning process at a time.

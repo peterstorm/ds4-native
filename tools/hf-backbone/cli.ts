@@ -3,11 +3,17 @@
 //
 //   bun tools/hf-backbone/cli.ts plan     REPO REVISION OUT_PLAN.json
 //   bun tools/hf-backbone/cli.ts download OUT_PLAN.json OUT.safetensors
+//   bun tools/hf-backbone/cli.ts verify   BASE.safetensors DERIVED.safetensors DERIVATIVE.json
 //
 // `plan` reads every shard's header (two small range requests per shard).
 // `download` fetches the planned ranges with retries and writes the file; the
 // assembled tensors are byte-identical slices of the source shards.
-import { closeSync, fsyncSync, openSync, readFileSync, writeFileSync, writeSync } from "fs";
+// `verify` checks a derivative's Backbone (e.g. WARMIND-1017's) against DeepSeek's:
+// the same tensors, the manifest's edited ones pristine in BASE and re-written in
+// DERIVED, every other byte the same. Exits non-zero on any finding.
+import { createHash } from "crypto";
+import { closeSync, fsyncSync, openSync, readFileSync, readSync, writeFileSync, writeSync } from "fs";
+import { judge, layoutFindings, parseManifest, type Observation } from "./derivative";
 import { assembledHeader, backboneTensors, chunkWrites, headerLength, parseHeader, planFetches, type ShardHeader } from "./plan";
 
 const out = (line: string): void => {
@@ -121,7 +127,57 @@ const download = async (planPath: string, outPath: string) => {
   out(`wrote ${outPath}: ${layout.length} tensors`);
 };
 
+/** Fill `buf` from `fd` at `position` (readSync may return short). */
+const readFully = (fd: number, buf: Uint8Array, position: number): void => {
+  for (let at = 0; at < buf.length; ) {
+    const n = readSync(fd, buf, at, buf.length - at, position + at);
+    if (n === 0) fail(`unexpected end of file at byte ${position + at}`);
+    at += n;
+  }
+};
+
+const localHeader = (fd: number, path: string): ShardHeader => {
+  const first8 = new Uint8Array(8);
+  readFully(fd, first8, 0);
+  const n = headerLength(first8);
+  if (!n.ok) return fail(`${path}: ${JSON.stringify(n.error)}`);
+  const json = new Uint8Array(n.value);
+  readFully(fd, json, 8);
+  const h = parseHeader(new TextDecoder().decode(json), n.value);
+  return h.ok ? h.value : fail(`${path}: ${JSON.stringify(h.error)}`);
+};
+
+const payload = (fd: number, h: ShardHeader, name: string): Buffer => {
+  const t = h.tensors.get(name);
+  if (!t) return fail(`no tensor ${name}`);
+  const buf = Buffer.allocUnsafe(t.end - t.begin);
+  readFully(fd, buf, h.dataStart + t.begin);
+  return buf;
+};
+
+const sha256 = (buf: Uint8Array): string => createHash("sha256").update(buf).digest("hex");
+
+const verify = (basePath: string, derivedPath: string, manifestPath: string) => {
+  const edits = parseManifest(readFileSync(manifestPath, "utf8"));
+  if (!edits.ok) return fail(`${manifestPath}: ${JSON.stringify(edits.error)}`);
+  const fb = openSync(basePath, "r"), fd = openSync(derivedPath, "r");
+  const base = localHeader(fb, basePath), derived = localHeader(fd, derivedPath);
+  const edited = new Set(edits.value.map((e) => e.tensor));
+  const shared = [...base.tensors.keys()].filter((name) => derived.tensors.has(name)).sort();
+  const observations = shared.map((name): Observation => {
+    const b = payload(fb, base, name), d = payload(fd, derived, name);
+    return !edited.has(name) && b.equals(d) ? { name, kind: "same" } : { name, kind: "digests", base: sha256(b), derived: sha256(d) };
+  });
+  closeSync(fb);
+  closeSync(fd);
+  const findings = [...layoutFindings(base, derived, edits.value), ...judge(observations, edits.value)];
+  for (const f of findings) out(`  ${f.kind} ${f.name}${"detail" in f ? `: ${f.detail}` : ""}`);
+  if (findings.length > 0) fail(`${findings.length} findings: ${derivedPath} is not ${basePath} with the manifest's edits`);
+  out(`PASS: ${edits.value.length} tensors re-written as the manifest records, the other ${shared.length - edits.value.length} byte-identical`);
+};
+
 const [cmd, a, b, c] = process.argv.slice(2);
 if (cmd === "plan" && a && b && c) await plan(a, b, c);
 else if (cmd === "download" && a && b) await download(a, b);
-else fail("usage: plan REPO REVISION OUT_PLAN.json | download PLAN.json OUT.safetensors");
+else if (cmd === "verify" && a && b && c) verify(a, b, c);
+else fail("usage: plan REPO REVISION OUT_PLAN.json | download PLAN.json OUT.safetensors | verify BASE DERIVED DERIVATIVE.json");
