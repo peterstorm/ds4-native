@@ -27,8 +27,8 @@ dotfiles (`--install` builds the pinned commit, `--launch` starts it).
 A derivative that re-writes only Backbone tensors serves from its own Backbone beside the same
 Expert store, GGUF and profile: `tools/hf-backbone` fetches it from the derivative's repo like
 DeepSeek's. jcartu's abliterated `WARMIND-1017` (132 tensors: `attn.wo_b` and
-`ffn.shared_experts.w2`, layers 4–36) is one; the profile serves it as `warmind-1017-native` with
-`WEIGHTS=warmind`. Its tensors have DeepSeek's dtypes and shapes, so the same kernels run them;
+`ffn.shared_experts.w2`, layers 4–36) is one; the desktop profile serves it by default as
+`warmind-1017-native` (`WEIGHTS=deepseek` for DeepSeek's). Its tensors have DeepSeek's dtypes and shapes, so the same kernels run them;
 Exactness was verified on DeepSeek's weights, not re-run on these.
 
 ## Read first
