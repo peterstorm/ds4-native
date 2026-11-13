@@ -199,8 +199,9 @@ int main(int argc, char** argv) {
   // (rewind::next_buffer), so each Session's next turn resumes there.
   const auto lanes = static_cast<uint32_t>(mc.lanes.value());
   if (!points_given) cc.rewind_points = std::max(cc.rewind_points, lanes + 1);
-  else if (cc.rewind_points != 0 && cc.rewind_points <= lanes)
-    die("--rewind-points " + std::to_string(cc.rewind_points) + ": more than --lanes (" + std::to_string(lanes) + "), or 0 for none");
+  else if (lanes > 1 && cc.rewind_points != 0 && cc.rewind_points <= lanes)  // a Lane's points spare the other Lanes' turns
+    die("--rewind-points " + std::to_string(cc.rewind_points) + ": with " + std::to_string(lanes) + " Lanes at least " +
+        std::to_string(lanes + 1) + ", or 0 for none");
 
   engine::FullModel m = [&] {
     try {
@@ -237,11 +238,6 @@ int main(int argc, char** argv) {
 
   // Admits `g`, or answers why not; false: it named no rid and every Lane is busy, so it waits its turn.
   const auto admit = [&](const wire::Generate& g) {
-    if (static_cast<int64_t>(g.prompt.size()) >= engine::kMaxCompressed) {
-      out(wire::error_line(g.rid, "the prompt (" + std::to_string(g.prompt.size()) + " tokens) leaves no room in the context of " +
-                                      std::to_string(engine::kMaxCompressed)));
-      return true;
-    }
     const uint64_t n = admitted++;
     engine::ReplyEvents ev;
     ev.token = [rid = g.rid](int32_t t) { out(wire::token_line(rid, t)); };
@@ -261,7 +257,16 @@ int main(int argc, char** argv) {
       out(failed_lines(rid, prompt, what));
       flights.erase(n);
     };
-    const auto lane = conversation.admit(g, std::move(ev));
+    // A failure while it is taken in (a checkpoint, the GPUs) ends the engine like any other, and this
+    // request is not in flight yet: it gets its own answer first.
+    const auto lane = [&] {
+      try {
+        return conversation.admit(g, std::move(ev));
+      } catch (const std::exception& e) {
+        out(failed_lines(g.rid, g.prompt.size(), e.what()));
+        throw;
+      }
+    }();
     if (!lane) {
       if (!lane.error().busy) out(wire::error_line(g.rid, lane.error().what));
       else if (g.rid) out(wire::busy_line(*g.rid, mc.lanes));

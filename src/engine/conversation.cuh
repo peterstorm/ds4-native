@@ -154,7 +154,9 @@ class Conversation {
     std::optional<Writing> writing;
   };
 
-  Request& request(lane::LaneId lane) { return *requests_.at(static_cast<size_t>(lane.index())); }
+  /** What `lane` holds: a request, or nothing. */
+  std::optional<Request>& slot(lane::LaneId lane) { return requests_.at(static_cast<size_t>(lane.index())); }
+  Request& request(lane::LaneId lane) { return *slot(lane); }
   reply::Limits limits(const Request& q) const { return {q.g.max_new, config_.stops, q.g.think}; }
   /** One Round of `feeds` (in Lane order), a Shared Round when of several Lanes. */
   Fed round(std::span<const Feed> feeds);

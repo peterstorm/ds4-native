@@ -178,8 +178,9 @@ void Conversation::carry_out(const rewind::Plan& p, const ReplyEvents& ev) {
 
 Result<lane::LaneId, Refused> Conversation::admit(wire::Generate g, ReplyEvents ev) {
   using R = Result<lane::LaneId, Refused>;
-  if (g.prompt.empty() || static_cast<int64_t>(g.prompt.size()) >= kMaxCompressed)
-    return R::err({"a prompt of 1 to " + std::to_string(kMaxCompressed - 1) + " tokens"});
+  if (static_cast<int64_t>(g.prompt.size()) >= kMaxCompressed)
+    return R::err({"the prompt (" + std::to_string(g.prompt.size()) + " tokens) leaves no room in the context of " +
+                   std::to_string(kMaxCompressed)});
   const double t0 = now_ms();
   const auto planned = rewind::plan(sessions_, g.prompt, config_.rewind);
   if (!planned) return R::err({rewind::what(planned.error()), planned.error() == rewind::PlanError::Busy});
@@ -200,7 +201,12 @@ Result<lane::LaneId, Refused> Conversation::admit(wire::Generate g, ReplyEvents 
       q.split = static_cast<size_t>(*p.split);
       q.marked = " (a Rewind point at " + std::to_string(*p.split) + ")";
     }
-    requests_.at(static_cast<size_t>(p.lane.index())) = std::move(q);
+    const bool split_here = q.split == from;
+    slot(p.lane) = std::move(q);
+    if (split_here) {  // nothing to read before it (--split-min 0): the point is the resume itself
+      mark(p.lane, false);
+      request(p.lane).split.reset();
+    }
     return R::ok(p.lane);
   } catch (...) {
     abandon();
@@ -213,11 +219,11 @@ bool Conversation::idle() const {
 }
 
 void Conversation::stop(lane::LaneId lane) {
-  if (auto& q = requests_.at(static_cast<size_t>(lane.index()))) q->stop = true;
+  if (auto& q = slot(lane)) q->stop = true;
 }
 
 void Conversation::wrap(lane::LaneId lane) {
-  if (auto& q = requests_.at(static_cast<size_t>(lane.index()))) q->wrap = true;
+  if (auto& q = slot(lane)) q->wrap = true;
 }
 
 void Conversation::abandon() {
@@ -234,7 +240,7 @@ bool Conversation::step() {
   try {
     const std::vector<lane::LaneId> ids = lanes().ids();
     for (const lane::LaneId id : ids)
-      if (const auto& q = requests_[static_cast<size_t>(id.index())]; q && q->stop) finish(id, reply::Finish::Cancel);
+      if (const auto& q = slot(id); q && q->stop) finish(id, reply::Finish::Cancel);
 
     std::vector<shared::LaneState> states;
     for (const auto& q : requests_) {
@@ -247,12 +253,12 @@ bool Conversation::step() {
     const auto next = shared::compose(states, static_cast<int64_t>(std::min(config_.sweep_min, most)));
     if (!next) throw std::logic_error(std::string("Conversation: ") + shared::what(next.error()));
 
-    struct Run {
+    struct Run {  // true: a pass ran
       Conversation& c;
       bool operator()(const shared::Rest&) const { return false; }
-      bool operator()(const shared::Sweep& s) const { return c.sweep_pass(s.lane), true; }
-      bool operator()(const shared::Solo& s) const { return c.solo_pass(s.lane), true; }
-      bool operator()(const shared::Rows& r) const { return c.rows_pass(r.rows), true; }
+      bool operator()(const shared::Sweep& s) const { c.sweep_pass(s.lane); return true; }
+      bool operator()(const shared::Solo& s) const { c.solo_pass(s.lane); return true; }
+      bool operator()(const shared::Rows& r) const { c.rows_pass(r.rows); return true; }
     };
     return std::visit(Run{*this}, next.value());
   } catch (...) {
@@ -265,7 +271,7 @@ void Conversation::guarded(lane::LaneId lane, const std::function<void()>& pass)
   try {
     pass();
   } catch (const NonFinite& e) {
-    auto& q = requests_.at(static_cast<size_t>(lane.index()));
+    auto& q = slot(lane);
     const auto failed = std::move(q->ev.failed);
     q.reset();
     sessions_ = rewind::released(rewind::forgot(std::move(sessions_), lane), lane);
@@ -330,8 +336,12 @@ void Conversation::begin_reply(lane::LaneId lane, std::span<const float> prompt_
                q.reused, q.resumed.c_str(), total - q.reused, q.marked.c_str(), prompt_ms,
                1000.0 * static_cast<double>(total - q.reused) / std::max(prompt_ms, 1e-9), lane.index());
   q.ev.prompt_end(prompt_logits);
-  q.writing = Writing{reply::start(limits(q)), std::nullopt, q.g.prompt, 0, 0, static_cast<int64_t>(total), 0,
-                      prompt_ms,               now_ms(),     m_.residency->stats()};
+  q.writing = Writing{.r = reply::start(limits(q)),
+                      .seen = q.g.prompt,
+                      .p = static_cast<int64_t>(total),
+                      .prompt_ms = prompt_ms,
+                      .t1_ms = now_ms(),
+                      .before = m_.residency->stats()};
   Writing& w = *q.writing;
   w.anchor = next_token(q, prompt_logits);
   if (const auto end = write(q, w.anchor, w.p)) finish(lane, *end);
@@ -423,7 +433,7 @@ void Conversation::solo_pass(lane::LaneId lane) {
 }
 
 void Conversation::finish(lane::LaneId lane, reply::Finish how) {
-  auto& held = requests_.at(static_cast<size_t>(lane.index()));
+  auto& held = slot(lane);
   const Request& q = *held;
   wire::Done d{0, q.g.prompt.size(), now_ms() - q.t0_ms, 0.0, how, 0, 0, q.reused};  // ended while reading its prompt
   if (q.writing) {

@@ -214,13 +214,10 @@ uint32_t next_buffer(const Sessions& s, lane::LaneId lane, uint32_t buffers) {
   auto spared = [&](const Point& p) {
     return std::any_of(lanes.begin(), lanes.end(), [&](lane::LaneId id) { return id != lane && s.turn_point(id) == p.buffer; });
   };
-  const Point* oldest = nullptr;
-  for (const bool sparing : {true, false}) {
-    for (const Point& p : s.points_)
-      if (!(sparing && spared(p)) && (oldest == nullptr || p.used < oldest->used)) oldest = &p;
-    if (oldest != nullptr) break;
-  }
-  return oldest->buffer;
+  // The least recently used of the points not spared; all spared: of them all.
+  return std::min_element(s.points_.begin(), s.points_.end(), [&](const Point& a, const Point& b) {
+           return std::pair(spared(a), a.used) < std::pair(spared(b), b.used);
+         })->buffer;
 }
 
 Sessions forgot(Sessions s, lane::LaneId lane) {

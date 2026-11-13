@@ -8,6 +8,7 @@
 //   ds4n-serve-check --backbone B --store S --gguf G --tokens FILE --system FILE [--dspark DIR]
 //                    [--expect LOGPROBS] [--slots N] [--ram-records R] [--prior P] [--ram-policy P]
 //                    [--timing FILE] [--long FILE,FILE,... [--long-tokens N]] [--lanes N] [--sweep-slots N]
+//                    [--split-min N]
 //
 // FILE (--tokens) is an antirez --dump-tokens prompt (ids on the first line); --system a long one
 // whose first 3,000 tokens stand for a system prompt that several conversations share. --expect
@@ -22,6 +23,9 @@
 // for), a subagent borrowing the prefix a busy Lane holds, a STOP for one of several, more
 // conversations than Lanes, a GEN that finds every Lane busy. Mix invariance: each must give the bits
 // its prompt gives cold and alone -- where, alone, DSpark drafts and here plain rows are shared.
+//
+// --split-min N (default 2,048, ds4n-serve's): 0 gives every prompt a Rewind point where it leaves what
+// the engine knows, at its resume too.
 //
 // Each scenario runs its requests on one Conversation -- back to back, or a group of them at once --
 // so they resume in place, take checkpoints back and restore Rewind points as a server's would, then
@@ -69,14 +73,19 @@ struct Outcome {
   wire::Done done;
 };
 
+/** The events that record a request's tokens and prompt-end logits into `o` (its `done` is the caller's). */
+engine::ReplyEvents recording(Outcome& o) {
+  engine::ReplyEvents ev;
+  ev.token = [&o](int32_t t) { o.tokens.push_back(t); };
+  ev.note = [](const std::string& n) { std::printf("  note: %s\n", n.c_str()); };
+  ev.prompt_end = [&o](std::span<const float> logits) { o.logits.assign(logits.begin(), logits.end()); };
+  return ev;
+}
+
 Outcome run(engine::Conversation& c, const std::vector<int32_t>& prompt, int64_t max_new, const sample::Sampling& s,
             bool spec) {
   Outcome o;
-  engine::ReplyEvents ev;
-  ev.token = [&](int32_t t) { o.tokens.push_back(t); };
-  ev.note = [](const std::string& n) { std::printf("  note: %s\n", n.c_str()); };
-  ev.prompt_end = [&](std::span<const float> logits) { o.logits.assign(logits.begin(), logits.end()); };
-  o.done = c.run({max_new, s, std::nullopt, spec, prompt}, ev);
+  o.done = c.run({max_new, s, std::nullopt, spec, prompt}, recording(o));
   return o;
 }
 
@@ -119,10 +128,7 @@ void together(engine::Conversation& c, std::span<Request> group) {
       Request& r = group[k];
       Flight& f = flights[k];
       if (!f.lane && r.join <= passes) {
-        engine::ReplyEvents ev;
-        ev.token = [&r](int32_t t) { r.warm.tokens.push_back(t); };
-        ev.note = [](const std::string& n) { std::printf("  note: %s\n", n.c_str()); };
-        ev.prompt_end = [&r](std::span<const float> logits) { r.warm.logits.assign(logits.begin(), logits.end()); };
+        engine::ReplyEvents ev = recording(r.warm);
         ev.done = [&r, &f](const wire::Done& d) {
           r.warm.done = d;
           f.ended = true;
@@ -186,6 +192,7 @@ int main(int argc, char** argv) {
   engine::FullModelConfig mc;
   std::string tokens_path, system_path, expect_path, timing_path, long_paths;
   size_t long_tokens = 240000;
+  size_t split_min = rewind::Settings{}.split_min;
   for (int i = 1; i < argc; i++) {
     const std::string a = argv[i];
     if (i + 1 >= argc) die("missing value for " + a);
@@ -209,6 +216,7 @@ int main(int argc, char** argv) {
     else if (a == "--timing") timing_path = v;
     else if (a == "--long") long_paths = v;
     else if (a == "--long-tokens") long_tokens = std::stoul(v);
+    else if (a == "--split-min") split_min = std::stoul(v);
     else if (a == "--lanes") {
       const auto lanes = lane::LaneCount::of(std::stoll(v));
       if (!lanes) die("--lanes: " + lanes.error().what);
@@ -220,7 +228,7 @@ int main(int argc, char** argv) {
     die("usage: ds4n-serve-check --backbone B --store S --gguf G --tokens FILE --system FILE [--dspark DIR] [--expect LOGPROBS]");
   engine::FullModel m = engine::load_full_model(mc);
   const std::vector<int32_t> stops = {m.eos, 128803};
-  const rewind::Settings keep{1024, 2048};
+  const rewind::Settings keep{1024, split_min};
   const size_t lanes = static_cast<size_t>(mc.lanes.value());
   const uint32_t points = std::max<uint32_t>(8, static_cast<uint32_t>(lanes) + 1);  // more than Lanes: rewind::next_buffer
   engine::Conversation conv(m, {points, 6ull << 30, keep, 64, stops});

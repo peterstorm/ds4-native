@@ -307,7 +307,8 @@ Rounds, per-Lane sweeps, rings, checkpoints and borrows); `engine/conversation` 
   queued in order and taken between passes; with nothing in flight the loop waits for one. A `GEN`
   naming no rid that finds every Lane busy waits its turn (an engine of one Lane is the queue it was).
 - **3.1: more Rewind points than Lanes is enforced in `tools/serve`**: the default becomes
-  `max(8, lanes + 1)`, and an explicit `--rewind-points` of 1..lanes is refused (0 still means none).
+  `max(8, lanes + 1)`, and with more than one Lane an explicit `--rewind-points` of 1..lanes is refused
+  (0 still means none; one Lane has no other Lane's turn to spare, so any count serves it).
 - **3.2 as planned**: non-finite logits at a request's pick fail that request (`ERR <rid>`,
   `DONE <rid> … cancel`) and forget its Lane; any other failure fails every request in flight and ends
   the engine (exit 2).

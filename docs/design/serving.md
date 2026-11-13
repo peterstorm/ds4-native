@@ -242,10 +242,11 @@ checkpoint's `tokenizer.json`); `--launch` writes the server's config and starts
 the shared inference key; `--stop` stops it. Settings: 8,400 Slots (8,500 does not fit beside
 DSpark and the 256K caches), 3,000 RAM tier records as a victim tier (`--ram-policy victim`: the Slots' evictions copied down, forward-pass.md; 48 of the Slots spares), Maya's Expert profile, `--sweep-min 96`,
 6 GB of checkpoints and 8 Rewind points (with the server loaded ~13 GB of the 91 stay free).
-`--lanes N` (not set by the profile yet: one Lane) takes ~78 Slots a Lane beyond the first: 8,322
-Slots at 2, 8,166 at 4 (both measured to fit), and at least N + 1 Rewind points. Not set by the
-profile yet either, both measured (Concurrent Sessions): `--ram-records 3400` (~7 % more tok/s; ~8 GiB
-of host memory then stay free) and `--sweep-slots 384` with 128 more `--slots`.
+`--lanes N` takes ~78 Slots a Lane beyond the first: 8,322 Slots at 2, 8,166 at 4 (both measured to
+fit), and at least N + 1 Rewind points. Since 2026-11-13 the profile runs `--lanes 4` with
+`--ram-records 3400` (~7 % more tok/s; ~6-8 GiB of host memory then stay free) and `--sweep-slots 384`
+with 128 more `--slots` (8,294): three reviewers at once measured 112.8 tok/s together and all done in
+63 s, against ~85 s taking turns, their replies byte-identical to the one-Lane engine's.
 The server runs with `--fit-max-tokens`: a request whose max_tokens does not fit the 256K context
 beside its prompt gets the room there is.
 
