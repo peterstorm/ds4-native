@@ -60,7 +60,7 @@ FullModel load_full_model(const FullModelConfig& c) {
   const Backbone backbone = take(open_backbone(c.backbone), c.backbone);
   m.decoder = std::make_unique<Decoder>(std::array<int, 2>{0, 1},
                                         std::array<cuda::ExpertDirectory, 2>{m.residency->directory(0), m.residency->directory(1)},
-                                        Launches::Graphs, c.sweep_rounds, c.lanes);
+                                        Launches::Graphs, c.sweep_rounds, c.lanes, c.round_graph_bytes);
   for (int l = 0; l < model::kLayers; l++) m.decoder->add_layer(take(load_layer(backbone, l), "layer " + std::to_string(l)));
   {
     const HostHead h = take(load_head(backbone), "head");

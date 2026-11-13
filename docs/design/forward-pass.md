@@ -196,8 +196,15 @@ group mask), and a whole Round as one graph per (rows, group mask). The group ma
 is all that decides which launches a step records (a KV source's compress and index-key launches
 exist only for rows that complete a group). One Session's Round has two masks per width -- the two
 parities of p0, the shapes the engine always had -- and a Shared Round whichever its rows'
-positions give; the Lanes themselves are device values, so one graph serves rows of any Lanes. No
-captured launch takes a
+positions give; the Lanes themselves are device values, so one graph serves rows of any Lanes.
+A Shared Round's mask is free, so whole Rounds have 510 shapes, and a graph holds device memory until
+it is destroyed (measured 2026-11-13: the warm-up's 38 take 250 MiB a GPU, ~6.6 MiB each). Uncapped,
+a few hours of 3-4 requests at once filled the last gigabyte and `cudaGraphInstantiate` ran out of
+memory. `core/round_graphs` keeps them within a budget (`--round-graphs-mb`, 512 MiB a GPU): past it
+the least recently launched are destroyed, after a sync, and captured again when their shape comes
+back; when a GPU has no room for a new one, every other Round graph goes first. Placement only
+(`ds4n-serve-check --lanes 4 --round-graphs-mb 0`, a capture for nearly every Round: 69 pass, 0 fail).
+No captured launch takes a
 per-Round host value: `begin_round(p0)` uploads the Round's `model::RoundIndex` (per row:
 position, latent positions, ring slot, compressed lengths and rows per ratio) and the rows'
 window slots, and kernels read them as `cuda::IntArg` device arguments -- launches are sized for

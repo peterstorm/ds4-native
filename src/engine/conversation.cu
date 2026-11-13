@@ -503,6 +503,10 @@ void Conversation::warm_up() {
       round(feeds);
     }
   m_.decoder->sync();
+  const RoundGraphStats graphs = m_.decoder->round_graph_stats();
+  std::fprintf(stderr, "ds4n-serve: Round graphs: %zu kept after the warm-up, %.0f MiB a GPU (%llu captured, %llu dropped for the budget)\n",
+               graphs.kept, static_cast<double>(graphs.bytes) / (1 << 20), static_cast<unsigned long long>(graphs.captured),
+               static_cast<unsigned long long>(graphs.dropped));
   sessions_ = rewind::Sessions(lanes());  // nothing the throwaway prompt left is kept
   stored_.clear();
 }

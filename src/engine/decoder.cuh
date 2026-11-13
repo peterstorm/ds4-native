@@ -18,7 +18,9 @@
 // own: nothing a row computes depends on the rows beside it.
 //
 // Each layer step replays as a CUDA graph captured on first use, per (layer,
-// rows, which rows complete a ratio-2 group: model::group_mask).
+// rows, which rows complete a ratio-2 group: model::group_mask). Whole Rounds'
+// graphs are kept within a budget of device memory (core/round_graphs: Shared
+// Rounds have 510 shapes, and a graph holds memory until it is destroyed).
 // Nothing a graph launches takes a per-step host value: begin_round uploads the
 // Round's model::RoundIndex (positions, Lanes, ring slots, cache lengths and rows),
 // which kernels read when they run, and stages both Engram tables' rows in
@@ -56,6 +58,7 @@
 #include "core/layer_weights.hpp"
 #include "core/model.hpp"
 #include "core/moe_plan.hpp"
+#include "core/round_graphs.hpp"
 #include "cuda/resolve.cuh"
 #include "engine/device_layer.cuh"
 #include "engine/host_layer.hpp"
@@ -100,6 +103,16 @@ struct DraftBlock {
 
 /** How the decoder issues a layer step's kernels. */
 enum class Launches { Graphs, Eager };
+
+/** The device memory a GPU's Round graphs may hold together (core/round_graphs), by default. */
+constexpr uint64_t kRoundGraphBytes = 512ull << 20;
+
+/** The Round graphs a GPU holds, and how many were captured and destroyed for the budget so far. */
+struct RoundGraphStats {
+  size_t kept = 0;
+  uint64_t bytes = 0;  // the most either GPU's free memory fell by, summed over the kept graphs
+  uint64_t captured = 0, dropped = 0;
+};
 
 /**
  * A Rewind point's rings (core/rewind): both GPUs' window rings of the target's layers, their
@@ -171,10 +184,12 @@ class Decoder {
   /**
    * Two devices with peer access to each other, and each one's view of the Expert cache.
    * `chunk_rounds`: the Rounds of 8 a prompt sweep (prefill) takes at once; 0 for none. `lanes`: the
-   * Sessions' caches it holds at once (~730 MiB a GPU each at the full context).
+   * Sessions' caches it holds at once (~730 MiB a GPU each at the full context). `round_graph_bytes`:
+   * the device memory a GPU's Round graphs may hold together (the least recently launched are
+   * destroyed past it, and captured again when a Round of their Shape comes back).
    */
   Decoder(std::array<int, 2> devices, std::array<cuda::ExpertDirectory, 2> experts, Launches launches = Launches::Graphs,
-          int chunk_rounds = 0, lane::LaneCount lanes = {});
+          int chunk_rounds = 0, lane::LaneCount lanes = {}, uint64_t round_graph_bytes = kRoundGraphBytes);
   ~Decoder();
   Decoder(const Decoder&) = delete;
   Decoder& operator=(const Decoder&) = delete;
@@ -249,6 +264,10 @@ class Decoder {
 
   /** Wait until both GPUs finished everything launched so far. */
   void sync();
+
+  RoundGraphStats round_graph_stats() const {
+    return {round_shapes_.count(), round_shapes_.bytes(), round_graphs_captured_, round_graphs_dropped_};
+  }
 
   /** A snapshot sized for this decoder's rings (after every add_layer and add_draft); its contents unset. */
   WindowSnapshot window_snapshot();
@@ -354,8 +373,18 @@ class Decoder {
   void transfer(const WindowSnapshot& w, bool to_host, lane::LaneId lane);
   /** `lane`, or a throw when this decoder has no such Lane. */
   int checked(lane::LaneId lane) const;
+  /**
+   * Capture the current Round's graph on both GPUs and keep it, destroying the least recently
+   * launched past the budget. When a GPU has no room to instantiate it, every other Round graph goes
+   * first; a throw when it does not fit even then.
+   */
+  void capture_round(round_graphs::Shape shape);
+  /** Destroy `shapes`' graphs on both GPUs, after everything launched so far (one may be in flight). */
+  void destroy_round_graphs(std::span<const round_graphs::Shape> shapes);
   std::array<std::unique_ptr<Gpu>, 2> gpus_;
   Launches launches_;
+  round_graphs::Kept round_shapes_;
+  uint64_t round_graphs_captured_ = 0, round_graphs_dropped_ = 0;
   lane::LaneCount lanes_;
   int rows_ = 0;
   int group_mask_ = 0;  // the current Round's model::group_mask

@@ -20,6 +20,8 @@
 #include <vector>
 
 #include "core/model.hpp"
+#include "core/result.hpp"
+#include "core/round_graphs.hpp"
 #include "core/moe_groups.hpp"
 #include "core/moe_reference.hpp"
 #include "core/mx_tiles.hpp"
@@ -189,9 +191,12 @@ static_assert(kMaxRows == moe::kMaxTokens && kMaxRows == cuda::kMaxTokens, "a Ro
 static_assert(static_cast<size_t>(kMaxRows) * cuda::kEngramKvRows <= static_cast<size_t>(cuda::kExchangeMaxBlocks) * cuda::kExchangeChunk,
               "a Round's largest exchange (its Engram KV) fits the kernel exchange's inbox");
 
-/** What `enqueue` puts on `stream`, captured as an executable graph (nothing runs). */
+/**
+ * What `enqueue` puts on `stream`, captured as an executable graph (nothing runs), or the error
+ * instantiating it gave (cudaErrorMemoryAllocation: the device has no room for it).
+ */
 template <class Enqueue>
-cudaGraphExec_t capture(cudaStream_t stream, Enqueue&& enqueue) {
+Result<cudaGraphExec_t, cudaError_t> try_capture(cudaStream_t stream, Enqueue&& enqueue) {
   check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "cudaStreamBeginCapture");
   try {
     enqueue();
@@ -206,8 +211,16 @@ cudaGraphExec_t capture(cudaStream_t stream, Enqueue&& enqueue) {
   cudaGraphExec_t exec = nullptr;
   const cudaError_t e = cudaGraphInstantiate(&exec, graph, 0);
   cudaGraphDestroy(graph);
-  check(e, "cudaGraphInstantiate");
-  return exec;
+  if (e != cudaSuccess) return Result<cudaGraphExec_t, cudaError_t>::err(e);
+  return Result<cudaGraphExec_t, cudaError_t>::ok(exec);
+}
+
+/** `try_capture`, or a throw. */
+template <class Enqueue>
+cudaGraphExec_t capture(cudaStream_t stream, Enqueue&& enqueue) {
+  const auto exec = try_capture(stream, std::forward<Enqueue>(enqueue));
+  if (!exec) check(exec.error(), "cudaGraphInstantiate");
+  return exec.value();
 }
 
 }  // namespace detail
@@ -264,9 +277,10 @@ struct Decoder::Gpu {
   cuda::ExchangeLink link{};
   std::map<int, DeviceLayer> layers;
   std::map<int, LayerLaunches> launches;
-  // Captured layer steps by (layer, rows, model::group_mask, mode), and whole Rounds by (rows, group mask).
+  // Captured layer steps by (layer, rows, model::group_mask, mode), and whole Rounds by Shape: the
+  // ones Decoder's round_graphs::Kept names, on both GPUs alike.
   std::map<std::tuple<int, int, int, StepMode>, cudaGraphExec_t> graphs;
-  std::map<std::pair<int, int>, cudaGraphExec_t> round_graphs;
+  std::map<round_graphs::Shape, cudaGraphExec_t> round_graphs;
   cuda::ExpertDirectory experts{};  // this GPU's view of the Expert cache
   cuda::ResolvedMoe resolved{};
   // The stream between layers, per row: h in, h_next after Engram, h_mid after attention, back to h after the FFN.

@@ -366,5 +366,8 @@ turns, it holds the queue). DSpark gains little in shared Rounds: each Session d
 - **While sharing**: no DSpark (only a Lane writing alone drafts); a prompt sweep holds the GPUs,
   the other Lanes pausing for its whole piece; `--slots` is not sized from the Lanes (the Ledger is
   not wired: give ~78 fewer a Lane); `STAT` is the engine's, not a request's.
+- **Round graphs are kept within a budget** (`--round-graphs-mb`, 512 MiB a GPU; forward-pass.md,
+  Graph replay): VRAM the Slots must leave free. A shape outside it is captured again when it
+  returns, a few ms once.
 - **Checkpoints live in RAM only**: they do not outlast the engine (Maya's also go to a folder).
 - **262,144-token context** (kMaxCompressed), text only.

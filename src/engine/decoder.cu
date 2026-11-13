@@ -3,8 +3,8 @@
 namespace ds4n::engine {
 
 Decoder::Decoder(std::array<int, 2> devices, std::array<cuda::ExpertDirectory, 2> experts, Launches launches,
-                 int chunk_rounds, lane::LaneCount lanes)
-    : launches_(launches), lanes_(lanes) {
+                 int chunk_rounds, lane::LaneCount lanes, uint64_t round_graph_bytes)
+    : launches_(launches), round_shapes_(round_graph_bytes), lanes_(lanes) {
   const char* loading = std::getenv("CUDA_MODULE_LOADING");
   if (loading == nullptr || std::string(loading) != "EAGER")
     throw CudaError("the two-GPU decoder needs CUDA_MODULE_LOADING=EAGER set before CUDA initializes");
@@ -714,25 +714,72 @@ void Decoder::decode_round() {
   if (rows_ == 0) throw CudaError("decode_round before begin_round");
   const bool any_engram = gpus_[0]->layers.contains(kEngramLayers[0]) || gpus_[0]->layers.contains(kEngramLayers[1]);
   if (any_engram && !engram_staged_) throw CudaError("an Engram layer needs the Round's Engram rows (begin_round)");
-  const std::pair<int, int> key{rows_, group_mask_};
+  const round_graphs::Shape shape{rows_, group_mask_};
+  if (launches_ == Launches::Graphs && !round_shapes_.launched(shape)) capture_round(shape);
   for (auto& gp : gpus_) {
     Gpu& s = *gp;
     check(cudaSetDevice(s.device), "cudaSetDevice");
-    if (launches_ == Launches::Graphs && !s.round_graphs.contains(key))
-      s.round_graphs[key] = capture(s.stream, [&] {
-        for (const auto& [layer, d] : s.layers)
-          if (layer < kLayers) s.enqueue_layer(layer, rows_, group_mask_);  // DSpark stages run in draft()
-      });
-  }
-  for (auto& gp : gpus_) {
-    Gpu& s = *gp;
-    check(cudaSetDevice(s.device), "cudaSetDevice");
-    if (launches_ == Launches::Graphs) check(cudaGraphLaunch(s.round_graphs.at(key), s.stream), "cudaGraphLaunch");
+    if (launches_ == Launches::Graphs) check(cudaGraphLaunch(s.round_graphs.at(shape), s.stream), "cudaGraphLaunch");
     else
       for (const auto& [layer, d] : s.layers)
         if (layer < kLayers) s.enqueue_layer(layer, rows_, group_mask_);
     for (int t = 0; t < 2; t++)
       if (s.layers.contains(kEngramLayers[t])) check(cudaEventRecord(s.staged_rows[t], s.stream), "cudaEventRecord");
+  }
+}
+
+void Decoder::capture_round(round_graphs::Shape shape) {
+  // The bytes the graph took (the most either GPU's free memory fell by), or nothing when a GPU had
+  // no room for it: then neither GPU keeps one.
+  const auto attempt = [&]() -> std::optional<uint64_t> {
+    uint64_t bytes = 0;
+    for (auto& gp : gpus_) {
+      Gpu& s = *gp;
+      check(cudaSetDevice(s.device), "cudaSetDevice");
+      size_t before = 0, after = 0, total = 0;
+      check(cudaMemGetInfo(&before, &total), "cudaMemGetInfo");
+      const auto exec = try_capture(s.stream, [&] {
+        for (const auto& [layer, d] : s.layers)
+          if (layer < kLayers) s.enqueue_layer(layer, shape.rows, shape.group_mask);  // DSpark stages run in draft()
+      });
+      if (!exec) {
+        if (exec.error() != cudaErrorMemoryAllocation) check(exec.error(), "cudaGraphInstantiate");
+        destroy_round_graphs(std::array{shape});
+        return std::nullopt;
+      }
+      s.round_graphs[shape] = exec.value();
+      check(cudaMemGetInfo(&after, &total), "cudaMemGetInfo");
+      bytes = std::max<uint64_t>(bytes, before > after ? before - after : 0);
+    }
+    return bytes;
+  };
+  std::optional<uint64_t> bytes = attempt();
+  if (!bytes) {
+    const std::vector<round_graphs::Shape> others = round_shapes_.dropped();
+    std::fprintf(stderr, "ds4n: no device memory for a Round graph (%d rows, mask %d): the %zu kept go\n", shape.rows,
+                 shape.group_mask, others.size());
+    destroy_round_graphs(others);
+    round_graphs_dropped_ += others.size();
+    bytes = attempt();
+  }
+  if (!bytes) throw CudaError("cudaGraphInstantiate: out of memory with no other Round graph kept");
+  round_graphs_captured_++;
+  const std::vector<round_graphs::Shape> gone = round_shapes_.captured(shape, *bytes);
+  destroy_round_graphs(gone);
+  round_graphs_dropped_ += gone.size();
+}
+
+void Decoder::destroy_round_graphs(std::span<const round_graphs::Shape> shapes) {
+  if (shapes.empty()) return;
+  sync();
+  for (auto& gp : gpus_) {
+    Gpu& s = *gp;
+    check(cudaSetDevice(s.device), "cudaSetDevice");
+    for (const round_graphs::Shape shape : shapes)
+      if (const auto it = s.round_graphs.find(shape); it != s.round_graphs.end()) {
+        check(cudaGraphExecDestroy(it->second), "cudaGraphExecDestroy");
+        s.round_graphs.erase(it);
+      }
   }
 }
 
@@ -824,6 +871,7 @@ void Decoder::add_draft(const HostDraft& w, std::span<const float> noise_embeddi
     for (auto& [key, exec] : s.round_graphs) check(cudaGraphExecDestroy(exec), "cudaGraphExecDestroy");
     s.graphs.clear();
     s.round_graphs.clear();
+    round_shapes_.dropped();
     const size_t feature_elems = static_cast<size_t>(s.lanes) * Gpu::kFeatureStride;
     for (bf16*& f : dr.features) {
       f = a.alloc<bf16>(feature_elems);

@@ -26,6 +26,7 @@ struct FullModelConfig {
   RamPolicy ram_policy = RamPolicy::Recent;
   int sweep_rounds = kSweepRounds;  // a prompt sweep's chunk (Rounds of 8)
   lane::LaneCount lanes{};          // Sessions on the GPUs at once (each ~730 MiB a GPU: that many fewer Slots fit)
+  uint64_t round_graph_bytes = kRoundGraphBytes;  // the device memory a GPU's Round graphs may hold (core/round_graphs)
 };
 
 struct FullModel {

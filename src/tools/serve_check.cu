@@ -7,7 +7,7 @@
 //
 //   ds4n-serve-check --backbone B --store S --gguf G --tokens FILE --system FILE [--dspark DIR]
 //                    [--expect LOGPROBS] [--slots N] [--ram-records R] [--prior P] [--ram-policy P]
-//                    [--timing FILE] [--long FILE,FILE,... [--long-tokens N]] [--lanes N] [--sweep-slots N]
+//                    [--timing FILE] [--long FILE,FILE,... [--long-tokens N]] [--lanes N] [--sweep-slots N] [--round-graphs-mb N]
 //                    [--split-min N]
 //
 // FILE (--tokens) is an antirez --dump-tokens prompt (ids on the first line); --system a long one
@@ -204,6 +204,7 @@ int main(int argc, char** argv) {
     else if (a == "--slots") mc.slots = static_cast<uint32_t>(std::stoul(v));
     else if (a == "--ram-records") mc.ram_records = static_cast<uint32_t>(std::stoul(v));
     else if (a == "--sweep-slots") mc.sweep_slots = static_cast<uint32_t>(std::stoul(v));
+    else if (a == "--round-graphs-mb") mc.round_graph_bytes = std::stoull(v) << 20;
     else if (a == "--prior") mc.prior = v;
     else if (a == "--ram-policy") {
       const auto policy = engine::ram_policy_named(v);

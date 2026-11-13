@@ -6,10 +6,13 @@
 //   ds4n-serve --serve --backbone B --store S --gguf G [--dspark DIR] [--slots N] [--ram-records R]
 //              [--lanes N] [--prior PROFILE] [--ram-policy recent|popular|victim] [--rewind-points N]
 //              [--sweep-min N] [--checkpoint-gb G] [--keep-min N] [--split-min N] [--stops 1,128803]
-//              [--sweep-slots N]
+//              [--sweep-slots N] [--round-graphs-mb N]
 //
 // --sweep-slots N (default 512, at least 384): the Slots prompt sweeps load into, VRAM that --slots
 // cannot use; fewer of them leave room for that many more --slots.
+// --round-graphs-mb N (default 512): the device memory a GPU's captured Round graphs may hold
+// together; past it the least recently launched are destroyed and captured again when needed
+// (core/round_graphs). VRAM that --slots must leave free.
 //
 // Requests from any of the conversations it keeps (engine/conversation): an agent's tool loop and a
 // chat's next turn read only their new tokens; a conversation another one took a Lane from comes
@@ -165,6 +168,7 @@ int main(int argc, char** argv) {
     else if (a == "--slots") mc.slots = static_cast<uint32_t>(std::stoul(v));
     else if (a == "--ram-records") mc.ram_records = static_cast<uint32_t>(std::stoul(v));
     else if (a == "--sweep-slots") mc.sweep_slots = static_cast<uint32_t>(std::stoul(v));
+    else if (a == "--round-graphs-mb") mc.round_graph_bytes = std::stoull(v) << 20;
     else if (a == "--lanes") {
       const auto lanes = lane::LaneCount::of(std::stoll(v));
       if (!lanes) die("--lanes: " + lanes.error().what);
