@@ -1,0 +1,43 @@
+{
+  "exe": "/models/ds41/native/mix/bench/bin/ds4n-serve-lanes",
+  "args": [
+    "--backbone",
+    "/models/ds41/native/warmind/backbone.safetensors",
+    "--store",
+    "/models/ds41/native/experts.ds4n",
+    "--gguf",
+    "/models/ds41/engram/DeepSeek-V4.1-Flash-1017-MXFP4.gguf",
+    "--dspark",
+    "/models/ds41/hf-1017-mtp",
+    "--slots",
+    "8322",
+    "--ram-records",
+    "3000",
+    "--prior",
+    "/models/ds41/baseline/maya-expert-profile.bin",
+    "--ram-policy",
+    "victim",
+    "--lanes", "2", "--sweep-min",
+    "96",
+    "--checkpoint-gb",
+    "6",
+    "--rewind-points",
+    "8"
+  ],
+  "cwd": "/models/ds41/native/serve",
+  "tokenizer": "/models/ds41/native/serve/tokenizer",
+  "model_name": "warmind-1017-native",
+  "gpu": [
+    0,
+    1
+  ],
+  "sampling": {
+    "temperature": 1.0,
+    "top_p": 1.0
+  },
+  "reasoning_effort": "high",
+  "thinking_budget": 262144,
+  "port": 8011,
+  "host": "0.0.0.0",
+  "log": "/models/ds41/native/mix/bench/lanes2/server.log"
+}

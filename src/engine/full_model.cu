@@ -7,6 +7,7 @@
 #include <stdexcept>
 
 #include "core/expert_cache.hpp"
+#include "core/store_layout.hpp"
 #include "io/file.hpp"
 
 namespace ds4n::engine {
@@ -39,28 +40,35 @@ FullModel load_full_model(const FullModelConfig& c) {
     if (!f && !f.eof()) throw std::runtime_error("cannot read " + c.prior);
     prior = take(cache::ExpertCache::prior_from_profile(std::as_bytes(std::span(raw)), cache::Policy{}, 1), c.prior);
   }
+  // The decoder's sweep places a layer's Experts while the layer runs (decoder_sweep): the scratch
+  // Slots hold all 384 a layer can route to, or a placement would evict one its own layer reads.
+  if (c.sweep_slots < store::kExperts)
+    throw std::runtime_error("sweep Slots: " + std::to_string(c.sweep_slots) + " given, at least " + std::to_string(store::kExperts) +
+                             " (the Experts one layer's sweep can read)");
   ResidencyConfig rc;
   rc.store_path = c.store;
   rc.slots = c.slots;
   rc.ram_records = c.ram_records;
+  rc.sweep_slots = c.sweep_slots;
   rc.prior = std::move(prior);
   rc.ram_policy = c.ram_policy;
   m.residency = ExpertResidency::open(rc);
-  std::fprintf(stderr, "ds4n: Expert cache: %u Slots warm in %.1f s, RAM tier %u records\n", c.slots,
-               m.residency->stats().warm_ms / 1e3, c.ram_records);
+  std::fprintf(stderr, "ds4n: Expert cache: %u Slots warm in %.1f s (and %u for prompt sweeps), RAM tier %u records\n", c.slots,
+               m.residency->stats().warm_ms / 1e3, c.sweep_slots, c.ram_records);
 
   const auto t_load = Clock::now();
   const Backbone backbone = take(open_backbone(c.backbone), c.backbone);
   m.decoder = std::make_unique<Decoder>(std::array<int, 2>{0, 1},
                                         std::array<cuda::ExpertDirectory, 2>{m.residency->directory(0), m.residency->directory(1)},
-                                        Launches::Graphs, c.sweep_rounds);
+                                        Launches::Graphs, c.sweep_rounds, c.lanes);
   for (int l = 0; l < model::kLayers; l++) m.decoder->add_layer(take(load_layer(backbone, l), "layer " + std::to_string(l)));
   {
     const HostHead h = take(load_head(backbone), "head");
     m.decoder->add_head(h.norm, h.head);
   }
   m.embeddings = take(EmbeddingTable::load(backbone), "embedding");
-  std::fprintf(stderr, "ds4n: Backbone: 40 layers, the head and the embedding loaded in %.1f s\n", seconds_since(t_load));
+  std::fprintf(stderr, "ds4n: Backbone: 40 layers, the head and the embedding loaded in %.1f s; %d Lane(s)\n", seconds_since(t_load),
+               c.lanes.value());
 
   if (!c.dspark.empty()) {
     const auto t_draft = Clock::now();

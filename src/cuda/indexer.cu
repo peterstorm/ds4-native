@@ -32,7 +32,8 @@ __device__ __forceinline__ uint8_t fp4_code(float v, float s) {
  * holds element j (low nibble) and j + 16 (high nibble): lanes with L%8 < 4
  * own elements below 16 and take the high nibbles from lane L + 4.
  */
-__global__ void append_kernel(const __nv_bfloat16* __restrict__ keys, IntArg first, int n, uint8_t* __restrict__ cache) {
+__global__ void append_kernel(const __nv_bfloat16* __restrict__ keys, IntArg first, int n, uint8_t* __restrict__ cache,
+                              LaneArg cache_lane) {
   const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
   const int lane = threadIdx.x & 31;
   if (warp >= n) return;
@@ -53,7 +54,7 @@ __global__ void append_kernel(const __nv_bfloat16* __restrict__ keys, IntArg fir
   for (int u = 0; u < 4; u++) mine |= static_cast<uint32_t>(fp4_code(v[u], s)) << (8 * u);
   const uint32_t high = __shfl_down_sync(0xFFFFFFFFu, mine, 4);
   const int64_t pos = first.get() + warp;
-  uint8_t* tile = cache + static_cast<size_t>(pos / 16) * kIndexTileBytes;
+  uint8_t* tile = cache + cache_lane.offset() + static_cast<size_t>(pos / 16) * kIndexTileBytes;
   const int r = static_cast<int>(pos % 16);
   if (sub < 4) *reinterpret_cast<uint32_t*>(tile + code_offset(r, b, sub)) = mine | (high << 4);
   if (sub == 0) tile[scale_offset(r, b)] = static_cast<uint8_t>(exp + 127);
@@ -103,7 +104,8 @@ __global__ void prepare_kernel(const __nv_bfloat16* __restrict__ q, const float*
  */
 __global__ void __launch_bounds__(128) score_kernel(const uint8_t* __restrict__ cache, IntArg length, IndexQueries queries,
                                                     const uint32_t* __restrict__ block_mask, int64_t mask_stride,
-                                                    __nv_bfloat16* __restrict__ scores, int64_t score_stride) {
+                                                    __nv_bfloat16* __restrict__ scores, int64_t score_stride,
+                                                    LaneArg lanes) {
   const int row = blockIdx.y;
   const IndexQuery q = queries.at(row);
   if (block_mask != nullptr) block_mask += row * mask_stride;
@@ -119,7 +121,7 @@ __global__ void __launch_bounds__(128) score_kernel(const uint8_t* __restrict__ 
   const int qq = lane & 3;
   float part_a = 0.0f, part_b = 0.0f;
   if (live0 || live1) {
-    const uint8_t* t = cache + static_cast<size_t>(tile) * kIndexTileBytes;
+    const uint8_t* t = cache + lanes.row(row).offset() + static_cast<size_t>(tile) * kIndexTileBytes;
     const uint4 pair[2] = {*reinterpret_cast<const uint4*>(t + lane * 16),
                            *reinterpret_cast<const uint4*>(t + 512 + lane * 16)};
     const uint32_t s4 = *reinterpret_cast<const uint32_t*>(t + kIndexBlocks * 256 + ((lane >> 2) + 8 * (lane & 1)) * 4);
@@ -197,9 +199,9 @@ __global__ void mark_blocks_kernel(const int32_t* __restrict__ chosen, IntArg bl
 
 }  // namespace
 
-void append_index_keys(const __nv_bfloat16* keys, IntArg first, int n, uint8_t* cache, cudaStream_t stream) {
+void append_index_keys(const __nv_bfloat16* keys, IntArg first, int n, uint8_t* cache, cudaStream_t stream, LaneArg lane) {
   if (n <= 0) return;
-  append_kernel<<<(n * 32 + 127) / 128, 128, 0, stream>>>(keys, first, n, cache);
+  append_kernel<<<(n * 32 + 127) / 128, 128, 0, stream>>>(keys, first, n, cache, lane);
 }
 
 void prepare_index_query(const __nv_bfloat16* q, const float* projection, int splits, int token, IndexQuery out,
@@ -215,16 +217,17 @@ void prepare_index_queries(const __nv_bfloat16* q, const float* projection, int 
 }
 
 void index_scores(const uint8_t* cache, IntArg compress_len, const IndexQuery& q, const uint32_t* block_mask,
-                  __nv_bfloat16* scores, cudaStream_t stream) {
-  index_scores_rows(cache, compress_len, 1, IndexQueries{q.codes, q.scales, q.weights}, block_mask, 0, scores, 0, stream);
+                  __nv_bfloat16* scores, cudaStream_t stream, LaneArg lane) {
+  index_scores_rows(cache, compress_len, 1, IndexQueries{q.codes, q.scales, q.weights}, block_mask, 0, scores, 0, stream, lane);
 }
 
 void index_scores_rows(const uint8_t* cache, IntArg compress_len, int rows, IndexQueries q, const uint32_t* block_masks,
-                       int64_t mask_stride, __nv_bfloat16* scores, int64_t score_stride, cudaStream_t stream) {
+                       int64_t mask_stride, __nv_bfloat16* scores, int64_t score_stride, cudaStream_t stream,
+                       LaneArg lanes) {
   const int64_t tiles = (compress_len.bound() + 15) / 16;
   if (tiles <= 0 || rows <= 0) return;
   score_kernel<<<dim3(static_cast<unsigned>((tiles * 32 + 127) / 128), rows), 128, 0, stream>>>(
-      cache, compress_len, q, block_masks, mask_stride, scores, score_stride);
+      cache, compress_len, q, block_masks, mask_stride, scores, score_stride, lanes);
 }
 
 void candidate_blocks(const __nv_bfloat16* scores, IntArg compress_len, uint32_t* block_mask,

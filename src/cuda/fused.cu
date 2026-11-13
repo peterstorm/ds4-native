@@ -36,7 +36,7 @@ __global__ void __launch_bounds__(kThreads) kv_to_cache_kernel(Planes in, const 
                                                                const float* __restrict__ freqs, int rope_dim,
                                                                const int64_t* __restrict__ positions,
                                                                __nv_bfloat16* __restrict__ cache,
-                                                               const int64_t* __restrict__ slots) {
+                                                               const int64_t* __restrict__ slots, LaneArg lanes) {
   __shared__ float vals[kMaxDim], red[kThreads];
   const int tok = blockIdx.x, dim = in.rows;
   for (int i = threadIdx.x; i < dim; i += kThreads) vals[i] = plane_sum_bf16(in, i, tok);
@@ -47,7 +47,7 @@ __global__ void __launch_bounds__(kThreads) kv_to_cache_kernel(Planes in, const 
   const int tail = dim - rope_dim, t = threadIdx.x;
   if (t < rope_dim / 2) ops::rope_pair(vals[tail + 2 * t], vals[tail + 2 * t + 1], positions[tok], freqs[t], false);
   __syncthreads();
-  __nv_bfloat16* out = cache + static_cast<size_t>(slots[tok]) * dim;
+  __nv_bfloat16* out = cache + lanes.row(tok).offset() + static_cast<size_t>(slots[tok]) * dim;
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   for (int g = warp; g < dim / 32; g += kThreads / 32) {  // FP8 quant-dequant, one warp per group of 32
     const float v = vals[g * 32 + lane];
@@ -199,8 +199,9 @@ void clear_fragments(ActFragments act, int groups, cudaStream_t stream) {
 }
 
 void kv_to_cache(Planes in, int tokens, const __nv_bfloat16* w, float eps, const float* freqs, int rope_dim,
-                 const int64_t* positions, __nv_bfloat16* cache, const int64_t* slots, cudaStream_t stream) {
-  kv_to_cache_kernel<<<tokens, kThreads, 0, stream>>>(in, w, eps, freqs, rope_dim, positions, cache, slots);
+                 const int64_t* positions, __nv_bfloat16* cache, const int64_t* slots, cudaStream_t stream,
+                 LaneArg lanes) {
+  kv_to_cache_kernel<<<tokens, kThreads, 0, stream>>>(in, w, eps, freqs, rope_dim, positions, cache, slots, lanes);
 }
 
 void planes_rope(Planes in, int tokens, int heads, int head_dim, int rope_dim, const float* freqs,

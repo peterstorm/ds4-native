@@ -17,10 +17,13 @@ as `deepseek-v4.1-flash-native` on the desktop's :8000.
 
 `ds4n-serve --serve --backbone … --store … --gguf … [--dspark …]` speaks Project Maya's engine
 protocol on stdin/stdout; Maya's `serve/server.py` (MIT, unmodified, from its checkout) runs it and
-puts the chat template, tool calls and streaming on `/v1`. One request at a time, from any of the
+puts the chat template, tool calls and streaming on `/v1`. Requests come from any of the
 conversations it keeps: an agent's tool loop and a chat's next turn read only their new tokens, a
 conversation another one took the GPUs from comes back from its KV checkpoint in RAM, and a
-subagent resumes where it leaves its parent's system prompt — all Exactly (`ds4n-serve-check`). The
+subagent resumes where it leaves its parent's system prompt — all Exactly (`ds4n-serve-check`).
+One request at a time by default; `--lanes N` runs N at once, their rows sharing Rounds, each Reply
+the bits it is alone (Mix invariance; `docs/design/serving.md`, Concurrent Sessions, for what it
+buys and costs). The
 desktop profile is `scripts/inference/deepseek/ds41-1017-native/run-ds41-1017-native.sh` in the
 dotfiles (`--install` builds the pinned commit, `--launch` starts it).
 

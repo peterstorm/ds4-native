@@ -3,8 +3,8 @@
 namespace ds4n::engine {
 
 Decoder::Decoder(std::array<int, 2> devices, std::array<cuda::ExpertDirectory, 2> experts, Launches launches,
-                 int chunk_rounds)
-    : launches_(launches) {
+                 int chunk_rounds, lane::LaneCount lanes)
+    : launches_(launches), lanes_(lanes) {
   const char* loading = std::getenv("CUDA_MODULE_LOADING");
   if (loading == nullptr || std::string(loading) != "EAGER")
     throw CudaError("the two-GPU decoder needs CUDA_MODULE_LOADING=EAGER set before CUDA initializes");
@@ -22,6 +22,7 @@ Decoder::Decoder(std::array<int, 2> devices, std::array<cuda::ExpertDirectory, 2
     Gpu& s = *gpu;
     s.rank = g;
     s.device = devices[g];
+    s.lanes = lanes.value();
     check(cudaStreamCreateWithFlags(&s.stream, cudaStreamNonBlocking), "cudaStreamCreate");
     for (cudaStream_t& side : s.sides) check(cudaStreamCreateWithFlags(&side, cudaStreamNonBlocking), "cudaStreamCreate");
     for (cudaEvent_t& ev : s.branch) check(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "cudaEventCreate");
@@ -187,15 +188,18 @@ void Decoder::add_layer(const HostLayer& w) {
     l.shared_gate_up = prepare(s.arena, {fp8_job(d.shared_gate, 0, s.act_xf, s.moe.gate_of(shared), kExpertRows, kSplitsExpert),
                                          fp8_job(d.shared_up, 0, s.act_xf, s.moe.up_of(shared), kExpertRows, kSplitsExpert)});
     l.shared_down = prepare(s.arena, {fp8_job(d.shared_down, 0, s.moe.hidden_of(shared), s.moe.down_of(shared), kDim, 1)});
-    // Caches this layer owns.
-    s.window[w.id] = s.arena.alloc<bf16>(static_cast<size_t>(kRing) * kHeadDim);
-    check(cudaMemset(s.window[w.id], 0, static_cast<size_t>(kRing) * kHeadDim * 2), "memset");
+    // Caches this layer owns: every Lane's (a DSpark stage's window is one context, whatever the Lanes).
+    const size_t lanes = w.id < kLayers ? static_cast<size_t>(s.lanes) : 1;
+    const size_t window_elems = lanes * static_cast<size_t>(Gpu::kWindowStride);
+    s.window[w.id] = s.arena.alloc<bf16>(window_elems);
+    check(cudaMemset(s.window[w.id], 0, window_elems * sizeof(bf16)), "memset");
     if (kind.kv_source) {
-      s.compressed[w.id] = s.arena.alloc<bf16>(static_cast<size_t>(kMaxCompressed / kind.compress_ratio) * kHeadDim);
-      s.index_cache[w.id] = s.arena.alloc<uint8_t>(cuda::index_cache_bytes(kMaxCompressed / kind.compress_ratio));
+      s.compressed[w.id] = s.arena.alloc<bf16>(lanes * static_cast<size_t>(Gpu::compressed_stride(w.id)));
+      s.index_cache[w.id] = s.arena.alloc<uint8_t>(lanes * static_cast<size_t>(Gpu::index_stride(w.id)));
       if (kind.compress_ratio == 2) {
-        s.pools[w.id] = {s.arena.alloc<float>(cuda::kPoolRing * kHeadDim), s.arena.alloc<float>(cuda::kPoolRing * kHeadDim)};
-        cuda::init_pool(s.pools[w.id], s.stream);
+        const size_t pool_elems = lanes * static_cast<size_t>(Gpu::kPoolStride);
+        s.pools[w.id] = {s.arena.alloc<float>(pool_elems), s.arena.alloc<float>(pool_elems)};
+        for (int lane = 0; lane < static_cast<int>(lanes); lane++) cuda::init_pool(s.pool_of(w.id, lane), s.stream);
       }
     }
     if (s.chunk.capacity > 0 && w.id < kLayers) {
@@ -209,18 +213,37 @@ void Decoder::add_layer(const HostLayer& w) {
   }
 }
 
-void Decoder::begin_round(int64_t p0, std::span<const float> embeddings, std::span<const uint8_t> engram_rows) {
+int Decoder::checked(lane::LaneId lane) const {
+  if (lane.index() >= lanes_.value()) throw CudaError("Lane " + std::to_string(lane.index()) + ": this decoder has no such Lane");
+  return lane.index();
+}
+
+void Decoder::begin_round(int64_t p0, std::span<const float> embeddings, std::span<const uint8_t> engram_rows, lane::LaneId lane) {
   const size_t rows = embeddings.size() / kDim;
   if (rows < 1 || rows > static_cast<size_t>(kMaxRows) || embeddings.size() != rows * kDim)
     throw CudaError("begin_round: 1 to 8 embedding rows of 5120 values");
-  if (p0 < 0 || p0 + static_cast<int64_t>(rows) > kMaxCompressed)
-    throw CudaError("position outside this executor's compressed capacity");
+  std::array<model::RoundRow, kMaxRows> at;
+  for (size_t r = 0; r < rows; r++) at[r] = {lane, p0 + static_cast<int64_t>(r)};
+  begin_round(std::span<const model::RoundRow>(at.data(), rows), embeddings, engram_rows);
+}
+
+void Decoder::begin_round(std::span<const model::RoundRow> at, std::span<const float> embeddings,
+                          std::span<const uint8_t> engram_rows) {
+  const size_t rows = at.size();
+  const auto index = model::round_index(at);
+  if (!index) throw CudaError(std::string("begin_round: ") + model::what(index.error()));
+  if (embeddings.size() != rows * kDim) throw CudaError("begin_round: 1 to 8 embedding rows of 5120 values");
+  for (const model::RoundRow& row : at) {
+    checked(row.lane);
+    if (row.pos >= kMaxCompressed) throw CudaError("position outside this executor's compressed capacity");
+    // A resume below DSpark's context (a new Session at 0): it is seeded again.
+    if (row.lane == seeded_lane_ && row.pos < seeded_) seeded_ = 0;
+  }
   if (!engram_rows.empty() && engram_rows.size() != rows * kEngramTokenBytes)
     throw CudaError("begin_round: Engram rows must be each row's 2 x 24 rows of 264 bytes");
+  const model::RoundIndex& round = index.value();
   rows_ = static_cast<int>(rows);
-  p0_ = p0;
-  if (p0 < seeded_) seeded_ = 0;  // a resume below DSpark's context (a new Session at 0): it is seeded again
-  const model::RoundIndex round = model::round_index(p0, rows_);
+  group_mask_ = model::group_mask(round);
   engram_staged_ = !engram_rows.empty();
   for (auto& gp : gpus_) {
     Gpu& s = *gp;
@@ -237,7 +260,7 @@ void Decoder::begin_round(int64_t p0, std::span<const float> embeddings, std::sp
       }
     sg.round = round;
     for (size_t r = 0; r < rows; r++) {
-      for (int i = 0; i < kWindow; i++) sg.idx[r][i] = window_slot(p0 + static_cast<int64_t>(r), i);
+      for (int i = 0; i < kWindow; i++) sg.idx[r][i] = window_slot(at[r].pos, i);
       for (int c = 0; c < kHcCopies; c++)
         for (int i = 0; i < kDim; i++) sg.h[r][c * kDim + i] = __float2bfloat16(embeddings[r * kDim + i]);
     }
@@ -256,15 +279,19 @@ void Decoder::sync() {
   }
 }
 
-std::vector<std::pair<std::byte*, size_t>> Decoder::Gpu::rings() {
+std::vector<std::pair<std::byte*, size_t>> Decoder::Gpu::rings(int lane) {
   std::vector<std::pair<std::byte*, size_t>> out;
   for (const auto& [layer, ring] : window)
-    if (layer < kLayers) out.emplace_back(reinterpret_cast<std::byte*>(ring), static_cast<size_t>(kRing) * kHeadDim * sizeof(bf16));
-  for (const auto& [layer, pool] : pools)
+    if (layer < kLayers)
+      out.emplace_back(reinterpret_cast<std::byte*>(window_of(layer, lane)), static_cast<size_t>(kWindowStride) * sizeof(bf16));
+  for (const auto& [layer, unused] : pools) {
+    const cuda::PoolSlots pool = pool_of(layer, lane);
     for (float* half : {pool.kv, pool.score})
-      out.emplace_back(reinterpret_cast<std::byte*>(half), static_cast<size_t>(kPoolRing) * kHeadDim * sizeof(float));
+      out.emplace_back(reinterpret_cast<std::byte*>(half), static_cast<size_t>(kPoolStride) * sizeof(float));
+  }
   if (draft.features[0] != nullptr)
-    for (bf16* f : draft.features) out.emplace_back(reinterpret_cast<std::byte*>(f), static_cast<size_t>(kRing) * kDim * sizeof(bf16));
+    for (size_t t = 0; t < draft.features.size(); t++)
+      out.emplace_back(reinterpret_cast<std::byte*>(feature_of(t, lane)), static_cast<size_t>(kFeatureStride) * sizeof(bf16));
   return out;
 }
 
@@ -275,17 +302,18 @@ WindowSnapshot::~WindowSnapshot() {
 
 WindowSnapshot Decoder::window_snapshot() {
   WindowSnapshot w;
-  for (const auto& [at, n] : gpus_[0]->rings()) w.bytes_ += n;
+  for (const auto& [at, n] : gpus_[0]->rings(0)) w.bytes_ += n;  // every Lane's are the same sizes
   for (std::byte*& h : w.host_) check(cudaHostAlloc(&h, w.bytes_, cudaHostAllocPortable), "cudaHostAlloc");
   return w;
 }
 
-void Decoder::transfer(const WindowSnapshot& w, bool to_host) {
+void Decoder::transfer(const WindowSnapshot& w, bool to_host, lane::LaneId lane) {
+  const int of = checked(lane);
   for (auto& gp : gpus_) {
     Gpu& s = *gp;
     check(cudaSetDevice(s.device), "cudaSetDevice");
     size_t at = 0;
-    for (const auto& [ring, n] : s.rings()) {
+    for (const auto& [ring, n] : s.rings(of)) {
       if (at + n > w.bytes_) throw CudaError("the window snapshot was made for other rings");
       std::byte* host = w.host_[s.rank] + at;
       check(to_host ? cudaMemcpyAsync(host, ring, n, cudaMemcpyDeviceToHost, s.stream)
@@ -296,32 +324,38 @@ void Decoder::transfer(const WindowSnapshot& w, bool to_host) {
   }
 }
 
-std::vector<std::pair<std::byte*, size_t>> Decoder::Gpu::checkpoint_regions(int64_t committed) {
+std::vector<std::pair<std::byte*, size_t>> Decoder::Gpu::kv_regions(int lane, int64_t committed) {
   std::vector<std::pair<std::byte*, size_t>> out;
-  for (const auto& [layer, rows] : compressed) {
+  for (const auto& [layer, unused] : compressed) {
     const int64_t n = committed / model::kind(layer).compress_ratio;  // the rows positions below `committed` completed
-    out.emplace_back(reinterpret_cast<std::byte*>(rows), static_cast<size_t>(n) * kHeadDim * sizeof(bf16));
-    out.emplace_back(reinterpret_cast<std::byte*>(index_cache.at(layer)), cuda::index_cache_bytes(n));
+    out.emplace_back(reinterpret_cast<std::byte*>(compressed_of(layer, lane)), static_cast<size_t>(n) * kHeadDim * sizeof(bf16));
+    out.emplace_back(reinterpret_cast<std::byte*>(index_of(layer, lane)), cuda::index_cache_bytes(n));
   }
-  for (const auto& region : rings()) out.push_back(region);
+  return out;
+}
+
+std::vector<std::pair<std::byte*, size_t>> Decoder::Gpu::checkpoint_regions(int lane, int64_t committed) {
+  std::vector<std::pair<std::byte*, size_t>> out = kv_regions(lane, committed);
+  for (const auto& region : rings(lane)) out.push_back(region);
   return out;
 }
 
 size_t Decoder::checkpoint_bytes(int64_t committed) {
   size_t n = 0;
-  for (const auto& [at, bytes] : gpus_[0]->checkpoint_regions(committed)) n += bytes;
+  for (const auto& [at, bytes] : gpus_[0]->checkpoint_regions(0, committed)) n += bytes;  // every Lane's are the same sizes
   return kGpus * n;
 }
 
-StoredCaches Decoder::checkpoint(int64_t committed) {
+StoredCaches Decoder::checkpoint(int64_t committed, lane::LaneId lane) {
   if (committed < 0 || committed > kMaxCompressed) throw CudaError("checkpoint: position outside the caches");
+  const int of = checked(lane);
   sync();
   StoredCaches c;
   c.committed = committed;
   for (auto& gp : gpus_) {
     Gpu& s = *gp;
     check(cudaSetDevice(s.device), "cudaSetDevice");
-    const auto regions = s.checkpoint_regions(committed);
+    const auto regions = s.checkpoint_regions(of, committed);
     size_t total = 0;
     for (const auto& [at, n] : regions) total += n;
     std::vector<std::byte>& host = c.gpu[s.rank];
@@ -342,14 +376,14 @@ void Decoder::keep_turn(StoredCaches& c, const WindowSnapshot& from) {
   c.turn = std::move(turn);
 }
 
-void Decoder::take_back(const StoredCaches& c, StoredRings rings) {
+void Decoder::take_back(const StoredCaches& c, StoredRings rings, lane::LaneId lane) {
   if (rings == StoredRings::Turn && !c.turn) throw CudaError("take_back: the checkpoint kept no turn");
+  const int of = checked(lane);
   sync();
   for (auto& gp : gpus_) {
     Gpu& s = *gp;
     check(cudaSetDevice(s.device), "cudaSetDevice");
-    auto regions = s.checkpoint_regions(c.committed);
-    if (rings != StoredRings::Own) regions.resize(regions.size() - s.rings().size());
+    const auto regions = rings == StoredRings::Own ? s.checkpoint_regions(of, c.committed) : s.kv_regions(of, c.committed);
     size_t off = 0;
     for (const auto& [at, n] : regions) {
       if (off + n > c.gpu[s.rank].size()) throw CudaError("take_back: the checkpoint was made for other caches");
@@ -359,23 +393,37 @@ void Decoder::take_back(const StoredCaches& c, StoredRings rings) {
     if (rings != StoredRings::Turn) continue;
     const std::vector<std::byte>& turn = (*c.turn)[s.rank];
     off = 0;
-    for (const auto& [ring, n] : s.rings()) {  // a WindowSnapshot's layout (transfer)
+    for (const auto& [ring, n] : s.rings(of)) {  // a WindowSnapshot's layout (transfer)
       if (off + n > turn.size()) throw CudaError("take_back: the turn was kept for other rings");
       check(cudaMemcpy(ring, turn.data() + off, n, cudaMemcpyHostToDevice), "take back a turn");
       off += n;
     }
   }
-  seeded_ = 0;
+  if (lane == seeded_lane_) seeded_ = 0;
 }
 
-void Decoder::save(WindowSnapshot& into) { transfer(into, true); }
-
-void Decoder::restore(const WindowSnapshot& from) {
-  transfer(from, false);
-  seeded_ = 0;
+void Decoder::lend(lane::LaneId from, lane::LaneId to, int64_t committed) {
+  if (committed < 0 || committed > kMaxCompressed) throw CudaError("lend: position outside the caches");
+  const int source = checked(from), target = checked(to);
+  if (source == target) throw CudaError("lend: a Lane lends to another");
+  for (auto& gp : gpus_) {
+    Gpu& s = *gp;
+    check(cudaSetDevice(s.device), "cudaSetDevice");
+    const auto theirs = s.kv_regions(source, committed), mine = s.kv_regions(target, committed);
+    for (size_t i = 0; i < theirs.size(); i++)
+      if (theirs[i].second > 0)
+        check(cudaMemcpyAsync(mine[i].first, theirs[i].first, theirs[i].second, cudaMemcpyDeviceToDevice, s.stream), "lend");
+  }
 }
 
-void Decoder::Gpu::enqueue_layer(int layer, int rows, int parity, StepMode mode) {
+void Decoder::save(WindowSnapshot& into, lane::LaneId lane) { transfer(into, true, lane); }
+
+void Decoder::restore(const WindowSnapshot& from, lane::LaneId lane) {
+  transfer(from, false, lane);
+  if (lane == seeded_lane_) seeded_ = 0;
+}
+
+void Decoder::Gpu::enqueue_layer(int layer, int rows, int group_mask, StepMode mode) {
   const LayerKind kind = model::kind(layer);
   const bool chunked = mode != StepMode::Round;
   const size_t stream_row = static_cast<size_t>(kHcCopies) * kDim * sizeof(bf16);
@@ -404,15 +452,19 @@ void Decoder::Gpu::enqueue_layer(int layer, int rows, int parity, StepMode mode)
   const int64_t* kv_slots = kind.draft ? draft.block_slots : round->ring_slot;
   const cuda::ExpertDirectory& dir = kind.draft ? draft.experts : experts;
   const cuda::ResolvedMoe& res = kind.draft ? draft.resolved : resolved;
-  // Row r's position p0 + r has the parity of parity + r, all a group's completion depends on.
-  auto produced_row = [&](int r) { return kind.kv_source && model::completes_group(parity + r, ratio); };
+  // Which rows complete a group: every row of a ratio-1 source, those of the mask of a ratio-2 one.
+  auto produced_row = [&](int r) { return kind.kv_source && (ratio == 1 || ((group_mask >> r) & 1) != 0); };
+  // Each row's own Lane's caches, read from the Round's index when the kernels run. An engine of one
+  // Lane, and a DSpark stage (one context), has the caches at their start.
+  auto lanes_by = [&](int64_t stride) { return lanes > 1 && !kind.draft ? cuda::LaneArg{round->lane, stride} : cuda::LaneArg{}; };
   auto compress_len = [&](int r) { return IntArg::at(&round->compress_len[ratio][r], kMaxCompressed); };
   auto compress_row = [&](int r) { return IntArg::at(&round->compress_row[ratio][r], kMaxCompressed - 1); };
 
   // The target features DSpark drafts from: the input streams of its target layers.
   if (draft.features[0] != nullptr)
     for (size_t t = 0; t < kDraftTargetLayers.size(); t++)
-      if (layer == kDraftTargetLayers[t]) cuda::capture_features(h, rows, kDim, pos, draft.features[t], kRing, st);
+      if (layer == kDraftTargetLayers[t])
+        cuda::capture_features(h, rows, kDim, pos, draft.features[t], kRing, st, lanes_by(kFeatureStride));
 
   // Engram adds its memory into the stream this layer reads.
   bf16* h_in = h;
@@ -450,7 +502,7 @@ void Decoder::Gpu::enqueue_layer(int layer, int rows, int parity, StepMode mode)
   // Branch 1: the rows' KV into the window ring (only attention reads it) beside the q path.
   fork(1);
   cuda::kv_to_cache({planes_kv, kSplitsWkv, kHeadDim}, rows, d.kv_norm, kNormEps, d.rope_freqs, kRopeDim, pos,
-                    window.at(layer), kv_slots, side(1));
+                    window.at(layer), kv_slots, side(1), lanes_by(kWindowStride));
   branch_done(1);
   run(l.qb, st);
   cuda::planes_rope({planes_qb, kSplitsWqB, kLocalHeads * kHeadDim}, rows, kLocalHeads, kHeadDim, kRopeDim, d.rope_freqs, pos,
@@ -465,7 +517,7 @@ void Decoder::Gpu::enqueue_layer(int layer, int rows, int parity, StepMode mode)
         bf16* latent_r = latent + static_cast<size_t>(r) * kHeadDim;
         if (ratio == 2)
           cuda::compress_pool(planes_bf, kSplitsBf16, r, pos + r, pools.at(layer), d.compress_norm, kNormEps, latent_r,
-                              produced, st);
+                              produced, st, lanes_by(kPoolStride).row(r));
         else
           cuda::compress_project(planes_bf, kSplitsBf16, r, d.compress_norm, kNormEps, latent_r, st);
       }
@@ -481,7 +533,7 @@ void Decoder::Gpu::enqueue_layer(int layer, int rows, int parity, StepMode mode)
           cuda::sum_planes_bf16(planes_bf, kSplitsWk, cuda::kIndexDim, 1, k_raw, st);
           cuda::rmsnorm(k_raw, d.index_k_norm, cuda::kIndexDim, 1, kNormEps, k_idx, st);
           cuda::rope(k_idx, 1, 1, cuda::kIndexDim, kRopeDim, d.rope_freqs, latent_pos + r, false, st);
-          cuda::append_index_keys(k_idx, compress_row(r), 1, index_cache.at(layer), st);
+          cuda::append_index_keys(k_idx, compress_row(r), 1, index_cache.at(layer), st, lanes_by(index_stride(layer)).row(r));
         }
       cuda::planes_rope({planes_iq, kSplitsIndexQ, cuda::kIndexHeads * cuda::kIndexDim}, rows, cuda::kIndexHeads,
                         cuda::kIndexDim, kRopeDim, d.rope_freqs, pos, q_idx, st);
@@ -492,7 +544,8 @@ void Decoder::Gpu::enqueue_layer(int layer, int rows, int parity, StepMode mode)
         cuda::prepare_index_query(q_idx + static_cast<size_t>(r) * cuda::kIndexHeads * cuda::kIndexDim, planes_proj,
                                   kSplitsBf16, r, iq[r], st);
         cuda::index_scores(index_cache.at(kind.cache_owner), compress_len(r), iq[r],
-                           kind.uses_candidates ? candidates_r : nullptr, scores_r, st);
+                           kind.uses_candidates ? candidates_r : nullptr, scores_r, st,
+                           lanes_by(index_stride(kind.cache_owner)).row(r));
         if (kind.candidate_source) cuda::candidate_blocks(scores_r, compress_len(r), candidates_r, select, st);
         cuda::top_positions(scores_r, compress_len(r), kRing, topk + static_cast<size_t>(r) * kTopK, select.select, st);
       }
@@ -506,7 +559,7 @@ void Decoder::Gpu::enqueue_layer(int layer, int rows, int parity, StepMode mode)
               "latent");
         cuda::rope(latent_c_r, 1, 1, kHeadDim, kRopeDim, d.rope_freqs, latent_pos + r, false, st);
         cuda::fp4_quant_dequant_e4m3(latent_c_r, 1, kHeadDim, st);
-        cuda::store_row(latent_c_r, kHeadDim, compressed.at(layer), compress_row(r), st);
+        cuda::store_row(latent_c_r, kHeadDim, compressed.at(layer), compress_row(r), st, lanes_by(compressed_stride(layer)).row(r));
       }
     check(cudaMemcpy2DAsync(idx + kWindow, kIdxStride * sizeof(int32_t), topk, kTopK * sizeof(int32_t),
                             kTopK * sizeof(int32_t), rows, cudaMemcpyDeviceToDevice, st),
@@ -515,7 +568,8 @@ void Decoder::Gpu::enqueue_layer(int layer, int rows, int parity, StepMode mode)
 
   // Attention, its output projections and the exchange.
   join(1);
-  const cuda::KvSources kv_sources{window.at(layer), ratio ? compressed.at(kind.cache_owner) : nullptr};
+  const cuda::KvSources kv_sources{window.at(layer), ratio ? compressed.at(kind.cache_owner) : nullptr, lanes_by(kWindowStride),
+                                   ratio ? lanes_by(compressed_stride(kind.cache_owner)) : cuda::LaneArg{}};
   check(cuda::sparse_attn(q, kv_sources, attn_idx, n_idx, kIdxStride, d.sink, rows, kSoftmaxScale, attn, o, st),
         "sparse_attn");
   cuda::unrope_quantize(o, rows, kLocalHeads, kHeadDim, kRopeDim, d.rope_freqs, pos, kLocalHeads / kLocalGroups,
@@ -588,22 +642,21 @@ std::vector<StepTrace> Decoder::decode_layer(int layer, bool trace_step) {
   if (rows_ == 0) throw CudaError("decode_layer before begin_round");
   const LayerKind kind = model::kind(layer);
   if (kind.engram && !engram_staged_) throw CudaError("an Engram layer needs the Round's Engram rows (begin_round)");
-  const int parity = static_cast<int>(p0_ % 2);
   const bool graphs = launches_ == Launches::Graphs;
-  const std::tuple<int, int, int, StepMode> key{layer, rows_, parity, StepMode::Round};
+  const std::tuple<int, int, int, StepMode> key{layer, rows_, group_mask_, StepMode::Round};
 
   // Capture on both GPUs (instantiation may allocate), then launch on both.
   for (auto& gp : gpus_) {
     Gpu& s = *gp;
     check(cudaSetDevice(s.device), "cudaSetDevice");
     if (graphs && !s.graphs.contains(key))
-      s.graphs[key] = capture(s.stream, [&] { s.enqueue_layer(layer, rows_, parity); });
+      s.graphs[key] = capture(s.stream, [&] { s.enqueue_layer(layer, rows_, group_mask_); });
   }
   for (auto& gp : gpus_) {
     Gpu& s = *gp;
     check(cudaSetDevice(s.device), "cudaSetDevice");
     if (graphs) check(cudaGraphLaunch(s.graphs.at(key), s.stream), "cudaGraphLaunch");
-    else s.enqueue_layer(layer, rows_, parity);
+    else s.enqueue_layer(layer, rows_, group_mask_);
     if (kind.engram) check(cudaEventRecord(s.staged_rows[layer == kEngramLayers[0] ? 0 : 1], s.stream), "cudaEventRecord");
   }
   if (!trace_step) return {};
@@ -661,15 +714,14 @@ void Decoder::decode_round() {
   if (rows_ == 0) throw CudaError("decode_round before begin_round");
   const bool any_engram = gpus_[0]->layers.contains(kEngramLayers[0]) || gpus_[0]->layers.contains(kEngramLayers[1]);
   if (any_engram && !engram_staged_) throw CudaError("an Engram layer needs the Round's Engram rows (begin_round)");
-  const int parity = static_cast<int>(p0_ % 2);
-  const std::pair<int, int> key{rows_, parity};
+  const std::pair<int, int> key{rows_, group_mask_};
   for (auto& gp : gpus_) {
     Gpu& s = *gp;
     check(cudaSetDevice(s.device), "cudaSetDevice");
     if (launches_ == Launches::Graphs && !s.round_graphs.contains(key))
       s.round_graphs[key] = capture(s.stream, [&] {
         for (const auto& [layer, d] : s.layers)
-          if (layer < kLayers) s.enqueue_layer(layer, rows_, parity);  // DSpark stages run in draft()
+          if (layer < kLayers) s.enqueue_layer(layer, rows_, group_mask_);  // DSpark stages run in draft()
       });
   }
   for (auto& gp : gpus_) {
@@ -678,7 +730,7 @@ void Decoder::decode_round() {
     if (launches_ == Launches::Graphs) check(cudaGraphLaunch(s.round_graphs.at(key), s.stream), "cudaGraphLaunch");
     else
       for (const auto& [layer, d] : s.layers)
-        if (layer < kLayers) s.enqueue_layer(layer, rows_, parity);
+        if (layer < kLayers) s.enqueue_layer(layer, rows_, group_mask_);
     for (int t = 0; t < 2; t++)
       if (s.layers.contains(kEngramLayers[t])) check(cudaEventRecord(s.staged_rows[t], s.stream), "cudaEventRecord");
   }
@@ -737,10 +789,10 @@ void Decoder::Gpu::enqueue_head(const bf16* final_norm, int rows) {
   cuda::sum_planes_f32(head_planes, 1, half, rows, head_out, st);
 }
 
-void Decoder::Gpu::enqueue_seed(int first, int rows) {
+void Decoder::Gpu::enqueue_seed(int first, int rows, int lane) {
   const cudaStream_t st = stream;
   const SeedIndex* index = draft.seed;
-  cuda::gather_features({draft.features[0], draft.features[1], draft.features[2]}, kDim, index->feature_slot + first, rows,
+  cuda::gather_features({feature_of(0, lane), feature_of(1, lane), feature_of(2, lane)}, kDim, index->feature_slot + first, rows,
                         draft.seed_x, st);
   cuda::quantize_activations(draft.seed_x, rows, draft.act_features, st);
   run(draft.main_proj_launch, st);
@@ -772,9 +824,10 @@ void Decoder::add_draft(const HostDraft& w, std::span<const float> noise_embeddi
     for (auto& [key, exec] : s.round_graphs) check(cudaGraphExecDestroy(exec), "cudaGraphExecDestroy");
     s.graphs.clear();
     s.round_graphs.clear();
+    const size_t feature_elems = static_cast<size_t>(s.lanes) * Gpu::kFeatureStride;
     for (bf16*& f : dr.features) {
-      f = a.alloc<bf16>(static_cast<size_t>(kRing) * kDim);
-      check(cudaMemset(f, 0, static_cast<size_t>(kRing) * kDim * 2), "memset");
+      f = a.alloc<bf16>(feature_elems);
+      check(cudaMemset(f, 0, feature_elems * sizeof(bf16)), "memset");
     }
     dr.main_proj = upload_fp8(w.main_proj, a);
     dr.main_norm = a.upload_bf16(w.main_norm);
@@ -835,7 +888,12 @@ void Decoder::add_draft_expert(int stage, int expert, std::span<const std::byte>
   }
 }
 
-DraftBlock Decoder::draft(int64_t p, int32_t token, std::span<const float> anchor_embedding) {
+DraftBlock Decoder::draft(int64_t p, int32_t token, std::span<const float> anchor_embedding, lane::LaneId lane) {
+  const int of = checked(lane);
+  if (lane != seeded_lane_) {  // the context is another Lane's: this one's from its feature rings
+    seeded_ = 0;
+    seeded_lane_ = lane;
+  }
   constexpr size_t half = kVocab / kGpus;
   Gpu& lead = *gpus_[0];
   Gpu& peer = *gpus_[1];
@@ -862,7 +920,7 @@ DraftBlock Decoder::draft(int64_t p, int32_t token, std::span<const float> ancho
       }
       check(cudaMemcpyAsync(s.draft.seed, &sg.seed, sizeof(SeedIndex), cudaMemcpyHostToDevice, s.stream), "seed");
       check(cudaEventRecord(s.staged_seed, s.stream), "cudaEventRecord");
-      for (int first = 0; first < count; first += kMaxRows) s.enqueue_seed(first, std::min(kMaxRows, count - first));
+      for (int first = 0; first < count; first += kMaxRows) s.enqueue_seed(first, std::min(kMaxRows, count - first), of);
     }
     // The block starts like a Round: positions p .. p + 4, the anchor's and the noise token's
     // embeddings in all four copies; every row attends to the context ring and the whole block.

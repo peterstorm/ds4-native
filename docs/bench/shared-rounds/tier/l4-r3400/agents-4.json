@@ -1,0 +1,59 @@
+{
+ "set": "agents",
+ "at_once": 4,
+ "wall_s": 100.69,
+ "completion_tokens": 9600,
+ "aggregate_tok_s": 95.34,
+ "first_token_s": {
+  "min": 1.93,
+  "max": 7.92
+ },
+ "longest_silence_s": 6.1,
+ "errors": 0,
+ "requests": [
+  {
+   "name": "impl-ts",
+   "first_token_s": 2.99,
+   "done_s": 100.69,
+   "prompt_tokens": 181,
+   "completion_tokens": 2400,
+   "longest_silence_s": 5.05,
+   "finish": "length",
+   "error": "",
+   "writing_tok_s": 24.56
+  },
+  {
+   "name": "impl-rust",
+   "first_token_s": 1.93,
+   "done_s": 100.69,
+   "prompt_tokens": 182,
+   "completion_tokens": 2400,
+   "longest_silence_s": 6.1,
+   "finish": "length",
+   "error": "",
+   "writing_tok_s": 24.3
+  },
+  {
+   "name": "review-py",
+   "first_token_s": 7.92,
+   "done_s": 100.69,
+   "prompt_tokens": 388,
+   "completion_tokens": 2400,
+   "longest_silence_s": 5.99,
+   "finish": "length",
+   "error": "",
+   "writing_tok_s": 25.87
+  },
+  {
+   "name": "review-java",
+   "first_token_s": 5.37,
+   "done_s": 100.69,
+   "prompt_tokens": 314,
+   "completion_tokens": 2400,
+   "longest_silence_s": 3.44,
+   "finish": "length",
+   "error": "",
+   "writing_tok_s": 25.18
+  }
+ ]
+}

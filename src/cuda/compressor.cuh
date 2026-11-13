@@ -11,6 +11,7 @@
 #include <cstdint>
 
 #include "core/model.hpp"
+#include "cuda/lane_arg.cuh"
 
 namespace ds4n::cuda {
 
@@ -29,10 +30,12 @@ void init_pool(PoolSlots slots, cudaStream_t stream);
 /**
  * Ratio 2: fold token column `token` of the GEMV planes ([split][1024][8]) into
  * position *pos's slot; when *pos is odd pool it with position *pos - 1's, write the latent
- * ([512] BF16) and set *produced = 1, else *produced = 0.
+ * ([512] BF16) and set *produced = 1, else *produced = 0. `slots`: the pool of `lane` (the token's
+ * Lane; its stride in values, the same for kv and score).
  */
 void compress_pool(const float* planes, int splits, int token, const int64_t* pos, PoolSlots slots,
-                   const __nv_bfloat16* norm, float eps, __nv_bfloat16* latent, int* produced, cudaStream_t stream);
+                   const __nv_bfloat16* norm, float eps, __nv_bfloat16* latent, int* produced, cudaStream_t stream,
+                   LaneArg lane = {});
 
 /** Ratio 1: latent = RMSNorm(bf16(wkv(x))) from planes [split][512][8], token column `token`. */
 void compress_project(const float* planes, int splits, int token, const __nv_bfloat16* norm, float eps,

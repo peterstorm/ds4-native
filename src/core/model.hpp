@@ -5,6 +5,10 @@
 // and the CPU layer oracle both read these, so they cannot drift apart.
 #include <array>
 #include <cstdint>
+#include <span>
+
+#include "core/lane.hpp"
+#include "core/result.hpp"
 
 namespace ds4n::model {
 
@@ -183,10 +187,11 @@ constexpr bool completes_group(int64_t p, int ratio) { return (p + 1) % ratio ==
 static_assert(completes_group(5, 2) && !completes_group(4, 2) && completes_group(4, 1));
 
 /**
- * Everything a Round -- `rows` consecutive positions p0 .. p0 + rows - 1, one row each -- derives
- * from its positions, computed once on the host and handed to the GPUs (CUDA graphs replay kernels
- * whose sizes and addresses must not depend on host values). Struct of arrays, all int64: a kernel
- * takes a pointer to a field and reads row r's value at index r. A decode step is a one-row Round.
+ * Everything a Round derives from its rows' positions and Lanes, computed once on the host and handed
+ * to the GPUs (CUDA graphs replay kernels whose sizes and addresses must not depend on host values).
+ * Struct of arrays, all int64: a kernel takes a pointer to a field and reads row r's value at index
+ * r. Each row's entries depend on that row's position and Lane alone -- never on the rows beside it --
+ * so a row computes the same in any Round. A decode step is a one-row Round.
  */
 struct RoundIndex {
   int64_t rows;
@@ -195,27 +200,95 @@ struct RoundIndex {
   int64_t ring_slot[kMaxRows];        // p % kRing: the row's window ring slot
   int64_t compress_len[3][kMaxRows];  // by ratio: compressed positions the row sees, (p + 1) / ratio
   int64_t compress_row[3][kMaxRows];  // by ratio: the row a latent completed at p is written to, p / ratio
+  int64_t lane[kMaxRows];             // the row's Lane: whose caches it reads and writes
+  int64_t completes[3][kMaxRows];     // by ratio: 1 where p completes a group (a KV source compresses a latent there), else 0
+  friend constexpr bool operator==(const RoundIndex&, const RoundIndex&) = default;
 };
 
-/** The Round of `rows` positions from p0 (rows in 1..kMaxRows); rows past `rows` stay zero. */
-constexpr RoundIndex round_index(int64_t p0, int rows) {
+/** One row of a Round: the position it is fed at, in its Lane. */
+struct RoundRow {
+  lane::LaneId lane;
+  int64_t pos;
+  friend constexpr bool operator==(const RoundRow&, const RoundRow&) = default;
+};
+
+namespace detail {
+/** Row i of `s`: what position p in Lane `lane` derives. */
+constexpr void set_row(RoundIndex& s, int i, int64_t lane, int64_t p) {
+  s.pos[i] = p;
+  s.ring_slot[i] = p % kRing;
+  s.lane[i] = lane;
+  for (int r = 1; r <= 2; r++) {
+    s.latent_pos[r][i] = p + 1 - r;
+    s.compress_len[r][i] = (p + 1) / r;
+    s.compress_row[r][i] = p / r;
+    s.completes[r][i] = completes_group(p, r) ? 1 : 0;
+  }
+}
+}  // namespace detail
+
+/** The Round of `rows` positions from p0 in `lane` (rows in 1..kMaxRows); rows past `rows` stay zero. */
+constexpr RoundIndex round_index(lane::LaneId lane, int64_t p0, int rows) {
   RoundIndex s{};
   s.rows = rows;
-  for (int i = 0; i < rows; i++) {
-    const int64_t p = p0 + i;
-    s.pos[i] = p;
-    s.ring_slot[i] = p % kRing;
-    for (int r = 1; r <= 2; r++) {
-      s.latent_pos[r][i] = p + 1 - r;
-      s.compress_len[r][i] = (p + 1) / r;
-      s.compress_row[r][i] = p / r;
-    }
-  }
+  for (int i = 0; i < rows; i++) detail::set_row(s, i, lane.index(), p0 + i);
   return s;
+}
+
+/** The same in the first Lane. */
+constexpr RoundIndex round_index(int64_t p0, int rows) { return round_index(lane::LaneId(), p0, rows); }
+
+/**
+ * Which of a Round's rows complete a ratio-2 group, a bit a row: with its row count, all that
+ * decides which kernels a layer step launches (the rest they read from the RoundIndex when they
+ * run). A one-Lane Round's alternates from its first position's parity.
+ */
+constexpr int group_mask(const RoundIndex& s) {
+  int mask = 0;
+  for (int r = 0; r < s.rows; r++) mask |= static_cast<int>(s.completes[2][r]) << r;
+  return mask;
 }
 
 static_assert(round_index(5, 1).compress_len[2][0] == 3 && round_index(kRing + 4, 1).ring_slot[0] == 4 &&
               round_index(7, 1).compress_row[2][0] == 3 && round_index(7, 1).latent_pos[2][0] == 6);
 static_assert(round_index(4, 3).pos[2] == 6 && round_index(4, 3).pos[3] == 0 && round_index(4, 3).compress_len[1][2] == 7);
+static_assert(round_index(4, 3).completes[2][1] == 1 && round_index(4, 3).completes[2][0] == 0 && round_index(4, 3).lane[2] == 0);
+static_assert(lane::kMaxLanes <= kMaxRows, "every busy Lane has a row in every Round");
+static_assert(group_mask(round_index(4, 3)) == 0b010 && group_mask(round_index(5, 3)) == 0b101 && group_mask(round_index(7, 1)) == 1);
+
+/** Why rows do not make a Round. */
+enum class RoundError { NoRows, TooManyRows, NegativePosition, LanesNotAscending, PositionsNotConsecutive };
+
+constexpr const char* what(RoundError e) {
+  switch (e) {
+    case RoundError::NoRows: return "a Round has at least one row";
+    case RoundError::TooManyRows: return "a Round has at most 8 rows";
+    case RoundError::NegativePosition: return "a row's position is negative";
+    case RoundError::LanesNotAscending: return "a Round's rows are sorted by Lane";
+    case RoundError::PositionsNotConsecutive: return "a Lane's rows are at consecutive positions, ascending";
+  }
+  return "not a Round";
+}
+
+/**
+ * The Round of `rows`, which may be of several Lanes (a Shared Round): 1..kMaxRows of them, sorted
+ * by Lane, each Lane's at consecutive ascending positions -- the order a ratio-2 pool chains its
+ * state in, row to row. One Lane's rows from p0 give round_index(p0, rows) but for the Lane.
+ */
+inline Result<RoundIndex, RoundError> round_index(std::span<const RoundRow> rows) {
+  using R = Result<RoundIndex, RoundError>;
+  if (rows.empty()) return R::err(RoundError::NoRows);
+  if (rows.size() > static_cast<size_t>(kMaxRows)) return R::err(RoundError::TooManyRows);
+  RoundIndex s{};
+  s.rows = static_cast<int64_t>(rows.size());
+  for (size_t i = 0; i < rows.size(); i++) {
+    if (rows[i].pos < 0) return R::err(RoundError::NegativePosition);
+    if (i > 0 && rows[i].lane < rows[i - 1].lane) return R::err(RoundError::LanesNotAscending);
+    if (i > 0 && rows[i].lane == rows[i - 1].lane && rows[i].pos != rows[i - 1].pos + 1)
+      return R::err(RoundError::PositionsNotConsecutive);
+    detail::set_row(s, static_cast<int>(i), rows[i].lane.index(), rows[i].pos);
+  }
+  return R::ok(s);
+}
 
 }  // namespace ds4n::model

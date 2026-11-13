@@ -1,10 +1,10 @@
 #pragma once
 // Several Sessions decoding on one Expert cache (pure, a study's model): their recorded traffic --
 // an access record of one row a Round, 40 layer steps a token -- merged the way a server could run
-// them. Taking turns, as the engine does (one request at a time): one Session's Rounds until its turn
-// ends, then the next one's. Sharing Rounds (not built: a Round's rows would need per-Session
-// caches): every Session still writing has rows in every Round, and each layer step needs the union
-// of their Experts. A verify Round's rows are taken as the Session's next tokens -- the drafts it
+// them. Taking turns, as an engine of one Lane does (one request at a time): one Session's Rounds
+// until its turn ends, then the next one's. Sharing Rounds, as an engine of several Lanes does
+// (core/shared_round): every Session still writing has rows in every Round, and each layer step needs
+// the union of their Experts. A verify Round's rows are taken as the Session's next tokens -- the drafts it
 // keeps are those tokens, and a rejected draft routes like the token the target wrote there. The
 // merged steps replay through cache::replay_tiers; the Rounds price them (ds4n-cache-study --sessions).
 #include <cstdint>

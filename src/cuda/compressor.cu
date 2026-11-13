@@ -52,8 +52,11 @@ __global__ void init_kernel(PoolSlots s) {
 __global__ void __launch_bounds__(kThreads) pool_kernel(const float* __restrict__ planes, int splits, int token,
                                                        const int64_t* __restrict__ pos, PoolSlots s,
                                                        const __nv_bfloat16* __restrict__ norm, float eps,
-                                                       __nv_bfloat16* __restrict__ latent, int* __restrict__ produced) {
+                                                       __nv_bfloat16* __restrict__ latent, int* __restrict__ produced,
+                                                       LaneArg lane) {
   const int t = threadIdx.x;
+  s.kv += lane.offset();
+  s.score += lane.offset();
   const int64_t p = *pos;
   const int slot = static_cast<int>(p % kPoolRing);
   const bool completes = p % 2 == 1;
@@ -138,8 +141,9 @@ void init_pool(PoolSlots slots, cudaStream_t stream) {
 }
 
 void compress_pool(const float* planes, int splits, int token, const int64_t* pos, PoolSlots slots,
-                   const __nv_bfloat16* norm, float eps, __nv_bfloat16* latent, int* produced, cudaStream_t stream) {
-  pool_kernel<<<1, kThreads, 0, stream>>>(planes, splits, token, pos, slots, norm, eps, latent, produced);
+                   const __nv_bfloat16* norm, float eps, __nv_bfloat16* latent, int* produced, cudaStream_t stream,
+                   LaneArg lane) {
+  pool_kernel<<<1, kThreads, 0, stream>>>(planes, splits, token, pos, slots, norm, eps, latent, produced, lane);
 }
 
 void compress_project(const float* planes, int splits, int token, const __nv_bfloat16* norm, float eps,

@@ -1,0 +1,26 @@
+{
+ "set": "gate",
+ "at_once": 1,
+ "wall_s": 30.41,
+ "completion_tokens": 2400,
+ "aggregate_tok_s": 78.91,
+ "first_token_s": {
+  "min": 2.88,
+  "max": 2.88
+ },
+ "longest_silence_s": 2.86,
+ "errors": 0,
+ "requests": [
+  {
+   "name": "gate-code",
+   "first_token_s": 2.88,
+   "done_s": 30.41,
+   "prompt_tokens": 391,
+   "completion_tokens": 2400,
+   "longest_silence_s": 2.86,
+   "finish": "length",
+   "error": "",
+   "writing_tok_s": 87.15
+  }
+ ]
+}

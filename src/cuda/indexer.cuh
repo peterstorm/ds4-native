@@ -16,6 +16,7 @@
 #include <cstdint>
 
 #include "cuda/int_arg.cuh"
+#include "cuda/lane_arg.cuh"
 #include "cuda/select.cuh"
 
 namespace ds4n::cuda {
@@ -41,8 +42,11 @@ constexpr int64_t candidate_mask_words(int64_t positions) {
   return ((positions + kCandidateBlockSize - 1) / kCandidateBlockSize + 31) / 32;
 }
 
-/** fp4_act_quant (block 32, E8M0) of keys [n][128] (BF16, after RoPE) into positions first .. first + n - 1. */
-void append_index_keys(const __nv_bfloat16* keys, IntArg first, int n, uint8_t* cache, cudaStream_t stream);
+/**
+ * fp4_act_quant (block 32, E8M0) of keys [n][128] (BF16, after RoPE) into positions first .. first + n - 1
+ * of the cache of `lane` (its stride in bytes).
+ */
+void append_index_keys(const __nv_bfloat16* keys, IntArg first, int n, uint8_t* cache, cudaStream_t stream, LaneArg lane = {});
 
 /** One query ready to score: per head group G, B fragments over 4 K blocks, and the head weights. */
 struct IndexQuery {
@@ -73,10 +77,10 @@ void prepare_index_query(const __nv_bfloat16* q, const float* projection, int sp
 
 /**
  * scores[t] (BF16) for t < compress_len. With `block_mask` (candidate_mask_words), positions in
- * unmarked blocks score -inf and skip the MMA.
+ * unmarked blocks score -inf and skip the MMA. `cache`: the keys of `lane` (its stride in bytes).
  */
 void index_scores(const uint8_t* cache, IntArg compress_len, const IndexQuery& q, const uint32_t* block_mask,
-                  __nv_bfloat16* scores, cudaStream_t stream);
+                  __nv_bfloat16* scores, cudaStream_t stream, LaneArg lane = {});
 
 /** Scratch for the selections: block keys for up to `max_positions` positions, the chosen blocks. */
 struct IndexSelectScratch {
@@ -103,9 +107,13 @@ void top_positions(const __nv_bfloat16* scores, IntArg compress_len, int32_t off
 void prepare_index_queries(const __nv_bfloat16* q, const float* projection, int splits, int rows, IndexQueries out,
                            cudaStream_t stream);
 
-/** index_scores for every row: scores at scores + r * score_stride, masks (or null) at r * mask_stride words. */
+/**
+ * index_scores for every row: scores at scores + r * score_stride, masks (or null) at r * mask_stride words,
+ * row r's keys in the cache of lanes.row(r).
+ */
 void index_scores_rows(const uint8_t* cache, IntArg compress_len, int rows, IndexQueries q, const uint32_t* block_masks,
-                       int64_t mask_stride, __nv_bfloat16* scores, int64_t score_stride, cudaStream_t stream);
+                       int64_t mask_stride, __nv_bfloat16* scores, int64_t score_stride, cudaStream_t stream,
+                       LaneArg lanes = {});
 
 /** Per-row selection scratch: select words, block keys and chosen blocks for `rows` rows. */
 struct IndexSelectRows {

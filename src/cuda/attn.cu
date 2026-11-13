@@ -105,6 +105,8 @@ __global__ void __launch_bounds__(kSplitThreads) split_kernel(const __nv_bfloat1
   const int rows = min(kAttnSplitRows, n_idx - split * kAttnSplitRows);
 
   // Gather: 64 rows x 1 KB as uint4, zeros for -1 and for slots past n_idx; 8 loads in flight per thread.
+  const __nv_bfloat16* window = kv.window + kv.window_lanes.row(row).offset();
+  const __nv_bfloat16* compressed = kv.compressed + kv.compressed_lanes.row(row).offset();
   __shared__ int slot_row[kAttnSplitRows];
   if (threadIdx.x < kAttnSplitRows) {
     const int id = threadIdx.x < rows ? ids[threadIdx.x] : -1;
@@ -120,8 +122,8 @@ __global__ void __launch_bounds__(kSplitThreads) split_kernel(const __nv_bfloat1
     for (int j = 0; j < kBatch; j++) {
       const int c = threadIdx.x + (base + j) * kSplitThreads, r = c / (kAttnDim / 8), part = c % (kAttnDim / 8);
       const int id = slot_row[r];
-      const __nv_bfloat16* row = id < kAttnWindow ? kv.window + static_cast<size_t>(id) * kAttnDim
-                                                  : kv.compressed + static_cast<size_t>(id - kAttnWindow) * kAttnDim;
+      const __nv_bfloat16* row = id < kAttnWindow ? window + static_cast<size_t>(id) * kAttnDim
+                                                  : compressed + static_cast<size_t>(id - kAttnWindow) * kAttnDim;
       v[j] = id >= 0 ? __ldg(reinterpret_cast<const uint4*>(row) + part) : make_uint4(0, 0, 0, 0);
     }
 #pragma unroll

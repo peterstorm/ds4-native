@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "core/engram.hpp"
+#include "core/lane.hpp"
 #include "engine/decoder.cuh"
 #include "engine/engram_source.hpp"
 #include "engine/expert_residency.cuh"
@@ -18,9 +19,13 @@ struct FullModelConfig {
   std::string backbone, store, gguf;
   std::string dspark;              // the checkpoint shards holding mtp.* (empty: no drafting)
   uint32_t slots = 8000, ram_records = 512;
+  // A prompt sweep's scratch Slots, beside `slots` in VRAM (ResidencyConfig::sweep_slots). A layer's
+  // sweep reads up to all 384 of its Experts from them, so no fewer than that.
+  uint32_t sweep_slots = ResidencyConfig{}.sweep_slots;
   std::string prior;               // an Expert pick-count profile warming the Slots (empty: by key)
   RamPolicy ram_policy = RamPolicy::Recent;
   int sweep_rounds = kSweepRounds;  // a prompt sweep's chunk (Rounds of 8)
+  lane::LaneCount lanes{};          // Sessions on the GPUs at once (each ~730 MiB a GPU: that many fewer Slots fit)
 };
 
 struct FullModel {

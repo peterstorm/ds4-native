@@ -1,0 +1,70 @@
+{
+ "set": "gate",
+ "at_once": 5,
+ "wall_s": 141.32,
+ "completion_tokens": 11893,
+ "aggregate_tok_s": 84.16,
+ "first_token_s": {
+  "min": 3.06,
+  "max": 113.81
+ },
+ "longest_silence_s": 10.01,
+ "errors": 0,
+ "requests": [
+  {
+   "name": "gate-code",
+   "first_token_s": 32.86,
+   "done_s": 56.57,
+   "prompt_tokens": 391,
+   "completion_tokens": 2400,
+   "longest_silence_s": 10.01,
+   "finish": "length",
+   "error": "",
+   "writing_tok_s": 101.21
+  },
+  {
+   "name": "gate-silent",
+   "first_token_s": 86.15,
+   "done_s": 111.16,
+   "prompt_tokens": 393,
+   "completion_tokens": 2293,
+   "longest_silence_s": 10.01,
+   "finish": "stop",
+   "error": "",
+   "writing_tok_s": 91.68
+  },
+  {
+   "name": "gate-tests",
+   "first_token_s": 59.18,
+   "done_s": 83.62,
+   "prompt_tokens": 392,
+   "completion_tokens": 2400,
+   "longest_silence_s": 10.01,
+   "finish": "length",
+   "error": "",
+   "writing_tok_s": 98.19
+  },
+  {
+   "name": "gate-types",
+   "first_token_s": 113.81,
+   "done_s": 141.32,
+   "prompt_tokens": 390,
+   "completion_tokens": 2400,
+   "longest_silence_s": 10.01,
+   "finish": "length",
+   "error": "",
+   "writing_tok_s": 87.23
+  },
+  {
+   "name": "gate-comments",
+   "first_token_s": 3.06,
+   "done_s": 30.27,
+   "prompt_tokens": 390,
+   "completion_tokens": 2400,
+   "longest_silence_s": 2.99,
+   "finish": "length",
+   "error": "",
+   "writing_tok_s": 88.21
+  }
+ ]
+}

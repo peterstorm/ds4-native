@@ -4,16 +4,22 @@
 // ARGS...` and speaks GEN / T / DONE with it over stdin and stdout.
 //
 //   ds4n-serve --serve --backbone B --store S --gguf G [--dspark DIR] [--slots N] [--ram-records R]
-//              [--prior PROFILE] [--ram-policy recent|popular|victim] [--rewind-points N] [--sweep-min N]
-//              [--checkpoint-gb G] [--keep-min N] [--split-min N] [--stops 1,128803]
+//              [--lanes N] [--prior PROFILE] [--ram-policy recent|popular|victim] [--rewind-points N]
+//              [--sweep-min N] [--checkpoint-gb G] [--keep-min N] [--split-min N] [--stops 1,128803]
+//              [--sweep-slots N]
 //
-// One request at a time (READY ... stop: no multi, no PAUSE), from any of the conversations it keeps
-// (engine/conversation): an agent's tool loop and a chat's next turn read only their new tokens; a
-// conversation another one took the GPUs from comes back from its KV checkpoint in host memory
-// (--checkpoint-gb of them, the least recently used dropped first); a subagent's first prompt
-// resumes where it leaves the system prompt it shares with its parent. Stdout carries the protocol
-// only (NOTE lines tell the server's log what happened to the conversations); everything else goes
-// to stderr (the server's log).
+// --sweep-slots N (default 512, at least 384): the Slots prompt sweeps load into, VRAM that --slots
+// cannot use; fewer of them leave room for that many more --slots.
+//
+// Requests from any of the conversations it keeps (engine/conversation): an agent's tool loop and a
+// chat's next turn read only their new tokens; a conversation another one took a Lane from comes
+// back from its KV checkpoint in host memory (--checkpoint-gb of them, the least recently used
+// dropped first); a subagent's first prompt resumes where it leaves the system prompt it shares with
+// its parent. With --lanes N (default 1) up to N requests run at once, their rows sharing Rounds
+// (READY ... stop multi=N; each Lane's caches take ~730 MiB a GPU: give --slots that many fewer, ~78 a
+// Lane); with one Lane requests take turns, as the server expects of an engine without multi. Stdout
+// carries the protocol only (NOTE lines tell the server's log what happened to the conversations);
+// everything else goes to stderr (the server's log).
 #include <unistd.h>
 
 #include <cerrno>
@@ -22,6 +28,7 @@
 #include <csignal>
 #include <cstdio>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <random>
 #include <string>
@@ -46,9 +53,9 @@ void out(const std::string& line) {
 }
 
 /**
- * Stdin on a thread of its own, so a request in flight sees STOP and WRAP: those set flags; GEN and
- * QUIT (and lines that do not parse) queue for the main thread. read(2), not std::cin: glibc's exit()
- * waits on stdin's lock, which a getline waiting for input holds.
+ * Stdin on a thread of its own, its lines queued in order for the main thread, which takes them
+ * between the engine's passes: a STOP, a WRAP or another GEN reaches requests in flight. read(2), not
+ * std::cin: glibc's exit() waits on stdin's lock, which a getline waiting for input holds.
  */
 struct Input {
   using Line = Result<wire::Command, wire::WireError>;
@@ -56,7 +63,6 @@ struct Input {
   std::condition_variable cv;
   std::deque<Line> lines;
   bool eof = false;
-  std::atomic<bool> stop{false}, wrap{false};
 
   void start() {
     std::thread([this] {
@@ -78,33 +84,28 @@ struct Input {
         }
         Line line = wire::parse(std::string_view(buf).substr(0, nl), model::kVocab, seeds());
         buf.erase(0, nl + 1);
-        if (line && std::holds_alternative<wire::Stop>(line.value())) {
-          stop = true;
-          continue;
-        }
-        if (line && std::holds_alternative<wire::Wrap>(line.value())) {
-          wrap = true;
-          continue;
-        }
-        if (line && std::holds_alternative<wire::Quit>(line.value())) stop = true;  // ends a request in flight too
         std::lock_guard lock(mu);
         lines.push_back(std::move(line));
         cv.notify_one();
       }
       std::lock_guard lock(mu);
       eof = true;
-      stop = true;
       cv.notify_one();
     }).detach();
   }
-  /** The next queued line; none at the end of input. */
-  std::optional<Line> next() {
+  /** The next queued line, waiting for one when `wait`; none: nothing is queued (waiting: the input ended). */
+  std::optional<Line> next(bool wait) {
     std::unique_lock lock(mu);
-    cv.wait(lock, [&] { return !lines.empty() || eof; });
+    if (wait) cv.wait(lock, [&] { return !lines.empty() || eof; });
     if (lines.empty()) return std::nullopt;
     Line l = std::move(lines.front());
     lines.pop_front();
     return l;
+  }
+  /** Whether the input ended and every line of it was taken. */
+  bool ended() {
+    std::lock_guard lock(mu);
+    return eof && lines.empty();
   }
 };
 
@@ -122,6 +123,25 @@ std::vector<int32_t> ids_of(const std::string& s) {
   return v;
 }
 
+/** A request in flight: its Lane, what its lines are tagged with, its prompt's length. */
+struct Flight {
+  lane::LaneId lane;
+  std::optional<wire::Rid> rid;
+  size_t prompt;
+};
+
+/** The lines of a request (of `prompt` tokens) that ran and failed: its ERR, and a DONE so the server's turn for it ends. */
+std::string failed_lines(std::optional<wire::Rid> rid, size_t prompt, const std::string& what) {
+  return wire::error_line(rid, what) + wire::done_line(rid, {0, prompt, 0.0, 0.0, reply::Finish::Cancel, 0, 0, 0});
+}
+
+template <class... F>
+struct Overloaded : F... {
+  using F::operator()...;
+};
+template <class... F>
+Overloaded(F...) -> Overloaded<F...>;
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -129,7 +149,7 @@ int main(int argc, char** argv) {
   engine::FullModelConfig mc;
   engine::ConversationConfig cc;
   std::string stops;
-  bool serve = false;
+  bool serve = false, points_given = false;
   for (int i = 1; i < argc; i++) {
     const std::string a = argv[i];
     if (a == "--serve") {
@@ -144,13 +164,22 @@ int main(int argc, char** argv) {
     else if (a == "--dspark") mc.dspark = v;
     else if (a == "--slots") mc.slots = static_cast<uint32_t>(std::stoul(v));
     else if (a == "--ram-records") mc.ram_records = static_cast<uint32_t>(std::stoul(v));
+    else if (a == "--sweep-slots") mc.sweep_slots = static_cast<uint32_t>(std::stoul(v));
+    else if (a == "--lanes") {
+      const auto lanes = lane::LaneCount::of(std::stoll(v));
+      if (!lanes) die("--lanes: " + lanes.error().what);
+      mc.lanes = lanes.value();
+    }
     else if (a == "--prior") mc.prior = v;
     else if (a == "--ram-policy") {
       const auto policy = engine::ram_policy_named(v);
       if (!policy) die("--ram-policy takes recent, popular or victim: " + v);
       mc.ram_policy = *policy;
     }
-    else if (a == "--rewind-points") cc.rewind_points = static_cast<uint32_t>(std::stoul(v));
+    else if (a == "--rewind-points") {
+      cc.rewind_points = static_cast<uint32_t>(std::stoul(v));
+      points_given = true;
+    }
     else if (a == "--sweep-min") cc.sweep_min = std::stoul(v);
     else if (a == "--checkpoint-gb") cc.checkpoint_budget = static_cast<uint64_t>(std::stod(v) * 1e9);
     else if (a == "--keep-min") cc.rewind.keep_min = std::stoul(v);
@@ -165,7 +194,13 @@ int main(int argc, char** argv) {
     else die("unknown argument " + a);
   }
   if (!serve || mc.backbone.empty() || mc.store.empty() || mc.gguf.empty())
-    die("usage: ds4n-serve --serve --backbone B --store S --gguf G [--dspark DIR] [--slots N] [--ram-records R]");
+    die("usage: ds4n-serve --serve --backbone B --store S --gguf G [--dspark DIR] [--slots N] [--ram-records R] [--lanes N]");
+  // More Rewind points than Lanes: no Lane's last prompt's end is lost to another Lane's points
+  // (rewind::next_buffer), so each Session's next turn resumes there.
+  const auto lanes = static_cast<uint32_t>(mc.lanes.value());
+  if (!points_given) cc.rewind_points = std::max(cc.rewind_points, lanes + 1);
+  else if (cc.rewind_points != 0 && cc.rewind_points <= lanes)
+    die("--rewind-points " + std::to_string(cc.rewind_points) + ": more than --lanes (" + std::to_string(lanes) + "), or 0 for none");
 
   engine::FullModel m = [&] {
     try {
@@ -185,48 +220,94 @@ int main(int argc, char** argv) {
   char info[320];
   std::snprintf(info, sizeof info,
                 "INFO engine=ds4-native engine_kind=ds4-native context=%lld vram_slots=%u ram_records=%u dspark=%d "
-                "rewind_points=%u checkpoint_gb=%.1f logit_bias=1\n",
+                "rewind_points=%u checkpoint_gb=%.1f logit_bias=1 lanes=%u\n",
                 static_cast<long long>(engine::kMaxCompressed), mc.slots, mc.ram_records, m.dspark ? 1 : 0, cc.rewind_points,
-                static_cast<double>(cc.checkpoint_budget) / 1e9);
+                static_cast<double>(cc.checkpoint_budget) / 1e9, lanes);
   out(info);
-  out(wire::ready_line(engine::kMaxCompressed));
-  std::fprintf(stderr, "ds4n-serve: ready (GEN <max_new> [keys] <ids>; STOP, WRAP, QUIT)\n");
+  out(wire::ready_line(engine::kMaxCompressed, mc.lanes));  // one Lane: no multi=, and so no rids
+  std::fprintf(stderr, "ds4n-serve: ready, %u Lane(s) (GEN <max_new> [keys] <ids>; STOP, WRAP, QUIT)\n", lanes);
 
   Input in;
   in.start();
-  const engine::ReplyEvents events{[](int32_t t) { out(wire::token_line(t)); },
-                                   [](const wire::Progress& p) { out(wire::progress_line(p)); },
-                                   [](const wire::Stat& s) { out(wire::stat_line(s)); },
-                                   [](const std::string& n) {
-                                     std::fprintf(stderr, "ds4n-serve: %s\n", n.c_str());
-                                     out("NOTE sessions: " + n + "\n");
-                                   },
-                                   &in.stop, &in.wrap};
-  while (const std::optional<Input::Line> line = in.next()) {
-    if (!*line) {
-      out("ERR " + line->error().what + "\n");
-      continue;
+  std::map<uint64_t, Flight> flights;  // the requests in flight, by the order they were admitted in
+  uint64_t admitted = 0;
+  std::deque<wire::Generate> waiting;  // GENs naming no rid that found every Lane busy: they take turns
+  bool wrapping = false;               // the server is stopping: replies close their reasoning
+  bool quit = false;
+
+  // Admits `g`, or answers why not; false: it named no rid and every Lane is busy, so it waits its turn.
+  const auto admit = [&](const wire::Generate& g) {
+    if (static_cast<int64_t>(g.prompt.size()) >= engine::kMaxCompressed) {
+      out(wire::error_line(g.rid, "the prompt (" + std::to_string(g.prompt.size()) + " tokens) leaves no room in the context of " +
+                                      std::to_string(engine::kMaxCompressed)));
+      return true;
     }
-    if (std::holds_alternative<wire::Quit>(line->value())) break;
-    const auto* g = std::get_if<wire::Generate>(&line->value());
-    if (g == nullptr) continue;
-    in.stop = false;  // a STOP from before this request is not for it
-    if (static_cast<int64_t>(g->prompt.size()) >= engine::kMaxCompressed) {
-      out("ERR the prompt (" + std::to_string(g->prompt.size()) + " tokens) leaves no room in the context of " +
-          std::to_string(engine::kMaxCompressed) + "\n");
-      continue;
-    }
-    try {
-      out(wire::done_line(conversation.run(*g, events)));
-    } catch (const std::exception& e) {
-      const std::string what = e.what();
+    const uint64_t n = admitted++;
+    engine::ReplyEvents ev;
+    ev.token = [rid = g.rid](int32_t t) { out(wire::token_line(rid, t)); };
+    ev.progress = [rid = g.rid](const wire::Progress& p) { out(wire::progress_line(rid, p)); };
+    ev.stat = [](const wire::Stat& s) { out(wire::stat_line(s)); };
+    ev.note = [](const std::string& note) {
+      std::fprintf(stderr, "ds4n-serve: %s\n", note.c_str());
+      out("NOTE sessions: " + note + "\n");
+    };
+    ev.done = [&flights, n, rid = g.rid](const wire::Done& d) {
+      out(wire::done_line(rid, d));
+      flights.erase(n);
+    };
+    // Non-finite logits leave the engine sound (that Lane's Session starts over): the others go on.
+    ev.failed = [&flights, n, rid = g.rid, prompt = g.prompt.size()](const std::string& what) {
       std::fprintf(stderr, "ds4n-serve: %s\n", what.c_str());
-      out("ERR " + what + "\n");
-      out(wire::done_line({0, g->prompt.size(), 0.0, 0.0, reply::Finish::Cancel, 0, 0, 0}));
-      // Non-finite logits leave the engine sound (the Session starts over); a CUDA or I/O failure may
-      // not: end, and the server starts the engine again.
-      if (what.find("non-finite") == std::string::npos) return 2;
+      out(failed_lines(rid, prompt, what));
+      flights.erase(n);
+    };
+    const auto lane = conversation.admit(g, std::move(ev));
+    if (!lane) {
+      if (!lane.error().busy) out(wire::error_line(g.rid, lane.error().what));
+      else if (g.rid) out(wire::busy_line(*g.rid, mc.lanes));
+      else return false;
+      return true;
     }
+    flights.emplace(n, Flight{lane.value(), g.rid, g.prompt.size()});
+    if (wrapping) conversation.wrap(lane.value());
+    return true;
+  };
+  const auto command = Overloaded{
+      [&](const wire::Generate& g) {
+        if (!waiting.empty() || !admit(g)) waiting.push_back(g);
+      },
+      [&](const wire::Stop& s) {  // the request it names, or naming none every one in flight
+        for (const auto& [n, f] : flights)
+          if (!s.rid || f.rid == s.rid) conversation.stop(f.lane);
+      },
+      [&](const wire::Wrap&) {
+        wrapping = true;
+        for (const auto& [n, f] : flights) conversation.wrap(f.lane);
+      },
+      [&](const wire::Quit&) { quit = true; },
+  };
+
+  try {
+    while (!quit) {
+      while (!waiting.empty() && admit(waiting.front())) waiting.pop_front();
+      // Every line that arrived, then one pass; with nothing in flight, wait for a line.
+      while (!quit) {
+        const std::optional<Input::Line> line = in.next(conversation.idle());
+        if (!line) break;
+        if (*line) std::visit(command, line->value());
+        else out(wire::error_line(line->error().rid, line->error().what));
+      }
+      if (in.ended()) quit = true;
+      if (quit)  // requests in flight end ("cancel"), each with its DONE
+        for (const auto& [n, f] : flights) conversation.stop(f.lane);
+      conversation.step();
+    }
+  } catch (const std::exception& e) {
+    // A CUDA or I/O failure may leave the engine unsound: every request in flight fails, and the
+    // server starts the engine again.
+    std::fprintf(stderr, "ds4n-serve: %s\n", e.what());
+    for (const auto& [n, f] : flights) out(failed_lines(f.rid, f.prompt, e.what()));
+    return 2;
   }
   m.decoder->sync();  // nothing in flight reads the Expert cache once it closes
   return 0;

@@ -1,0 +1,26 @@
+{
+ "set": "agents",
+ "at_once": 1,
+ "wall_s": 24.23,
+ "completion_tokens": 2400,
+ "aggregate_tok_s": 99.05,
+ "first_token_s": {
+  "min": 1.6,
+  "max": 1.6
+ },
+ "longest_silence_s": 1.59,
+ "errors": 0,
+ "requests": [
+  {
+   "name": "impl-ts",
+   "first_token_s": 1.6,
+   "done_s": 24.23,
+   "prompt_tokens": 181,
+   "completion_tokens": 2400,
+   "longest_silence_s": 1.59,
+   "finish": "length",
+   "error": "",
+   "writing_tok_s": 106.07
+  }
+ ]
+}

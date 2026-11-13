@@ -9,11 +9,16 @@
 #include <array>
 #include <cstdint>
 
+#include "cuda/lane_arg.cuh"
+
 namespace ds4n::cuda {
 
-/** For each of `rows` rows: ring[pos[r] % ring_rows] = bf16(mean of row r's four hc copies of h ([rows][4][dim])). */
+/**
+ * For each of `rows` rows: ring[pos[r] % ring_rows] = bf16(mean of row r's four hc copies of h ([rows][4][dim])),
+ * in the ring of row r's Lane (`lanes`, a per-row array; its stride in values).
+ */
 void capture_features(const __nv_bfloat16* h, int rows, int dim, const int64_t* pos, __nv_bfloat16* ring, int ring_rows,
-                      cudaStream_t stream);
+                      cudaStream_t stream, LaneArg lanes = {});
 
 /** out[r] = rings[0][slots[r]] | rings[1][slots[r]] | rings[2][slots[r]] ([rows][3 * dim]). */
 void gather_features(std::array<const __nv_bfloat16*, 3> rings, int dim, const int32_t* slots, int rows,

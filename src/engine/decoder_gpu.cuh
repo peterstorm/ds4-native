@@ -35,6 +35,7 @@
 #include "cuda/glue.cuh"
 #include "cuda/indexer.cuh"
 #include "cuda/int_arg.cuh"
+#include "cuda/lane_arg.cuh"
 #include "cuda/moe.cuh"
 #include "cuda/mx_gemv.cuh"
 #include "cuda/planes.cuh"
@@ -263,8 +264,7 @@ struct Decoder::Gpu {
   cuda::ExchangeLink link{};
   std::map<int, DeviceLayer> layers;
   std::map<int, LayerLaunches> launches;
-  // Captured layer steps by (layer, rows, parity of the first position, mode), and whole Rounds by
-  // (rows, parity).
+  // Captured layer steps by (layer, rows, model::group_mask, mode), and whole Rounds by (rows, group mask).
   std::map<std::tuple<int, int, int, StepMode>, cudaGraphExec_t> graphs;
   std::map<std::pair<int, int>, cudaGraphExec_t> round_graphs;
   cuda::ExpertDirectory experts{};  // this GPU's view of the Expert cache
@@ -274,10 +274,30 @@ struct Decoder::Gpu {
   // The mixes per row; mix_ffn starts each Round as `identities` (pre mix one-hot on copy 0).
   cuda::HcMixes *identities = nullptr, *mix_attn = nullptr, *mix_ffn = nullptr;
   model::RoundIndex* round = nullptr;  // this Round's, uploaded by begin_round
-  // Caches.
+  // The Sessions' caches, per layer: every Lane's one after another (cuda/lane_arg.cuh), the pointer
+  // the first Lane's. A DSpark stage's window (its context ring and block) is one, whatever the Lanes.
+  int lanes = 1;
   std::map<int, bf16*> window, compressed;
   std::map<int, uint8_t*> index_cache;
   std::map<int, cuda::PoolSlots> pools;
+  // From one Lane's cache to the next, in the cache's elements.
+  static constexpr int64_t kWindowStride = static_cast<int64_t>(kRing) * kHeadDim;
+  static constexpr int64_t kPoolStride = static_cast<int64_t>(kPoolRing) * kHeadDim;
+  static constexpr int64_t kFeatureStride = static_cast<int64_t>(kRing) * kDim;
+  static int64_t compressed_stride(int layer) { return kMaxCompressed / model::kind(layer).compress_ratio * kHeadDim; }
+  static int64_t index_stride(int layer) {
+    return static_cast<int64_t>(cuda::index_cache_bytes(kMaxCompressed / model::kind(layer).compress_ratio));
+  }
+  // One Lane's caches: what a prompt sweep, a Rewind point and a checkpoint work on.
+  bf16* window_of(int layer, int lane) const { return window.at(layer) + lane * kWindowStride; }
+  bf16* compressed_of(int layer, int lane) const { return compressed.at(layer) + lane * compressed_stride(layer); }
+  uint8_t* index_of(int layer, int lane) const { return index_cache.at(layer) + lane * index_stride(layer); }
+  cuda::PoolSlots pool_of(int layer, int lane) const {
+    const cuda::PoolSlots& p = pools.at(layer);
+    return {p.kv + lane * kPoolStride, p.score + lane * kPoolStride};
+  }
+  bf16* feature_of(size_t target, int lane) const { return draft.features[target] + lane * kFeatureStride; }
+  int sweep_lane = 0;  // the Lane the prompt sweep under way reads for (its waves launch with that Lane's caches)
   int32_t* topk = nullptr;       // [row][512], from the last index source
   uint32_t* candidates = nullptr;  // [row][kMaskWords], from the candidate source
   cuda::IndexSelectScratch select{};
@@ -305,7 +325,7 @@ struct Decoder::Gpu {
 
   /** DSpark on this GPU (add_draft); `features[0]` stays null until then. */
   struct Draft {
-    std::array<bf16*, kDraftTargetLayers.size()> features{};  // [kRing][5120] per target layer, by position
+    std::array<bf16*, kDraftTargetLayers.size()> features{};  // [lanes][kRing][5120] per target layer, by position
     DeviceFp8 main_proj;
     bf16 *main_norm = nullptr, *norm = nullptr;
     Launch main_proj_launch;
@@ -437,11 +457,11 @@ struct Decoder::Gpu {
   WaveClock clock;                             // GPU 0's, when profiling
 
   /**
-   * One layer step for `rows` rows from a position of parity `parity` (`mode` Round), or a prompt
-   * sweep's Round `*chunk.current` with its state loaded from its slot first and stored back after
-   * (Chunk).
+   * One layer step for `rows` rows of which those in `group_mask` complete a ratio-2 group (`mode`
+   * Round), or a prompt sweep's Round `*chunk.current` with its state loaded from its slot first and
+   * stored back after (Chunk).
    */
-  void enqueue_layer(int layer, int rows, int parity, StepMode mode = StepMode::Round);
+  void enqueue_layer(int layer, int rows, int group_mask, StepMode mode = StepMode::Round);
   /** Allocate a sweep's chunk arrays, grouped-MoE working set and wave scratch for `chunk_rounds` Rounds. */
   void allocate_sweep(int chunk_rounds);
   /** The pinned buffers and events allocate_sweep made. */
@@ -460,18 +480,19 @@ struct Decoder::Gpu {
                       std::span<const uint8_t* const> halves, const moe::TokenColumns& columns, size_t row0);
   /** The head over `rows` rows of the stream after the last layer: this GPU's half of the logits into head_out. */
   void enqueue_head(const bf16* final_norm, int rows);
-  /** Project `rows` accepted positions (from row `first` of the seed index) into every stage's context ring. */
-  void enqueue_seed(int first, int rows);
+  /** Project `rows` accepted positions of `lane` (from row `first` of the seed index) into every stage's context ring. */
+  void enqueue_seed(int first, int rows, int lane);
   /**
-   * The rings a WindowSnapshot copies, in a fixed order (device address, bytes): the target layers'
-   * window rings, the ratio-2 pools, DSpark's feature rings.
+   * The rings of `lane` a WindowSnapshot copies, in a fixed order (device address, bytes): the target
+   * layers' window rings, the ratio-2 pools, DSpark's feature rings.
    */
-  std::vector<std::pair<std::byte*, size_t>> rings();
+  std::vector<std::pair<std::byte*, size_t>> rings(int lane);
   /**
-   * What a KV checkpoint of positions [0, committed) copies, in a fixed order: each KV source's
-   * compressed rows and index-key tiles below its compressed length, then rings().
+   * What a KV checkpoint of `lane`'s positions [0, committed) copies, in a fixed order: each KV
+   * source's compressed rows and index-key tiles below its compressed length (kv_regions), then rings().
    */
-  std::vector<std::pair<std::byte*, size_t>> checkpoint_regions(int64_t committed);
+  std::vector<std::pair<std::byte*, size_t>> kv_regions(int lane, int64_t committed);
+  std::vector<std::pair<std::byte*, size_t>> checkpoint_regions(int lane, int64_t committed);
 };
 
 }  // namespace ds4n::engine

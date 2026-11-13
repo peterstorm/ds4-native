@@ -20,7 +20,7 @@
 // reply tokens of one row a Round (ds4n-model-run --sweep 0 --prefill 1), and serves the first k
 // replies (k = 1, 2, 4, 6, ...) on the engine's caches (the first --slots, a victim tier of --tiers
 // records, default 3,000) the two ways core/session_mix has them: taking turns of --turn tokens
-// (default 400; the engine today) or sharing Rounds (concurrent Sessions, not built), plain or with
+// (default 400; an engine of one Lane) or sharing Rounds (--lanes N; the engine shares plain rows only), plain or with
 // DSpark verify Rounds kept by --accept (each draft's acceptance given the ones before; default an
 // agent's reasoning and code). The time is a model of the engine's measured costs (the constants
 // below): the Rounds' Experts on the GPUs, the drafts, the Loads' waits and the turns' switches.

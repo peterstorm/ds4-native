@@ -28,9 +28,23 @@ prompt — microseconds against a 10–30 ms decode step. Nothing in it touches 
 | `ERR <message>` | a request that could not run (then `DONE … cancel` when it had started) |
 | `STOP` / `WRAP` / `QUIT` | end the request in flight / close an open reasoning block now / end the engine |
 
+**Several requests at once** (Maya's multi-request mode, served with `--lanes N`; Concurrent
+Sessions, below). An engine with more
+than one Lane says `READY 262144 stop multi=<lanes>`; the server then sends up to that many requests
+at a time, each `GEN` naming itself with a key `rid=<id>`, and that request's own lines carry the rid
+after the verb: `T <rid> <id>`, `PP <rid> ...`, `DONE <rid> ...`, `ERR <rid> <message>`.
+`STOP <rid>` ends that request alone; `STAT`, `INFO` and `WRAP` stay untagged. A `GEN` that finds
+every Lane busy gets `ERR <rid> all <lanes> conversation states are busy`. With one Lane the server
+sends no rid and every line is as in the table. Every line is queued in order and taken between the
+engine's passes, so a `STOP` or another `GEN` reaches requests in flight within one Round (or one
+prompt sweep). `tools/session-bench/maya_contract.py` runs Maya's own engine wrapper on the real
+engine: each of three requests at once gets the tokens and the `DONE` figures it gets alone, a
+consumer that stops ends only its request, a request beyond the Lanes is refused.
+
 `GENI` (pictures) is refused: ds4-native has no vision tower. Non-finite logits give
 `ERR non-finite logits (...)`, which the server answers by running the request again from token 0
-(the engine forgets the Session); any other failure ends the engine and the server restarts it.
+(the engine forgets that request's Lane's Session, and the other requests go on); any other failure
+fails every request in flight and ends the engine, and the server restarts it.
 
 ## The caches
 
@@ -76,7 +90,9 @@ cut back to where those caches still hold, Exactly, what a resume reads:
 So a resume needs KV holding the prompt's prefix and rings near the resume point, and the two may
 come from different places. `rewind::Sessions` keeps three kinds of state:
 
-- **The live Session** — the GPUs' caches and their tokens.
+- **A live Session in each Lane** — that Lane's caches on the GPUs and their tokens. The engine has
+  `--lanes N` of them (default 1); at one Lane every plan is the one it made before Lanes (its tests
+  run the earlier planner beside it).
 - **Rewind points** — the rings (40 window rings, 3 pools, 3 feature rings; 46 MB a GPU) copied into
   pinned memory at one position, with the tokens they were written for. Since the KV below a
   position is the same for every conversation sharing its tokens, a point serves *any* KV holding
@@ -101,13 +117,21 @@ come from different places. `rewind::Sessions` keeps three kinds of state:
 `rewind::plan` takes the KV from the live Session or a checkpoint, and the rings from that state, a
 checkpoint's turn, or any Rewind point whose tokens it shares — whichever feeds fewest tokens, never
 past the prompt's last token (its logits are the first pick's); ties go to the live Session and to a
-state's own rings. `rewind::Plan::source` names the pair: `FromLive{OwnRings | PointRings}` or
-`FromCheckpoint{OwnRings | PointRings | TurnRings}`. When the prompt shares at least `--split-min` (2,048) tokens more with some state than it can
+state's own rings. `rewind::Plan::source` names the pair: `FromLive{OwnRings | PointRings}`,
+`FromCheckpoint{OwnRings | PointRings | TurnRings}`, or — with several Lanes — `FromLane{lane,
+PointRings}`: the prefix another Lane holds, **borrowed** (copied into the Lane the prompt takes; rows
+below a Lane's committed tokens are final, so a Lane still writing lends too). `Plan::lane` is the
+Lane it takes: the Lane whose conversation it continues (its own rings, or its last prompt's end),
+else a free one, else the least recently used not busy; with every Lane busy there is no plan
+(`PlanError::Busy`). When the prompt shares at least `--split-min` (2,048) tokens more with some state than it can
 resume at, the plan **splits** the read there for a Rewind point. A conversation that differs from
 another only in its last 16 tokens is that one's re-rendered turn (the two cannot be told apart).
 
-`rewind::Sessions` is a value; `plan`, `set_aside`, `within`, `resumed`, `wrote`, `marked`,
-`next_buffer` and `forgot_live` take it and return the next one. Its tests drive it against an
+`rewind::Sessions` is a value; `plan`, `set_aside`, `within`, `resumed`, `released`, `wrote`,
+`marked`, `next_buffer` and `forgot` take it (and the Lane they are about) and return the next one.
+A Lane is busy from `resumed` to `released`. `next_buffer` spares the Rewind point at another
+Lane's last prompt's end, so with more points than Lanes an idle Session's next turn is never read
+again for another Lane's Splits. Its tests drive it against an
 independent model of the engine (every ring slot and KV row remembering the position and token
 prefix that wrote it; checkpoints and points as copies): over interleaved conversations under a
 shared system prompt — agents' next steps, re-rendered turns, deep cuts, verify Rounds, a squeezed
@@ -117,9 +141,16 @@ no earlier than that turn's prompt end.
 
 ## A request (`engine/conversation`)
 
+A request is **admitted** into a Lane (step 1) and then advances a **pass** at a time with
+whatever else is in flight: `Conversation::step` asks `core/shared_round::compose` what the Lanes'
+requests need next and runs it — a prompt sweep for one Lane (the others pause), one Lane's own step
+when it writes alone (DSpark included), or a Round with rows of every Lane at work. With one Lane
+that is the sequence below, one request after another.
+
 1. Plan, restore the point if any, resume.
 2. Read the prompt's unread tail: a **prompt sweep** from `--sweep-min` tokens (default 96), else
-   Rounds of 8 (STOP is checked between them). Measured on a 9K prompt's tail:
+   Rounds of 8 (STOP is checked between them; beside other Lanes at work, as many of a Round's 8
+   rows as they leave). Measured on a 9K prompt's tail:
 
    | tail tokens | sweep ms | Rounds ms |
    |---:|---:|---:|
@@ -171,7 +202,7 @@ no earlier than that turn's prompt end.
 On the whole model, each scenario runs its requests back to back on one Conversation (so they
 resume in place, take checkpoints back and restore points as the server's would), then every prompt
 again cold (from position 0); each compares the prompt-end logits bit for bit and the reply token
-for token, 2026-11-03:
+for token, 2026-11-03 (and again 2026-11-13 on the scheduler, at 1, 2 and 4 Lanes):
 
 | Check | Result |
 |---|---|
@@ -188,6 +219,19 @@ for token, 2026-11-03:
 | a 240,000-token prompt (four Cohorts) read warm — a checkpoint's 3,000-token prefix, then chunks at 3,000 + 64K k — against cold (chunks at 64K k) | equal |
 | its agent's next step at 240K, resumed in place | equal, reused 240,031 of 240,080 |
 
+**Mix invariance** (`--lanes 2` and `--lanes 4`, 2026-11-13): requests at once, each against its
+prompt cold and alone — where DSpark drafts, so every row also sets plain shared rows against DSpark:
+
+| Check | Result |
+|---|---|
+| every scenario above with one request at a time on 4 Lanes | equal, the same tokens reused (no conversation is set aside while a Lane is free) |
+| 2, 3 and 4 Sessions at once, greedy; 4 sampled (seed 1234) | equal |
+| one of 4 stopped a few tokens into its Reply while three write | a prefix of its Reply alone; the three equal |
+| a tool loop joining a Reply under way (its 41 new tokens as rows beside the writer), then a 9,000-token prompt (a sweep, the others pausing) | equal, the tool loop reused 95 of 136 |
+| a parent's next step with three subagents joining, each borrowing the system prompt from the parent's busy Lane | equal, each reused 3,000 |
+| five conversations on four Lanes in turn; the first, set aside, continued from its checkpoint | equal, reused 1,123 of 1,172 |
+| a request beyond the Lanes; a STOP for each | refused as busy; all end |
+
 ## Running it
 
 The desktop profile is the dotfiles' `scripts/inference/deepseek/ds41-1017-native/run-ds41-1017-native.sh`:
@@ -198,6 +242,10 @@ checkpoint's `tokenizer.json`); `--launch` writes the server's config and starts
 the shared inference key; `--stop` stops it. Settings: 8,400 Slots (8,500 does not fit beside
 DSpark and the 256K caches), 3,000 RAM tier records as a victim tier (`--ram-policy victim`: the Slots' evictions copied down, forward-pass.md; 48 of the Slots spares), Maya's Expert profile, `--sweep-min 96`,
 6 GB of checkpoints and 8 Rewind points (with the server loaded ~13 GB of the 91 stay free).
+`--lanes N` (not set by the profile yet: one Lane) takes ~78 Slots a Lane beyond the first: 8,322
+Slots at 2, 8,166 at 4 (both measured to fit), and at least N + 1 Rewind points. Not set by the
+profile yet either, both measured (Concurrent Sessions): `--ram-records 3400` (~7 % more tok/s; ~8 GiB
+of host memory then stay free) and `--sweep-slots 384` with 128 more `--slots`.
 The server runs with `--fit-max-tokens`: a request whose max_tokens does not fit the 256K context
 beside its prompt gets the room there is.
 
@@ -213,7 +261,56 @@ taking one back 8 ms. A worker's *first* prompt shares little with its parent: p
 with `--exclude-tools subagent`, so their tool list — near the top of the system prompt — differs
 at once; workers of one kind share their whole system prompt with each other.
 
-## Concurrent Sessions (studied 2026-11-04, not built)
+## Concurrent Sessions (studied 2026-11-04; built and measured 2026-11-13)
+
+`--lanes N` gives the engine N **Lanes** (`core/lane`): caches for N live Sessions at once, ~730 MiB
+a GPU each, so ~78 fewer Slots a Lane. The pure core decides — which Lane a prompt takes and what it
+resumes from, a borrow of another Lane's prefix included (`core/rewind`); what the next pass holds
+(`core/shared_round::compose`: a tail of `--sweep-min` tokens or more is a Prompt sweep that holds
+the GPUs; one Lane writing alone steps as an engine of one Lane does, DSpark included; otherwise
+every Lane at work has rows in the Round, a writing Lane exactly one, the rest to Lanes still
+reading); a Round's index from rows of several Lanes (`model::round_index`) — and the shell carries
+it out: Lane-indexed caches on the GPUs (forward-pass.md), `engine/conversation`'s passes, the
+tagged wire. **Mix invariance** holds on the whole model (Exactness, above), and through Maya's
+server every Reply of the arms below is byte for byte the serial engine's.
+
+Measured through the server (2026-11-13; `tools/session-bench`, the recorded prompts sent at once,
+greedy, 2,400-token replies, a fresh engine per arm, results in `docs/bench/shared-rounds/`). Each
+cell: tok/s in all; wall clock; when the last request got its first token.
+
+| Requests at once | taking turns (1 Lane, 8,400 Slots) | 2 Lanes (8,322 Slots) | 4 Lanes (8,166 Slots) |
+|---|---|---|---|
+| Wave gate, 5 reviewers of one diff | 84.2; 141 s; 114 s | 94.7; 126 s; 99 s | 106.2; 112 s; 82 s (the first four: 3-13 s) |
+| 4 different agents | 95.4; 101 s; 77 s | 97.1; 99 s; 52 s | 90.6; 106 s; 9 s |
+| 2 reviewers | 85.4; 55 s; 31 s | 94.9; 49 s; 6 s | 91.3; 51 s; 6 s |
+| 2 agents | 99.8; 48 s; 26 s | 102.3; 47 s; 3 s | 99.4; 48 s; 3 s |
+| 1 reviewer | 80-85 | 78.5 | 73.6 |
+| 1 agent | 93-95 | 92.8 | 89.0 |
+
+What it buys is mostly waiting: nobody queues behind another's whole answer. In tokens it buys
++26 % for reviewers of one diff at 4 Lanes and +11 % at 2, nothing for agents that route apart
+(-5 % at 4 Lanes), and it costs a lone request the Slots the Lanes take: about -3 % at 2 Lanes,
+-6 to -9 % at 4. Less than the study below predicted, because Loads decide it: a Shared Round needs
+the union of its rows' Experts and a Miss for one row stalls them all (four reviewers waited on
+Loads for 40 s of 76 s; four different agents took ~10 Loads a token against 5 alone), and Shared
+Rounds are plain rows, without DSpark, which alone already writes these prompts at 80-110 tok/s
+(the study assumed 79-91). So the default stays one Lane; 2 Lanes never lost on these arms, and 4
+suits Wave gates and panels. Each Session while sharing writes 49-55 tok/s beside one other and
+23-32 beside three. A prompt sweep still holds the GPUs: writers pause for it (3-4 s for a
+1,500-token read).
+
+The Loads themselves are at the hardware's speed (a step's are issued together; the engine's
+counters times 0.36 ms a RAM tier Load and 1.7 ms a store read give its measured wait to 1 %), a
+token takes as many shared as alone (6-7), and the fifth that read the drive are over half of the
+wait. So what helps is cache, for one Session as for four: 3,400 RAM tier records instead of 3,000
+served ~7 % more on every arm (five reviewers at 4 Lanes 106.2 -> 113.7 tok/s, one request at one
+Lane 80.7 -> 87.2), for 7 GiB more pinned host memory; `--sweep-slots 384` frees 128 of the 512
+Slots prompt sweeps load into for `--slots` (a layer's sweep reads at most 384; the whole check
+passes and prompts read as fast), worth 0-2 %. A tier of 5,000-7,000 records would be worth
+18-28 % by the replay, and needs more host RAM than there is (the plan's "What the Loads are made
+of"; `docs/bench/shared-rounds/tier/`).
+
+The study that came first (2026-11-04):
 
 pi runs up to 4 subagents at once, and with a local parent every one of them asks this engine (pi's
 `local-workloads-use-parent`): Loom's Waves, its Wave gates (five reviewers per Task) and its panels
@@ -259,12 +356,14 @@ turns, it holds the queue). DSpark gains little in shared Rounds: each Session d
 
 ## Limits
 
-- **One request at a time.** Conversations take turns on the GPUs (each switch sets one aside and
-  takes one back, ~50 ms for 4.5K tokens); no PAUSE / fair slices, no batching several at once
-  (Maya's `multi=`): parallel subagents queue in the server. A request in line used to send nothing
-  until its turn, and behind other agents' long answers Node's fetch cut it after 300 s; the
-  dotfiles' Maya patch (`maya-serve-keepalive.patch`) now sends keep-alives while it waits (three
-  planning requests at once, served 2026-11-04: the third waited 28.6 s, no stream silent over 10 s).
-  Sharing Rounds would serve Loom's fan-outs ~1.5x faster (Concurrent Sessions, above).
+- **One request at a time by default.** With one Lane conversations take turns on the GPUs (each
+  switch sets one aside and takes one back, ~50 ms for 4.5K tokens) and parallel subagents queue in
+  the server; the dotfiles' Maya patch (`maya-serve-keepalive.patch`) sends keep-alives while they
+  wait. `--lanes N` runs N at once (Concurrent Sessions, above), at the price of Slots; requests
+  beyond N queue in the server as before. No PAUSE / fair slices, no priorities: every Lane at work
+  has a row in every Round.
+- **While sharing**: no DSpark (only a Lane writing alone drafts); a prompt sweep holds the GPUs,
+  the other Lanes pausing for its whole piece; `--slots` is not sized from the Lanes (the Ledger is
+  not wired: give ~78 fewer a Lane); `STAT` is the engine's, not a request's.
 - **Checkpoints live in RAM only**: they do not outlast the engine (Maya's also go to a folder).
 - **262,144-token context** (kMaxCompressed), text only.

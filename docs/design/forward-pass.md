@@ -145,7 +145,21 @@ compute exactly what its rows would one at a time (`tests/core/test_round.cpp`):
 - a row's compressed length excludes every latent a later row completes, so index keys and
   compressed rows for the whole Round can be written before any row scores;
 - ratio-2 pools take the rows in position order, and which rows complete a group
-  (`model::completes_group`) depends only on the parity of p0.
+  (`model::completes_group`) depends only on each row's own position (for one Session's Round: on
+  the parity of p0).
+
+**Rows of several Lanes (a Shared Round).** An engine started with `--lanes N` holds N Sessions'
+caches at once, each cache one allocation with the Lanes one after another. A Round's rows may then
+be of several Lanes (`model::round_index(rows)`: sorted by Lane, a Lane's at consecutive
+positions), and every kernel that reads or writes a Session's cache -- `kv_to_cache`, `store_row`,
+`compress_pool`, `append_index_keys`, `index_scores`, sparse attention's `KvSources`, DSpark's
+`capture_features` -- takes the cache's start and a `cuda::LaneArg`: the row's Lane, read from the
+Round's `RoundIndex::lane` on the device when the kernel runs, and the stride from one Lane's cache
+to the next. Nothing else in a layer step knows whose row it is on (GEMVs, routing, the MoE union
+and its per-row combine order, the exchanges and the head were row-wise already), so a row
+computes the same bits in any Round: **Mix invariance** (`ds4n-serve-check --lanes 4`). With one
+Lane the offset is zero and the addresses are the ones the engine always used. A ratio-2 pool
+chains its state from row to row only within a Lane, which the row order gives it.
 Work that is per row by nature (compressor pooling, index-key appends, index scoring and top-k,
 compressed stores) loops over the rows inside the graph. The routing Plan is the union of the
 rows' Experts, so each routed Expert streams once per Round.
@@ -177,7 +191,13 @@ lazy first launch can wait on the device), and a 10 s watchdog in the exchange t
 instead of hanging.
 
 **Graph replay.** A layer step replays as a CUDA graph captured on first use per (layer, rows,
-parity of p0), and a whole Round as one graph per (rows, parity). No captured launch takes a
+group mask), and a whole Round as one graph per (rows, group mask). The group mask
+(`model::group_mask`) has a bit for each row that completes a ratio-2 group: with the row count it
+is all that decides which launches a step records (a KV source's compress and index-key launches
+exist only for rows that complete a group). One Session's Round has two masks per width -- the two
+parities of p0, the shapes the engine always had -- and a Shared Round whichever its rows'
+positions give; the Lanes themselves are device values, so one graph serves rows of any Lanes. No
+captured launch takes a
 per-Round host value: `begin_round(p0)` uploads the Round's `model::RoundIndex` (per row:
 position, latent positions, ring slot, compressed lengths and rows per ratio) and the rows'
 window slots, and kernels read them as `cuda::IntArg` device arguments -- launches are sized for
@@ -210,7 +230,7 @@ long-prompt reference) and then the grouped one.
 Between its layer steps a Round's state -- stream, FFN mixes, Round index, window slots, top-k,
 candidate blocks, Engram rows -- lives in a slot of chunk arrays; a chunked layer step loads the
 slot of the Round a device value names into the working buffers and stores it back, so one
-captured graph per (layer, rows, parity) replays for every Round. Exact by the Round argument
+captured graph per (layer, rows, group mask) replays for every Round. Exact by the Round argument
 (each row reads only earlier positions, all in the caches by then): `ds4n-model-run` dumps from
 sweeps are byte-identical to the Rounds' and to the sequential exact run.
 
@@ -228,7 +248,7 @@ layer and names it).
 last ~22 layers' Experts, so it reloads nearly every Expert as it meets each layer (15.8K reads for
 9K tokens), and decode right after the prompt finds the early layers gone (14 tok/s). A sweep's
 steps are posted flagged (`moe::kSweepStep`, a device value the decoder sets around its launches):
-their Experts in the decode Slots are Hits there, the rest load into 512 scratch Slots (LRU among
+their Experts in the decode Slots are Hits there, the rest load into 512 scratch Slots (`--sweep-slots`, at least a layer's 384 Experts; LRU among
 themselves, after the decode Slots in the pool). A key lives in one region at a time. Placement
 only: the dumps stay byte-identical.
 

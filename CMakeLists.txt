@@ -27,6 +27,7 @@ add_library(ds4n_core STATIC
   src/core/cache_replay.cpp
   src/core/slot_map.cpp
   src/core/session_mix.cpp
+  src/core/shared_round.cpp
   src/core/speculation.cpp
   src/core/moe_groups.cpp
   src/core/row_index.cpp
@@ -142,10 +143,12 @@ add_executable(ds4n_tests
   tests/core/test_indexer.cpp
   tests/core/test_compressor.cpp
   tests/core/test_compare.cpp
+  tests/core/test_lane.cpp
   tests/core/test_round.cpp
   tests/core/test_cache_replay.cpp
   tests/core/test_slot_map.cpp
   tests/core/test_session_mix.cpp
+  tests/core/test_shared_round.cpp
   tests/core/test_speculation.cpp
   tests/core/test_moe_groups.cpp
   tests/core/test_row_index.cpp

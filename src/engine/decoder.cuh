@@ -12,10 +12,15 @@
 // exchange and hc_post. No host round trip per layer: a step only waits when
 // an Expert is missing, and then on the service, not on the caller.
 //
+// A Round's rows may be of several Lanes (core/lane.hpp: a Shared Round), each
+// row reading and writing its own Lane's caches -- sorted by Lane, a Lane's at
+// consecutive positions -- and computes what its rows would in Rounds of their
+// own: nothing a row computes depends on the rows beside it.
+//
 // Each layer step replays as a CUDA graph captured on first use, per (layer,
-// rows, parity of the first position: which rows complete a ratio-2 group).
+// rows, which rows complete a ratio-2 group: model::group_mask).
 // Nothing a graph launches takes a per-step host value: begin_round uploads the
-// Round's model::RoundIndex (positions, ring slots, cache lengths and rows),
+// Round's model::RoundIndex (positions, Lanes, ring slots, cache lengths and rows),
 // which kernels read when they run, and stages both Engram tables' rows in
 // fixed pinned memory that the graphs copy from.
 //
@@ -47,6 +52,7 @@
 #include <vector>
 
 #include "core/engram.hpp"
+#include "core/lane.hpp"
 #include "core/layer_weights.hpp"
 #include "core/model.hpp"
 #include "core/moe_plan.hpp"
@@ -164,27 +170,38 @@ class Decoder {
  public:
   /**
    * Two devices with peer access to each other, and each one's view of the Expert cache.
-   * `chunk_rounds`: the Rounds of 8 a prompt sweep (prefill) takes at once; 0 for none.
+   * `chunk_rounds`: the Rounds of 8 a prompt sweep (prefill) takes at once; 0 for none. `lanes`: the
+   * Sessions' caches it holds at once (~730 MiB a GPU each at the full context).
    */
   Decoder(std::array<int, 2> devices, std::array<cuda::ExpertDirectory, 2> experts, Launches launches = Launches::Graphs,
-          int chunk_rounds = 0);
+          int chunk_rounds = 0, lane::LaneCount lanes = {});
   ~Decoder();
   Decoder(const Decoder&) = delete;
   Decoder& operator=(const Decoder&) = delete;
+
+  lane::LaneCount lanes() const { return lanes_; }
 
   /** Upload a layer to both GPUs and prepare its launches. */
   void add_layer(const HostLayer& w);
 
   /**
-   * Start a Round of rows at positions p0, p0 + 1, ...: their embeddings ([rows][5120] BF16 values,
-   * 1 to 8 rows) in all four copies each, pre mix one-hot on copy 0, the Round's positions, and the
-   * Engram rows ([rows] x kEngramTokenBytes, or empty when no Engram layer runs). p0 = 0 starts a
-   * new Session: every cache read is bounded by the reading row's position (window slots, compressed
-   * and index rows below its compressed length, a ratio-2 pool slot written before it is read), so a
-   * previous Session's rows are never read. A p0 below the last Round's resumes the Session there
-   * (exact where core/rewind says so).
+   * Start a Round of rows at positions p0, p0 + 1, ... of `lane`: their embeddings ([rows][5120] BF16
+   * values, 1 to 8 rows) in all four copies each, pre mix one-hot on copy 0, the Round's positions, and
+   * the Engram rows ([rows] x kEngramTokenBytes, or empty when no Engram layer runs). p0 = 0 starts a
+   * new Session in the Lane: every cache read is bounded by the reading row's position (window slots,
+   * compressed and index rows below its compressed length, a ratio-2 pool slot written before it is
+   * read), so a previous Session's rows are never read. A p0 below the Lane's last Round's resumes
+   * its Session there (exact where core/rewind says so).
    */
-  void begin_round(int64_t p0, std::span<const float> embeddings, std::span<const uint8_t> engram_rows = {});
+  void begin_round(int64_t p0, std::span<const float> embeddings, std::span<const uint8_t> engram_rows = {},
+                   lane::LaneId lane = {});
+
+  /**
+   * Start a Round of `rows` (model::round_index's: sorted by Lane, a Lane's at consecutive
+   * positions), a Shared Round when of several Lanes; embeddings and Engram rows in row order.
+   */
+  void begin_round(std::span<const model::RoundRow> rows, std::span<const float> embeddings,
+                   std::span<const uint8_t> engram_rows = {});
 
   /**
    * One step of `layer` for the current Round. With `trace`, waits for the step and returns rank 0's
@@ -194,13 +211,13 @@ class Decoder {
   std::vector<StepTrace> decode_layer(int layer, bool trace = true);
 
   /**
-   * Every added layer, in order, for the current Round: one graph per GPU (per rows and parity),
+   * Every added layer, in order, for the current Round: one graph per GPU (per rows and group mask),
    * returning as soon as it is launched.
    */
   void decode_round();
 
   /**
-   * A prompt sweep: tokens at positions p0, p0 + 1, ... (`embeddings` [tokens][5120]; `engram` the
+   * A prompt sweep for `lane`: tokens at positions p0, p0 + 1, ... (`embeddings` [tokens][5120]; `engram` the
    * tokens' Engram row ids, read with `read_engram`, both empty when no Engram layer runs) as Rounds of
    * 8 rows, in chunks of up to chunk_rounds Rounds, each chunk layer by layer: every Round goes through layer L before any
    * goes through L + 1, so a layer's Experts are read once per chunk instead of once per Round that
@@ -228,7 +245,7 @@ class Decoder {
    * them. DS4N_DECODER_TAIL=0 runs every layer on every row.
    */
   void prefill(int64_t p0, std::span<const float> embeddings, std::span<const EngramTokenRows> engram = {},
-               const EngramReader& read_engram = {}, const ExpertPlacer& place = {});
+               const EngramReader& read_engram = {}, const ExpertPlacer& place = {}, lane::LaneId lane = {});
 
   /** Wait until both GPUs finished everything launched so far. */
   void sync();
@@ -236,33 +253,41 @@ class Decoder {
   /** A snapshot sized for this decoder's rings (after every add_layer and add_draft); its contents unset. */
   WindowSnapshot window_snapshot();
 
-  /** Copy the rings into `into`, after everything launched so far (returns once the copies are launched). */
-  void save(WindowSnapshot& into);
+  /** Copy `lane`'s rings into `into`, after everything launched so far (returns once the copies are launched). */
+  void save(WindowSnapshot& into, lane::LaneId lane = {});
 
   /**
-   * Put `from`'s rings back (launched after everything so far): below the position it was saved at,
-   * the caches hold what they held then. DSpark's context starts over (draft() seeds it again from
-   * the feature rings).
+   * Put `from`'s rings back into `lane` (launched after everything so far): below the position it was
+   * saved at, the Lane's caches hold what they held then -- whichever Lane they were saved from, when
+   * `lane`'s KV holds the same tokens. DSpark's context starts over (draft() seeds it again from the
+   * feature rings).
    */
-  void restore(const WindowSnapshot& from);
+  void restore(const WindowSnapshot& from, lane::LaneId lane = {});
 
   /** Host bytes (both GPUs) a KV checkpoint of positions [0, committed) takes: its compressed and index rows and the rings. */
   size_t checkpoint_bytes(int64_t committed);
 
   /**
-   * A KV checkpoint (core/rewind): both GPUs' compressed and index rows below `committed` and their
-   * rings, copied to the host once everything launched so far ran (it waits).
+   * A KV checkpoint (core/rewind) of `lane`: both GPUs' compressed and index rows below `committed`
+   * and their rings, copied to the host once everything launched so far ran (it waits).
    */
-  StoredCaches checkpoint(int64_t committed);
+  StoredCaches checkpoint(int64_t committed, lane::LaneId lane = {});
 
   /** `from`'s rings copied into `c` as its turn, once everything launched so far ran (it waits). */
   void keep_turn(StoredCaches& c, const WindowSnapshot& from);
 
   /**
-   * `c`'s rows back on both GPUs (it waits), with the rings `rings` names (StoredRings::Turn needs
-   * keep_turn's copy). DSpark's context starts over.
+   * `c`'s rows back on both GPUs in `lane` (it waits), with the rings `rings` names (StoredRings::Turn
+   * needs keep_turn's copy). DSpark's context starts over.
    */
-  void take_back(const StoredCaches& c, StoredRings rings);
+  void take_back(const StoredCaches& c, StoredRings rings, lane::LaneId lane = {});
+
+  /**
+   * A borrow (core/rewind, FromLane): the compressed and index rows of `from` below `committed` copied
+   * into `to`, after everything launched so far (returns once the copies are launched). Those rows
+   * are final in `from` whatever it goes on to write; `to`'s rings come from a Rewind point (restore).
+   */
+  void lend(lane::LaneId from, lane::LaneId to, int64_t committed);
 
   /** Upload the final norm and the head (BF16 values [129280][5120]); each GPU keeps its half of the vocabulary. */
   void add_head(const std::vector<float>& norm, const std::vector<float>& head);
@@ -282,13 +307,14 @@ class Decoder {
   void add_draft_expert(int stage, int expert, std::span<const std::byte> record);
 
   /**
-   * Draft a block for the anchor `token` at position p (embedding `anchor_embedding`): first the
+   * Draft a block for `lane`'s anchor `token` at position p (embedding `anchor_embedding`): first the
    * context takes every position below p it has not yet (their target features, captured when a
    * Round decoded them; the caller guarantees every position below p is committed), then the
    * stages, the head, the Markov chain and the confidence head.
-   * Uses the Round buffers: call between Rounds, after the last Round's logits().
+   * Uses the Round buffers: call between Rounds, after the last Round's logits(). The context is one
+   * Lane's at a time: drafting for another seeds it again.
    */
-  DraftBlock draft(int64_t p, int32_t token, std::span<const float> anchor_embedding);
+  DraftBlock draft(int64_t p, int32_t token, std::span<const float> anchor_embedding, lane::LaneId lane = {});
 
  private:
   struct Gpu;
@@ -324,14 +350,18 @@ class Decoder {
                            EngramReads& progress);
   /** A sweep's grouped MoE for `layer` over the chunk's tokens [first_row, tokens), its Experts in `slot_of`. */
   void grouped_moe(int layer, size_t first_row, size_t tokens, std::span<const std::optional<uint32_t>> slot_of);
-  /** Copy every GPU's rings into `w` (`to_host`) or back from it, after everything launched so far. */
-  void transfer(const WindowSnapshot& w, bool to_host);
+  /** Copy every GPU's rings of `lane` into `w` (`to_host`) or back from it, after everything launched so far. */
+  void transfer(const WindowSnapshot& w, bool to_host, lane::LaneId lane);
+  /** `lane`, or a throw when this decoder has no such Lane. */
+  int checked(lane::LaneId lane) const;
   std::array<std::unique_ptr<Gpu>, 2> gpus_;
   Launches launches_;
+  lane::LaneCount lanes_;
   int rows_ = 0;
-  int64_t p0_ = 0;
+  int group_mask_ = 0;  // the current Round's model::group_mask
   bool engram_staged_ = false;
-  int64_t seeded_ = 0;       // DSpark's context holds every position below this one (up to kDraftContext)
+  int64_t seeded_ = 0;       // DSpark's context holds every position of seeded_lane_ below this one (up to kDraftContext)
+  lane::LaneId seeded_lane_;
   std::vector<float> noise_;  // the noise token's embedding
   // A prompt sweep's Engram rows ([2][chunk rows] x kEngramTableBytes), pinned host memory both GPUs
   // read where they need it (the two Engram layers) instead of a copy in VRAM.

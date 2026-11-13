@@ -17,6 +17,7 @@
 #include <cstdint>
 
 #include "cuda/glue.cuh"
+#include "cuda/lane_arg.cuh"
 #include "cuda/mx_gemv.cuh"
 
 namespace ds4n::cuda {
@@ -33,11 +34,12 @@ void clear_fragments(ActFragments act, int groups, cudaStream_t stream);
 
 /**
  * Each token's KV row: bf16(sum of planes) -> RMSNorm(w, eps) -> RoPE on the last `rope_dim` at
- * positions[t] -> FP8 quant-dequant per 32 -> row slots[t] of `cache` (rows of in.rows BF16).
- * Rows 512; one block per token.
+ * positions[t] -> FP8 quant-dequant per 32 -> row slots[t] of `cache` (rows of in.rows BF16), in the
+ * cache of token t's Lane (`lanes`, a per-token array; its stride in values). Rows 512; one block per token.
  */
 void kv_to_cache(Planes in, int tokens, const __nv_bfloat16* w, float eps, const float* freqs, int rope_dim,
-                 const int64_t* positions, __nv_bfloat16* cache, const int64_t* slots, cudaStream_t stream);
+                 const int64_t* positions, __nv_bfloat16* cache, const int64_t* slots, cudaStream_t stream,
+                 LaneArg lanes = {});
 
 /** Heads [tokens][heads][head_dim] = bf16(sum of planes), then RoPE on each head's last `rope_dim` at positions[t]. */
 void planes_rope(Planes in, int tokens, int heads, int head_dim, int rope_dim, const float* freqs,

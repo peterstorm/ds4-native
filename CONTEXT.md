@@ -70,10 +70,14 @@ Byte arithmetic that fixes Slot counts per GPU and phase from mandatory state, n
 One forward pass producing one token for one Session.
 
 **Round**:
-One forward pass over up to 8 rows at consecutive positions of one Session (a prefill chunk, DSpark verification rows, or one decode row), layer by layer; its outputs are exactly those of its rows decoded one at a time. Rows of several Sessions in one Round need per-Session caches (not built).
+One forward pass over up to 8 rows, layer by layer (a prefill chunk, DSpark verification rows, or one decode row); its outputs are exactly those of its rows decoded one at a time. Its rows are sorted by **Lane**, at consecutive positions within each (`model::round_index`): rows of one Session in the usual case, of several in a **Shared Round**.
+
+**Lane**:
+The GPUs' caches for one live Session -- its compressed rows, index keys, window rings, ratio-2 pools and DSpark feature rings -- and its Engram History; the engine has `--lanes N` of them (`lane::LaneCount`, a Lane named by a `lane::LaneId`), all the full context. A Lane is **busy** from the request that takes it until that request ends, and no other request is given it meanwhile. A live Session occupies one Lane; a prompt continuing a Lane's own conversation stays there, anything else takes a free Lane, else the least recently used one not busy (`core/rewind`).
+_Avoid_: slot (VRAM for an Expert, and Maya's parked conversation), seat, stream (CUDA's)
 
 **Shared Round**:
-A Round holding rows of several Sessions, each writing its own Reply, so each layer's Experts stream once for all of them; the engine instead lets Sessions **take turns** (one request at a time). Studied, not built: `core/session_mix` and `ds4n-cache-study --sessions` replay recorded Sessions both ways (serving.md, Concurrent Sessions).
+A Round holding rows of several Lanes, each row reading and writing only its own Lane's caches, so each layer's Experts stream once for all the Sessions in it; what a Round holds is `core/shared_round`'s to say. With one Lane (the default), or one request, Sessions **take turns** as before. Only a Lane writing alone drafts with DSpark: a Shared Round's rows are plain. `core/session_mix` and `ds4n-cache-study --sessions` replay recorded Sessions both ways (serving.md, Concurrent Sessions).
 _Avoid_: batch (the prompt sweep's Cohort and Wave already batch rows of one Session), multi (Maya's protocol flag, not ours)
 
 **Anchor**:
@@ -120,7 +124,7 @@ A Session set aside whole in host RAM — both GPUs' compressed and index rows b
 _Avoid_: slot (Maya's word for it, and ours for VRAM), parked session (prose only)
 
 **Resume**:
-Starting a prompt at a position instead of 0: the prompt's longest prefix shared with KV the engine holds (the live Session's or a KV checkpoint's), cut back to a position some ring state still answers Exactly (the window and feature rings at most 512 positions written past it, an odd position's ratio-2 pool at most 15; `core/rewind`). The compressed and index caches are written once per position — below a position, the same bits for every conversation with those tokens — so they never limit it.
+Starting a prompt at a position instead of 0: the prompt's longest prefix shared with KV the engine holds (a Lane's -- its own in place, or another Lane's prefix copied over, a **borrow** -- or a KV checkpoint's), cut back to a position some ring state still answers Exactly (the window and feature rings at most 512 positions written past it, an odd position's ratio-2 pool at most 15; `core/rewind`). The compressed and index caches are written once per position — below a position, the same bits for every conversation with those tokens — so they never limit it.
 
 **Split**:
 Reading a prompt in two pieces with a Rewind point between, where it leaves tokens another kept state shares (a subagent leaving its parent's system prompt), so the next prompt sharing them Resumes there.
@@ -157,15 +161,20 @@ Byte-identical full-vocabulary logits, token ids, KV bytes and counters versus t
 **Oracle**:
 An independent slow implementation (antirez/ds4, Maya's `ref.py`, or the HF reference code) used to anchor the Reference configuration.
 
+**Mix invariance**:
+A request's prompt-end logits and Reply are bit-identical whether it ran alone or shared Rounds with any other requests, in any Lane: sharing changes timing, never output. The gate of Shared Rounds, as Slot-count invariance is the Expert cache's.
+
 ## Relationships
 
 - An **Expert** has one **Expert record** in the **Expert store** and, under tensor parallelism, two **Halves**
 - A **Slot** holds at most one **Expert**; the **Ledger** fixes how many **Slots** each GPU has
 - A **Miss** is served from the **RAM tier** if present there, otherwise from the **Expert store**
-- A **Round** contains one to eight rows of one **Session**; a **Step** is a one-row **Round**; a **Round**'s **Routing plan** is the union of its rows' Experts
+- A **Round** contains one to eight rows; a **Step** is a one-row **Round**; a **Round**'s **Routing plan** is the union of its rows' Experts, whatever their **Lanes**
+- A live **Session** occupies one **Lane**; a **KV checkpoint** is a Session in no Lane
 - A **KV checkpoint** holds one **Session** at one position; a later checkpoint of the same conversation replaces it
-- A **Rewind point** belongs to no Session: it serves any KV holding its tokens
-- A **Resume** takes KV from the live **Session** or a **KV checkpoint**, and rings from that state, a **KV checkpoint**'s turn, or a **Rewind point** — whichever reads fewest of the prompt's tokens
+- A **Rewind point** belongs to no Session and no **Lane**: it serves any KV holding its tokens
+- A **Resume** takes KV from a **Lane** (in place, or its prefix borrowed into another) or a **KV checkpoint**, and rings from that state, a **KV checkpoint**'s turn, or a **Rewind point** — whichever reads fewest of the prompt's tokens
+- Every busy **Lane** has a row in every **Shared Round**; a **Prompt sweep** holds the GPUs alone, the other **Lanes** pausing
 - **Cache-conditional routing** makes outputs depend on **Expert cache** contents; with λ = 0 every policy is **Exact**
 
 ## Example Dialogue
@@ -180,4 +189,5 @@ An independent slow implementation (antirez/ds4, Maya's `ref.py`, or the HF refe
 - "cache" was used for the **Expert cache**, the RAM page cache, ZFS ARC and **KV checkpoints** — resolved: say **Expert cache**, page cache, ARC or **KV checkpoint**.
 - "slot" in Project Maya also means a parked conversation — resolved: here **Slot** is VRAM for an **Expert**; parked conversations are **KV checkpoints**.
 - "shard" means split files (GGUF parts, HF safetensors) only — a GPU's share of an **Expert** is a **Half**.
+- "live Session" meant the one conversation on the GPUs — resolved: with **Lanes** there is one per Lane; say "a Lane's Session", and "the live Session" only where one Lane is meant.
 - "chunk" in the decoder (`Decoder::Gpu::Chunk`, `--sweep` chunks) is a **Cohort** — not an **Expert record** (which prose must not call a chunk); the code keeps the name for now.

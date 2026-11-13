@@ -10,10 +10,10 @@ constexpr int kThreads = 256;
 constexpr int kHcCopies = 4;
 
 __global__ void capture_kernel(const __nv_bfloat16* __restrict__ h, int dim, const int64_t* __restrict__ pos,
-                               __nv_bfloat16* __restrict__ ring, int ring_rows) {
+                               __nv_bfloat16* __restrict__ ring, int ring_rows, LaneArg lanes) {
   const int r = blockIdx.y;
   const __nv_bfloat16* row = h + static_cast<size_t>(r) * kHcCopies * dim;
-  __nv_bfloat16* out = ring + static_cast<size_t>(pos[r] % ring_rows) * dim;
+  __nv_bfloat16* out = ring + lanes.row(r).offset() + static_cast<size_t>(pos[r] % ring_rows) * dim;
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < dim; i += gridDim.x * blockDim.x) {
     float sum = 0.0f;
     for (int c = 0; c < kHcCopies; c++) sum = __fmaf_rn(__bfloat162float(row[c * dim + i]), 0.25f, sum);
@@ -92,8 +92,8 @@ __global__ void __launch_bounds__(1024) confidence_kernel(const float* __restric
 }  // namespace
 
 void capture_features(const __nv_bfloat16* h, int rows, int dim, const int64_t* pos, __nv_bfloat16* ring, int ring_rows,
-                      cudaStream_t stream) {
-  capture_kernel<<<dim3((dim + kThreads - 1) / kThreads, rows), kThreads, 0, stream>>>(h, dim, pos, ring, ring_rows);
+                      cudaStream_t stream, LaneArg lanes) {
+  capture_kernel<<<dim3((dim + kThreads - 1) / kThreads, rows), kThreads, 0, stream>>>(h, dim, pos, ring, ring_rows, lanes);
 }
 
 void gather_features(std::array<const __nv_bfloat16*, 3> rings, int dim, const int32_t* slots, int rows,

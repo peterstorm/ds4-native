@@ -6,6 +6,7 @@
 #include <cstdint>
 
 #include "core/model.hpp"
+#include "cuda/lane_arg.cuh"
 
 namespace ds4n::cuda {
 
@@ -28,11 +29,16 @@ constexpr int kAttnHeads = 32;      // heads per GPU
 constexpr int kAttnDim = 512;       // head_dim (one shared latent KV)
 constexpr int kAttnSplitRows = 64;  // index slots per split (one CTA)
 
-/** The KV rows a slot index names: window ring rows below kAttnWindow (the ring's slots), then the compressed cache. */
+/**
+ * The KV rows a slot index names: window ring rows below kAttnWindow (the ring's slots), then the
+ * compressed cache -- for query row t, those of its Lane (the two LaneArgs' row t; strides in values).
+ */
 constexpr int kAttnWindow = model::kRing;
 struct KvSources {
   const __nv_bfloat16* window;      // [kAttnWindow][512]
   const __nv_bfloat16* compressed;  // [n][512]: slot index i >= kAttnWindow reads row i - kAttnWindow
+  LaneArg window_lanes{};
+  LaneArg compressed_lanes{};
 };
 
 constexpr int attn_splits(int n_idx) { return (n_idx + kAttnSplitRows - 1) / kAttnSplitRows; }

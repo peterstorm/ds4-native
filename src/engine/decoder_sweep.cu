@@ -340,7 +340,7 @@ void Decoder::Gpu::enqueue_wave(int layer, const WaveRows& w, WavePhase phase) {
   auto compress = [&] {
     cuda::bf16_gemv(d.compress_w, v.xa_f, d.compress_rows, kDim, rows, kSplitsBf16, v.planes_bf, st);
     cuda::compress_rows(v.planes_bf, kSplitsBf16, ratio, rows, w.first_produced[ratio], produced.n, pos,
-                        ratio == 2 ? pools.at(layer) : cuda::PoolSlots{}, d.compress_norm, kNormEps, v.latent, st);
+                        ratio == 2 ? pool_of(layer, sweep_lane) : cuda::PoolSlots{}, d.compress_norm, kNormEps, v.latent, st);
   };
   auto append_keys = [&] {  // every key the wave completes, before any row scores
     cuda::bf16_to_f32(v.latent, static_cast<size_t>(produced.n) * kHeadDim, v.latent_f, st);
@@ -348,7 +348,7 @@ void Decoder::Gpu::enqueue_wave(int layer, const WaveRows& w, WavePhase phase) {
     cuda::sum_planes_bf16(v.planes_wk, kSplitsWk, cuda::kIndexDim, produced.n, v.k_raw, st);
     cuda::rmsnorm(v.k_raw, d.index_k_norm, cuda::kIndexDim, produced.n, kNormEps, v.k_idx, st);
     cuda::rope(v.k_idx, produced.n, 1, cuda::kIndexDim, kRopeDim, d.rope_freqs, produced.latent_pos, false, st);
-    cuda::append_index_keys(v.k_idx, first_compressed, produced.n, index_cache.at(layer), st);
+    cuda::append_index_keys(v.k_idx, first_compressed, produced.n, index_of(layer, sweep_lane), st);
   };
   auto store_latents = [&] {
     check(cudaMemcpyAsync(v.latent_c, v.latent, static_cast<size_t>(produced.n) * kHeadDim * sizeof(bf16),
@@ -356,7 +356,7 @@ void Decoder::Gpu::enqueue_wave(int layer, const WaveRows& w, WavePhase phase) {
           "latents");
     cuda::rope(v.latent_c, produced.n, 1, kHeadDim, kRopeDim, d.rope_freqs, produced.latent_pos, false, st);
     cuda::fp4_quant_dequant_e4m3(v.latent_c, produced.n, kHeadDim, st);
-    cuda::store_rows(v.latent_c, produced.n, kHeadDim, compressed.at(layer), first_compressed, st);
+    cuda::store_rows(v.latent_c, produced.n, kHeadDim, compressed_of(layer, sweep_lane), first_compressed, st);
   };
   clock.mark(st);
 
@@ -377,7 +377,7 @@ void Decoder::Gpu::enqueue_wave(int layer, const WaveRows& w, WavePhase phase) {
     case WavePhase::Attention: {
       if (draft.features[0] != nullptr)  // the target features DSpark drafts from
         for (size_t t = 0; t < kDraftTargetLayers.size(); t++)
-          if (layer == kDraftTargetLayers[t]) cuda::capture_features(h, rows, kDim, pos, draft.features[t], kRing, st);
+          if (layer == kDraftTargetLayers[t]) cuda::capture_features(h, rows, kDim, pos, feature_of(t, sweep_lane), kRing, st);
       if (kind.engram) cuda::engram_gate(h, v.kv_engram, d.engram_q, d.engram_k, kNormEps, rows, v.h_next[p], st);
       const cuda::HcParams attn_params{d.hc_attn_fn, d.hc_attn_scale, d.hc_attn_base, kNormEps, kHcEps, kSinkhornIters};
       cuda::hc_mixes(h_in, attn_params, kDim, rows, v.hc_scratch, v.mix_attn[p], st);
@@ -391,7 +391,7 @@ void Decoder::Gpu::enqueue_wave(int layer, const WaveRows& w, WavePhase phase) {
       cuda::rmsnorm(v.qlora, d.q_norm, kQLora, rows, kNormEps, v.qr, st);
       cuda::quantize_activations(v.qr, rows, v.act_qr, st);
       cuda::kv_to_cache({v.planes_kv, kSplitsWkv, kHeadDim}, rows, d.kv_norm, kNormEps, d.rope_freqs, kRopeDim, pos,
-                        window.at(layer), v.ring_slot + r0, st);
+                        window_of(layer, sweep_lane), v.ring_slot + r0, st);
       wide(l.qb);
       cuda::planes_rope({v.planes_qb, kSplitsWqB, kLocalHeads * kHeadDim}, rows, kLocalHeads, kHeadDim, kRopeDim, d.rope_freqs,
                         pos, v.q, st);
@@ -417,7 +417,7 @@ void Decoder::Gpu::enqueue_wave(int layer, const WaveRows& w, WavePhase phase) {
             uint32_t* masks = chunk.candidates + (r0 + s0) * kMaskStride;
             const cuda::IndexQueries q{v.queries.codes + s0 * cuda::kQueryCodeBytes, v.queries.scales + s0 * cuda::kQueryScaleBytes,
                                        v.queries.weights + s0 * cuda::kIndexHeads};
-            cuda::index_scores_rows(index_cache.at(kind.cache_owner), len, n, q, kind.uses_candidates ? masks : nullptr, kMaskStride,
+            cuda::index_scores_rows(index_of(kind.cache_owner, sweep_lane), len, n, q, kind.uses_candidates ? masks : nullptr, kMaskStride,
                                     v.scores, kMaxCompressed, st);
             lap(WaveSection::IndexScores);
             if (kind.candidate_source)
@@ -435,7 +435,7 @@ void Decoder::Gpu::enqueue_wave(int layer, const WaveRows& w, WavePhase phase) {
       }
 
       const int n_idx = ratio ? kWindow + kTopK : kWindow;
-      const cuda::KvSources kv_sources{window.at(layer), ratio ? compressed.at(kind.cache_owner) : nullptr};
+      const cuda::KvSources kv_sources{window_of(layer, sweep_lane), ratio ? compressed_of(kind.cache_owner, sweep_lane) : nullptr};
       constexpr size_t kHeadsElems = static_cast<size_t>(kLocalHeads) * kHeadDim;
       for (int a0 = 0; a0 < rows; a0 += kAttnRows) {
         const int n = std::min(kAttnRows, rows - a0);
@@ -522,8 +522,9 @@ void Decoder::Gpu::enqueue_wave(int layer, const WaveRows& w, WavePhase phase) {
 }
 
 void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<const EngramTokenRows> engram,
-                      const EngramReader& read_engram, const ExpertPlacer& place) {
+                      const EngramReader& read_engram, const ExpertPlacer& place, lane::LaneId lane) {
   Gpu& lead = *gpus_[0];
+  for (auto& gp : gpus_) gp->sweep_lane = checked(lane);  // its waves launch with this Lane's caches
   const int capacity = lead.chunk.capacity;
   if (capacity == 0) throw CudaError("prefill: this decoder was made without chunk capacity");
   const size_t tokens = embeddings.size() / kDim;
@@ -533,7 +534,7 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
   const bool any_engram = lead.layers.contains(kEngramLayers[0]) || lead.layers.contains(kEngramLayers[1]);
   if (any_engram && (engram.size() != tokens || !read_engram))
     throw CudaError("prefill: the Engram layers need every token's row ids and a reader");
-  if (p0 < seeded_) seeded_ = 0;  // a resume below DSpark's context (a new Session at 0): it is seeded again
+  if (lane == seeded_lane_ && p0 < seeded_) seeded_ = 0;  // a resume below DSpark's context (a new Session at 0): it is seeded again
   const size_t per_chunk = static_cast<size_t>(capacity) * kMaxRows;
   const bool graphs = launches_ == Launches::Graphs;
   const bool grouped = static_cast<bool>(place);
@@ -569,7 +570,8 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
     const int64_t c0 = p0 + static_cast<int64_t>(first);
     const int rounds = static_cast<int>((n + kMaxRows - 1) / kMaxRows);
     const int tail = static_cast<int>(n - static_cast<size_t>(rounds - 1) * kMaxRows);
-    const int parity = static_cast<int>(c0 % 2);  // every Round of 8 starts on the same parity
+    // Every Round of 8 starts on the same parity: one group mask for the full Rounds, its low bits for the tail.
+    auto mask_of = [&](int rows) { return model::group_mask(model::round_index(c0, rows)); };
     auto rows_of = [&](int g) { return g + 1 == rounds ? tail : kMaxRows; };
 
     // Each Round's starting state, on the host: its index, window slots, embeddings, Engram rows, identity mixes.
@@ -579,7 +581,7 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
     for (auto& m : mixes) m.pre[0] = 1.0f;
     for (int g = 0; g < rounds; g++) {
       const int64_t q0 = c0 + static_cast<int64_t>(g) * kMaxRows;
-      index[g] = model::round_index(q0, rows_of(g));
+      index[g] = model::round_index(lane, q0, rows_of(g));
       for (int r = 0; r < rows_of(g); r++)
         for (int i = 0; i < kWindow; i++)
           idx[(static_cast<size_t>(g) * kMaxRows + r) * kIdxStride + i] = window_slot(q0 + r, i);
@@ -641,9 +643,9 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
       check(cudaSetDevice(s.device), "cudaSetDevice");
       for (const auto& [layer, unused] : s.layers)
         for (const int rows : {kMaxRows, tail}) {
-          const std::tuple<int, int, int, StepMode> key{layer, rows, parity, StepMode::Chunk};
+          const std::tuple<int, int, int, StepMode> key{layer, rows, mask_of(rows), StepMode::Chunk};
           if (!grouped && layer < kLayers && graphs && !s.graphs.contains(key))
-            s.graphs[key] = capture(s.stream, [&] { s.enqueue_layer(layer, rows, parity, StepMode::Chunk); });
+            s.graphs[key] = capture(s.stream, [&] { s.enqueue_layer(layer, rows, mask_of(rows), StepMode::Chunk); });
         }
     }
 
@@ -721,8 +723,9 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
           check(cudaMemcpyAsync(s.chunk.current, s.chunk.round_numbers + g, sizeof(int32_t), cudaMemcpyHostToDevice,
                                 s.stream),
                 "chunk Round");
-          if (graphs) check(cudaGraphLaunch(s.graphs.at({layer, rows_of(g), parity, StepMode::Chunk}), s.stream), "cudaGraphLaunch");
-          else s.enqueue_layer(layer, rows_of(g), parity, StepMode::Chunk);
+          if (graphs)
+            check(cudaGraphLaunch(s.graphs.at({layer, rows_of(g), mask_of(rows_of(g)), StepMode::Chunk}), s.stream), "cudaGraphLaunch");
+          else s.enqueue_layer(layer, rows_of(g), mask_of(rows_of(g)), StepMode::Chunk);
         }
     };
     // A layer's combine of wave k is its MoE output's exchange (CombineSend, CombineAdd on the link
@@ -861,7 +864,7 @@ void Decoder::prefill(int64_t p0, std::span<const float> embeddings, std::span<c
               "last Round");
       }
     rows_ = tail;
-    p0_ = c0 + static_cast<int64_t>(rounds - 1) * kMaxRows;
+    group_mask_ = mask_of(tail);
     engram_staged_ = any_engram;
   }
   if (lead.clock.on) {

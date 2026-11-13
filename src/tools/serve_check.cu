@@ -7,7 +7,7 @@
 //
 //   ds4n-serve-check --backbone B --store S --gguf G --tokens FILE --system FILE [--dspark DIR]
 //                    [--expect LOGPROBS] [--slots N] [--ram-records R] [--prior P] [--ram-policy P]
-//                    [--timing FILE] [--long FILE,FILE,... [--long-tokens N]]
+//                    [--timing FILE] [--long FILE,FILE,... [--long-tokens N]] [--lanes N] [--sweep-slots N]
 //
 // FILE (--tokens) is an antirez --dump-tokens prompt (ids on the first line); --system a long one
 // whose first 3,000 tokens stand for a system prompt that several conversations share. --expect
@@ -16,14 +16,24 @@
 // --long: prompts concatenated into one of --long-tokens (default 240,000), read cold (several
 // prompt-sweep chunks) and resumed by an agent's next step, each against a cold read.
 //
-// Each scenario runs its requests on one Conversation back to back -- so they resume in place, take
-// checkpoints back and restore Rewind points as a server's would -- then every prompt again cold.
+// --lanes N (default 1): the engine with N Lanes. Every scenario runs on it as with one, and with
+// N > 1 more follow, of requests at once: Sessions writing beside each other (greedy, sampled), ones
+// joining mid-flight (a few prompt tokens read as rows beside writers, a prompt sweep the others pause
+// for), a subagent borrowing the prefix a busy Lane holds, a STOP for one of several, more
+// conversations than Lanes, a GEN that finds every Lane busy. Mix invariance: each must give the bits
+// its prompt gives cold and alone -- where, alone, DSpark drafts and here plain rows are shared.
+//
+// Each scenario runs its requests on one Conversation -- back to back, or a group of them at once --
+// so they resume in place, take checkpoints back and restore Rewind points as a server's would, then
+// every prompt again cold.
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <functional>
 #include <nlohmann/json.hpp>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -46,6 +56,13 @@ std::vector<int32_t> read_tokens(const std::string& path) {
   return nlohmann::json::parse(line).get<std::vector<int32_t>>();
 }
 
+int failures = 0;
+
+void check(bool ok, const std::string& what) {
+  std::printf("%s %s\n", ok ? "PASS" : "FAIL", what.c_str());
+  failures += !ok;
+}
+
 struct Outcome {
   std::vector<int32_t> tokens;
   std::vector<float> logits;  // the prompt's end
@@ -58,16 +75,9 @@ Outcome run(engine::Conversation& c, const std::vector<int32_t>& prompt, int64_t
   engine::ReplyEvents ev;
   ev.token = [&](int32_t t) { o.tokens.push_back(t); };
   ev.note = [](const std::string& n) { std::printf("  note: %s\n", n.c_str()); };
+  ev.prompt_end = [&](std::span<const float> logits) { o.logits.assign(logits.begin(), logits.end()); };
   o.done = c.run({max_new, s, std::nullopt, spec, prompt}, ev);
-  o.logits = c.prompt_logits();
   return o;
-}
-
-int failures = 0;
-
-void check(bool ok, const std::string& what) {
-  std::printf("%s %s\n", ok ? "PASS" : "FAIL", what.c_str());
-  failures += !ok;
 }
 
 bool same_bits(const std::vector<float>& a, const std::vector<float>& b) {
@@ -92,26 +102,76 @@ struct Request {
   bool spec;
   std::optional<size_t> reuse;  // the tokens it should reuse warm (none: whatever)
   Outcome warm;
+  // In a group at once: admitted once this many of the group's passes ran, and stopped (STOP) after this many.
+  size_t join = 0;
+  std::optional<size_t> stop_at = std::nullopt;
 };
 
+/** `group`'s requests on `c` at once, each from its `join` on, until all ended: their warm outcomes. */
+void together(engine::Conversation& c, std::span<Request> group) {
+  struct Flight {
+    std::optional<lane::LaneId> lane;
+    bool ended = false;
+  };
+  std::vector<Flight> flights(group.size());
+  for (size_t passes = 0;; passes++) {
+    for (size_t k = 0; k < group.size(); k++) {
+      Request& r = group[k];
+      Flight& f = flights[k];
+      if (!f.lane && r.join <= passes) {
+        engine::ReplyEvents ev;
+        ev.token = [&r](int32_t t) { r.warm.tokens.push_back(t); };
+        ev.note = [](const std::string& n) { std::printf("  note: %s\n", n.c_str()); };
+        ev.prompt_end = [&r](std::span<const float> logits) { r.warm.logits.assign(logits.begin(), logits.end()); };
+        ev.done = [&r, &f](const wire::Done& d) {
+          r.warm.done = d;
+          f.ended = true;
+        };
+        ev.failed = [&r, &f](const std::string& what) {
+          check(false, r.what + ": " + what);
+          f.ended = true;
+        };
+        const auto lane = c.admit({r.max_new, r.sampling, std::nullopt, r.spec, r.prompt}, std::move(ev));
+        if (!lane) die(r.what + " was not admitted: " + lane.error().what);
+        f.lane = lane.value();
+      }
+      if (f.lane && !f.ended && r.stop_at == passes) c.stop(*f.lane);
+    }
+    if (std::all_of(flights.begin(), flights.end(), [](const Flight& f) { return f.ended; })) return;
+    c.step();
+  }
+}
+
+bool starts_with(const std::vector<int32_t>& all, const std::vector<int32_t>& prefix) {
+  return all.size() >= prefix.size() && std::equal(prefix.begin(), prefix.end(), all.begin());
+}
+
 /**
- * A scenario's requests on `warm` back to back (`next` builds request k from the outcomes before it,
- * returning false when there are no more), then each prompt on `cold` from position 0, compared.
+ * A scenario's requests on `warm` (`next` adds the next one, or the next group to run at once, built
+ * from the outcomes before, returning false when there are no more), then each prompt on `cold` from
+ * position 0 and alone, compared. A request stopped on the way wrote a prefix of the cold Reply.
  */
 void scenario(const std::string& name, engine::Conversation& warm, engine::Conversation& cold,
               const std::function<bool(std::vector<Request>&)>& next) {
   std::printf("-- %s\n", name.c_str());
   warm.forget_live();  // whatever ran before left the GPUs' caches
   std::vector<Request> done;
-  while (next(done)) {
-    Request& r = done.back();
-    r.warm = run(warm, r.prompt, r.max_new, r.sampling, r.spec);
-    std::printf("  %s: %zu tokens, %zu reused, %zu written\n", r.what.c_str(), r.prompt.size(), r.warm.done.reused,
-                r.warm.tokens.size());
+  for (size_t ran = 0; next(done); ran = done.size()) {
+    together(warm, std::span(done).subspan(ran));
+    for (size_t k = ran; k < done.size(); k++)
+      std::printf("  %s%s: %zu tokens, %zu reused, %zu written\n", done[k].what.c_str(), done.size() - ran > 1 ? " (at once)" : "",
+                  done[k].prompt.size(), done[k].warm.done.reused, done[k].warm.tokens.size());
   }
   for (const Request& r : done) {
     cold.forget_live();
     const Outcome c = run(cold, r.prompt, r.max_new, r.sampling, r.spec);
+    if (r.stop_at) {
+      check(r.warm.done.finish == reply::Finish::Cancel && starts_with(c.tokens, r.warm.tokens) &&
+                (r.warm.logits.empty() || same_bits(r.warm.logits, c.logits)),
+            name + ", " + r.what + ": stopped after " + std::to_string(r.warm.tokens.size()) + " of the cold run's " +
+                std::to_string(c.tokens.size()) + " tokens");
+      continue;
+    }
     check(same_bits(r.warm.logits, c.logits) && r.warm.tokens == c.tokens,
           name + ", " + r.what + ": reused " + std::to_string(r.warm.done.reused) + " of " + std::to_string(r.prompt.size()) +
               ", the cold run's logits and " + std::to_string(c.tokens.size()) + " tokens");
@@ -136,6 +196,7 @@ int main(int argc, char** argv) {
     else if (a == "--dspark") mc.dspark = v;
     else if (a == "--slots") mc.slots = static_cast<uint32_t>(std::stoul(v));
     else if (a == "--ram-records") mc.ram_records = static_cast<uint32_t>(std::stoul(v));
+    else if (a == "--sweep-slots") mc.sweep_slots = static_cast<uint32_t>(std::stoul(v));
     else if (a == "--prior") mc.prior = v;
     else if (a == "--ram-policy") {
       const auto policy = engine::ram_policy_named(v);
@@ -148,6 +209,11 @@ int main(int argc, char** argv) {
     else if (a == "--timing") timing_path = v;
     else if (a == "--long") long_paths = v;
     else if (a == "--long-tokens") long_tokens = std::stoul(v);
+    else if (a == "--lanes") {
+      const auto lanes = lane::LaneCount::of(std::stoll(v));
+      if (!lanes) die("--lanes: " + lanes.error().what);
+      mc.lanes = lanes.value();
+    }
     else die("unknown argument " + a);
   }
   if (mc.backbone.empty() || mc.store.empty() || mc.gguf.empty() || tokens_path.empty() || system_path.empty())
@@ -155,8 +221,10 @@ int main(int argc, char** argv) {
   engine::FullModel m = engine::load_full_model(mc);
   const std::vector<int32_t> stops = {m.eos, 128803};
   const rewind::Settings keep{1024, 2048};
-  engine::Conversation conv(m, {8, 6ull << 30, keep, 64, stops});
-  engine::Conversation endless(m, {8, 6ull << 30, keep, 64, {}});  // no end-of-turn tokens: replies run to max_new
+  const size_t lanes = static_cast<size_t>(mc.lanes.value());
+  const uint32_t points = std::max<uint32_t>(8, static_cast<uint32_t>(lanes) + 1);  // more than Lanes: rewind::next_buffer
+  engine::Conversation conv(m, {points, 6ull << 30, keep, 64, stops});
+  engine::Conversation endless(m, {points, 6ull << 30, keep, 64, {}});  // no end-of-turn tokens: replies run to max_new
   engine::Conversation cold(m, {0, 0, keep, 64, stops});             // keeps nothing: every prompt from position 0
   engine::Conversation cold_endless(m, {0, 0, keep, 64, {}});
   engine::Conversation rounds(m, {0, 0, keep, SIZE_MAX, stops});   // never sweeps: Rounds of 8 only
@@ -272,6 +340,101 @@ int main(int argc, char** argv) {
     }
     return true;
   });
+
+  // Requests at once, on an engine of several Lanes (Mix invariance): each against its prompt cold and alone.
+  if (lanes > 1) {
+    const sample::Sampling sampled = sample::make_sampling({0.8f, 64, 0.95f, 0.0f, 1234, {}, {}}, model::kVocab).value();
+    const std::vector<std::vector<int32_t>> conversations = {prompt, concat(system, own(0)), concat(head(system, 1000), own(1)), own(2)};
+    const size_t most = std::min(lanes, conversations.size());
+    const auto at_once = [&](size_t n, const sample::Sampling& s, std::optional<size_t> stop_first) {
+      return [&, n, s, stop_first](std::vector<Request>& r) {
+        if (!r.empty()) return false;
+        for (size_t k = 0; k < n; k++)
+          r.push_back({"Session " + std::to_string(k), conversations[k], 48, s, spec, std::nullopt, {}, 0, k == 0 ? stop_first : std::nullopt});
+        return true;
+      };
+    };
+    for (size_t n = 2; n <= most; n++)
+      scenario(std::to_string(n) + " Sessions at once", conv, cold, at_once(n, greedy, std::nullopt));
+    scenario(std::to_string(most) + " Sessions at once, sampled (seed 1234)", conv, cold, at_once(most, sampled, std::nullopt));
+    // The first, its short prompt read as rows beside the others' Replies, is stopped a few tokens into its own.
+    scenario("one of " + std::to_string(most) + " stopped", endless, cold_endless, at_once(most, greedy, 24));
+
+    // A Reply under way; a tool loop joins it (its few new prompt tokens read as rows beside the
+    // writer), then a 9,000-token prompt (a prompt sweep, the others pausing).
+    scenario("joining mid-flight", endless, cold_endless, [&](std::vector<Request>& r) {
+      switch (r.size()) {
+        case 0: r.push_back({"a conversation", prompt, 48, greedy, spec, std::nullopt, {}}); break;
+        case 1:
+          r.push_back({"a long reply", concat(system, own(0)), 160, greedy, spec, std::nullopt, {}});
+          r.push_back({"the conversation's tool loop, joining", concat(prompt, r[0].warm.tokens, head(tool, 40)), 32, greedy, spec,
+                       prompt.size() + r[0].warm.tokens.size() - 1, {}, 6});
+          if (lanes > 2) r.push_back({"a 9000-token prompt, joining", head(longp, 9000), 32, greedy, spec, std::nullopt, {}, 14});
+          break;
+        default: return false;
+      }
+      return true;
+    });
+
+    // A parent's next step under way in its Lane; subagents under the same system prompt take the
+    // others, each borrowing the system prompt's KV from a Lane that holds it (the parent's, busy).
+    // Each conversation's own text is one no scenario before read: all a subagent can resume is the
+    // system prompt (a checkpoint of the same conversation, left by an earlier scenario, would give more).
+    const size_t subagents = std::min(lanes - 1, size_t{3});
+    const size_t apart = 30000;
+    if (longp.size() >= apart + 1500 * (subagents + 2)) {
+      auto under_system = [&](size_t k) {
+        return concat(system, std::vector<int32_t>(longp.begin() + apart + 1500 * k, longp.begin() + apart + 1500 * (k + 1)));
+      };
+      scenario("subagents beside their parent", conv, cold, [&](std::vector<Request>& r) {
+        switch (r.size()) {
+          case 0: r.push_back({"parent", under_system(0), 48, greedy, spec, std::nullopt, {}}); break;
+          case 1: r.push_back({"first subagent", under_system(1), 32, greedy, spec, std::nullopt, {}}); break;
+          case 2:
+            r.push_back({"parent's next step", concat(r[0].prompt, r[0].warm.tokens, tool), 64, greedy, spec,
+                         r[0].prompt.size() + r[0].warm.tokens.size() - 1, {}});
+            for (size_t k = 0; k < subagents; k++)
+              r.push_back({"subagent " + std::to_string(k + 2) + ", joining", under_system(k + 2), 32, greedy, spec, system.size(), {},
+                           3 + 2 * k});
+            break;
+          default: return false;
+        }
+        return true;
+      });
+    }
+
+    // More conversations than Lanes, in turn: the last takes the least recently used Lane, whose
+    // Session is set aside, and that conversation's next step takes its checkpoint back. Their text is
+    // past everything the scenarios before read, so no state those left holds any of it (a checkpoint
+    // that held the first one's tokens would stand in for setting it aside).
+    const size_t fresh = 12000;
+    if (longp.size() >= fresh + (lanes + 1) * 1100) {
+      auto slice = [&](size_t k) {
+        return std::vector<int32_t>(longp.begin() + fresh + 1100 * k, longp.begin() + fresh + 1100 * (k + 1));
+      };
+      scenario("more conversations than Lanes", conv, cold, [&](std::vector<Request>& r) {
+        const size_t k = r.size();
+        if (k <= lanes) r.push_back({"conversation " + std::to_string(k), slice(k), 24, greedy, spec, std::nullopt, {}});
+        else if (k == lanes + 1) r.push_back({"the first one's next step", concat(slice(0), r[0].warm.tokens, tool), 24, greedy, spec,
+                                              slice(0).size() + r[0].warm.tokens.size() - 1, {}});
+        else return false;
+        return true;
+      });
+    }
+
+    // A GEN beyond the Lanes is refused as busy, and a STOP ends requests still reading their prompts.
+    {
+      std::printf("-- every Lane busy\n");
+      conv.forget_live();
+      for (size_t k = 0; k < lanes; k++)
+        if (!conv.admit({8, greedy, std::nullopt, false, tool}, {})) die("a free Lane refused a request");
+      const auto extra = conv.admit({8, greedy, std::nullopt, false, tool}, {});
+      check(!extra && extra.error().busy, "a request beyond " + std::to_string(lanes) + " Lanes is refused as busy");
+      for (const lane::LaneId id : conv.lanes().ids()) conv.stop(id);
+      while (conv.step()) {}
+      check(conv.idle(), "a STOP for each ends them all");
+    }
+  }
 
   // A context past the 64K sweep chunk: read cold in several chunks, then an agent's next step resumed on it.
   if (!long_paths.empty()) {

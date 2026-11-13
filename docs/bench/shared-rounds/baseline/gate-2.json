@@ -1,0 +1,37 @@
+{
+ "set": "gate",
+ "at_once": 2,
+ "wall_s": 54.96,
+ "completion_tokens": 4693,
+ "aggregate_tok_s": 85.38,
+ "first_token_s": {
+  "min": 3.01,
+  "max": 31.41
+ },
+ "longest_silence_s": 10.01,
+ "errors": 0,
+ "requests": [
+  {
+   "name": "gate-code",
+   "first_token_s": 31.41,
+   "done_s": 54.96,
+   "prompt_tokens": 391,
+   "completion_tokens": 2400,
+   "longest_silence_s": 10.01,
+   "finish": "length",
+   "error": "",
+   "writing_tok_s": 101.88
+  },
+  {
+   "name": "gate-silent",
+   "first_token_s": 3.01,
+   "done_s": 28.87,
+   "prompt_tokens": 393,
+   "completion_tokens": 2293,
+   "longest_silence_s": 2.98,
+   "finish": "stop",
+   "error": "",
+   "writing_tok_s": 88.65
+  }
+ ]
+}

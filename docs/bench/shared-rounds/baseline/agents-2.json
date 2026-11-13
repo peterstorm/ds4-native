@@ -1,0 +1,37 @@
+{
+ "set": "agents",
+ "at_once": 2,
+ "wall_s": 48.09,
+ "completion_tokens": 4800,
+ "aggregate_tok_s": 99.82,
+ "first_token_s": {
+  "min": 1.98,
+  "max": 26.19
+ },
+ "longest_silence_s": 10.01,
+ "errors": 0,
+ "requests": [
+  {
+   "name": "impl-ts",
+   "first_token_s": 26.19,
+   "done_s": 48.09,
+   "prompt_tokens": 181,
+   "completion_tokens": 2400,
+   "longest_silence_s": 10.01,
+   "finish": "length",
+   "error": "",
+   "writing_tok_s": 109.6
+  },
+  {
+   "name": "impl-rust",
+   "first_token_s": 1.98,
+   "done_s": 25.08,
+   "prompt_tokens": 182,
+   "completion_tokens": 2400,
+   "longest_silence_s": 1.95,
+   "finish": "length",
+   "error": "",
+   "writing_tok_s": 103.88
+  }
+ ]
+}
