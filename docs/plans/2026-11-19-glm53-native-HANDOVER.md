@@ -1,4 +1,4 @@
-# HANDOVER: GLM-5.3 full uncensored on ds4-native — session state 2026-11-19
+# HANDOVER: GLM-5.3 full uncensored on ds4-native — session state 2026-11-19 (updated 15:10)
 
 Resume point for any fresh session. Companion to
 [`2026-11-19-glm53-native.md`](2026-11-19-glm53-native.md) (the plan — read it first; its
@@ -16,64 +16,79 @@ backbone differs (119 bf16 residual-writer tensors). Speed expectation est. 15�
 30–50 with cache-conditional routing + RAM tier — a quality/architecture play. Phase 5's measured
 CyberGym verdict decides keep/archive.
 
-## Where things stand (2026-11-19 ~14:30)
+## Where things stand (2026-11-19 ~15:10, second session)
 
 ### Done
 
 | Artifact | Where | State |
 |---|---|---|
-| Plan (5 phases, revised: no probe, no NVMe purchase) | `ds4-native` main `baaf747`, `docs/plans/2026-11-19-glm53-native.md` | committed + pushed |
-| Expert store format + converter + tests | branch `glm53/store-convert` @ `44e0eeb` (pushed): `src/core/glm53_store.{hpp,cpp}`, `src/tools/glm53_store_build.cpp`, `tests/core/test_glm53_store.cpp`, wired in CMakeLists | 208/208 tests green; **smoke-proven on real kitaniai bytes** (2 layers / 512 experts converted 4.9 s @ 2.11 GB/s, verify byte-identical) |
+| Plan (5 phases, revised: no probe, no NVMe purchase) | `ds4-native` main `baaf747`, `docs/plans/2026-11-19-glm53-native.md` | committed + pushed; **Phase 2 corrected and Phase 3 progress on `glm53/engine-core`** |
+| Expert store format + converter + tests | branch `glm53/store-convert` @ `44e0eeb` (pushed); moved to `src/core/glm53/store.*` on `glm53/engine-core` | smoke-proven on real kitaniai bytes |
+| **Semantics oracle (Phase 3 step 1)** | branch `glm53/engine-core` (worktree `~/dev/ds4-native-glm53-engine`, stacked on store-convert + main): `src/core/glm53/{config,reference}`, `ref/glm-5.3/` (pinned transformers 5.16.0 + released config.json), `tools/glm53-golden/{make_golden.py,mutation-probe.sh}`, `tests/data/glm53-golden.safetensors` | golden matches the reference's causal prefill at 1.6e-6 relative, every Selection identical; mutation probe 10/10 killed; **225/225 tests green** |
+| **Converter safety fix** | same branch, `24b9a6a` | the deletable list could have listed MTP and unconverted shards; now it lists only verified, fully consumed shards and has a free-space preflight. Checked on real layer 10 (RAM tmpfs) |
+| Indexer reference pinning (old step 5) | `ref/glm-5.3/README.md` | **decided: transformers 5.16.0** |
+| Desktop space for the download | /models/voice deleted (operator-approved; TTS weights, re-downloadable), 82 exited containers + `ds4-native-dev:1` removed | `space-guard.sh` armed (pauses the fetch below 6 GiB free) |
 | Fetch tool | `ds4-native` main: `tools/glm53-store/fetch-kitaniai.sh`; deployed desktop-side at `/models/glm53-native/fetch-kitaniai.sh` | running |
 | Desktop reclaim (353.3 GB freed) | only export-source `model-*.safetensors` deleted; receipts `/models/glm53-hyperflare/archive-receipt-{fp4-local,uncensored}-shards.json` | done, flare untouched and still serving |
-| Inference reorg (dotfiles) | `.dotfiles` main `a157e3b6` (pushed): runbooks colocated in `scripts/inference/runbooks/`, 16 archived, `INDEX.md`, new `ds41-1017-native-runbook-2026-11-19.md` + `switch-primary-runbook-2026-11-19.md` | done, switch-primary-unit 4819 PASS, `/switch` verified live |
+| Inference reorg (dotfiles) | `.dotfiles` main `a157e3b6` (pushed) | done |
 
 ### In flight
 
 **Kitaniai download**: `/models/glm53-native/kitaniai` (305 files, 394.65 GiB), resumable
-`hf download`, log `/models/glm53-native/download.log`. At handover: **207/305, 280G on disk,
-~1.5 h remaining**. Session-lifetime monitor `kitaniai-fetch` dies with the session — a new
-session just re-checks the log (`grep "hf exit=" download.log`) or reruns
-`/models/glm53-native/fetch-kitaniai.sh` (it resumes).
+`hf download`, log `/models/glm53-native/download.log`. At ~14:50: 251/305 files, 61 GiB free
+and ~8 GiB margin expected at the end. **`/models/glm53-native/space-guard.sh`** runs alongside.
+It kills the fetch, which is resumable, if rpool free drops under 6 GiB, and logs to
+`space-guard.log`. If it fired, free space and rerun `fetch-kitaniai.sh`.
 
-## Next actions, in order (exact commands)
+## Next actions, in order
 
-1. **Confirm download complete** (desktop): `grep "hf exit=" /models/glm53-native/download.log`
-   — if absent and no `hf download` process, rerun the fetch script; it resumes.
-2. **Full convert + verify** (desktop, ~3–6 min CPU at measured 2.1 GB/s; sync the worktree
-   first if the branch moved):
+1. **Confirm download complete**: `grep "hf exit=" /models/glm53-native/download.log`, and check
+   `space-guard.log` is empty. If not complete and no `hf download` is running, rerun the fetch
+   script (it resumes).
+2. **Expert-only shards first** (fits now). Build `glm53/engine-core` on the desktop (see the
+   environment notes). Then, layer range by layer range, in layer order:
    ```bash
-   cd /tmp/ds4n-glm53-build   # synced copy of ds4-native-glm53 worktree (rebuild if needed)
-   docker run --rm -v /models:/models -v /tmp/ds4n-glm53-build:/src -w /src ds4-native-dev:2 bash -c \
-     "ls /models/glm53-native/kitaniai/model-*.safetensors | xargs ./build/ds4n-glm53-store-build \
-      --out /models/glm53-native/experts.ds4n --threads 16" \
-     # then the identical command with --verify; expect 'all records identical'
+   # shards for the range: jq over model.safetensors.index.json (every shard holding those layers' Experts)
+   ./build/ds4n-glm53-store-build --out /models/glm53-native/experts.ds4n --layers A-B --threads 16 SHARDS...
+   ./build/ds4n-glm53-store-build --out /models/glm53-native/experts.ds4n --layers A-B --threads 16 --verify SHARDS...
+   # delete exactly the "deletable shards" line (expert-only, verified); receipt it
    ```
-   Then **delete the source shards** the tool lists as expert-only (`deletable shards:` line) to
-   reclaim ~365G — keep every non-expert file (config, tokenizer, receipts) for the backbones.
-   Receipt the deletion the way the hyperflare archive receipts were written.
-3. **Backbone A (uncensored)**: extract all non-expert tensors (attention, DSA indexer, router,
-   shared experts, dense layers 0–2, embeddings, head, norms, layer-78 MTP block) from the
-   remaining kitaniai files into `/models/glm53-native/backbone-uncensored.safetensors`; reuse
-   the `tools/hf-backbone` verify pattern with a `DERIVATIVE.json` naming the kitaniai rev.
-4. **Backbone B (cyber)**: fetch non-expert tensors of `dealignai/GLM-5.3-CYBERSECURITY-FP8`
-   (sibling, same architecture, same expert bytes) → `backbone-cyber.safetensors` + verify.
-5. **Indexer reference pinning** (the one real design decision, can start any time — reading +
-   CPU oracle, no weights/GPU): pick ONE reference for the DSA lightning-indexer numerics
-   (candidates: vLLM's NSA/DSA path, llama.cpp `GGML_OP_LIGHTNING_INDEXER` — note open bug
-   #32122 documents our exact 32-head case — ciprianveg's B12X fork), capture golden
-   activations, then port per Phase 3 of the plan (MLA + DSA executor, MTP last).
-6. Phases 4–5 per the plan (fifth switch-primary entry `glm-native`, slots ladder, CyberGym).
+   The preflight refuses a range that would leave under 8 GiB free; take smaller ranges. **Do
+   not** convert everything first. 85 of 282 shards interleave backbone tensors, and doing it in
+   that order ends ~90 GiB short (plan, Phase 2 correction).
+3. **Build the backbone extractor** (Phase 2 tool, missing). Per mixed shard, copy its non-Expert
+   tensors (attention, DSA indexer, router + bias, shared experts, dense layers 0–2,
+   embeddings, head, norms, the layer-78 MTP block *including its 256 Experts*) into
+   `/models/glm53-native/backbone-uncensored/part-NNNNN.safetensors`, byte for byte and verified.
+   Then the shard's Experts are converted and verified, and the shard is deleted. Reuse the
+   `tools/hf-backbone` DERIVATIVE.json pattern naming kitaniai rev `12170112`.
+4. **Real-weights Semantics oracle run** (Phase 3 step 2, CPU): a shell `TensorLookup` over the
+   backbone parts (FP8/BF16 → FP32) plus an Expert source dequantizing store records, then a few
+   tokens of a real prompt through `glm53::decode_token`. It produces the first real-weights
+   numbers: Selection tie rate, activation scales for the W4A4 decision.
+5. **Reference configuration decision**: activation precision into MXFP4 linears (the checkpoint
+   declares W4A4 MXFP4 inputs; DS4.1's kernels use E4M3), measured as KL against the Semantics
+   oracle. Then the bit-exact oracle, then kernels (first GPU window).
+6. **Backbone B (cyber)**: does not fit on rpool next to store + Backbone A (~13 GiB short). It
+   needs a space decision first.
+7. Phases 4–5 per the plan (fifth switch-primary entry `glm-native`, slots ladder, CyberGym).
 
 ## Environment facts (the things that cost time to rediscover)
 
-- **Builds run on desktop**, not the homelab dev box (no cmake; NixOS purity): sync worktree →
-  `/tmp/ds4n-glm53-build` → `docker run -v /tmp/ds4n-glm53-build:/src -w /src ds4-native-dev:2
-  bash -c "cmake -B build -DDS4N_CUDA=OFF -DCMAKE_BUILD_TYPE=Release && cmake --build build
-  --target ds4n-glm53-store-build ds4n_tests -j 16"`. CPU-only config is right for core work;
-  CUDA tools need the desktop GPUs in a scheduled window.
-- Worktree: `~/dev/ds4-native-glm53` (branch `glm53/store-convert`). Do not delete until the
-  branch merges. Desktop clone of `ds4-native` at `2b647a3` lags main — pull before Phase 3.
+- **Builds run on desktop**, not the homelab dev box (no cmake; NixOS purity). Sync the worktree
+  with `tar --exclude=./build --exclude=./.git -czf - . | ssh desktop 'tar -xzf - -C
+  /tmp/ds4n-glm53-engine-build'`, then `docker run --rm -v
+  /tmp/ds4n-glm53-engine-build:/src -w /src ds4-native-dev:2 bash -c "cmake -B build
+  -DDS4N_CUDA=OFF -DCMAKE_BUILD_TYPE=Release && cmake --build build --target
+  ds4n-glm53-store-build ds4n_tests -j 16 && ./build/ds4n_tests"`. CPU-only config is right for
+  core work; CUDA tools need the desktop GPUs in a scheduled window. Mount `/models:ro` for
+  anything that only reads weights.
+- **Goldens**: `tools/glm53-golden/make_golden.py` runs in the same image after
+  `python3 -m pip install transformers==5.16.0`. Plain `pip` targets a different interpreter than
+  the image's `/opt/venv` python. Regenerating is deterministic for a given seed.
+- Worktrees: `~/dev/ds4-native-glm53` (branch `glm53/store-convert`) and
+  `~/dev/ds4-native-glm53-engine` (branch `glm53/engine-core`, which contains store-convert and
+  main). Merge engine-core and both go. Desktop clone of `ds4-native` at `2b647a3` lags main.
 - **Repo Result API**: `Result<T,E>::ok()/::err()` factories only, `.value()` to unwrap — no
   `operator*`/`operator->` (Rust-isms fail to compile and cascade misleading
   unused-function `-Werror`s). Read `src/core/result.hpp` before writing core code.
@@ -98,6 +113,8 @@ session just re-checks the log (`grep "hf exit=" download.log`) or reruns
 |---|---|
 | The plan (phases, decisions, budget of truth) | `ds4-native/docs/plans/2026-11-19-glm53-native.md` |
 | This handover | `ds4-native/docs/plans/2026-11-19-glm53-native-HANDOVER.md` |
+| Pinned GLM-5.3 reference + why | `ds4-native/ref/glm-5.3/README.md` |
+| GLM terms (Selection, Full/Shared layer, Latent row, Semantics oracle) | `ds4-native/CONTEXT.md`, GLM-5.3 section |
 | Feasibility base (measured constants) | `ds4-native/docs/research/2026-10-26-feasibility.md` |
 | Serving design / engine internals | `ds4-native/docs/design/{serving,forward-pass,dspark}.md` |
 | Inference map (primaries, runbooks) | `.dotfiles/scripts/inference/INDEX.md` |
@@ -111,6 +128,10 @@ session just re-checks the log (`grep "hf exit=" download.log`) or reruns
 - Quark E8M0 scale grouping beyond the shape check: confirm scale bytes are per-32 *and* whether
   the tensor layout interleaves any tile structure the piper must know (one-day check with the
   CPU oracle).
-- `e_score_correction_bias` + sigmoid routing tie-breaking: match ONE reference to the bit.
+- ~~`e_score_correction_bias` + sigmoid routing tie-breaking: match ONE reference to the bit~~:
+  the reference is pinned (transformers 5.16.0) and the Semantics oracle breaks ties to the lower
+  Expert id / position. The bit-level match is the Reference configuration's job (next actions 5).
+- Activation precision into MXFP4 linears (W4A4 as declared vs E4M3), RoPE angle rounding at long
+  context, and the Selection tie rate: plan, Open items.
 - MTP fragility: dealignai reports stock-vLLM breakage; our engine owns the path, but budget
   MTP as stretch, not dependency.
