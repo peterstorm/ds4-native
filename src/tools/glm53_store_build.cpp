@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <regex>
 #include <set>
 #include <string>
 #include <thread>
@@ -179,23 +180,31 @@ int main(int argc, char** argv) {
     return 1;
   }
   if (!args.verify) {
-    // Shard occupancy: a shard is deletable when every tensor it holds was
-    // consumed by the store (expert sextuplets only — backbone, MTP, router
-    // and metadata tensors keep their shards alive).
-    std::map<uint32_t, std::pair<uint64_t, uint64_t>> occupancy;  // shard -> {all tensors, expert tensors}
+    // Shard occupancy: a shard is deletable when every tensor it holds is an
+    // expert sextuplet member (weight or weight_scale) of an expert whose
+    // layer this run converted — shards holding backbone, MTP, router or
+    // metadata tensors, or experts of layers this run did not convert, stay.
+    // The incremental convert-and-delete flow (plan Phase 2) deletes exactly
+    // this list between batches.
+    std::map<uint32_t, std::pair<uint64_t, uint64_t>> occupancy;  // shard -> {all tensors, converted expert tensors}
+    const std::set<uint32_t> converted_layers(layers.begin(), layers.end());
+    static const std::regex expert_tensor(
+        "^model\\.layers\\.(\\d+)\\.mlp\\.experts\\.(\\d+)\\.(?:gate|up|down)_proj\\.weight(?:_scale)?$");
     for (const auto& [name, st] : index) {
       auto& o = occupancy[st.shard];
       o.first++;
-      if (name.find(".mlp.experts.") != std::string::npos &&
-          (name.ends_with(".gate_proj.weight") || name.ends_with(".up_proj.weight") ||
-           name.ends_with(".down_proj.weight")))
-        o.second++;
+      std::smatch m;
+      if (std::regex_match(name, m, expert_tensor)) {
+        const uint32_t l = static_cast<uint32_t>(std::stoul(m[1]));
+        const uint32_t e = static_cast<uint32_t>(std::stoul(m[2]));
+        if (converted_layers.count(l) && e < glm53::kExperts) o.second++;
+      }
     }
     std::set<uint32_t> deletable;
     for (const auto& [shard, o] : occupancy)
       if (o.first == o.second && o.second > 0) deletable.insert(shard);
     if (!deletable.empty()) {
-      std::printf("deletable shards (expert tensors only):");
+      std::printf("deletable shards (expert tensors of converted layers only):");
       for (uint32_t s : deletable) std::printf(" %s", args.shards[s].c_str());
       std::printf("\n");
     }
