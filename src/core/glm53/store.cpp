@@ -1,6 +1,8 @@
 #include "core/glm53/store.hpp"
 
+#include <algorithm>
 #include <cstring>
+#include <iterator>
 
 #include "core/mx_tiles.hpp"
 
@@ -77,6 +79,54 @@ Result<ExpertSource, LayoutError> expert_source(const std::map<std::string, Shar
   if (!down) return Result<ExpertSource, LayoutError>::err(std::move(down).error());
   return Result<ExpertSource, LayoutError>::ok(
       ExpertSource{std::move(gate).value(), std::move(up).value(), std::move(down).value()});
+}
+
+namespace {
+
+/** A decimal number at the front of `s` (no sign, no leading zeros, at most 9 digits); consumes it. */
+std::optional<uint32_t> take_number(std::string_view& s) {
+  size_t n = 0;
+  while (n < s.size() && s[n] >= '0' && s[n] <= '9') n++;
+  if (n == 0 || n > 9 || (n > 1 && s[0] == '0')) return std::nullopt;
+  uint32_t v = 0;
+  for (size_t i = 0; i < n; i++) v = v * 10 + static_cast<uint32_t>(s[i] - '0');
+  s.remove_prefix(n);
+  return v;
+}
+
+/** Consume `prefix` from the front of `s` if it is there. */
+bool take(std::string_view& s, std::string_view prefix) {
+  if (!s.starts_with(prefix)) return false;
+  s.remove_prefix(prefix.size());
+  return true;
+}
+
+}  // namespace
+
+std::optional<uint32_t> stored_expert_layer(std::string_view name) {
+  if (!take(name, "model.layers.")) return std::nullopt;
+  const auto layer = take_number(name);
+  if (!layer || !take(name, ".mlp.experts.")) return std::nullopt;
+  const auto expert = take_number(name);
+  if (!expert || *expert >= kExperts || !take(name, ".")) return std::nullopt;
+  if (!take(name, "gate_proj.") && !take(name, "up_proj.") && !take(name, "down_proj.")) return std::nullopt;
+  if (name != "weight" && name != "weight_scale") return std::nullopt;
+  if (*layer < kFirstMoeLayer || *layer > kLastMoeLayer) return std::nullopt;
+  return layer;
+}
+
+std::set<uint32_t> deletable_shards(const std::map<std::string, ShardedTensor>& index,
+                                    std::span<const uint32_t> converted) {
+  const std::set<uint32_t> done(converted.begin(), converted.end());
+  std::set<uint32_t> seen, keep;
+  for (const auto& [name, st] : index) {
+    seen.insert(st.shard);
+    const auto layer = stored_expert_layer(name);
+    if (!layer || !done.contains(*layer)) keep.insert(st.shard);
+  }
+  std::set<uint32_t> out;
+  std::set_difference(seen.begin(), seen.end(), keep.begin(), keep.end(), std::inserter(out, out.end()));
+  return out;
 }
 
 Result<std::vector<std::byte>, LayoutError> build_record(const Sextuplet& s) {

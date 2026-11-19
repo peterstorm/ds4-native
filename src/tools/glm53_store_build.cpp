@@ -2,15 +2,22 @@
 // safetensors shards into the GLM-5.3 Expert store (core/glm53/store.hpp), or
 // verify an existing store.
 //
-//   ds4n-glm53-store-build --out STORE [--layers A-B] [--threads N] [--verify] SHARD...
+//   ds4n-glm53-store-build --out STORE [--layers A-B] [--threads N] [--min-free-gib G] [--verify] SHARD...
 //
 // Layers are converted only when all their sextuplets are present in the given
-// shards, so a partial download converts what it can (incremental
-// convert-and-delete: plan docs/plans/2026-11-19-glm53-native.md). The store
-// file is sized to the full layout up front (sparse). After a successful
-// non-verify run the tool prints which shards hold nothing but converted
-// expert tensors — those are safe to delete; shards holding backbone, MTP or
-// metadata tensors are never listed.
+// shards, so a partial download converts what it can. The store file is sized
+// to the full layout up front (sparse); a write run first checks that the
+// store's filesystem keeps at least G GiB (default 8) free after the records it
+// is about to write — the pool is shared with the serving stack, and ENOSPC
+// there takes it down.
+//
+// A --verify run that finds every record identical prints the shards that now
+// hold nothing the store lacks (core/glm53/store deletable_shards: every tensor
+// a stored-Expert tensor of a verified layer). Shards holding backbone, router,
+// shared-expert, MTP (layer 78) or unverified layers' tensors are never listed.
+// Kitaniai interleaves backbone tensors into 85 of its 282 shards, so those
+// leave only after the backbone is extracted from them (plan, Phase 2).
+#include <sys/statvfs.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -18,8 +25,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <map>
-#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -36,6 +43,7 @@ struct Args {
   std::vector<std::string> shards;
   uint32_t first = glm53::kFirstMoeLayer, last = glm53::kLastMoeLayer;
   unsigned threads = 8;
+  uint64_t min_free_gib = 8;
   bool verify = false;
 };
 
@@ -44,6 +52,7 @@ bool parse_args(int argc, char** argv, Args& a) {
     const std::string s = argv[i];
     if (s == "--out" && i + 1 < argc) a.out = argv[++i];
     else if (s == "--threads" && i + 1 < argc) a.threads = static_cast<unsigned>(std::stoul(argv[++i]));
+    else if (s == "--min-free-gib" && i + 1 < argc) a.min_free_gib = std::stoull(argv[++i]);
     else if (s == "--verify") a.verify = true;
     else if (s == "--layers" && i + 1 < argc) {
       const std::string r = argv[++i];
@@ -66,7 +75,8 @@ bool parse_args(int argc, char** argv, Args& a) {
 int main(int argc, char** argv) {
   Args args;
   if (!parse_args(argc, argv, args))
-    die("usage: ds4n-glm53-store-build --out STORE [--layers A-B] [--threads N] [--verify] SHARD...");
+    die("usage: ds4n-glm53-store-build --out STORE [--layers A-B] [--threads N] [--min-free-gib G] [--verify] "
+        "SHARD...");
 
   std::vector<io::Fd> fds;
   std::map<std::string, glm53::ShardedTensor> index;
@@ -88,6 +98,20 @@ int main(int argc, char** argv) {
     else std::fprintf(stderr, "layer %u: not fully present in the given shards, skipped\n", l);
   }
   if (layers.empty()) die("no complete layers in the given shards");
+
+  if (!args.verify) {
+    // Free-space preflight: the records about to be written (their padding is
+    // zeros, which the compressed dataset does not store) plus the floor.
+    const auto dir = std::filesystem::path(args.out).parent_path();
+    struct statvfs fs {};
+    if (::statvfs(dir.empty() ? "." : dir.c_str(), &fs) != 0) die("statvfs " + dir.string());
+    const uint64_t free_bytes = uint64_t{fs.f_bavail} * fs.f_frsize;
+    const uint64_t need = layers.size() * uint64_t{glm53::kExperts} * glm53::kHalves * glm53::kHalfPayloadBytes;
+    const uint64_t floor = args.min_free_gib << 30;
+    if (free_bytes < need + floor)
+      die("not enough free space: " + std::to_string(free_bytes >> 30) + " GiB free, " + std::to_string(need >> 30) +
+          " GiB to write + " + std::to_string(args.min_free_gib) + " GiB floor (convert fewer layers, or free space)");
+  }
 
   auto out = io::open_file(args.out, args.verify ? io::Access::ReadDirect : io::Access::WriteDirect);
   if (!out) die(out.error().what);
@@ -178,27 +202,14 @@ int main(int argc, char** argv) {
     std::printf("mismatched records: %lu\n", mismatches.load());
     return 1;
   }
-  if (!args.verify) {
-    // Shard occupancy: a shard is deletable when every tensor it holds was
-    // consumed by the store (expert sextuplets only — backbone, MTP, router
-    // and metadata tensors keep their shards alive).
-    std::map<uint32_t, std::pair<uint64_t, uint64_t>> occupancy;  // shard -> {all tensors, expert tensors}
-    for (const auto& [name, st] : index) {
-      auto& o = occupancy[st.shard];
-      o.first++;
-      if (name.find(".mlp.experts.") != std::string::npos &&
-          (name.ends_with(".gate_proj.weight") || name.ends_with(".up_proj.weight") ||
-           name.ends_with(".down_proj.weight")))
-        o.second++;
-    }
-    std::set<uint32_t> deletable;
-    for (const auto& [shard, o] : occupancy)
-      if (o.first == o.second && o.second > 0) deletable.insert(shard);
-    if (!deletable.empty()) {
-      std::printf("deletable shards (expert tensors only):");
-      for (uint32_t s : deletable) std::printf(" %s", args.shards[s].c_str());
-      std::printf("\n");
-    }
+  if (args.verify) {
+    // Proven by this verify run: these layers' records match their sources.
+    const auto deletable = glm53::deletable_shards(index, layers);
+    std::printf("deletable shards (only verified Expert tensors):");
+    for (uint32_t s : deletable) std::printf(" %s", args.shards[s].c_str());
+    std::printf("%s\n", deletable.empty() ? " none" : "");
+  } else {
+    std::printf("run the same command with --verify to list the shards that are now safe to delete\n");
   }
   return 0;
 }

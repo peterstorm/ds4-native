@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <numeric>
+#include <random>
 #include <set>
 
 #include "core/glm53/store.hpp"
@@ -192,4 +193,95 @@ TEST_CASE("header round-trip and mismatch detection") {
   CHECK(!decode_header(corrupted).is_ok());
   auto short_header = std::vector<std::byte>(64, std::byte{0});
   CHECK(!decode_header(short_header).is_ok());
+}
+
+TEST_CASE("stored_expert_layer names exactly the routed-Expert tensors the store holds") {
+  CHECK(stored_expert_layer("model.layers.10.mlp.experts.255.down_proj.weight_scale") == 10u);
+  CHECK(stored_expert_layer("model.layers.3.mlp.experts.0.gate_proj.weight") == 3u);
+  CHECK(stored_expert_layer("model.layers.77.mlp.experts.7.up_proj.weight") == 77u);
+  // Never stored: the MTP block's Experts, dense layers, shared experts, routers, backbone.
+  CHECK(!stored_expert_layer("model.layers.78.mlp.experts.7.up_proj.weight"));
+  CHECK(!stored_expert_layer("model.layers.2.mlp.experts.7.up_proj.weight"));
+  CHECK(!stored_expert_layer("model.layers.10.mlp.shared_experts.gate_proj.weight"));
+  CHECK(!stored_expert_layer("model.layers.10.mlp.gate.weight"));
+  CHECK(!stored_expert_layer("model.layers.10.mlp.gate.e_score_correction_bias"));
+  CHECK(!stored_expert_layer("model.layers.10.self_attn.q_a_proj.weight"));
+  CHECK(!stored_expert_layer("model.embed_tokens.weight"));
+  // Malformed lookalikes.
+  CHECK(!stored_expert_layer("model.layers.10.mlp.experts.256.up_proj.weight"));
+  CHECK(!stored_expert_layer("model.layers.010.mlp.experts.1.up_proj.weight"));
+  CHECK(!stored_expert_layer("model.layers.10.mlp.experts.1.up_proj.weight.extra"));
+  CHECK(!stored_expert_layer("model.layers.10.mlp.experts.1.up_proj.bias"));
+  CHECK(!stored_expert_layer("model.layers.10.mlp.experts.gate_up_proj"));
+  CHECK(!stored_expert_layer("model.layers.99999999999.mlp.experts.1.up_proj.weight"));
+}
+
+namespace {
+
+std::map<std::string, ShardedTensor> shard_index(
+    std::initializer_list<std::pair<uint32_t, std::vector<std::string>>> shards) {
+  std::map<std::string, ShardedTensor> index;
+  for (const auto& [shard, names] : shards)
+    for (const auto& n : names) index[n] = ShardedTensor{shard, safetensors::Tensor{safetensors::Dtype::U8, {1}, 0, 1}};
+  return index;
+}
+
+std::vector<std::string> sextuplet(uint32_t layer, uint32_t expert) {
+  const std::string b = "model.layers." + std::to_string(layer) + ".mlp.experts." + std::to_string(expert) + ".";
+  return {b + "gate_proj.weight", b + "gate_proj.weight_scale", b + "up_proj.weight",
+          b + "up_proj.weight_scale", b + "down_proj.weight", b + "down_proj.weight_scale"};
+}
+
+std::vector<std::string> join(std::vector<std::string> a, const std::vector<std::string>& b) {
+  a.insert(a.end(), b.begin(), b.end());
+  return a;
+}
+
+}  // namespace
+
+TEST_CASE("deletable_shards keeps every shard holding anything the store lacks") {
+  const auto index = shard_index({
+      {0, join(sextuplet(10, 0), sextuplet(10, 1))},                            // layer 10 only
+      {1, join(sextuplet(10, 2), sextuplet(11, 0))},                            // spans layers 10-11
+      {2, join(sextuplet(12, 0), {"model.layers.12.self_attn.o_proj.weight"})},  // mixed with backbone
+      {3, sextuplet(78, 0)},                                                    // the MTP block's Experts
+      {4, {"model.embed_tokens.weight"}},                                       // backbone only
+  });
+  const std::vector<uint32_t> none, ten{10}, ten_eleven{10, 11}, all{10, 11, 12, 78};
+  CHECK(deletable_shards(index, none).empty());
+  CHECK(deletable_shards(index, ten) == std::set<uint32_t>{0});
+  CHECK(deletable_shards(index, ten_eleven) == std::set<uint32_t>{0, 1});
+  // Even with every layer named, backbone, mixed and MTP shards stay (78 is never stored).
+  CHECK(deletable_shards(index, all) == std::set<uint32_t>{0, 1});
+}
+
+TEST_CASE("deletable_shards only grows as more layers are converted") {
+  std::mt19937 rng(17);
+  for (int trial = 0; trial < 200; trial++) {
+    std::map<std::string, ShardedTensor> index;
+    for (uint32_t shard = 0; shard < 12; shard++) {
+      const int pieces = std::uniform_int_distribution<int>(1, 3)(rng);
+      for (int p = 0; p < pieces; p++) {
+        const uint32_t layer = std::uniform_int_distribution<uint32_t>(kFirstMoeLayer - 1, kLastMoeLayer + 1)(rng);
+        const uint32_t expert = std::uniform_int_distribution<uint32_t>(0, kExperts - 1)(rng);
+        for (const auto& n : sextuplet(layer, expert))
+          index[n] = ShardedTensor{shard, safetensors::Tensor{safetensors::Dtype::U8, {1}, 0, 1}};
+      }
+    }
+    std::vector<uint32_t> converted;
+    std::set<uint32_t> before;
+    for (int step = 0; step < 20; step++) {
+      converted.push_back(std::uniform_int_distribution<uint32_t>(kFirstMoeLayer, kLastMoeLayer)(rng));
+      const auto now = deletable_shards(index, converted);
+      CHECK(std::includes(now.begin(), now.end(), before.begin(), before.end()));
+      // And nothing deletable holds a tensor of a layer that was not converted.
+      for (const auto& [name, st] : index)
+        if (now.contains(st.shard)) {
+          const auto layer = stored_expert_layer(name);
+          REQUIRE(layer.has_value());
+          CHECK(std::find(converted.begin(), converted.end(), *layer) != converted.end());
+        }
+      before = now;
+    }
+  }
 }

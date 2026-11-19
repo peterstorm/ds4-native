@@ -14,8 +14,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <optional>
+#include <set>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "core/result.hpp"
@@ -116,6 +119,24 @@ struct Sextuplet {
 };
 
 Result<std::vector<std::byte>, LayoutError> build_record(const Sextuplet& s);
+
+/**
+ * The model layer of a routed-Expert source tensor the store holds — exactly
+ * `model.layers.L.mlp.experts.E.{gate,up,down}_proj.{weight,weight_scale}`
+ * with L a stored layer (3..77) and E < 256. Anything else is nullopt: the
+ * backbone, routers, shared experts, and the MTP block's (layer 78) own
+ * Experts, which stay resident and are never stored.
+ */
+std::optional<uint32_t> stored_expert_layer(std::string_view tensor_name);
+
+/**
+ * Shards that hold nothing the store does not now have: every tensor in them
+ * is a stored-Expert tensor of a layer in `converted`. A shard with any other
+ * tensor (backbone, MTP, an unconverted layer's Experts) is kept. Only
+ * meaningful once those layers are written and verified.
+ */
+std::set<uint32_t> deletable_shards(const std::map<std::string, ShardedTensor>& index,
+                                    std::span<const uint32_t> converted);
 
 /** Store file header (first kHeaderBytes of the file). */
 struct StoreHeader {
