@@ -6,11 +6,12 @@
 // Values are FP32; dot products accumulate in double and round once, so the
 // oracle sits within FP32 noise of the reference's own FP32 run.
 //
-// This is the *semantics* anchor, not yet a Reference configuration: the GPU
-// executor's quantized arithmetic (MXFP4 Experts, FP8/BF16 Backbone) gets its
-// own bit-exact oracle on top of these functions, as DS4.1's did. What the
-// oracle can already vary is the Experts' activation precision
-// (expert_outputs, finish_layer), to measure what each candidate loses.
+// This is the *semantics* anchor, not the Reference configuration: the GPU
+// executor's arithmetic gets its own bit-exact oracle on top of these
+// functions, as DS4.1's did (the MoE: core/glm53/exact_moe;
+// docs/design/glm53-reference-configuration.md). What this oracle can vary is
+// the Experts' activation precision (expert_outputs, finish_layer), to
+// measure what each candidate loses.
 //
 // Two places where the oracle's form differs from the reference's text but not
 // its mathematics:
@@ -175,6 +176,9 @@ struct Route {
   float margin = 0.0f;
 };
 
+/** Route::margin for the biased scores `choice` and the chosen Expert ids. */
+float route_margin(std::span<const float> choice, std::span<const int32_t> chosen);
+
 /**
  * sigmoid(logits); the experts_per_token best of sigmoid + bias (ties to the
  * lower id); weights = the chosen unbiased sigmoids / (their sum + 1e-20) *
@@ -274,6 +278,19 @@ Result<std::vector<ExpertOutput>, StepError> expert_outputs(const Config& config
  */
 Result<LayerStep, StepError> finish_layer(const Config& config, const LayerWeights& w, LayerStart start,
                                           std::span<const ExpertOutput> routed);
+
+/** A Sparse layer's feed-forward computed in another arithmetic (core/glm53/exact_moe), with the Route it took. */
+struct FeedForward {
+  std::vector<float> out;  // [hidden]
+  Route route;
+};
+
+/**
+ * The rest of the layer with its feed-forward from elsewhere: the residual
+ * stream start.mid + ffn.out, and ffn.route in place of the oracle's own
+ * (start.route). Fails if ffn.out is not hidden_size wide.
+ */
+Result<LayerStep, StepError> finish_layer(const Config& config, LayerStart start, FeedForward ffn);
 
 /** begin_layer and finish_layer in FP32 with the routed Experts from `weights`: the Semantics oracle. */
 Result<LayerStep, StepError> decode_layer(const Config& config, const ModelWeights& weights, int layer,

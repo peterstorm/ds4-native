@@ -7,8 +7,8 @@
 // its decoded record. Nothing else of its Expert or layer need still be on disk,
 // which is what lets a shard holding the tail of one layer and the head of the
 // next leave after the next layer's pass (kitaniai: 68 such shards, 181 Experts
-// split across two shards). It also reads Experts back for the Semantics
-// oracle (StoreReader).
+// split across two shards). It also reads Experts back for the oracles
+// (StoreReader).
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -17,7 +17,6 @@
 #include <utility>
 #include <vector>
 
-#include "core/glm53/dequant.hpp"
 #include "core/glm53/store.hpp"
 #include "core/result.hpp"
 #include "io/file.hpp"
@@ -45,17 +44,19 @@ Result<StoreCheck, IoError> check_store_tensors(const std::string& store_path,
                                                 const std::map<std::string, glm53::ShardedTensor>& index,
                                                 uint32_t first, uint32_t last, unsigned threads);
 
-/** An Expert store open for reading routed Experts in FP32 (the Semantics oracle's Expert source). */
+/** An Expert store open for reading routed Experts back. */
 class StoreReader {
  public:
   /** Open `path`; a header that does not match this build is an error. */
   static Result<StoreReader, IoError> open(const std::string& path);
 
   /**
-   * Expert `id` dequantized from its record. An id outside the store, or a
-   * record that does not decode (unwritten, damaged), is an error.
+   * Expert `id`'s six source tensors, decoded from its record byte for byte:
+   * what the Reference configuration reads (core/glm53/exact_moe), and the
+   * Semantics oracle dequantized (glm53::dequantize_expert). An id outside the
+   * store, or a record that does not decode (unwritten, damaged), is an error.
    */
-  Result<glm53::ExpertValues, IoError> read(glm53::ExpertId id) const;
+  Result<glm53::ExpertTensors, IoError> read_tensors(glm53::ExpertId id) const;
 
  private:
   explicit StoreReader(Fd fd) : fd_(std::move(fd)) {}

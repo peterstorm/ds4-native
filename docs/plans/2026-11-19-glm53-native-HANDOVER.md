@@ -1,4 +1,4 @@
-# HANDOVER: GLM-5.3 full uncensored on ds4-native — session state 2026-11-19 (updated 20:15)
+# HANDOVER: GLM-5.3 full uncensored on ds4-native — session state 2026-11-19 (updated 21:30)
 
 Resume point for any fresh session. Companion to
 [`2026-11-19-glm53-native.md`](2026-11-19-glm53-native.md) (the plan — read it first; its
@@ -16,7 +16,7 @@ backbone differs (119 bf16 residual-writer tensors). Speed expectation est. 15�
 30–50 with cache-conditional routing + RAM tier — a quality/architecture play. Phase 5's measured
 CyberGym verdict decides keep/archive.
 
-## Where things stand (2026-11-19 ~20:15, second session)
+## Where things stand (2026-11-19 ~21:30, second session)
 
 ### Done
 
@@ -29,6 +29,7 @@ CyberGym verdict decides keep/archive.
 | **Per-tensor release + consume driver** | same branch: `decode_record` (inverse of `build_record`), `StoredTensor` parse, `io/glm53_store` `check_store_tensors`, `tools/glm53-store/consume.sh` | the per-layer release rule would have stranded the 68 shards that hold two layers' Experts (~100 GiB): once a layer's first shards leave, that layer can never be verified whole again. A stored tensor is now proven against its slice of its decoded record. Driver walks shards in file order with per-Expert convert (skips what the store holds), part repair, and all-zero records read as not converted. Real shards 1–9 through the driver in RAM (shards read-only): all released, then an independent verify of the *original* shards matched all 512 Experts of layers 10–11; canary on real ZFS (3 shards) before the full run. Review by an independent agent: no deletion-safety blocker; its findings (compression, ordering, part repair, crash windows) are fixed. 234 core + 4 I/O tests; 6/6 mutants killed |
 | **First real-weights run (Phase 3 step 2)** | same branch: `begin_layer`/`finish_layer`/`bind_layer` (the oracle's seam at the routed Experts), `core/glm53/{dequant,precision}`, `io/glm53_weights` `BackboneParts`, `io/glm53_store` `StoreReader`, `ds4n-glm53-oracle-run`; receipts `docs/bench/glm53-oracle/2026-11-19-capitals.*` | 21-token prompt on CPU, 478 s, beside the live flare deployment: " Rome" at p 0.994, " Paris"/" Berlin" top-1. Route margins median 3.5e-3 (≈ one BF16 step), 9/1,725 within 1e-5. Feed-forward input error: W4A4 11.6%, E4M3 2.65%. Layer-major decoding bit-identical to `decode_token` on the golden; mutation probe 11/11. 245 core + 7 I/O tests |
 | **Activation precision measured (Phase 3 step 3)** | same branch: `core/glm53/precision` `ActivationPrecision` (MXFP4 with Quark's "even" scale, read from amd-quark 0.13), `expert_outputs` + `finish_layer` over `ExpertOutput`s (the seam at the routed Experts' outputs), oracle-run `--prompt`×N `--activations`; receipts `docs/bench/glm53-oracle/2026-11-19-activations.*` | 5 prompts, 315 positions, 1,961 s on 30 threads with flare stopped (operator-approved; **left stopped** at the operator's word: `docker start glm53-flash-hyperflare-tp2-uncensored` brings it back, ~1 min to load). Mean KL vs FP32: W4A4 0.0616, E4M3 0.0051, BF16 0.0036; perplexity 3.975 / 3.805 / 3.826 vs 3.849. **E4M3 decided** (operator; plan settled decision 8). Prompt 0 at FP32 reproduces step 2's output exactly; mutation probe 12/12; 249 core + 7 I/O tests |
+| **The MoE's Reference configuration (Phase 3 step 4)** | same branch: `docs/design/glm53-reference-configuration.md`, `core/glm53/exact_moe` (bit-exact MoE oracle on the Expert codes, from DS4.1's primitives unchanged), `StoreReader::read_tensors`, `BackboneParts::load_shared_expert`, `finish_layer(FeedForward)`, oracle-run `--activations exact`, `tools/glm53-golden/exact-moe-mutation-probe.sh`; receipts `docs/bench/glm53-oracle/2026-11-19-exact-moe.*` | router 6 planes, Halves, split-K 2, no clamp, weight folded before down, ascending-id combine then shared, then the Exchange. Pinned by `kReferenceBits` (512 tokens incl. hidden fragments) plus a double-precision spec witness (< 1e-3); mutation probe 16/16. Real weights, 5 prompts, 3,582 s: mean KL vs FP32 **0.0091** (E4M3 alone 0.0051; FP32/E4M3 streams reproduce step 3 exactly), top-1 306/315, perplexity 3.816. The extra ~0.004 is uniform (BF16 roundings + folded weight, not isolated yet: design "Open"). 266 core + 8 I/O tests |
 | **Converter safety fix** | same branch, `24b9a6a` | the deletable list could have listed MTP and unconverted shards; now it lists only verified, fully consumed shards and has a free-space preflight. Checked on real layer 10 (RAM tmpfs) |
 | Indexer reference pinning (old step 5) | `ref/glm-5.3/README.md` | **decided: transformers 5.16.0** |
 | Desktop space for the download | /models/voice deleted (operator-approved; TTS weights, re-downloadable), 82 exited containers + `ds4-native-dev:1` removed | `space-guard.sh` armed (pauses the fetch below 6 GiB free) |
@@ -124,8 +125,13 @@ An independent audit (python, read-only, against the index) found:
    step 3): W4A4 as the checkpoint declares it costs mean KL 0.0616 nats and 3.3% perplexity
    against FP32; E4M3 costs 0.0051, BF16 0.0036. **Decided: E4M3 activations for routed and
    shared Experts** (plan settled decision 8; decode is weight-bandwidth bound either way).
-   Next, fix the router's reduction order (82 of 23,625 real routes within 1e-5, 6 exact ties),
-   write the bit-exact oracle, then the kernels (first GPU window).
+   The MoE's orders are now fixed and its bit-exact oracle written (`core/glm53/exact_moe`,
+   plan Phase 3 step 4). Next: the GPU MoE gated 100% bit-identical against it (first GPU
+   window), and the attention side's orders, fixed with their kernels (design, "By operation").
+   Any change to `exact_moe`'s arithmetic changes `kReferenceBits` in
+   `tests/core/glm53/test_exact_moe.cpp`: change the design doc with it, and rerun
+   `tools/glm53-golden/exact-moe-mutation-probe.sh` (in the dev image, from the repo root,
+   after a configured build; ~16 rebuilds of one file).
 6. **Backbone B (cyber)**: does not fit on rpool next to store + Backbone A (est. 20–30 GiB short). It
    needs a space decision first.
 7. Phases 4–5 per the plan (fifth switch-primary entry `glm-native`, slots ladder, CyberGym).
@@ -172,6 +178,7 @@ An independent audit (python, read-only, against the index) found:
 | This handover | `ds4-native/docs/plans/2026-11-19-glm53-native-HANDOVER.md` |
 | Pinned GLM-5.3 reference + why | `ds4-native/ref/glm-5.3/README.md` |
 | GLM terms (Selection, Full/Shared layer, Latent row, Backbone part, Semantics oracle, Activation precision, Route margin) | `ds4-native/CONTEXT.md`, GLM-5.3 section |
+| GLM-5.3 Reference configuration (MoE fixed; attention by operation) | `ds4-native/docs/design/glm53-reference-configuration.md` |
 | Feasibility base (measured constants) | `ds4-native/docs/research/2026-10-26-feasibility.md` |
 | Serving design / engine internals | `ds4-native/docs/design/{serving,forward-pass,dspark}.md` |
 | Inference map (primaries, runbooks) | `.dotfiles/scripts/inference/INDEX.md` |

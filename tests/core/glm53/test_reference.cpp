@@ -313,6 +313,35 @@ TEST_CASE("finish_layer takes exactly its Route's Experts' outputs, at one preci
   CHECK_FALSE(bind_layer(config, -1, g.lookup()).is_ok());
 }
 
+// Another arithmetic (the Reference configuration's MoE) computes the whole
+// feed-forward and its own Route; the oracle only adds it to the residual
+// stream and keeps everything attention made.
+TEST_CASE("finish_layer with a feed-forward from elsewhere adds it to mid and records its Route") {
+  const Golden& g = golden();
+  const Config config = golden_config();
+  const Dims& d = config.dims();
+  int sparse = 0;
+  while (config.mlp(sparse) != MlpKind::Sparse) sparse++;
+  const auto layer = bind_layer(config, sparse, g.lookup());
+  REQUIRE(layer.is_ok());
+  std::mt19937 rng(23);
+  const auto x = random_vector(rng, static_cast<size_t>(d.hidden));
+  const LayerCache empty;
+  const std::vector<int32_t> self{0};
+  const auto start = begin_layer(config, layer.value(), sparse, empty, x, self).value();
+
+  FeedForward ffn{random_vector(rng, static_cast<size_t>(d.hidden)), Route{{0, 3, 5}, {1.0f, 0.5f, 1.0f}, 0.125f}};
+  const auto step = finish_layer(config, start, ffn);
+  REQUIRE(step.is_ok());
+  for (size_t i = 0; i < ffn.out.size(); i++) CHECK(step.value().out[i] == start.mid[i] + ffn.out[i]);
+  CHECK(step.value().route.expert == ffn.route.expert);
+  CHECK(step.value().route.margin == 0.125f);
+  CHECK(step.value().row.latent == start.row.latent);
+  CHECK(step.value().selection == start.selection);
+  ffn.out.pop_back();
+  CHECK_FALSE(finish_layer(config, start, ffn).is_ok());
+}
+
 namespace {
 
 /** The golden config with Experts 32 wide inside, so block precisions fit (hidden is 64). */

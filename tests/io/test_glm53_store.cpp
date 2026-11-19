@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 
+#include "core/glm53/dequant.hpp"
 #include "core/glm53/store.hpp"
 #include "io/glm53_backbone.hpp"
 #include "io/glm53_store.hpp"
@@ -189,7 +190,7 @@ TEST_CASE("a shard spanning two layers is released by the next layer's pass, aft
   }
 }
 
-TEST_CASE("StoreReader reads an Expert back as its source tensors dequantized, and refuses what holds none") {
+TEST_CASE("StoreReader reads an Expert back as its source tensors, byte for byte, and refuses what holds none") {
   TempDir dir;
   std::mt19937 rng(43);
   Six six = random_six(rng);
@@ -200,17 +201,20 @@ TEST_CASE("StoreReader reads an Expert back as its source tensors dequantized, a
 
   const auto reader = io::StoreReader::open(store);
   REQUIRE(reader.is_ok());
-  const auto e = reader.value().read({3, 7});
-  REQUIRE(e.is_ok());
-  CHECK(e.value().gate == dequantize_mxfp4(six.codes[0], six.scales[0], kIntermediate, kHidden).value());
-  CHECK(e.value().up == dequantize_mxfp4(six.codes[1], six.scales[1], kIntermediate, kHidden).value());
-  CHECK(e.value().down == dequantize_mxfp4(six.codes[2], six.scales[2], kHidden, kIntermediate).value());
+  const auto raw = reader.value().read_tensors({3, 7});  // the codes themselves, for the Reference configuration
+  REQUIRE(raw.is_ok());
+  CHECK(raw.value().codes == six.codes);
+  CHECK(raw.value().scales == six.scales);
+  const auto e = dequantize_expert(raw.value());  // and their values, for the Semantics oracle
+  CHECK(e.gate == dequantize_mxfp4(six.codes[0], six.scales[0], kIntermediate, kHidden).value());
+  CHECK(e.up == dequantize_mxfp4(six.codes[1], six.scales[1], kIntermediate, kHidden).value());
+  CHECK(e.down == dequantize_mxfp4(six.codes[2], six.scales[2], kHidden, kIntermediate).value());
 
-  CHECK_FALSE(reader.value().read({3, 8}).is_ok());     // unwritten
-  CHECK_FALSE(reader.value().read({2, 0}).is_ok());     // a Dense layer has no records
-  CHECK_FALSE(reader.value().read({3, 256}).is_ok());   // no such Expert
+  CHECK_FALSE(reader.value().read_tensors({3, 8}).is_ok());    // unwritten
+  CHECK_FALSE(reader.value().read_tensors({2, 0}).is_ok());    // a Dense layer has no records
+  CHECK_FALSE(reader.value().read_tensors({3, 256}).is_ok());  // no such Expert
   write_at(store, record_offset({3, 7}) + kHalfPayloadBytes, {std::byte{1}});
-  CHECK_FALSE(reader.value().read({3, 7}).is_ok());     // non-zero padding: damaged
+  CHECK_FALSE(reader.value().read_tensors({3, 7}).is_ok());    // non-zero padding: damaged
 
   write_at(store, 0, std::vector<std::byte>(4));
   CHECK_FALSE(io::StoreReader::open(store).is_ok());

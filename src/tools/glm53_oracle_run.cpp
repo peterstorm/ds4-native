@@ -1,15 +1,20 @@
 // ds4n-glm53-oracle-run: the GLM-5.3 Semantics oracle (core/glm53/reference)
 // on the real weights, CPU only: the engine's semantics on real prompts, and
-// what each candidate activation precision for the Experts loses against it.
+// what each candidate arithmetic for the Experts loses against it.
 //
 //   ds4n-glm53-oracle-run --config ref/glm-5.3/config.json --backbone DIR --store FILE
-//                         --prompt ID,ID,... [--prompt ID,...]... [--activations fp32,bf16,e4m3,mxfp4]
+//                         --prompt ID,ID,... [--prompt ID,...]... [--activations fp32,bf16,e4m3,mxfp4,exact]
 //                         [--generate N] [--threads T] [--resident E] [--report FILE]
 //
-// Each prompt runs once per activation precision listed — a stream, with its
-// own caches and residual stream — teacher-forced on the prompt's tokens. The
-// first precision (default fp32: the oracle itself) is the baseline every
-// other is compared against.
+// Each prompt runs once per arithmetic listed — a stream, with its own caches
+// and residual stream — teacher-forced on the prompt's tokens. fp32, bf16,
+// e4m3 and mxfp4 are the Semantics oracle with the Experts' activations at
+// that precision; `exact` is the Reference configuration's MoE
+// (core/glm53/exact_moe: its router, the Experts' MXFP4 codes on E4M3
+// activations with its roundings and orders, the BF16 exchange) on every
+// Sparse layer, the rest of the model still the Semantics oracle. The first
+// listed (default fp32: the oracle itself) is the baseline every other is
+// compared against.
 //
 // The model does not fit in RAM as FP32 (~66 GB of Backbone, ~1.4 TB of routed
 // Experts), so a run goes a layer at a time over all streams together: bind
@@ -18,14 +23,15 @@
 // (begin_layer, growing the stream's cache; streams in parallel); read the
 // union of the Experts the Routes name from the store once, at most E at a
 // time (default 64, ~150 MB each in FP32), running each over every token that
-// routes to it at that token's stream's precision (expert_outputs); then
-// finish every token (finish_layer). The prompts are one round; each generated
-// token (greedy, per stream) is another.
+// routes to it in that token's stream's arithmetic (expert_outputs, or
+// exact::expert_halves on the record's codes); then finish every token
+// (finish_layer). The prompts are one round; each generated token (greedy, per
+// stream) is another.
 //
 // Reported (stdout, and --report as JSON): for the baseline, per prompt
 // position the log-prob and rank of the prompt's next token and the top 10,
 // the perplexity, the Route margins and the Selections; for every other
-// precision, per position KL(baseline ‖ precision) over the full vocabulary,
+// arithmetic, per position KL(baseline ‖ it) over the full vocabulary,
 // whether its top token agrees, its perplexity, and how many of its Routes
 // differ from the baseline's; and every stream's greedy continuation. Token
 // ids only: decode them with the checkpoint's tokenizer.
@@ -44,9 +50,12 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <variant>
 #include <vector>
 
 #include "core/glm53/config.hpp"
+#include "core/glm53/dequant.hpp"
+#include "core/glm53/exact_moe.hpp"
 #include "core/glm53/precision.hpp"
 #include "core/glm53/reference.hpp"
 #include "io/glm53_store.hpp"
@@ -54,13 +63,35 @@
 
 using namespace ds4n;
 using glm53::ActivationPrecision;
+namespace exact = glm53::exact;
 
 namespace {
+
+/** The Reference configuration's MoE on the Sparse layers (core/glm53/exact_moe). */
+struct ExactMoe {
+  friend auto operator<=>(ExactMoe, ExactMoe) = default;
+};
+
+/** How a stream runs its Experts: the Semantics oracle at an activation precision, or the Reference configuration. */
+using Arithmetic = std::variant<ActivationPrecision, ExactMoe>;
+
+std::string name_of(const Arithmetic& a) {
+  if (const auto* p = std::get_if<ActivationPrecision>(&a)) return std::string(glm53::name_of(*p));
+  return "exact";
+}
+
+std::optional<Arithmetic> parse_arithmetic(const std::string& name) {
+  if (name == "exact") return Arithmetic{ExactMoe{}};
+  if (const auto p = glm53::parse_activation_precision(name)) return Arithmetic{*p};
+  return std::nullopt;
+}
+
+bool is_exact(const Arithmetic& a) { return std::holds_alternative<ExactMoe>(a); }
 
 struct Args {
   std::string config, backbone, store, report;
   std::vector<std::vector<int32_t>> prompts;
-  std::vector<ActivationPrecision> precisions;  // the first is the baseline
+  std::vector<Arithmetic> arithmetics;  // the first is the baseline
   int generate = 0;
   unsigned threads = 8;
   size_t resident = 64;
@@ -90,13 +121,13 @@ bool parse_args(int argc, char** argv, Args& a) {
       a.prompts.push_back(std::move(prompt));
     } else if (s == "--activations") {
       for (const auto& name : split(v)) {
-        const auto p = glm53::parse_activation_precision(name);
-        if (!p || std::find(a.precisions.begin(), a.precisions.end(), *p) != a.precisions.end()) return false;
-        a.precisions.push_back(*p);
+        const auto p = parse_arithmetic(name);
+        if (!p || std::find(a.arithmetics.begin(), a.arithmetics.end(), *p) != a.arithmetics.end()) return false;
+        a.arithmetics.push_back(*p);
       }
     } else return false;
   }
-  if (a.precisions.empty()) a.precisions.push_back(ActivationPrecision::Fp32);
+  if (a.arithmetics.empty()) a.arithmetics.push_back(ActivationPrecision::Fp32);
   return argc % 2 == 1 && !a.config.empty() && !a.backbone.empty() && !a.store.empty() && !a.prompts.empty() &&
          a.generate >= 0 && a.threads > 0 && a.resident >= 8;
 }
@@ -140,10 +171,10 @@ struct Model {
   std::vector<float> final_norm;
 };
 
-/** One prompt at one activation precision: its caches, its Routes, and what the baseline measures. */
+/** One prompt in one arithmetic: its caches, its Routes, and what the baseline measures. */
 struct Stream {
   size_t prompt = 0;
-  ActivationPrecision precision = ActivationPrecision::Fp32;
+  Arithmetic arithmetic = ActivationPrecision::Fp32;
   bool baseline = false;
   std::vector<glm53::LayerCache> caches;                  // [layer]
   std::vector<std::vector<std::vector<int32_t>>> routes;  // [layer][position] the Route's Experts (Sparse layers)
@@ -158,6 +189,12 @@ struct Use {
 
 /** Tokens a group of one Expert's uses runs over at once: enough to read each weight row once for many. */
 constexpr size_t kTokensPerJob = 16;
+
+/** One routed Expert read from the store, in the forms the chunk's uses need. */
+struct LoadedExpert {
+  std::optional<glm53::ExpertValues> values;  // FP32, for Semantics streams
+  std::optional<exact::Fp4Expert> codes;      // MXFP4 codes, for exact streams
+};
 
 /**
  * Feeds tokens[s] to stream s, at the positions after what its caches hold,
@@ -187,15 +224,32 @@ std::vector<std::vector<std::vector<float>>> run_round(const Model& m, const Arg
     if (!weights) die(weights.error().what);
     const auto bound = glm53::bind_layer(config, L, io::lookup_of(weights.value()));
     if (!bound) die(where + bound.error().what);
+    // Exact streams on a Sparse layer need the layer in the Reference
+    // configuration's form: the bound router and bias, the shared expert's codes.
+    const auto* moe = std::get_if<glm53::MoeWeights>(&bound.value().mlp);
+    const bool any_exact = std::ranges::any_of(streams, [](const Stream& s) { return is_exact(s.arithmetic); });
+    std::optional<exact::Fp4Expert> shared;
+    std::optional<exact::MoeLayer> exact_layer;  // views `shared`
+    if (moe && any_exact) {
+      auto raw = m.parts.load_shared_expert(L);
+      if (!raw) die(where + raw.error().what);
+      auto codes = exact::fp4_expert(raw.value());
+      if (!codes) die(where + "shared expert: " + codes.error().what);
+      shared = std::move(codes).value();
+      exact_layer.emplace(exact::MoeLayer{moe->router, moe->bias, *shared});
+    }
     const double load_s = seconds_since(t0);
 
     // Attention and routing, each stream's tokens in position order (a row
-    // joins the cache before the next token attends), streams in parallel.
+    // joins the cache before the next token attends), streams in parallel. An
+    // exact stream routes with the Reference configuration's router instead.
     const auto t1 = std::chrono::steady_clock::now();
     std::vector<std::vector<glm53::LayerStart>> starts(S);
+    std::vector<std::vector<std::optional<exact::MoeStart>>> exact_tokens(S);
     if (auto e = parallel_for(S, args.threads, [&](size_t s) -> std::optional<std::string> {
           Stream& st = streams[s];
           auto& cache = st.caches[static_cast<size_t>(L)];
+          exact_tokens[s].resize(tokens[s].size());
           for (size_t i = 0; i < tokens[s].size(); i++) {
             auto r = glm53::begin_layer(config, bound.value(), L, cache, x[s][i], selection[s][i]);
             if (!r) return where + r.error().what;
@@ -207,9 +261,15 @@ std::vector<std::vector<std::vector<float>>> run_round(const Model& m, const Arg
                 if (selection[s][i].size() < static_cast<size_t>(cache.length)) st.selections_dropping++;
               }
             }
-            if (!r.value().route.expert.empty()) {
-              st.routes[static_cast<size_t>(L)].push_back(r.value().route.expert);
-              if (st.baseline) st.route_margins.push_back(r.value().route.margin);
+            if (exact_layer && is_exact(st.arithmetic)) {
+              auto begun = exact::begin_moe(d, *exact_layer, r.value().ffn_in);
+              if (!begun) return where + begun.error().what;
+              exact_tokens[s][i] = std::move(begun).value();
+            }
+            const auto& route = exact_tokens[s][i] ? exact_tokens[s][i]->route : r.value().route;
+            if (!route.expert.empty()) {
+              st.routes[static_cast<size_t>(L)].push_back(route.expert);
+              if (st.baseline) st.route_margins.push_back(route.margin);
             }
             starts[s].push_back(std::move(r).value());
           }
@@ -221,13 +281,19 @@ std::vector<std::vector<std::vector<float>>> run_round(const Model& m, const Arg
     // The routed Experts, Expert-major: the union of every Route's Experts,
     // read at most `resident` at a time, each run over all the tokens it serves.
     const auto t2 = std::chrono::steady_clock::now();
+    auto route_of = [&](size_t s, size_t i) -> const glm53::Route& {
+      return exact_tokens[s][i] ? exact_tokens[s][i]->route : starts[s][i].route;
+    };
     std::map<int32_t, std::vector<Use>> uses;
     std::vector<std::vector<std::vector<glm53::ExpertOutput>>> routed(S);
+    std::vector<std::vector<std::vector<exact::Halves>>> routed_halves(S);
     for (size_t s = 0; s < S; s++) {
       routed[s].resize(starts[s].size());
+      routed_halves[s].resize(starts[s].size());
       for (size_t i = 0; i < starts[s].size(); i++) {
-        const auto& experts = starts[s][i].route.expert;
-        routed[s][i].resize(experts.size());
+        const auto& experts = route_of(s, i).expert;
+        if (is_exact(streams[s].arithmetic)) routed_halves[s][i].resize(experts.size());
+        else routed[s][i].resize(experts.size());
         for (size_t k = 0; k < experts.size(); k++) uses[experts[k]].push_back(Use{s, i, k});
       }
     }
@@ -236,34 +302,51 @@ std::vector<std::vector<std::vector<float>>> run_round(const Model& m, const Arg
     for (size_t first = 0; first < ids.size(); first += args.resident) {
       const std::vector<int32_t> chunk(ids.begin() + static_cast<std::ptrdiff_t>(first),
                                        ids.begin() + static_cast<std::ptrdiff_t>(std::min(first + args.resident, ids.size())));
-      std::vector<glm53::ExpertValues> values(chunk.size());
+      std::vector<LoadedExpert> loaded(chunk.size());
       if (auto e = parallel_for(chunk.size(), args.threads, [&](size_t k) -> std::optional<std::string> {
-            auto v = m.store.read({static_cast<uint32_t>(L), static_cast<uint32_t>(chunk[k])});
-            if (!v) return v.error().what;
-            values[k] = std::move(v).value();
+            auto t = m.store.read_tensors({static_cast<uint32_t>(L), static_cast<uint32_t>(chunk[k])});
+            if (!t) return t.error().what;
+            const auto& us = uses.at(chunk[k]);
+            auto exact_use = [&](const Use& u) { return is_exact(streams[u.stream].arithmetic); };
+            if (!std::ranges::all_of(us, exact_use)) loaded[k].values = glm53::dequantize_expert(t.value());
+            if (std::ranges::any_of(us, exact_use)) {
+              auto codes = exact::fp4_expert(t.value());
+              if (!codes) return where + codes.error().what;
+              loaded[k].codes = std::move(codes).value();
+            }
             return std::nullopt;
           }))
         die(*e);
 
       struct Job {
         size_t expert;  // index into chunk
-        ActivationPrecision precision;
+        Arithmetic arithmetic;
         std::vector<Use> uses;
       };
       std::vector<Job> jobs;
       for (size_t k = 0; k < chunk.size(); k++) {
-        std::map<ActivationPrecision, std::vector<Use>> by_precision;
-        for (const Use& u : uses.at(chunk[k])) by_precision[streams[u.stream].precision].push_back(u);
-        for (auto& [p, us] : by_precision)
+        std::map<Arithmetic, std::vector<Use>> by_arithmetic;
+        for (const Use& u : uses.at(chunk[k])) by_arithmetic[streams[u.stream].arithmetic].push_back(u);
+        for (auto& [a, us] : by_arithmetic)
           for (size_t j = 0; j < us.size(); j += kTokensPerJob)
-            jobs.push_back(Job{k, p, std::vector<Use>(us.begin() + static_cast<std::ptrdiff_t>(j),
+            jobs.push_back(Job{k, a, std::vector<Use>(us.begin() + static_cast<std::ptrdiff_t>(j),
                                                       us.begin() + static_cast<std::ptrdiff_t>(std::min(j + kTokensPerJob, us.size())))});
       }
       if (auto e = parallel_for(jobs.size(), args.threads, [&](size_t j) -> std::optional<std::string> {
             const Job& job = jobs[j];
+            if (is_exact(job.arithmetic)) {
+              for (const Use& u : job.uses) {
+                const exact::MoeStart& t = *exact_tokens[u.stream][u.token];
+                auto halves = exact::expert_halves(*loaded[job.expert].codes, t.input, t.route.weight[u.slot]);
+                if (!halves) return where + halves.error().what;
+                routed_halves[u.stream][u.token][u.slot] = std::move(halves).value();
+              }
+              return std::nullopt;
+            }
             std::vector<std::span<const float>> inputs;
             for (const Use& u : job.uses) inputs.push_back(starts[u.stream][u.token].ffn_in);
-            auto out = glm53::expert_outputs(config, values[job.expert].mlp(), inputs, job.precision);
+            auto out = glm53::expert_outputs(config, loaded[job.expert].values->mlp(), inputs,
+                                             std::get<ActivationPrecision>(job.arithmetic));
             if (!out) return where + out.error().what;
             for (size_t q = 0; q < job.uses.size(); q++) {
               const Use& u = job.uses[q];
@@ -275,14 +358,22 @@ std::vector<std::vector<std::vector<float>>> run_round(const Model& m, const Arg
     }
     const double experts_s = seconds_since(t2);
 
-    // The rest of every token's layer.
+    // The rest of every token's layer: an exact token finishes its MoE
+    // (exact::finish_moe) and hands the oracle the result.
     const auto t3 = std::chrono::steady_clock::now();
     std::vector<std::pair<size_t, size_t>> items;
     for (size_t s = 0; s < S; s++)
       for (size_t i = 0; i < starts[s].size(); i++) items.emplace_back(s, i);
     if (auto e = parallel_for(items.size(), args.threads, [&](size_t j) -> std::optional<std::string> {
           const auto [s, i] = items[j];
-          auto step = glm53::finish_layer(config, bound.value(), std::move(starts[s][i]), routed[s][i]);
+          auto step = [&]() -> Result<glm53::LayerStep, glm53::StepError> {
+            if (!exact_tokens[s][i]) return glm53::finish_layer(config, bound.value(), std::move(starts[s][i]), routed[s][i]);
+            exact::MoeStart& t = *exact_tokens[s][i];
+            auto out = exact::finish_moe(*exact_layer, t, routed_halves[s][i]);
+            if (!out) return Result<glm53::LayerStep, glm53::StepError>::err({out.error().what});
+            return glm53::finish_layer(config, std::move(starts[s][i]),
+                                       glm53::FeedForward{std::move(out).value().out, std::move(t.route)});
+          }();
           if (!step) return where + step.error().what;
           x[s][i] = std::move(step).value().out;
           return std::nullopt;
@@ -350,7 +441,7 @@ double quantile(std::vector<double> v, double q) {
   return v[static_cast<size_t>(q * static_cast<double>(v.size() - 1))];
 }
 
-/** One precision's comparison with the baseline, over every prompt position of every prompt. */
+/** One arithmetic's comparison with the baseline, over every prompt position of every prompt. */
 struct Comparison {
   std::vector<double> kl;
   size_t agree = 0;
@@ -364,7 +455,7 @@ int main(int argc, char** argv) {
   Args args;
   if (!parse_args(argc, argv, args))
     die("usage: --config FILE --backbone DIR --store FILE --prompt ID,ID,... [--prompt ...] "
-        "[--activations fp32,bf16,e4m3,mxfp4 (distinct; the first is the baseline)] [--generate N] [--threads T] "
+        "[--activations fp32,bf16,e4m3,mxfp4,exact (distinct; the first is the baseline)] [--generate N] [--threads T] "
         "[--resident E>=8] [--report FILE]");
   const auto t0 = std::chrono::steady_clock::now();
 
@@ -390,16 +481,16 @@ int main(int argc, char** argv) {
   std::fprintf(stderr, "loaded %zu Backbone tensors' index and the head in %.1f s\n", m.parts.tensors(),
                seconds_since(t0));
 
-  // Streams: prompt-major, the baseline precision first within each prompt.
+  // Streams: prompt-major, the baseline arithmetic first within each prompt.
   const glm53::Dims& d = m.config.dims();
-  const size_t P = args.precisions.size();
+  const size_t P = args.arithmetics.size();
   std::vector<Stream> streams;
   std::vector<std::vector<int32_t>> feed;
   for (size_t p = 0; p < args.prompts.size(); p++)
     for (size_t q = 0; q < P; q++) {
       Stream s;
       s.prompt = p;
-      s.precision = args.precisions[q];
+      s.arithmetic = args.arithmetics[q];
       s.baseline = q == 0;
       s.caches.resize(static_cast<size_t>(d.layers));
       s.routes.resize(static_cast<size_t>(d.layers));
@@ -490,18 +581,18 @@ int main(int argc, char** argv) {
   const auto below = [&](float t) { return std::count_if(margins.begin(), margins.end(), [&](float v) { return v < t; }); };
   const float min_margin = margins.empty() ? 0.0f : *std::min_element(margins.begin(), margins.end());
   const auto perplexity = [](const Comparison& c) { return c.scored ? std::exp(c.nll / static_cast<double>(c.scored)) : 0.0; };
-  const std::string base_name(glm53::name_of(args.precisions[0]));
+  const std::string base_name = name_of(args.arithmetics[0]);
   std::printf("%s: perplexity %.4f over %zu next tokens\n", base_name.c_str(), perplexity(cmp[0]), cmp[0].scored);
   for (size_t q = 1; q < P; q++) {
     const auto& c = cmp[q];
     std::printf("%s vs %s: KL mean %.4g median %.4g p90 %.4g max %.4g nats over %zu positions; top-1 agrees %zu/%zu; "
                 "perplexity %.4f; Routes differing %zu/%zu\n",
-                std::string(glm53::name_of(args.precisions[q])).c_str(), base_name.c_str(), mean_of(c.kl), quantile(c.kl, 0.5),
+                name_of(args.arithmetics[q]).c_str(), base_name.c_str(), mean_of(c.kl), quantile(c.kl, 0.5),
                 quantile(c.kl, 0.9), quantile(c.kl, 1.0), c.kl.size(), c.agree, c.kl.size(), perplexity(c), c.routes_differing,
                 c.routes);
   }
   for (size_t s = 0; s < streams.size() && args.generate > 0; s++) {
-    std::printf("prompt %zu %s generated", streams[s].prompt, std::string(glm53::name_of(streams[s].precision)).c_str());
+    std::printf("prompt %zu %s generated", streams[s].prompt, name_of(streams[s].arithmetic).c_str());
     for (int32_t t : generated[s]) std::printf(" %d", t);
     std::printf("\n");
   }
@@ -518,7 +609,7 @@ int main(int argc, char** argv) {
     r << "{\"baseline\":\"" << base_name << "\",\"streams\":[";
     for (size_t s = 0; s < streams.size(); s++) {
       r << (s ? "," : "") << "{\"prompt\":" << streams[s].prompt << ",\"precision\":\""
-        << glm53::name_of(streams[s].precision) << "\",\"positions\":[" << positions[s].str() << "],\"generated\":[";
+        << name_of(streams[s].arithmetic) << "\",\"positions\":[" << positions[s].str() << "],\"generated\":[";
       for (size_t i = 0; i < generated[s].size(); i++) r << (i ? "," : "") << generated[s][i];
       r << "]}";
     }
@@ -531,7 +622,7 @@ int main(int argc, char** argv) {
     r << "],\"summary\":{";
     for (size_t q = 0; q < P; q++) {
       const auto& c = cmp[q];
-      r << (q ? "," : "") << "\"" << glm53::name_of(args.precisions[q]) << "\":{\"perplexity\":" << perplexity(c)
+      r << (q ? "," : "") << "\"" << name_of(args.arithmetics[q]) << "\":{\"perplexity\":" << perplexity(c)
         << ",\"scored\":" << c.scored;
       if (q > 0)
         r << ",\"kl_mean\":" << mean_of(c.kl) << ",\"kl_median\":" << quantile(c.kl, 0.5) << ",\"kl_p90\":" << quantile(c.kl, 0.9)

@@ -125,6 +125,29 @@ Result<std::map<std::string, WeightValues>, IoError> BackboneParts::load_layer(i
   return R::ok(std::move(out));
 }
 
+Result<glm53::ExpertTensors, IoError> BackboneParts::load_shared_expert(int layer) const {
+  using R = Result<glm53::ExpertTensors, IoError>;
+  using glm53::Part;
+  using glm53::Projection;
+  const std::string prefix = "model.layers." + std::to_string(layer) + ".mlp.shared_experts.";
+  glm53::ExpertTensors out;
+  for (const auto& [m, proj] : {std::pair{Projection::Gate, "gate_proj"}, std::pair{Projection::Up, "up_proj"},
+                               std::pair{Projection::Down, "down_proj"}})
+    for (const auto& [p, suffix] : {std::pair{Part::Codes, ".weight"}, std::pair{Part::Scales, ".weight_scale"}}) {
+      const std::string name = prefix + proj + suffix;
+      const auto it = tensors_.find(name);
+      if (it == tensors_.end()) return R::err(IoError{"no Backbone tensor " + name});
+      const auto shape = glm53::stored_tensor_shape(m, p);
+      const auto& t = it->second.tensor;
+      if (t.dtype != safetensors::Dtype::U8 || t.shape != std::vector<uint64_t>(shape.begin(), shape.end()))
+        return R::err(IoError{name + ": not U8 in a routed Expert's shape"});
+      auto b = bytes(name, it->second);
+      if (!b) return R::err(std::move(b).error());
+      (p == Part::Codes ? out.codes : out.scales)[static_cast<size_t>(m)] = std::move(b).value();
+    }
+  return R::ok(std::move(out));
+}
+
 glm53::TensorLookup lookup_of(const std::map<std::string, WeightValues>& weights) {
   return [&weights](const std::string& name) -> std::optional<glm53::TensorView> {
     const auto it = weights.find(name);

@@ -438,6 +438,18 @@ std::vector<int32_t> top_k(std::span<const float> scores, int k) {
   return idx;
 }
 
+float route_margin(std::span<const float> choice, std::span<const int32_t> chosen) {
+  std::vector<bool> is_chosen(choice.size(), false);
+  float worst_chosen = std::numeric_limits<float>::infinity(), best_other = -std::numeric_limits<float>::infinity();
+  for (int32_t e : chosen) {
+    is_chosen[static_cast<size_t>(e)] = true;
+    worst_chosen = std::min(worst_chosen, choice[static_cast<size_t>(e)]);
+  }
+  for (size_t e = 0; e < choice.size(); e++)
+    if (!is_chosen[e]) best_other = std::max(best_other, choice[e]);
+  return worst_chosen - best_other;
+}
+
 Route route(const Dims& d, std::span<const float> logits, std::span<const float> bias) {
   std::vector<float> sig(logits.size()), choice(logits.size());
   for (size_t e = 0; e < logits.size(); e++) {
@@ -446,15 +458,7 @@ Route route(const Dims& d, std::span<const float> logits, std::span<const float>
   }
   Route r;
   r.expert = top_k(choice, d.experts_per_token);
-  std::vector<bool> chosen(choice.size(), false);
-  float worst_chosen = std::numeric_limits<float>::infinity(), best_other = -std::numeric_limits<float>::infinity();
-  for (int32_t e : r.expert) {
-    chosen[static_cast<size_t>(e)] = true;
-    worst_chosen = std::min(worst_chosen, choice[static_cast<size_t>(e)]);
-  }
-  for (size_t e = 0; e < choice.size(); e++)
-    if (!chosen[e]) best_other = std::max(best_other, choice[e]);
-  r.margin = worst_chosen - best_other;
+  r.margin = route_margin(choice, r.expert);
   double sum = 0.0;
   for (int32_t e : r.expert) sum += sig[static_cast<size_t>(e)];
   const float denom = static_cast<float>(sum) + kRouteWeightSumEps;
@@ -536,6 +540,13 @@ Result<LayerStep, StepError> finish_layer(const Config& config, const LayerWeigh
     return R::err(StepError{block_misfit(precision)});
   const auto out = feed_forward(d, w.mlp, start.ffn_in, start.route, routed, precision);
   return R::ok(LayerStep{add(start.mid, out), std::move(start.row), std::move(start.selection), std::move(start.route)});
+}
+
+Result<LayerStep, StepError> finish_layer(const Config& config, LayerStart start, FeedForward ffn) {
+  using R = Result<LayerStep, StepError>;
+  if (ffn.out.size() != static_cast<size_t>(config.dims().hidden))
+    return R::err(StepError{"the feed-forward output is not hidden_size"});
+  return R::ok(LayerStep{add(start.mid, ffn.out), std::move(start.row), std::move(start.selection), std::move(ffn.route)});
 }
 
 Result<LayerStep, StepError> decode_layer(const Config& config, const ModelWeights& weights, int layer,

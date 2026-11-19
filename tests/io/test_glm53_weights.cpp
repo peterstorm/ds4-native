@@ -107,6 +107,42 @@ TEST_CASE("BackboneParts finds every tensor by name and loads it as FP32") {
   }
 }
 
+TEST_CASE("BackboneParts loads a shared expert's six tensors byte for byte, in a routed Expert's shapes only") {
+  using glm53::Part;
+  using glm53::Projection;
+  TempDir dir;
+  std::mt19937 rng(52);
+  const std::pair<Projection, const char*> projections[] = {
+      {Projection::Gate, "gate_proj"}, {Projection::Up, "up_proj"}, {Projection::Down, "down_proj"}};
+  glm53::ExpertTensors want;
+  std::vector<Entry> layer3, layer5;
+  for (const auto& [m, proj] : projections)
+    for (const auto p : {Part::Codes, Part::Scales}) {
+      const auto shape = glm53::stored_tensor_shape(m, p);
+      std::vector<std::byte> b(shape[0] * shape[1]);
+      for (auto& x : b) x = static_cast<std::byte>(rng());
+      const std::string suffix = p == Part::Codes ? ".weight" : ".weight_scale";
+      layer3.push_back({"model.layers.3.mlp.shared_experts." + std::string(proj) + suffix, "U8", {shape[0], shape[1]}, b});
+      // Layer 5's down scales are a column short: not a routed Expert's shape.
+      const bool odd = m == Projection::Down && p == Part::Scales;
+      layer5.push_back({"model.layers.5.mlp.shared_experts." + std::string(proj) + suffix, "U8",
+                        {shape[0], odd ? shape[1] - 1 : shape[1]},
+                        odd ? std::vector<std::byte>(shape[0] * (shape[1] - 1)) : b});
+      (p == Part::Codes ? want.codes : want.scales)[static_cast<size_t>(m)] = std::move(b);
+    }
+  write_shard(dir.path, "backbone-00001-of-00002.safetensors", layer3);
+  write_shard(dir.path, "backbone-00002-of-00002.safetensors", layer5);
+  const auto parts = io::BackboneParts::open(dir.path.string());
+  REQUIRE(parts.is_ok());
+
+  const auto shared = parts.value().load_shared_expert(3);
+  REQUIRE(shared.is_ok());
+  CHECK(shared.value().codes == want.codes);
+  CHECK(shared.value().scales == want.scales);
+  CHECK_FALSE(parts.value().load_shared_expert(5).is_ok());  // wrong shape
+  CHECK_FALSE(parts.value().load_shared_expert(4).is_ok());  // absent
+}
+
 TEST_CASE("BackboneParts refuses a name in two parts, an orphan U8, and an empty directory") {
   TempDir dir;
   const std::vector<std::byte> two(4);

@@ -1,8 +1,9 @@
 #pragma once
-// Imperative shell: GLM-5.3's weights in FP32 for the Semantics oracle, read
-// from where the consume left them — the Backbone parts (core/glm53/backbone)
-// and the Expert store (core/glm53/store). The conversions are
-// core/glm53/dequant; this file only finds bytes and reads them.
+// Imperative shell: GLM-5.3's Backbone weights read from where the consume
+// left them — the Backbone parts (core/glm53/backbone) — in FP32 for the
+// Semantics oracle, and the shared experts' raw MXFP4 for the Reference
+// configuration. The conversions are core/glm53/dequant; this file only finds
+// bytes and reads them.
 //
 // Nothing here holds the whole model: the oracle binds one layer's Backbone at
 // a time (glm53::bind_layer) and reads only the routed Experts a Route names.
@@ -47,6 +48,15 @@ class BackboneParts {
    * name, its scales folded in).
    */
   Result<std::map<std::string, WeightValues>, IoError> load_layer(int layer, unsigned threads) const;
+
+  /**
+   * Layer `layer`'s shared expert as its six checkpoint tensors, byte for byte
+   * (`mlp.shared_experts.{gate,up,down}_proj.weight` and `.weight_scale`): what
+   * the Reference configuration reads (core/glm53/exact_moe). They must be U8
+   * in a routed Expert's shapes (kitaniai: one shared expert of 2048); anything
+   * else, or a missing tensor, is an error.
+   */
+  Result<glm53::ExpertTensors, IoError> load_shared_expert(int layer) const;
 
   size_t tensors() const { return tensors_.size(); }
 

@@ -25,6 +25,7 @@ add_library(ds4n_core STATIC
   src/core/glm53/reference.cpp
   src/core/glm53/dequant.cpp
   src/core/glm53/precision.cpp
+  src/core/glm53/exact_moe.cpp
   src/core/indexer.cpp
   src/core/compressor.cpp
   src/core/layer_reference.cpp
@@ -164,6 +165,7 @@ add_executable(ds4n_tests
   tests/core/glm53/test_reference.cpp
   tests/core/glm53/test_dequant.cpp
   tests/core/glm53/test_precision.cpp
+  tests/core/glm53/test_exact_moe.cpp
   tests/core/test_indexer.cpp
   tests/core/test_compressor.cpp
   tests/core/test_compare.cpp

@@ -141,8 +141,8 @@ Result<StoreReader, IoError> StoreReader::open(const std::string& path) {
   return Result<StoreReader, IoError>::ok(StoreReader(std::move(fd).value()));
 }
 
-Result<glm53::ExpertValues, IoError> StoreReader::read(glm53::ExpertId id) const {
-  using R = Result<glm53::ExpertValues, IoError>;
+Result<glm53::ExpertTensors, IoError> StoreReader::read_tensors(glm53::ExpertId id) const {
+  using R = Result<glm53::ExpertTensors, IoError>;
   const auto where = "Expert " + std::to_string(id.layer) + "." + std::to_string(id.expert);
   if (id.layer < glm53::kFirstMoeLayer || id.layer > glm53::kLastMoeLayer || id.expert >= glm53::kExperts)
     return R::err(IoError{where + " is not in the store"});
@@ -154,7 +154,7 @@ Result<glm53::ExpertValues, IoError> StoreReader::read(glm53::ExpertId id) const
     return R::err(IoError{where + ": its record is unwritten"});
   auto decoded = glm53::decode_record(record);
   if (!decoded) return R::err(IoError{where + ": " + decoded.error().what});
-  return R::ok(glm53::dequantize_expert(decoded.value()));
+  return R::ok(std::move(decoded).value());
 }
 
 }  // namespace ds4n::io
