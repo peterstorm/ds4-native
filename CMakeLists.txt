@@ -19,6 +19,7 @@ add_library(ds4n_core STATIC
   src/core/engram.cpp
   src/core/moe_reference.cpp
   src/core/safetensors.cpp
+  src/core/glm53_store.cpp
   src/core/indexer.cpp
   src/core/compressor.cpp
   src/core/layer_reference.cpp
@@ -56,6 +57,8 @@ target_compile_options(ds4n_engine PRIVATE -Wall -Wextra -Wpedantic -Werror)
 
 add_executable(ds4n-store-build src/tools/store_build.cpp)
 target_link_libraries(ds4n-store-build PRIVATE ds4n_io)
+add_executable(ds4n-glm53-store-build src/tools/glm53_store_build.cpp)
+target_link_libraries(ds4n-glm53-store-build PRIVATE ds4n_io)
 add_executable(ds4n-readbench src/tools/read_bench.cpp)
 target_link_libraries(ds4n-readbench PRIVATE ds4n_io)
 add_executable(ds4n-cache-study src/tools/cache_study.cpp)
@@ -141,6 +144,7 @@ add_executable(ds4n_tests
   tests/core/test_moe_reference.cpp
   tests/core/test_det_math.cpp
   tests/core/test_safetensors.cpp
+  tests/core/test_glm53_store.cpp
   tests/core/test_indexer.cpp
   tests/core/test_compressor.cpp
   tests/core/test_compare.cpp
