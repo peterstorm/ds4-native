@@ -1,11 +1,11 @@
-// glm53_store: layout arithmetic, sextuplet location, record build round-trip.
+// glm53/store: layout arithmetic, sextuplet location, record build round-trip.
 #include <doctest/doctest.h>
 
 #include <algorithm>
 #include <numeric>
 #include <set>
 
-#include "core/glm53_store.hpp"
+#include "core/glm53/store.hpp"
 #include "core/mx_tiles.hpp"
 
 using namespace ds4n;
@@ -63,7 +63,7 @@ TEST_CASE("expert_source validates names, dtypes and shapes") {
   std::map<std::string, ShardedTensor> index;
   const auto add = [&](const std::string& name, safetensors::Dtype dtype, std::vector<uint64_t> shape) {
     const uint64_t bytes =
-        std::accumulate(shape.begin(), shape.end(), uint64_t{dtype == safetensors::Dtype::U8 ? 1 : 2},
+        std::accumulate(shape.begin(), shape.end(), uint64_t{dtype == safetensors::Dtype::U8 ? 1u : 2u},
                         std::multiplies<>());
     index[name] = ShardedTensor{0, safetensors::Tensor{dtype, std::move(shape), 0, bytes}};
   };

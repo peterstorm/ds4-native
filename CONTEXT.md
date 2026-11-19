@@ -164,6 +164,24 @@ An independent slow implementation (antirez/ds4, Maya's `ref.py`, or the HF refe
 **Mix invariance**:
 A request's prompt-end logits and Reply are bit-identical whether it ran alone or shared Rounds with any other requests, in any Lane: sharing changes timing, never output. The gate of Shared Rounds, as Slot-count invariance is the Expert cache's.
 
+### GLM-5.3 (the second architecture)
+
+The engine's second model, GLM-5.3 (`GlmMoeDsa`), has its own Backbone, Expert store layout (`core/glm53/store`) and executor, under `core/glm53/` and beside DS4.1's, never inside it. Terms above are DS4.1's unless a GLM entry here redefines them. Its pinned reference is transformers 5.16.0 (`ref/glm-5.3/README.md`).
+
+**Selection**:
+The key positions one query attends on one GLM layer: the indexer's best `index_topk` (2048) of the positions up to its own (all of them while there are fewer), ties going to the lower position.
+_Avoid_: mask, topk indices (in prose), candidates (DS4.1's indexer's first level)
+
+**Full layer** / **Shared layer**:
+A Full layer runs its own indexer and makes the token's Selection. A Shared layer has no indexer and attends the Selection of the nearest Full layer below it for the same token. Layer 0 is always Full. The released schedule is `FFF`, then `SSSF` repeated (`indexer_types`, or `index_topk_freq` 4 / `index_skip_topk_offset` 3).
+
+**Latent row**:
+One position's MLA cache entry on one GLM layer: its KV latent (512 values, the `kv_a_layernorm` output) and its rotated shared RoPE key (64), plus its index key (128) on Full layers. Attention reads the latent through each head's slice of `kv_b_proj` (the absorbed form) and never expands it to per-head keys and values.
+_Avoid_: compressed row (DS4.1's compressor), KV head
+
+**Semantics oracle**:
+GLM-5.3's FP32 CPU oracle (`core/glm53/reference`). It agrees with the pinned reference to FP32 noise, checked by golden activations (`tests/data/glm53-golden.safetensors`). It is not a Reference configuration: the quantized GPU executor gets its own bit-exact oracle built on top of it, as DS4.1's did.
+
 ## Relationships
 
 - An **Expert** has one **Expert record** in the **Expert store** and, under tensor parallelism, two **Halves**
@@ -176,6 +194,7 @@ A request's prompt-end logits and Reply are bit-identical whether it ran alone o
 - A **Resume** takes KV from a **Lane** (in place, or its prefix borrowed into another) or a **KV checkpoint**, and rings from that state, a **KV checkpoint**'s turn, or a **Rewind point** — whichever reads fewest of the prompt's tokens
 - Every busy **Lane** has a row in every **Shared Round**; a **Prompt sweep** holds the GPUs alone, the other **Lanes** pausing
 - **Cache-conditional routing** makes outputs depend on **Expert cache** contents; with λ = 0 every policy is **Exact**
+- On GLM-5.3 every **Shared layer** attends the **Selection** of the nearest **Full layer** below it; only **Full layers**' **Latent rows** carry index keys
 
 ## Example Dialogue
 

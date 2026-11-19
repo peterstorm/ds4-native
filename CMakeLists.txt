@@ -19,7 +19,9 @@ add_library(ds4n_core STATIC
   src/core/engram.cpp
   src/core/moe_reference.cpp
   src/core/safetensors.cpp
-  src/core/glm53_store.cpp
+  src/core/glm53/store.cpp
+  src/core/glm53/config.cpp
+  src/core/glm53/reference.cpp
   src/core/indexer.cpp
   src/core/compressor.cpp
   src/core/layer_reference.cpp
@@ -144,7 +146,9 @@ add_executable(ds4n_tests
   tests/core/test_moe_reference.cpp
   tests/core/test_det_math.cpp
   tests/core/test_safetensors.cpp
-  tests/core/test_glm53_store.cpp
+  tests/core/glm53/test_store.cpp
+  tests/core/glm53/test_config.cpp
+  tests/core/glm53/test_reference.cpp
   tests/core/test_indexer.cpp
   tests/core/test_compressor.cpp
   tests/core/test_compare.cpp
@@ -166,4 +170,6 @@ add_executable(ds4n_tests
 )
 target_link_libraries(ds4n_tests PRIVATE ds4n_core doctest::doctest)
 target_compile_options(ds4n_tests PRIVATE -Wall -Wextra)
+# Tests that read checked-in reference files (ref/, tests/data/) find them from here.
+target_compile_definitions(ds4n_tests PRIVATE DS4N_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 add_test(NAME core COMMAND ds4n_tests)

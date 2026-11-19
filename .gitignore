@@ -4,6 +4,7 @@ build/
 *.safetensors
 *.bin
 !data/maya-expert-profile.bin
+!tests/data/glm53-golden.safetensors
 *.log
 .cache/
 .memory/

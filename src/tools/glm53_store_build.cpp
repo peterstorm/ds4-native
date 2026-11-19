@@ -1,5 +1,5 @@
 // ds4n-glm53-store-build: convert GLM-5.3 routed Experts from kitaniai's
-// safetensors shards into the GLM-5.3 Expert store (core/glm53_store.hpp), or
+// safetensors shards into the GLM-5.3 Expert store (core/glm53/store.hpp), or
 // verify an existing store.
 //
 //   ds4n-glm53-store-build --out STORE [--layers A-B] [--threads N] [--verify] SHARD...
@@ -24,7 +24,7 @@
 #include <thread>
 #include <vector>
 
-#include "core/glm53_store.hpp"
+#include "core/glm53/store.hpp"
 #include "io/file.hpp"
 
 using namespace ds4n;
