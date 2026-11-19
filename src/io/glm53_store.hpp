@@ -7,14 +7,17 @@
 // its decoded record. Nothing else of its Expert or layer need still be on disk,
 // which is what lets a shard holding the tail of one layer and the head of the
 // next leave after the next layer's pass (kitaniai: 68 such shards, 181 Experts
-// split across two shards).
+// split across two shards). It also reads Experts back for the Semantics
+// oracle (StoreReader).
 #include <cstddef>
 #include <cstdint>
 #include <map>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "core/glm53/dequant.hpp"
 #include "core/glm53/store.hpp"
 #include "core/result.hpp"
 #include "io/file.hpp"
@@ -41,5 +44,22 @@ Result<StoreCheck, IoError> check_store_tensors(const std::string& store_path,
                                                 const std::vector<std::string>& shard_paths,
                                                 const std::map<std::string, glm53::ShardedTensor>& index,
                                                 uint32_t first, uint32_t last, unsigned threads);
+
+/** An Expert store open for reading routed Experts in FP32 (the Semantics oracle's Expert source). */
+class StoreReader {
+ public:
+  /** Open `path`; a header that does not match this build is an error. */
+  static Result<StoreReader, IoError> open(const std::string& path);
+
+  /**
+   * Expert `id` dequantized from its record. An id outside the store, or a
+   * record that does not decode (unwritten, damaged), is an error.
+   */
+  Result<glm53::ExpertValues, IoError> read(glm53::ExpertId id) const;
+
+ private:
+  explicit StoreReader(Fd fd) : fd_(std::move(fd)) {}
+  Fd fd_;
+};
 
 }  // namespace ds4n::io

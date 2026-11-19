@@ -23,6 +23,8 @@ add_library(ds4n_core STATIC
   src/core/glm53/backbone.cpp
   src/core/glm53/config.cpp
   src/core/glm53/reference.cpp
+  src/core/glm53/dequant.cpp
+  src/core/glm53/precision.cpp
   src/core/indexer.cpp
   src/core/compressor.cpp
   src/core/layer_reference.cpp
@@ -60,14 +62,17 @@ target_compile_options(ds4n_engine PRIVATE -Wall -Wextra -Wpedantic -Werror)
 
 add_executable(ds4n-store-build src/tools/store_build.cpp)
 target_link_libraries(ds4n-store-build PRIVATE ds4n_io)
-# GLM-5.3 shell: Backbone part files. Its own library, so ds4n_io (linked by the DS4.1 engine) is unchanged.
-add_library(ds4n_glm53_io STATIC src/io/glm53_backbone.cpp src/io/glm53_store.cpp)
+# GLM-5.3 shell: Backbone parts, the Expert store, and reading both back as FP32 weights. Its own library,
+# so ds4n_io (linked by the DS4.1 engine) is unchanged.
+add_library(ds4n_glm53_io STATIC src/io/glm53_backbone.cpp src/io/glm53_store.cpp src/io/glm53_weights.cpp)
 target_link_libraries(ds4n_glm53_io PUBLIC ds4n_io)
 target_compile_options(ds4n_glm53_io PRIVATE -Wall -Wextra -Wpedantic -Werror)
 add_executable(ds4n-glm53-store-build src/tools/glm53_store_build.cpp)
 target_link_libraries(ds4n-glm53-store-build PRIVATE ds4n_glm53_io)
 add_executable(ds4n-glm53-backbone-extract src/tools/glm53_backbone_extract.cpp)
 target_link_libraries(ds4n-glm53-backbone-extract PRIVATE ds4n_glm53_io)
+add_executable(ds4n-glm53-oracle-run src/tools/glm53_oracle_run.cpp)
+target_link_libraries(ds4n-glm53-oracle-run PRIVATE ds4n_glm53_io)
 add_executable(ds4n-readbench src/tools/read_bench.cpp)
 target_link_libraries(ds4n-readbench PRIVATE ds4n_io)
 add_executable(ds4n-cache-study src/tools/cache_study.cpp)
@@ -157,6 +162,8 @@ add_executable(ds4n_tests
   tests/core/glm53/test_backbone.cpp
   tests/core/glm53/test_config.cpp
   tests/core/glm53/test_reference.cpp
+  tests/core/glm53/test_dequant.cpp
+  tests/core/glm53/test_precision.cpp
   tests/core/test_indexer.cpp
   tests/core/test_compressor.cpp
   tests/core/test_compare.cpp
@@ -183,7 +190,8 @@ target_compile_definitions(ds4n_tests PRIVATE DS4N_SOURCE_DIR="${CMAKE_SOURCE_DI
 add_test(NAME core COMMAND ds4n_tests)
 
 # I/O-boundary tests (temp files): the GLM-5.3 Backbone part writer and verifier.
-add_executable(ds4n_glm53_io_tests tests/main.cpp tests/io/test_glm53_backbone.cpp tests/io/test_glm53_store.cpp)
+add_executable(ds4n_glm53_io_tests tests/main.cpp tests/io/test_glm53_backbone.cpp tests/io/test_glm53_store.cpp
+               tests/io/test_glm53_weights.cpp)
 target_link_libraries(ds4n_glm53_io_tests PRIVATE ds4n_glm53_io doctest::doctest)
 target_compile_options(ds4n_glm53_io_tests PRIVATE -Wall -Wextra)
 add_test(NAME glm53_io COMMAND ds4n_glm53_io_tests)

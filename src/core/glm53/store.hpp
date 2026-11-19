@@ -121,14 +121,14 @@ struct Sextuplet {
 
 Result<std::vector<std::byte>, LayoutError> build_record(const Sextuplet& s);
 
-/** One of an Expert's three matrices, and one of a matrix's two source tensors. */
-enum class Matrix : uint8_t { Gate, Up, Down };
+/** One of an Expert's three projections (gate_proj, up_proj, down_proj), and one of a projection's two source tensors. */
+enum class Projection : uint8_t { Gate, Up, Down };
 enum class Part : uint8_t { Codes, Scales };  // `.weight` (packed E2M1), `.weight_scale` (E8M0)
 
-/** A routed-Expert source tensor the store holds: which Expert, matrix and part. */
+/** A routed-Expert source tensor the store holds: which Expert, projection and part. */
 struct StoredTensor {
   ExpertId id;
-  Matrix matrix;
+  Projection projection;
   Part part;
   friend bool operator==(const StoredTensor&, const StoredTensor&) = default;
 };
@@ -144,12 +144,12 @@ std::optional<StoredTensor> stored_expert_tensor(std::string_view tensor_name);
 std::string tensor_name(const StoredTensor& t);  // inverse of stored_expert_tensor
 
 /** U8 shape of a stored tensor in kitaniai's checkpoint (codes 2 per byte; one E8M0 scale per 32). */
-std::array<uint64_t, 2> stored_tensor_shape(Matrix m, Part p);
+std::array<uint64_t, 2> stored_tensor_shape(Projection m, Part p);
 
 /** An Expert's six source tensors, as decode_record recovers them from its record. */
 struct ExpertTensors {
-  std::array<std::vector<std::byte>, 3> codes, scales;  // indexed by Matrix
-  std::span<const std::byte> get(Matrix m, Part p) const {
+  std::array<std::vector<std::byte>, 3> codes, scales;  // indexed by Projection
+  std::span<const std::byte> get(Projection m, Part p) const {
     const auto i = static_cast<size_t>(m);
     return p == Part::Codes ? std::span<const std::byte>(codes[i]) : std::span<const std::byte>(scales[i]);
   }

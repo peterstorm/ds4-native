@@ -104,7 +104,7 @@ int convert(const Args& args, const std::map<std::string, glm53::ShardedTensor>&
     for (uint32_t e = 0; e < glm53::kExperts; e++) {
       if (!glm53::expert_source(index, {l, e}).is_ok()) continue;  // not all six tensors given
       bool in_store = true;
-      for (const auto m : {glm53::Matrix::Gate, glm53::Matrix::Up, glm53::Matrix::Down})
+      for (const auto m : {glm53::Projection::Gate, glm53::Projection::Up, glm53::Projection::Down})
         for (const auto p : {glm53::Part::Codes, glm53::Part::Scales})
           in_store = in_store && held.contains(glm53::tensor_name({{l, e}, m, p}));
       if (in_store) already++;

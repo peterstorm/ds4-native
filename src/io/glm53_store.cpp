@@ -22,11 +22,27 @@ using Expert = std::pair<uint32_t, uint32_t>;  // (layer, expert), ordered for a
 
 std::optional<IoError> layout_error(const std::string& name, const glm53::StoredTensor& t,
                                     const safetensors::Tensor& st) {
-  const auto shape = glm53::stored_tensor_shape(t.matrix, t.part);
+  const auto shape = glm53::stored_tensor_shape(t.projection, t.part);
   if (st.dtype != safetensors::Dtype::U8) return IoError{name + ": expected U8"};
   if (st.shape != std::vector<uint64_t>(shape.begin(), shape.end())) return IoError{name + ": unexpected shape"};
   if (st.bytes != shape[0] * shape[1]) return IoError{name + ": byte size does not match its shape"};
   return std::nullopt;
+}
+
+/** A record the convert never wrote: the store file is sparse, so its bytes read as zero. */
+bool is_unwritten(std::span<const std::byte> record) {
+  return std::ranges::all_of(record, [](std::byte b) { return b == std::byte{0}; });
+}
+
+/** The store at `path`, open for reading, its header checked against this build. */
+Result<Fd, IoError> open_store(const std::string& path) {
+  using R = Result<Fd, IoError>;
+  auto fd = open_file(path, Access::ReadBuffered);
+  if (!fd) return fd;
+  std::vector<std::byte> header(glm53::kHeaderBytes);
+  if (auto r = pread_exact(fd.value(), header, 0); !r) return R::err(std::move(r).error());
+  if (auto h = glm53::decode_header(header); !h) return R::err(IoError{path + ": " + h.error().what});
+  return fd;
 }
 
 }  // namespace
@@ -47,11 +63,8 @@ Result<StoreCheck, IoError> check_store_tensors(const std::string& store_path,
 
   if (work.empty()) return R::ok(StoreCheck{});  // nothing to prove: the store need not exist yet
 
-  auto store = open_file(store_path, Access::ReadBuffered);
+  auto store = open_store(store_path);
   if (!store) return R::err(std::move(store).error());
-  std::vector<std::byte> header(glm53::kHeaderBytes);
-  if (auto r = pread_exact(store.value(), header, 0); !r) return R::err(std::move(r).error());
-  if (auto h = glm53::decode_header(header); !h) return R::err(IoError{store_path + ": " + h.error().what});
 
   std::vector<Fd> shards;
   for (const auto& path : shard_paths) {
@@ -80,7 +93,7 @@ Result<StoreCheck, IoError> check_store_tensors(const std::string& store_path,
       if (auto r = pread_exact(store.value(), record, glm53::record_offset({id.first, id.second})); !r) {
         io_error = std::move(r).error();
       } else {
-        blank = std::ranges::all_of(record, [](std::byte b) { return b == std::byte{0}; });
+        blank = is_unwritten(record);
         if (!blank)
           if (auto d = glm53::decode_record(record)) decoded = std::move(d).value();
       }
@@ -99,7 +112,7 @@ Result<StoreCheck, IoError> check_store_tensors(const std::string& store_path,
           io_error = std::move(r).error();
           break;
         }
-        const auto slice = decoded->get(p.tensor.matrix, p.tensor.part);
+        const auto slice = decoded->get(p.tensor.projection, p.tensor.part);
         (std::ranges::equal(slice, bytes) ? held : missing).push_back(p.name);
       }
       const std::lock_guard lock(merge);
@@ -120,6 +133,28 @@ Result<StoreCheck, IoError> check_store_tensors(const std::string& store_path,
   std::sort(out.absent.begin(), out.absent.end());
   std::sort(out.mismatched.begin(), out.mismatched.end());
   return R::ok(std::move(out));
+}
+
+Result<StoreReader, IoError> StoreReader::open(const std::string& path) {
+  auto fd = open_store(path);
+  if (!fd) return Result<StoreReader, IoError>::err(std::move(fd).error());
+  return Result<StoreReader, IoError>::ok(StoreReader(std::move(fd).value()));
+}
+
+Result<glm53::ExpertValues, IoError> StoreReader::read(glm53::ExpertId id) const {
+  using R = Result<glm53::ExpertValues, IoError>;
+  const auto where = "Expert " + std::to_string(id.layer) + "." + std::to_string(id.expert);
+  if (id.layer < glm53::kFirstMoeLayer || id.layer > glm53::kLastMoeLayer || id.expert >= glm53::kExperts)
+    return R::err(IoError{where + " is not in the store"});
+  std::vector<std::byte> record(glm53::kRecordStride);
+  if (auto r = pread_exact(fd_, record, glm53::record_offset(id)); !r) return R::err(std::move(r).error());
+  // An all-zero record decodes (to an Expert of zeros), but it is one the
+  // convert never wrote: reading it would silently zero the Expert.
+  if (is_unwritten(record))
+    return R::err(IoError{where + ": its record is unwritten"});
+  auto decoded = glm53::decode_record(record);
+  if (!decoded) return R::err(IoError{where + ": " + decoded.error().what});
+  return R::ok(glm53::dequantize_expert(decoded.value()));
 }
 
 }  // namespace ds4n::io

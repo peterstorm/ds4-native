@@ -54,6 +54,7 @@ probe topk-plus-one "$ref" "top_k(scores, d.index_topk)" "top_k(scores, d.index_
 probe biased-weight "$ref" "r.weight.push_back(sig[static_cast<size_t>(e)] / denom" "r.weight.push_back(choice[static_cast<size_t>(e)] / denom"
 probe no-route-scale "$ref" "/ denom * d.routed_scale" "/ denom"
 probe no-shared     "$ref" "static_cast<float>(acc[i]) + shared[i]" "static_cast<float>(acc[i])"
+probe routed-order  "$ref" "mlp_forward(routed[k], h)" "mlp_forward(routed[0], h)"
 probe head-scale    "$ref" "for (auto& v : head_w) v *= head_scale;" "for (auto& v : head_w) v *= 1.0f + 0.0f * head_scale;" equivalent
 
 restore

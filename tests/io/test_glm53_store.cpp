@@ -10,32 +10,22 @@
 #include <string>
 #include <vector>
 
-#include <nlohmann/json.hpp>
-
 #include "core/glm53/store.hpp"
 #include "io/glm53_backbone.hpp"
 #include "io/glm53_store.hpp"
+#include "glm53_fixtures.hpp"
 
 using namespace ds4n;
 using namespace ds4n::glm53;
+using namespace ds4n::test;
 namespace fs = std::filesystem;
 
 namespace {
 
-struct TempDir {
-  fs::path path;
-  TempDir() {
-    std::random_device rd;
-    path = fs::temp_directory_path() / ("ds4n-glm53-store-" + std::to_string(rd()) + std::to_string(rd()));
-    fs::create_directories(path);
-  }
-  ~TempDir() { fs::remove_all(path); }
-};
-
 /** An Expert's six source tensors, random. */
 struct Six {
   std::array<std::vector<std::byte>, 3> codes, scales;
-  const std::vector<std::byte>& get(Matrix m, Part p) const {
+  const std::vector<std::byte>& get(Projection m, Part p) const {
     return p == Part::Codes ? codes[static_cast<size_t>(m)] : scales[static_cast<size_t>(m)];
   }
   std::vector<std::byte> record() const {
@@ -48,7 +38,7 @@ struct Six {
 
 Six random_six(std::mt19937& rng) {
   Six s;
-  for (const auto m : {Matrix::Gate, Matrix::Up, Matrix::Down})
+  for (const auto m : {Projection::Gate, Projection::Up, Projection::Down})
     for (const auto p : {Part::Codes, Part::Scales}) {
       const auto shape = stored_tensor_shape(m, p);
       auto& v = p == Part::Codes ? s.codes[static_cast<size_t>(m)] : s.scales[static_cast<size_t>(m)];
@@ -58,39 +48,9 @@ Six random_six(std::mt19937& rng) {
   return s;
 }
 
-struct Entry {
-  std::string name, dtype;
-  std::vector<uint64_t> shape;
-  std::vector<std::byte> data;
-};
-
-Entry stored(const Six& s, ExpertId id, Matrix m, Part p) {
+Entry stored(const Six& s, ExpertId id, Projection m, Part p) {
   const auto shape = stored_tensor_shape(m, p);
   return {tensor_name({id, m, p}), "U8", {shape[0], shape[1]}, s.get(m, p)};
-}
-
-std::string write_shard(const fs::path& dir, const std::string& file, const std::vector<Entry>& entries) {
-  nlohmann::ordered_json j = nlohmann::ordered_json::object();
-  uint64_t at = 0;
-  for (const auto& e : entries) {
-    j[e.name] = {{"dtype", e.dtype}, {"shape", e.shape}, {"data_offsets", {at, at + e.data.size()}}};
-    at += e.data.size();
-  }
-  const std::string text = j.dump();
-  const uint64_t n = text.size();
-  const auto path = (dir / file).string();
-  std::ofstream out(path, std::ios::binary);
-  out.write(reinterpret_cast<const char*>(&n), 8);
-  out.write(text.data(), static_cast<std::streamsize>(n));
-  for (const auto& e : entries)
-    out.write(reinterpret_cast<const char*>(e.data.data()), static_cast<std::streamsize>(e.data.size()));
-  return path;
-}
-
-void write_at(const std::string& path, uint64_t offset, const std::vector<std::byte>& bytes) {
-  std::fstream f(path, std::ios::binary | std::ios::in | std::ios::out);
-  f.seekp(static_cast<std::streamoff>(offset));
-  f.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
 }
 
 std::string make_store(const fs::path& dir) {
@@ -117,7 +77,7 @@ TEST_CASE("a shard spanning two layers is released by the next layer's pass, aft
   TempDir dir;
   std::mt19937 rng(41);
   const Six e30 = random_six(rng), e31 = random_six(rng), e40 = random_six(rng);
-  const auto G = Matrix::Gate, U = Matrix::Up, D = Matrix::Down;
+  const auto G = Projection::Gate, U = Projection::Up, D = Projection::Down;
   const auto C = Part::Codes, S = Part::Scales;
   // A: all of 3.0, the first half of 3.1. B: the rest of 3.1, the head of 4.0.
   // C: the rest of 4.0 and a Backbone tensor.
@@ -227,4 +187,32 @@ TEST_CASE("a shard spanning two layers is released by the next layer's pass, aft
       CHECK(deletable_shards(later_index, narrow.value().in_store, extracted) == std::set<uint32_t>{1});
     }
   }
+}
+
+TEST_CASE("StoreReader reads an Expert back as its source tensors dequantized, and refuses what holds none") {
+  TempDir dir;
+  std::mt19937 rng(43);
+  Six six = random_six(rng);
+  for (auto& scales : six.scales)  // E8M0 away from NaN and overflow, so values compare
+    for (auto& b : scales) b = static_cast<std::byte>(100 + std::to_integer<int>(b) % 50);
+  const auto store = make_store(dir.path);
+  write_at(store, record_offset({3, 7}), six.record());
+
+  const auto reader = io::StoreReader::open(store);
+  REQUIRE(reader.is_ok());
+  const auto e = reader.value().read({3, 7});
+  REQUIRE(e.is_ok());
+  CHECK(e.value().gate == dequantize_mxfp4(six.codes[0], six.scales[0], kIntermediate, kHidden).value());
+  CHECK(e.value().up == dequantize_mxfp4(six.codes[1], six.scales[1], kIntermediate, kHidden).value());
+  CHECK(e.value().down == dequantize_mxfp4(six.codes[2], six.scales[2], kHidden, kIntermediate).value());
+
+  CHECK_FALSE(reader.value().read({3, 8}).is_ok());     // unwritten
+  CHECK_FALSE(reader.value().read({2, 0}).is_ok());     // a Dense layer has no records
+  CHECK_FALSE(reader.value().read({3, 256}).is_ok());   // no such Expert
+  write_at(store, record_offset({3, 7}) + kHalfPayloadBytes, {std::byte{1}});
+  CHECK_FALSE(reader.value().read({3, 7}).is_ok());     // non-zero padding: damaged
+
+  write_at(store, 0, std::vector<std::byte>(4));
+  CHECK_FALSE(io::StoreReader::open(store).is_ok());
+  CHECK_FALSE(io::StoreReader::open((dir.path / "missing.ds4n").string()).is_ok());
 }

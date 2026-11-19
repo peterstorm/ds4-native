@@ -23,7 +23,7 @@ bool shape_is(const safetensors::Tensor& t, std::array<uint64_t, 2> shape) {
 }
 
 Result<MatrixSource, LayoutError> matrix_source(const std::map<std::string, ShardedTensor>& index, ExpertId id,
-                                                Matrix m) {
+                                                Projection m) {
   const auto weight_name = tensor_name({id, m, Part::Codes}), scale_name = tensor_name({id, m, Part::Scales});
   const auto w = index.find(weight_name);
   if (w == index.end()) return Result<MatrixSource, LayoutError>::err(LayoutError{"missing tensor " + weight_name});
@@ -64,24 +64,24 @@ Result<std::vector<std::byte>, mx::TileError> tile_down_blocks(std::span<const s
 
 }  // namespace
 
-std::array<uint64_t, 2> stored_tensor_shape(Matrix m, Part p) {
-  const bool down = m == Matrix::Down;
+std::array<uint64_t, 2> stored_tensor_shape(Projection m, Part p) {
+  const bool down = m == Projection::Down;
   const uint64_t rows = down ? kHidden : kIntermediate, k = down ? kIntermediate : kHidden;
   return {rows, p == Part::Codes ? k / 2 : k / kBlockValues};
 }
 
 std::string tensor_name(const StoredTensor& t) {
-  static constexpr const char* kMatrixNames[] = {"gate_proj", "up_proj", "down_proj"};
+  static constexpr const char* kProjectionNames[] = {"gate_proj", "up_proj", "down_proj"};
   return "model.layers." + std::to_string(t.id.layer) + ".mlp.experts." + std::to_string(t.id.expert) + "." +
-         kMatrixNames[static_cast<size_t>(t.matrix)] + (t.part == Part::Codes ? ".weight" : ".weight_scale");
+         kProjectionNames[static_cast<size_t>(t.projection)] + (t.part == Part::Codes ? ".weight" : ".weight_scale");
 }
 
 Result<ExpertSource, LayoutError> expert_source(const std::map<std::string, ShardedTensor>& index, ExpertId id) {
-  auto gate = matrix_source(index, id, Matrix::Gate);
+  auto gate = matrix_source(index, id, Projection::Gate);
   if (!gate) return Result<ExpertSource, LayoutError>::err(std::move(gate).error());
-  auto up = matrix_source(index, id, Matrix::Up);
+  auto up = matrix_source(index, id, Projection::Up);
   if (!up) return Result<ExpertSource, LayoutError>::err(std::move(up).error());
-  auto down = matrix_source(index, id, Matrix::Down);
+  auto down = matrix_source(index, id, Projection::Down);
   if (!down) return Result<ExpertSource, LayoutError>::err(std::move(down).error());
   return Result<ExpertSource, LayoutError>::ok(
       ExpertSource{std::move(gate).value(), std::move(up).value(), std::move(down).value()});
@@ -115,17 +115,17 @@ std::optional<StoredTensor> stored_expert_tensor(std::string_view name) {
   if (!layer || !take(name, ".mlp.experts.")) return std::nullopt;
   const auto expert = take_number(name);
   if (!expert || *expert >= kExperts || !take(name, ".")) return std::nullopt;
-  Matrix matrix;
-  if (take(name, "gate_proj.")) matrix = Matrix::Gate;
-  else if (take(name, "up_proj.")) matrix = Matrix::Up;
-  else if (take(name, "down_proj.")) matrix = Matrix::Down;
+  Projection projection;
+  if (take(name, "gate_proj.")) projection = Projection::Gate;
+  else if (take(name, "up_proj.")) projection = Projection::Up;
+  else if (take(name, "down_proj.")) projection = Projection::Down;
   else return std::nullopt;
   Part part;
   if (name == "weight") part = Part::Codes;
   else if (name == "weight_scale") part = Part::Scales;
   else return std::nullopt;
   if (*layer < kFirstMoeLayer || *layer > kLastMoeLayer) return std::nullopt;
-  return StoredTensor{{*layer, *expert}, matrix, part};
+  return StoredTensor{{*layer, *expert}, projection, part};
 }
 
 std::set<uint32_t> deletable_shards(const std::map<std::string, ShardedTensor>& index,
@@ -223,7 +223,7 @@ Result<ExpertTensors, LayoutError> decode_record(std::span<const std::byte> reco
       std::memcpy(down.data() + r * kDownRowBytes + h * slice, down_blocks.value().data() + r * slice, slice);
   }
   ExpertTensors out;
-  for (const auto& [m, ggml] : {std::pair{Matrix::Gate, &gate}, {Matrix::Up, &up}, {Matrix::Down, &down}})
+  for (const auto& [m, ggml] : {std::pair{Projection::Gate, &gate}, {Projection::Up, &up}, {Projection::Down, &down}})
     packed_from_ggml(*ggml, out.codes[static_cast<size_t>(m)], out.scales[static_cast<size_t>(m)]);
   return R::ok(std::move(out));
 }

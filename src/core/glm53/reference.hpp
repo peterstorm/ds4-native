@@ -65,14 +65,18 @@ struct AttentionWeights {
   std::optional<IndexerWeights> indexer;
 };
 
-/** A Sparse layer's feed-forward: router, routed Experts (by id) and the shared expert. */
+/**
+ * A Sparse layer's Backbone feed-forward: the router and the shared expert. Its
+ * routed Experts are not here: a Route names the few a token needs, and the
+ * caller supplies them (ModelWeights::experts, or the Expert store).
+ */
 struct MoeWeights {
   Matrix router;                 // [experts][hidden]
   std::span<const float> bias;   // e_score_correction_bias, [experts]
-  std::vector<Mlp> experts;      // [experts]
   Mlp shared;
 };
 
+/** One layer's Backbone weights. */
 struct LayerWeights {
   std::span<const float> input_norm, post_attention_norm;
   AttentionWeights attention;
@@ -93,12 +97,15 @@ struct WeightError {
 /**
  * Every weight of a model, bound by name and shape against its Config. Only
  * bind_model builds one, so each layer's attention carries an indexer exactly
- * when the layer is Full and its feed-forward matches its MlpKind.
+ * when the layer is Full, its feed-forward matches its MlpKind, and a Sparse
+ * layer has all its routed Experts (a Dense layer none).
  */
 class ModelWeights {
  public:
   const Matrix& embed() const { return embed_; }
   const LayerWeights& layer(int i) const { return layers_[static_cast<size_t>(i)]; }
+  /** Layer i's routed Experts by id; empty on a Dense layer. */
+  std::span<const Mlp> experts(int i) const { return experts_[static_cast<size_t>(i)]; }
   std::span<const float> final_norm() const { return final_norm_; }
   const Matrix& head() const { return head_; }
 
@@ -107,18 +114,27 @@ class ModelWeights {
   ModelWeights() = default;
   Matrix embed_;
   std::vector<LayerWeights> layers_;
+  std::vector<std::vector<Mlp>> experts_;
   std::span<const float> final_norm_;
   Matrix head_;
 };
 
 /**
- * Bind the model's tensors under their Hugging Face names. Routed Experts are
- * read per Expert (`mlp.experts.E.{gate,up,down}_proj.weight`, the released
- * checkpoint's layout) or, when absent, from transformers' fused 3-D
+ * Bind the whole model's tensors under their Hugging Face names: a model small
+ * enough to hold in FP32 (the golden one). Routed Experts are read per Expert
+ * (`mlp.experts.E.{gate,up,down}_proj.weight`, the released checkpoint's
+ * layout) or, when absent, from transformers' fused 3-D
  * `mlp.experts.gate_up_proj` [E][2 moe_intermediate][hidden] (gate rows first)
  * and `mlp.experts.down_proj` [E][hidden][moe_intermediate].
  */
 Result<ModelWeights, WeightError> bind_model(const Config& config, const TensorLookup& lookup);
+
+/**
+ * Bind one layer's Backbone weights (everything of `model.layers.<layer>.`
+ * except its routed Experts): how a model too large for FP32 runs, a layer at
+ * a time. Same checks as bind_model.
+ */
+Result<LayerWeights, WeightError> bind_layer(const Config& config, int layer, const TensorLookup& lookup);
 
 // ---- building blocks (exposed for their own tests) -------------------------
 
@@ -148,6 +164,12 @@ std::vector<int32_t> top_k(std::span<const float> scores, int k);
 struct Route {
   std::vector<int32_t> expert;
   std::vector<float> weight;
+  /**
+   * The worst chosen biased score minus the best unchosen one (0 on a tie,
+   * infinity when every Expert is chosen): how far arithmetic noise is from
+   * changing the choice.
+   */
+  float margin = 0.0f;
 };
 
 /**
@@ -201,12 +223,35 @@ struct StepError {
   std::string what;
 };
 
+/** A layer for one token up to its routed Experts. */
+struct LayerStart {
+  std::vector<float> mid;          // the residual stream after attention
+  std::vector<float> ffn_in;       // post_attention_layernorm(mid): what the feed-forward and every Expert read
+  CacheRow row;                    // this position's cache row
+  std::vector<int32_t> selection;  // the key positions attended, ascending
+  Route route;                     // the routed Experts finish_layer needs (Sparse layers; empty on Dense ones)
+};
+
 /**
- * Layer `layer` for the token at position past.length() whose residual stream
- * is `x`. A Full layer makes its own Selection; a Shared layer attends
+ * Layer `layer` (whose Backbone is `w`) for the token at position
+ * past.length() whose residual stream is `x`, through attention and routing.
+ * A Full layer makes its own Selection; a Shared layer attends
  * `shared_selection`, the Selection the nearest Full layer below made for this
- * token.
+ * token. The row depends only on `x`, so a caller may run every token of a
+ * prompt through begin_layer (appending rows) before finishing any of them.
  */
+Result<LayerStart, StepError> begin_layer(const Config& config, const LayerWeights& w, int layer,
+                                          const LayerCache& past, std::span<const float> x,
+                                          std::span<const int32_t> shared_selection);
+
+/**
+ * The rest of the layer: the feed-forward, given `routed`, the Mlps of
+ * start.route.expert in that order (none on a Dense layer).
+ */
+Result<LayerStep, StepError> finish_layer(const Config& config, const LayerWeights& w, LayerStart start,
+                                          std::span<const Mlp> routed);
+
+/** begin_layer and finish_layer with the routed Experts from `weights`. */
 Result<LayerStep, StepError> decode_layer(const Config& config, const ModelWeights& weights, int layer,
                                           const LayerCache& past, std::span<const float> x,
                                           std::span<const int32_t> shared_selection);
@@ -222,10 +267,12 @@ Result<TokenStep, StepError> decode_token(const Config& config, const ModelWeigh
                                           int32_t token);
 
 /**
- * Append a TokenStep's cache rows to the Session. The caches grow by a row per
- * layer per token and are too large to copy per step, so this one function
- * mutates (the deliberate exception layer_reference.hpp makes for DS4.1).
+ * Append cache rows: one to a layer's cache, or a TokenStep's to the Session.
+ * The caches grow by a row per layer per token and are too large to copy per
+ * step, so these functions mutate (the deliberate exception layer_reference.hpp
+ * makes for DS4.1).
  */
+void append(LayerCache& cache, const CacheRow& row);
 void append(Session& session, const TokenStep& step);
 
 }  // namespace ds4n::glm53

@@ -197,11 +197,11 @@ TEST_CASE("header round-trip and mismatch detection") {
 
 TEST_CASE("stored_expert_tensor names exactly the routed-Expert tensors the store holds") {
   CHECK(stored_expert_tensor("model.layers.10.mlp.experts.255.down_proj.weight_scale") ==
-        StoredTensor{{10, 255}, Matrix::Down, Part::Scales});
+        StoredTensor{{10, 255}, Projection::Down, Part::Scales});
   CHECK(stored_expert_tensor("model.layers.3.mlp.experts.0.gate_proj.weight") ==
-        StoredTensor{{3, 0}, Matrix::Gate, Part::Codes});
+        StoredTensor{{3, 0}, Projection::Gate, Part::Codes});
   CHECK(stored_expert_tensor("model.layers.77.mlp.experts.7.up_proj.weight") ==
-        StoredTensor{{77, 7}, Matrix::Up, Part::Codes});
+        StoredTensor{{77, 7}, Projection::Up, Part::Codes});
   // Never stored: the MTP block's Experts, dense layers, shared experts, routers, backbone.
   CHECK(!stored_expert_tensor("model.layers.78.mlp.experts.7.up_proj.weight"));
   CHECK(!stored_expert_tensor("model.layers.2.mlp.experts.7.up_proj.weight"));
@@ -226,17 +226,17 @@ TEST_CASE("tensor_name and stored_expert_tensor are inverse over every stored te
   for (int trial = 0; trial < 2000; trial++) {
     const StoredTensor t{{std::uniform_int_distribution<uint32_t>(kFirstMoeLayer, kLastMoeLayer)(rng),
                           std::uniform_int_distribution<uint32_t>(0, kExperts - 1)(rng)},
-                         static_cast<Matrix>(std::uniform_int_distribution<int>(0, 2)(rng)),
+                         static_cast<Projection>(std::uniform_int_distribution<int>(0, 2)(rng)),
                          static_cast<Part>(std::uniform_int_distribution<int>(0, 1)(rng))};
     const auto parsed = stored_expert_tensor(tensor_name(t));
     REQUIRE(parsed.has_value());
     CHECK(*parsed == t);
   }
   // The shapes are kitaniai's: codes two per byte, one E8M0 scale per 32 weights.
-  CHECK(stored_tensor_shape(Matrix::Gate, Part::Codes) == std::array<uint64_t, 2>{kIntermediate, kHidden / 2});
-  CHECK(stored_tensor_shape(Matrix::Up, Part::Scales) == std::array<uint64_t, 2>{kIntermediate, kGateUpBlocks});
-  CHECK(stored_tensor_shape(Matrix::Down, Part::Codes) == std::array<uint64_t, 2>{kHidden, kIntermediate / 2});
-  CHECK(stored_tensor_shape(Matrix::Down, Part::Scales) == std::array<uint64_t, 2>{kHidden, kDownBlocks});
+  CHECK(stored_tensor_shape(Projection::Gate, Part::Codes) == std::array<uint64_t, 2>{kIntermediate, kHidden / 2});
+  CHECK(stored_tensor_shape(Projection::Up, Part::Scales) == std::array<uint64_t, 2>{kIntermediate, kGateUpBlocks});
+  CHECK(stored_tensor_shape(Projection::Down, Part::Codes) == std::array<uint64_t, 2>{kHidden, kIntermediate / 2});
+  CHECK(stored_tensor_shape(Projection::Down, Part::Scales) == std::array<uint64_t, 2>{kHidden, kDownBlocks});
 }
 
 namespace {
@@ -263,8 +263,8 @@ OwnedSextuplet random_sextuplet(std::mt19937& rng) {
 
 bool decodes_to(const ExpertTensors& d, const OwnedSextuplet& s) {
   for (size_t m = 0; m < 3; m++) {
-    if (!std::ranges::equal(d.get(static_cast<Matrix>(m), Part::Codes), s.codes[m])) return false;
-    const auto sc = d.get(static_cast<Matrix>(m), Part::Scales);
+    if (!std::ranges::equal(d.get(static_cast<Projection>(m), Part::Codes), s.codes[m])) return false;
+    const auto sc = d.get(static_cast<Projection>(m), Part::Scales);
     if (!std::equal(sc.begin(), sc.end(), s.scales[m].begin(), s.scales[m].end(),
                     [](std::byte a, uint8_t b) { return std::to_integer<uint8_t>(a) == b; }))
       return false;
@@ -329,7 +329,7 @@ std::map<std::string, ShardedTensor> shard_index(
 
 std::vector<std::string> sextuplet(uint32_t layer, uint32_t expert) {
   std::vector<std::string> out;
-  for (const auto m : {Matrix::Gate, Matrix::Up, Matrix::Down})
+  for (const auto m : {Projection::Gate, Projection::Up, Projection::Down})
     for (const auto p : {Part::Codes, Part::Scales}) out.push_back(tensor_name({{layer, expert}, m, p}));
   return out;
 }

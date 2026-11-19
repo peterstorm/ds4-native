@@ -171,6 +171,108 @@ TEST_CASE("decoding token by token reproduces the reference's causal prefill") {
                                           << worst_latent << ", index key " << worst_key);
 }
 
+// The real-weights run cannot hold the model: it binds one layer at a time and
+// runs every token of a batch through begin_layer before finishing any, with
+// the routed Experts supplied from outside. That order must change nothing.
+TEST_CASE("layer-major decoding with per-layer binding is bit-identical to decode_token") {
+  const Golden& g = golden();
+  const Config config = golden_config();
+  const Dims& d = config.dims();
+  auto bound = bind_model(config, g.lookup());
+  REQUIRE(bound.is_ok());
+  const auto& ids = g.ints.at("input_ids");
+
+  // Token-major, as decode_token runs.
+  Session session = empty_session(config);
+  std::vector<TokenStep> want;
+  for (int64_t id : ids) {
+    auto step = decode_token(config, bound.value(), session, static_cast<int32_t>(id));
+    REQUIRE(step.is_ok());
+    append(session, step.value());
+    want.push_back(std::move(step).value());
+  }
+
+  // Layer-major: each layer bound alone, every token begun, then every token finished.
+  std::vector<LayerCache> caches(static_cast<size_t>(d.layers));
+  std::vector<std::vector<float>> x;
+  for (int64_t id : ids) {
+    const auto e = std::span(g.f32.at("model.embed_tokens.weight")).subspan(static_cast<size_t>(id) * d.hidden, d.hidden);
+    x.emplace_back(e.begin(), e.end());
+  }
+  std::vector<std::vector<int32_t>> selection(ids.size());
+  for (int L = 0; L < d.layers; L++) {
+    const auto layer = bind_layer(config, L, g.lookup());
+    REQUIRE(layer.is_ok());
+    std::vector<LayerStart> starts;
+    for (size_t p = 0; p < ids.size(); p++) {
+      auto s = begin_layer(config, layer.value(), L, caches[static_cast<size_t>(L)], x[p], selection[p]);
+      REQUIRE(s.is_ok());
+      append(caches[static_cast<size_t>(L)], s.value().row);
+      if (config.indexer(L) == IndexerKind::Full) selection[p] = s.value().selection;
+      starts.push_back(std::move(s).value());
+    }
+    for (size_t p = 0; p < ids.size(); p++) {
+      std::vector<Mlp> routed;
+      for (int32_t e : starts[p].route.expert) routed.push_back(bound.value().experts(L)[static_cast<size_t>(e)]);
+      auto step = finish_layer(config, layer.value(), std::move(starts[p]), routed);
+      REQUIRE(step.is_ok());
+      const LayerStep& w = want[p].layers[static_cast<size_t>(L)];
+      CHECK(step.value().out == w.out);
+      CHECK(step.value().row.latent == w.row.latent);
+      CHECK(step.value().row.index_key == w.row.index_key);
+      CHECK(step.value().selection == w.selection);
+      CHECK(step.value().route.expert == w.route.expert);
+      CHECK(step.value().route.weight == w.route.weight);
+      x[p] = step.value().out;
+    }
+  }
+  for (size_t L = 0; L < caches.size(); L++) {
+    CHECK(caches[L].latent == session.layers[L].latent);
+    CHECK(caches[L].index_keys == session.layers[L].index_keys);
+  }
+}
+
+TEST_CASE("finish_layer takes exactly the routed Experts its Route names, in an Expert's shape") {
+  const Golden& g = golden();
+  const Config config = golden_config();
+  const Dims& d = config.dims();
+  auto bound = bind_model(config, g.lookup());
+  REQUIRE(bound.is_ok());
+  int sparse = 0;
+  while (config.mlp(sparse) != MlpKind::Sparse) sparse++;
+  const auto layer = bind_layer(config, sparse, g.lookup());
+  REQUIRE(layer.is_ok());
+  const std::vector<float> x(static_cast<size_t>(d.hidden), 0.25f);
+  const LayerCache empty;
+  const std::vector<int32_t> self{0};
+  auto start = [&] { return begin_layer(config, layer.value(), sparse, empty, x, self).value(); };
+  const auto s = start();
+  REQUIRE(s.route.expert.size() == static_cast<size_t>(d.experts_per_token));
+  CHECK(s.route.margin >= 0.0f);
+
+  std::vector<Mlp> routed;
+  for (int32_t e : s.route.expert) routed.push_back(bound.value().experts(sparse)[static_cast<size_t>(e)]);
+  CHECK(finish_layer(config, layer.value(), start(), routed).is_ok());
+  CHECK_FALSE(finish_layer(config, layer.value(), start(), std::span(routed).first(routed.size() - 1)).is_ok());
+  CHECK_FALSE(finish_layer(config, layer.value(), start(), {}).is_ok());
+  std::vector<Mlp> wrong(routed);
+  std::swap(wrong.front().gate, wrong.front().down);  // a down projection where the gate goes
+  CHECK_FALSE(finish_layer(config, layer.value(), start(), wrong).is_ok());
+
+  // A Dense layer takes none.
+  const auto dense = bind_layer(config, 0, g.lookup());
+  REQUIRE(dense.is_ok());
+  REQUIRE(config.mlp(0) == MlpKind::Dense);
+  auto ds = begin_layer(config, dense.value(), 0, empty, x, {});
+  REQUIRE(ds.is_ok());
+  CHECK(ds.value().route.expert.empty());
+  CHECK_FALSE(finish_layer(config, dense.value(), ds.value(), routed).is_ok());
+  CHECK(finish_layer(config, dense.value(), std::move(ds).value(), {}).is_ok());
+
+  CHECK_FALSE(bind_layer(config, d.layers, g.lookup()).is_ok());
+  CHECK_FALSE(bind_layer(config, -1, g.lookup()).is_ok());
+}
+
 TEST_CASE("the Session caches index keys on Full layers only") {
   const Golden& g = golden();
   const Config config = golden_config();
@@ -283,6 +385,16 @@ TEST_CASE("route: chooses by biased score, weighs by the unbiased one, weights s
       for (int b = 0; b < 32; b++)
         if (chosen[static_cast<size_t>(a)] && !chosen[static_cast<size_t>(b)])
           CHECK(sig(a) + bias[static_cast<size_t>(a)] >= sig(b) + bias[static_cast<size_t>(b)] - 1e-6);
+    // The margin is the worst pick's biased score minus the best non-pick's.
+    CHECK(r.margin >= 0.0f);
+    int runner = -1;
+    for (int e = 0; e < 32; e++)
+      if (!chosen[static_cast<size_t>(e)] &&
+          (runner < 0 || sig(e) + bias[static_cast<size_t>(e)] > sig(runner) + bias[static_cast<size_t>(runner)]))
+        runner = e;
+    double worst = 1e30;
+    for (int32_t e : r.expert) worst = std::min(worst, sig(e) + bias[static_cast<size_t>(e)]);
+    CHECK(r.margin == doctest::Approx(worst - (sig(runner) + bias[static_cast<size_t>(runner)])).epsilon(1e-5).scale(1.0));
     const double sum = std::accumulate(r.weight.begin(), r.weight.end(), 0.0);
     CHECK(sum == doctest::Approx(d.routed_scale).epsilon(1e-6));
     for (size_t k = 1; k < r.expert.size(); k++)

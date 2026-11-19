@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <numeric>
 
 namespace ds4n::glm53 {
@@ -126,14 +127,35 @@ LayerWeights bind_layer(Binder& b, const Config& config, int i) {
   moe.router = b.matrix(m + "gate.weight", d.experts, d.hidden);
   moe.bias = b.vector(m + "gate.e_score_correction_bias", d.experts);
   moe.shared = bind_mlp(b, m + "shared_experts.", d.hidden, d.shared_intermediate());
-  if (b.has(m + "experts.0.gate_proj.weight")) {
-    for (int e = 0; e < d.experts; e++)
-      moe.experts.push_back(bind_mlp(b, m + "experts." + std::to_string(e) + ".", d.hidden, d.moe_intermediate));
-  } else {
-    moe.experts = bind_fused_experts(b, m + "experts.", d);
-  }
-  w.mlp = std::move(moe);
+  w.mlp = moe;
   return w;
+}
+
+/** Layer i's routed Experts by id, per Expert or fused; none on a Dense layer. */
+std::vector<Mlp> bind_routed(Binder& b, const Config& config, int i) {
+  const Dims& d = config.dims();
+  if (config.mlp(i) == MlpKind::Dense) return {};
+  const std::string m = "model.layers." + std::to_string(i) + ".mlp.";
+  if (!b.has(m + "experts.0.gate_proj.weight")) return bind_fused_experts(b, m + "experts.", d);
+  std::vector<Mlp> experts;
+  for (int e = 0; e < d.experts; e++)
+    experts.push_back(bind_mlp(b, m + "experts." + std::to_string(e) + ".", d.hidden, d.moe_intermediate));
+  return experts;
+}
+
+bool fits(const Matrix& m, int rows, int cols) {
+  return m.rows == rows && m.cols == cols && m.w.size() == static_cast<size_t>(rows) * static_cast<size_t>(cols);
+}
+
+/** An Mlp with a routed Expert's shapes. */
+bool is_expert(const Dims& d, const Mlp& m) {
+  return fits(m.gate, d.moe_intermediate, d.hidden) && fits(m.up, d.moe_intermediate, d.hidden) &&
+         fits(m.down, d.hidden, d.moe_intermediate);
+}
+
+std::optional<std::string> layer_out_of_range(const Dims& d, int layer) {
+  if (layer < 0 || layer >= d.layers) return "no layer " + std::to_string(layer);
+  return std::nullopt;
 }
 
 // ---- attention -------------------------------------------------------------
@@ -268,26 +290,22 @@ Attended attend(const Dims& d, const AttentionWeights& w, std::span<const float>
   return Attended{linear(w.o, heads_out), std::move(row), std::move(selection)};
 }
 
-struct Fed {
-  std::vector<float> out;
-  Route route;
-};
-
-Fed feed_forward(const Dims& d, const std::variant<Mlp, MoeWeights>& mlp, std::span<const float> h) {
-  if (const auto* dense = std::get_if<Mlp>(&mlp)) return Fed{mlp_forward(*dense, h), {}};
+/** The feed-forward of `h`; on a Sparse layer `routed` are the Mlps of `r.expert`, in order. */
+std::vector<float> feed_forward(const Dims& d, const std::variant<Mlp, MoeWeights>& mlp, std::span<const float> h,
+                                const Route& r, std::span<const Mlp> routed) {
+  if (const auto* dense = std::get_if<Mlp>(&mlp)) return mlp_forward(*dense, h);
   const auto& moe = std::get<MoeWeights>(mlp);
-  Route r = route(d, linear(moe.router, h), moe.bias);
   // The reference accumulates each chosen Expert's weighted output into a zero
   // tensor in ascending Expert id, then adds the shared expert's.
   std::vector<double> acc(static_cast<size_t>(d.hidden), 0.0);
   for (size_t k = 0; k < r.expert.size(); k++) {
-    const auto y = mlp_forward(moe.experts[static_cast<size_t>(r.expert[k])], h);
+    const auto y = mlp_forward(routed[k], h);
     for (size_t i = 0; i < acc.size(); i++) acc[i] += static_cast<double>(y[i] * r.weight[k]);
   }
   const auto shared = mlp_forward(moe.shared, h);
   std::vector<float> out(acc.size());
   for (size_t i = 0; i < out.size(); i++) out[i] = static_cast<float>(static_cast<float>(acc[i]) + shared[i]);
-  return Fed{std::move(out), std::move(r)};
+  return out;
 }
 
 std::vector<float> add(std::span<const float> a, std::span<const float> b) {
@@ -307,9 +325,21 @@ Result<ModelWeights, WeightError> bind_model(const Config& config, const TensorL
   w.embed_ = b.matrix("model.embed_tokens.weight", d.vocab, d.hidden);
   w.final_norm_ = b.vector("model.norm.weight", d.hidden);
   w.head_ = b.matrix("lm_head.weight", d.vocab, d.hidden);
-  for (int i = 0; i < d.layers && b.error.empty(); i++) w.layers_.push_back(bind_layer(b, config, i));
+  for (int i = 0; i < d.layers && b.error.empty(); i++) {
+    w.layers_.push_back(bind_layer(b, config, i));
+    w.experts_.push_back(bind_routed(b, config, i));
+  }
   if (!b.error.empty()) return WeightResult::err(WeightError{b.error});
   return WeightResult::ok(std::move(w));
+}
+
+Result<LayerWeights, WeightError> bind_layer(const Config& config, int layer, const TensorLookup& lookup) {
+  using R = Result<LayerWeights, WeightError>;
+  if (auto bad = layer_out_of_range(config.dims(), layer)) return R::err(WeightError{*bad});
+  Binder b{lookup, {}};
+  auto w = bind_layer(b, config, layer);
+  if (!b.error.empty()) return R::err(WeightError{b.error});
+  return R::ok(std::move(w));
 }
 
 // ---- building blocks -------------------------------------------------------
@@ -381,6 +411,15 @@ Route route(const Dims& d, std::span<const float> logits, std::span<const float>
   }
   Route r;
   r.expert = top_k(choice, d.experts_per_token);
+  std::vector<bool> chosen(choice.size(), false);
+  float worst_chosen = std::numeric_limits<float>::infinity(), best_other = -std::numeric_limits<float>::infinity();
+  for (int32_t e : r.expert) {
+    chosen[static_cast<size_t>(e)] = true;
+    worst_chosen = std::min(worst_chosen, choice[static_cast<size_t>(e)]);
+  }
+  for (size_t e = 0; e < choice.size(); e++)
+    if (!chosen[e]) best_other = std::max(best_other, choice[e]);
+  r.margin = worst_chosen - best_other;
   double sum = 0.0;
   for (int32_t e : r.expert) sum += sig[static_cast<size_t>(e)];
   const float denom = static_cast<float>(sum) + kRouteWeightSumEps;
@@ -410,27 +449,50 @@ std::vector<float> index_scores(const Dims& d, std::span<const float> q, std::sp
 
 Session empty_session(const Config& config) { return Session{std::vector<LayerCache>(config.dims().layers)}; }
 
-Result<LayerStep, StepError> decode_layer(const Config& config, const ModelWeights& weights, int layer,
+Result<LayerStart, StepError> begin_layer(const Config& config, const LayerWeights& w, int layer,
                                           const LayerCache& past, std::span<const float> x,
                                           std::span<const int32_t> shared_selection) {
-  using R = Result<LayerStep, StepError>;
+  using R = Result<LayerStart, StepError>;
   const Dims& d = config.dims();
-  if (layer < 0 || layer >= d.layers) return R::err(StepError{"no layer " + std::to_string(layer)});
+  if (auto bad = layer_out_of_range(d, layer)) return R::err(StepError{*bad});
   if (x.size() != static_cast<size_t>(d.hidden)) return R::err(StepError{"stream width is not hidden_size"});
-  const bool full = config.indexer(layer) == IndexerKind::Full;
-  if (!full) {
+  if (config.indexer(layer) == IndexerKind::Shared) {
     if (shared_selection.empty()) return R::err(StepError{"a shared layer needs the Full layer's Selection"});
     for (int32_t t : shared_selection)
       if (t < 0 || t > past.length) return R::err(StepError{"Selection reaches past the current position"});
   }
 
-  const LayerWeights& w = weights.layer(layer);
   const auto h = rms_norm(x, w.input_norm, d.rms_eps);
   auto attended = attend(d, w.attention, h, past, shared_selection);
-  const auto mid = add(x, attended.out);
-  auto fed = feed_forward(d, w.mlp, rms_norm(mid, w.post_attention_norm, d.rms_eps));
-  return R::ok(LayerStep{add(mid, fed.out), std::move(attended.row), std::move(attended.selection),
-                         std::move(fed.route)});
+  LayerStart start{add(x, attended.out), {}, std::move(attended.row), std::move(attended.selection), {}};
+  start.ffn_in = rms_norm(start.mid, w.post_attention_norm, d.rms_eps);
+  if (const auto* moe = std::get_if<MoeWeights>(&w.mlp)) start.route = route(d, linear(moe->router, start.ffn_in), moe->bias);
+  return R::ok(std::move(start));
+}
+
+Result<LayerStep, StepError> finish_layer(const Config& config, const LayerWeights& w, LayerStart start,
+                                          std::span<const Mlp> routed) {
+  using R = Result<LayerStep, StepError>;
+  const Dims& d = config.dims();
+  if (routed.size() != start.route.expert.size())
+    return R::err(StepError{"expected " + std::to_string(start.route.expert.size()) + " routed Experts, got " +
+                            std::to_string(routed.size())});
+  for (const auto& m : routed)
+    if (!is_expert(d, m)) return R::err(StepError{"a routed Expert has the wrong shape"});
+  const auto out = feed_forward(d, w.mlp, start.ffn_in, start.route, routed);
+  return R::ok(LayerStep{add(start.mid, out), std::move(start.row), std::move(start.selection), std::move(start.route)});
+}
+
+Result<LayerStep, StepError> decode_layer(const Config& config, const ModelWeights& weights, int layer,
+                                          const LayerCache& past, std::span<const float> x,
+                                          std::span<const int32_t> shared_selection) {
+  using R = Result<LayerStep, StepError>;
+  if (auto bad = layer_out_of_range(config.dims(), layer)) return R::err(StepError{*bad});
+  auto start = begin_layer(config, weights.layer(layer), layer, past, x, shared_selection);
+  if (!start) return R::err(start.error());
+  std::vector<Mlp> routed;
+  for (int32_t e : start.value().route.expert) routed.push_back(weights.experts(layer)[static_cast<size_t>(e)]);
+  return finish_layer(config, weights.layer(layer), std::move(start).value(), routed);
 }
 
 Result<TokenStep, StepError> decode_token(const Config& config, const ModelWeights& weights, const Session& session,
@@ -456,15 +518,15 @@ Result<TokenStep, StepError> decode_token(const Config& config, const ModelWeigh
   return R::ok(std::move(step));
 }
 
+void append(LayerCache& cache, const CacheRow& row) {
+  cache.latent.insert(cache.latent.end(), row.latent.begin(), row.latent.end());
+  cache.k_rope.insert(cache.k_rope.end(), row.k_rope.begin(), row.k_rope.end());
+  cache.index_keys.insert(cache.index_keys.end(), row.index_key.begin(), row.index_key.end());
+  cache.length++;
+}
+
 void append(Session& session, const TokenStep& step) {
-  for (size_t i = 0; i < step.layers.size(); i++) {
-    LayerCache& c = session.layers[i];
-    const CacheRow& r = step.layers[i].row;
-    c.latent.insert(c.latent.end(), r.latent.begin(), r.latent.end());
-    c.k_rope.insert(c.k_rope.end(), r.k_rope.begin(), r.k_rope.end());
-    c.index_keys.insert(c.index_keys.end(), r.index_key.begin(), r.index_key.end());
-    c.length++;
-  }
+  for (size_t i = 0; i < step.layers.size(); i++) append(session.layers[i], step.layers[i].row);
 }
 
 }  // namespace ds4n::glm53

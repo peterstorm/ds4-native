@@ -1,4 +1,4 @@
-# HANDOVER: GLM-5.3 full uncensored on ds4-native — session state 2026-11-19 (updated 16:30)
+# HANDOVER: GLM-5.3 full uncensored on ds4-native — session state 2026-11-19 (updated 18:00)
 
 Resume point for any fresh session. Companion to
 [`2026-11-19-glm53-native.md`](2026-11-19-glm53-native.md) (the plan — read it first; its
@@ -16,7 +16,7 @@ backbone differs (119 bf16 residual-writer tensors). Speed expectation est. 15�
 30–50 with cache-conditional routing + RAM tier — a quality/architecture play. Phase 5's measured
 CyberGym verdict decides keep/archive.
 
-## Where things stand (2026-11-19 ~17:10, second session)
+## Where things stand (2026-11-19 ~18:00, second session)
 
 ### Done
 
@@ -27,6 +27,7 @@ CyberGym verdict decides keep/archive.
 | **Semantics oracle (Phase 3 step 1)** | branch `glm53/engine-core` (worktree `~/dev/ds4-native-glm53-engine`, stacked on store-convert + main): `src/core/glm53/{config,reference}`, `ref/glm-5.3/` (pinned transformers 5.16.0 + released config.json), `tools/glm53-golden/{make_golden.py,mutation-probe.sh}`, `tests/data/glm53-golden.safetensors` | golden matches the reference's causal prefill at 1.6e-6 relative, every Selection identical; mutation probe 10/10 killed; 225 tests green at the time |
 | **Backbone extractor + joint release** | same branch: `core/glm53/backbone`, `io/glm53_backbone` (own lib `ds4n_glm53_io`), `ds4n-glm53-backbone-extract`, `store-build --verify --backbone` | per-shard Backbone parts, atomic + verified. Real shards 2–5: 24 tensors bit-identical per the official safetensors reader, mixed shard 2 released, one flipped byte keeps its shard. 230 core + 3 I/O tests; 4/4 mutants killed |
 | **Per-tensor release + consume driver** | same branch: `decode_record` (inverse of `build_record`), `StoredTensor` parse, `io/glm53_store` `check_store_tensors`, `tools/glm53-store/consume.sh` | the per-layer release rule would have stranded the 68 shards that hold two layers' Experts (~100 GiB): once a layer's first shards leave, that layer can never be verified whole again. A stored tensor is now proven against its slice of its decoded record. Driver walks shards in file order with per-Expert convert (skips what the store holds), part repair, and all-zero records read as not converted. Real shards 1–9 through the driver in RAM (shards read-only): all released, then an independent verify of the *original* shards matched all 512 Experts of layers 10–11; canary on real ZFS (3 shards) before the full run. Review by an independent agent: no deletion-safety blocker; its findings (compression, ordering, part repair, crash windows) are fixed. 234 core + 4 I/O tests; 6/6 mutants killed |
+| **First real-weights run (Phase 3 step 2)** | same branch: `begin_layer`/`finish_layer`/`bind_layer` (the oracle's seam at the routed Experts), `core/glm53/{dequant,precision}`, `io/glm53_weights` `BackboneParts`, `io/glm53_store` `StoreReader`, `ds4n-glm53-oracle-run`; receipts `docs/bench/glm53-oracle/2026-11-19-capitals.*` | 21-token prompt on CPU, 478 s, beside the live flare deployment: " Rome" at p 0.994, " Paris"/" Berlin" top-1. Route margins median 3.5e-3 (≈ one BF16 step), 9/1,725 within 1e-5. Feed-forward input error: W4A4 11.6%, E4M3 2.65%. Layer-major decoding bit-identical to `decode_token` on the golden; mutation probe 11/11. 245 core + 7 I/O tests |
 | **Converter safety fix** | same branch, `24b9a6a` | the deletable list could have listed MTP and unconverted shards; now it lists only verified, fully consumed shards and has a free-space preflight. Checked on real layer 10 (RAM tmpfs) |
 | Indexer reference pinning (old step 5) | `ref/glm-5.3/README.md` | **decided: transformers 5.16.0** |
 | Desktop space for the download | /models/voice deleted (operator-approved; TTS weights, re-downloadable), 82 exited containers + `ds4-native-dev:1` removed | `space-guard.sh` armed (pauses the fetch below 6 GiB free) |
@@ -68,15 +69,14 @@ An independent audit (python, read-only, against the index) found:
 - the parts hold all 2,981 Backbone tensors exactly once (0 missing, 0 extra);
 - no blank Half among the store's 38,400.
 
-**Pending outside this repo:** the dataset is declared in `.dotfiles` branch
-`desktop/glm53-store-dataset` (worktree `~/.dotfiles-glm53-store`, `machines/desktop/disks.nix`).
-Until that is merged and deployed with `nixos-rebuild`, `mountpoint=legacy` means
-`/models/glm53-store` will not mount after a reboot. The fix by hand is
+**Pending deploy:** the dataset is declared in `.dotfiles` main `1c9e0e40`
+(`machines/desktop/disks.nix`). Until the desktop runs `nixos-rebuild` with it,
+`mountpoint=legacy` means `/models/glm53-store` will not mount after a reboot. The fix by hand is
 `sudo mount -t zfs rpool/models/glm53-store /models/glm53-store`.
 
 ## Next actions, in order
 
-1. **Merge and deploy the dataset declaration** (above), so the store survives a reboot.
+1. **Deploy the dataset declaration** (above), so the store survives a reboot.
 2. **How the consume worked** (`tools/glm53-store/consume.sh`; a rerun is a no-op now):
    ```bash
    BIN=/models/glm53-store/bin/<pinned> nohup setsid bash /models/glm53-store/consume.sh \
@@ -103,13 +103,25 @@ Until that is merged and deployed with `nixos-rebuild`, `mountpoint=legacy` mean
    Backbone B, whose tensors differ from kitaniai's on purpose. After the last range, keep
    `consume-receipts.log`, kitaniai's `conversion.json` and `artifact_manifest.json`, and the
    index next to the store.
-4. **Real-weights Semantics oracle run** (Phase 3 step 2, CPU): a shell `TensorLookup` over the
-   backbone parts (FP8/BF16 → FP32) plus an Expert source dequantizing store records, then a few
-   tokens of a real prompt through `glm53::decode_token`. It produces the first real-weights
-   numbers: Selection tie rate, activation scales for the W4A4 decision.
+4. **Real-weights Semantics oracle run: DONE** (Done table; plan Phase 3 step 2). Rerun it the
+   same way, CPU-capped so the live deployment keeps its share:
+   ```bash
+   # tokens: tokenizers' Tokenizer.from_file(kitaniai/tokenizer.json), text starting "[gMASK]<sop>"
+   docker run -d --name glm53-oracle --cpus 16 --memory 28g -v $D:$D \
+     -v /models/glm53-store:/models/glm53-store:ro ds4-native-dev:2 bash -c "nice -n 10 \
+     $D/ds4n-glm53-oracle-run --config $D/config.json --backbone /models/glm53-store/backbone-uncensored \
+     --store /models/glm53-store/experts.ds4n --prompt ID,ID,... --generate 3 --threads 16 \
+     --report $D/report.json > $D/out.txt 2> $D/err.txt"
+   ```
+   ~5 s per layer for a 21-token batch (attention is sequential per token; the Experts of a batch
+   run in parallel), ~15 s per generated token. The Selection tie rate is still open: it needs a
+   prompt over 2048 tokens.
 5. **Reference configuration decision**: activation precision into MXFP4 linears (the checkpoint
-   declares W4A4 MXFP4 inputs; DS4.1's kernels use E4M3), measured as KL against the Semantics
-   oracle. Then the bit-exact oracle, then kernels (first GPU window).
+   declares W4A4 MXFP4 inputs; DS4.1's kernels use E4M3). First numbers: W4A4 adds 11.6% relative
+   error at the feed-forward inputs, E4M3 2.65%. Decide by KL against the Semantics oracle over a
+   prompt set (add a precision switch to the oracle-run's feed-forward). Fix the router's
+   reduction order too: real Route margins are within 1e-5 for 9 of 1,725 routes. Then the
+   bit-exact oracle, then kernels (first GPU window).
 6. **Backbone B (cyber)**: does not fit on rpool next to store + Backbone A (est. 20–30 GiB short). It
    needs a space decision first.
 7. Phases 4–5 per the plan (fifth switch-primary entry `glm-native`, slots ladder, CyberGym).
@@ -155,7 +167,7 @@ Until that is merged and deployed with `nixos-rebuild`, `mountpoint=legacy` mean
 | The plan (phases, decisions, budget of truth) | `ds4-native/docs/plans/2026-11-19-glm53-native.md` |
 | This handover | `ds4-native/docs/plans/2026-11-19-glm53-native-HANDOVER.md` |
 | Pinned GLM-5.3 reference + why | `ds4-native/ref/glm-5.3/README.md` |
-| GLM terms (Selection, Full/Shared layer, Latent row, Semantics oracle) | `ds4-native/CONTEXT.md`, GLM-5.3 section |
+| GLM terms (Selection, Full/Shared layer, Latent row, Backbone part, Semantics oracle, Route margin) | `ds4-native/CONTEXT.md`, GLM-5.3 section |
 | Feasibility base (measured constants) | `ds4-native/docs/research/2026-10-26-feasibility.md` |
 | Serving design / engine internals | `ds4-native/docs/design/{serving,forward-pass,dspark}.md` |
 | Inference map (primaries, runbooks) | `.dotfiles/scripts/inference/INDEX.md` |
