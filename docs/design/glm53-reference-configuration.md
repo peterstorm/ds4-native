@@ -47,8 +47,9 @@ down once, and GLM reuses those definitions wherever its operations have the sam
    differ. Folding keeps one combine for routed and shared Experts and reuses DS4.1's kernels
    unchanged. The difference is down's E4M3 input rounded at another scale: two independent
    E4M3 roundings, ~2.6% RMS each, measured 2.5–5% apart per Expert output on random Experts.
-   That is noise of the same size and shape either way, not a bias, so it costs no KL beyond
-   E4M3's own.
+   On average that is noise of the same size either way. On real weights the last layers'
+   massive values make it uneven: folding is worse on layers 76–77 and better on 75 ("Open",
+   the rounding proxy), and whether it costs KL is not yet measured.
 5. **Halves:** GPU g holds intermediate rows [1024g, 1024g + 1024) of every Expert's gate and up,
    and the matching K range (blocks [32g, 32g + 32)) of its down. Each GPU sums its routed Half
    outputs in ascending Expert id (the Routing plan's order), then its shared Half, in FP32. The
@@ -81,7 +82,27 @@ down once, and GLM reuses those definitions wherever its operations have the sam
   candidates are the BF16 Exchange (an FP32 Exchange costs 12 KB more per token per Sparse layer
   over PCIe), the BF16 gate/up planes and hidden activations (DS4.1's kernels' form), and the
   folded weight. One run with each switched off decides whether any is worth a Reference
-  configuration change; until then the configuration stays DS4.1's, unchanged.
+  configuration change; until then the configuration stays DS4.1's, unchanged. The tool for
+  it: `core/glm53/moe_roundings` defines each departure from `exact_moe` (`WeightAfterDown`,
+  `Fp32GateUpHidden`, `Fp32Exchange`), and `ds4n-glm53-oracle-run --activations fp32
+  --moe-roundings FILE` measures each one's error on real activations against the FP32 MoE
+  output, next to the Semantics oracle at E4M3, on the baseline's own Routes. Holding the
+  Route fixed matters: a Route flipped by noise swaps in a different Expert, which shows as a
+  large output error even when its KL cost is small, so this measures the arithmetic only. If
+  no departure closes the gap, the router (BF16 input, plane order) is what remains.
+
+  **Measured 2026-11-19** (receipts `docs/bench/glm53-oracle/2026-11-19-moe-roundings.*`;
+  prompts 0 and 1, 88 tokens, 6,600 token-layers, 2,857 s). Summed over every layer, the
+  error energy relative to the Semantics oracle at E4M3 is: Reference 1.86, weight after down
+  0.98, FP32 gate/up/hidden 1.86, FP32 Exchange 1.91. The BF16 roundings and the BF16
+  Exchange cost nothing measurable, so the Exchange stays BF16 and the kernels keep DS4.1's
+  form. The folded weight looks like the whole gap, but the sum misleads: layers 75–77 carry
+  88% of the FP32 output energy (RMS ~900 per token at layer 77, ~1 at layer 10), so a few
+  massive values decide it. The per-layer median ratio is 1.02. Folding is worse on layers
+  76–77 (1.3% vs 0.96%, 1.9% vs 1.15% relative), better on 75 (1.5% vs 2.1%), and 0.71×
+  E4M3's energy summed without 76–77. Whether folding costs KL is therefore still open: the
+  decisive measurement is KL itself, an `exact` stream with the weight after down next to
+  the Reference one.
 - **Router plane count** if a wider router GEMV wins (DS4.1's runs at 13 µs, "too narrow"): any
   change is a Reference configuration change and must keep the order written here.
 
@@ -131,12 +152,10 @@ as written.
 
   The FP32 and E4M3 streams reproduce step 3's receipts line for line. `exact_moe` costs more
   than E4M3 alone on every prompt (1.3–2.6×); 3 of 315 positions exceed 0.1 nats. That is a
-  uniform extra noise, not one bad site: the Reference configuration adds BF16 roundings E4M3
-  alone does not have (gate/up per plane, the hidden activations, the Exchange) and the folded
-  weight's re-rounding. BF16 alone cost 0.0036 in step 3, and 0.0051 + 0.0036 ≈ 0.0091 — an
-  attribution not yet isolated by a run. Perplexity stays below FP32's (3.849) and within the
+  extra noise on every prompt, not one bad site. The rounding proxy ("Open") rules out the BF16
+  roundings and the BF16 Exchange. The remaining suspects are the folded weight, at the last
+  layers' massive values, and the router. Perplexity stays below FP32's (3.849) and within the
   prompts' own spread, so the whole-model gate's expectation is **≈ 0.009 nats**, not 0.005.
-  Which rounding costs what is open (below).
 - The GPU MoE against `exact_moe`: 100% bit-identical on real Experts at 1, 4 and 8 tokens, as
   `ds4n-moe-check` gates DS4.1 (first GPU window).
 - Whole-model: the exact decode's KL against the Semantics oracle on the step-3 prompt set,

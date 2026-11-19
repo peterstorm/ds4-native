@@ -4,7 +4,7 @@
 //
 //   ds4n-glm53-oracle-run --config ref/glm-5.3/config.json --backbone DIR --store FILE
 //                         --prompt ID,ID,... [--prompt ID,...]... [--activations fp32,bf16,e4m3,mxfp4,exact]
-//                         [--generate N] [--threads T] [--resident E] [--report FILE]
+//                         [--generate N] [--threads T] [--resident E] [--report FILE] [--moe-roundings FILE]
 //
 // Each prompt runs once per arithmetic listed — a stream, with its own caches
 // and residual stream — teacher-forced on the prompt's tokens. fp32, bf16,
@@ -35,7 +35,18 @@
 // whether its top token agrees, its perplexity, and how many of its Routes
 // differ from the baseline's; and every stream's greedy continuation. Token
 // ids only: decode them with the checkpoint's tokenizer.
+//
+// --moe-roundings FILE (the baseline must be fp32): what each rounding of the
+// Reference configuration's MoE costs, on real activations, without a stream
+// per candidate. On every Sparse layer, every baseline token's MoE is also run
+// at E4M3 in the Semantics oracle and as exact_moe with each
+// core/glm53/moe_roundings Departure, all on the baseline's own Route (so a
+// Route flip never counts as error), and each is compared with the baseline's
+// FP32 MoE output. The baseline's stream itself is unchanged. FILE gets one
+// TSV row per Sparse layer and round of squared errors; stdout, each
+// candidate's relative RMS error and its error energy relative to E4M3's.
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -56,6 +67,7 @@
 #include "core/glm53/config.hpp"
 #include "core/glm53/dequant.hpp"
 #include "core/glm53/exact_moe.hpp"
+#include "core/glm53/moe_roundings.hpp"
 #include "core/glm53/precision.hpp"
 #include "core/glm53/reference.hpp"
 #include "io/glm53_store.hpp"
@@ -90,6 +102,7 @@ bool is_exact(const Arithmetic& a) { return std::holds_alternative<ExactMoe>(a);
 
 struct Args {
   std::string config, backbone, store, report;
+  std::string moe_roundings;  // FILE, or empty: no MoE rounding study
   std::vector<std::vector<int32_t>> prompts;
   std::vector<Arithmetic> arithmetics;  // the first is the baseline
   int generate = 0;
@@ -111,6 +124,7 @@ bool parse_args(int argc, char** argv, Args& a) {
     else if (s == "--backbone") a.backbone = v;
     else if (s == "--store") a.store = v;
     else if (s == "--report") a.report = v;
+    else if (s == "--moe-roundings") a.moe_roundings = v;
     else if (s == "--generate") a.generate = std::stoi(v);
     else if (s == "--threads") a.threads = static_cast<unsigned>(std::stoul(v));
     else if (s == "--resident") a.resident = std::stoul(v);
@@ -129,7 +143,8 @@ bool parse_args(int argc, char** argv, Args& a) {
   }
   if (a.arithmetics.empty()) a.arithmetics.push_back(ActivationPrecision::Fp32);
   return argc % 2 == 1 && !a.config.empty() && !a.backbone.empty() && !a.store.empty() && !a.prompts.empty() &&
-         a.generate >= 0 && a.threads > 0 && a.resident >= 8;
+         a.generate >= 0 && a.threads > 0 && a.resident >= 8 &&
+         (a.moe_roundings.empty() || a.arithmetics.front() == Arithmetic{ActivationPrecision::Fp32});
 }
 
 [[noreturn]] void die(const std::string& msg) {
@@ -193,16 +208,50 @@ constexpr size_t kTokensPerJob = 16;
 /** One routed Expert read from the store, in the forms the chunk's uses need. */
 struct LoadedExpert {
   std::optional<glm53::ExpertValues> values;  // FP32, for Semantics streams
-  std::optional<exact::Fp4Expert> codes;      // MXFP4 codes, for exact streams
+  std::optional<exact::Fp4Expert> codes;      // MXFP4 codes, for exact streams and the rounding study
 };
+
+/** The rounding study's candidates: the Semantics oracle at E4M3, then each exact_moe Departure. */
+constexpr size_t kCandidates = 1 + exact::kDepartures.size();
+
+std::string candidate_name(size_t c) {
+  return c == 0 ? std::string("e4m3") : std::string(exact::name_of(exact::kDepartures[c - 1]));
+}
+
+/** One Sparse layer's rounding study over one round's baseline tokens: squared errors against their FP32 MoE outputs. */
+struct RoundingRow {
+  int layer = 0;
+  size_t tokens = 0;
+  double reference_sq = 0.0;                  // Σ ‖FP32 MoE output‖²
+  std::array<double, kCandidates> error_sq{};  // Σ ‖candidate − FP32‖², by candidate
+};
+
+/** The Departure whose Halves `d` runs on: Fp32Exchange departs only in the finish (moe_roundings). */
+exact::Departure halves_of(exact::Departure d) {
+  return d == exact::Departure::Fp32Exchange ? exact::Departure::None : d;
+}
+
+double squared_distance(std::span<const float> a, std::span<const float> b) {
+  double s = 0.0;
+  for (size_t i = 0; i < a.size(); i++) s += (static_cast<double>(a[i]) - b[i]) * (static_cast<double>(a[i]) - b[i]);
+  return s;
+}
+
+double squared_norm(std::span<const float> a) {
+  double s = 0.0;
+  for (const float v : a) s += static_cast<double>(v) * v;
+  return s;
+}
 
 /**
  * Feeds tokens[s] to stream s, at the positions after what its caches hold,
  * through every layer; returns each new token's residual stream after the last
- * layer, per stream.
+ * layer, per stream. With --moe-roundings, appends one RoundingRow per Sparse
+ * layer to `roundings`.
  */
 std::vector<std::vector<std::vector<float>>> run_round(const Model& m, const Args& args, std::vector<Stream>& streams,
-                                                       const std::vector<std::vector<int32_t>>& tokens) {
+                                                       const std::vector<std::vector<int32_t>>& tokens,
+                                                       std::vector<RoundingRow>& roundings) {
   const auto& config = m.config;
   const glm53::Dims& d = config.dims();
   const size_t S = streams.size();
@@ -228,9 +277,10 @@ std::vector<std::vector<std::vector<float>>> run_round(const Model& m, const Arg
     // configuration's form: the bound router and bias, the shared expert's codes.
     const auto* moe = std::get_if<glm53::MoeWeights>(&bound.value().mlp);
     const bool any_exact = std::ranges::any_of(streams, [](const Stream& s) { return is_exact(s.arithmetic); });
+    const bool study = moe && !args.moe_roundings.empty();
     std::optional<exact::Fp4Expert> shared;
     std::optional<exact::MoeLayer> exact_layer;  // views `shared`
-    if (moe && any_exact) {
+    if (moe && (any_exact || study)) {
       auto raw = m.parts.load_shared_expert(L);
       if (!raw) die(where + raw.error().what);
       auto codes = exact::fp4_expert(raw.value());
@@ -246,10 +296,12 @@ std::vector<std::vector<std::vector<float>>> run_round(const Model& m, const Arg
     const auto t1 = std::chrono::steady_clock::now();
     std::vector<std::vector<glm53::LayerStart>> starts(S);
     std::vector<std::vector<std::optional<exact::MoeStart>>> exact_tokens(S);
+    std::vector<std::vector<std::optional<exact::MoeStart>>> study_starts(S);  // the baseline's Route, exact's input
     if (auto e = parallel_for(S, args.threads, [&](size_t s) -> std::optional<std::string> {
           Stream& st = streams[s];
           auto& cache = st.caches[static_cast<size_t>(L)];
           exact_tokens[s].resize(tokens[s].size());
+          study_starts[s].resize(tokens[s].size());
           for (size_t i = 0; i < tokens[s].size(); i++) {
             auto r = glm53::begin_layer(config, bound.value(), L, cache, x[s][i], selection[s][i]);
             if (!r) return where + r.error().what;
@@ -265,6 +317,11 @@ std::vector<std::vector<std::vector<float>>> run_round(const Model& m, const Arg
               auto begun = exact::begin_moe(d, *exact_layer, r.value().ffn_in);
               if (!begun) return where + begun.error().what;
               exact_tokens[s][i] = std::move(begun).value();
+            }
+            if (study && st.baseline) {
+              auto input = exact::expert_input(r.value().ffn_in);
+              if (!input) return where + input.error().what;
+              study_starts[s][i] = exact::MoeStart{r.value().route, std::move(input).value()};
             }
             const auto& route = exact_tokens[s][i] ? exact_tokens[s][i]->route : r.value().route;
             if (!route.expert.empty()) {
@@ -287,13 +344,24 @@ std::vector<std::vector<std::vector<float>>> run_round(const Model& m, const Arg
     std::map<int32_t, std::vector<Use>> uses;
     std::vector<std::vector<std::vector<glm53::ExpertOutput>>> routed(S);
     std::vector<std::vector<std::vector<exact::Halves>>> routed_halves(S);
+    // The rounding study's routed Expert outputs: E4M3 in the Semantics oracle, and Halves per Departure.
+    std::vector<std::vector<std::vector<glm53::ExpertOutput>>> study_e4m3(S);
+    std::map<exact::Departure, std::vector<std::vector<std::vector<exact::Halves>>>> study_halves;
+    if (study)
+      for (const auto d : exact::kDepartures) study_halves[halves_of(d)].resize(S);
     for (size_t s = 0; s < S; s++) {
       routed[s].resize(starts[s].size());
       routed_halves[s].resize(starts[s].size());
+      study_e4m3[s].resize(starts[s].size());
+      for (auto& [d, halves] : study_halves) halves[s].resize(starts[s].size());
       for (size_t i = 0; i < starts[s].size(); i++) {
         const auto& experts = route_of(s, i).expert;
         if (is_exact(streams[s].arithmetic)) routed_halves[s][i].resize(experts.size());
         else routed[s][i].resize(experts.size());
+        if (study_starts[s][i]) {
+          study_e4m3[s][i].resize(experts.size());
+          for (auto& [d, halves] : study_halves) halves[s][i].resize(experts.size());
+        }
         for (size_t k = 0; k < experts.size(); k++) uses[experts[k]].push_back(Use{s, i, k});
       }
     }
@@ -308,8 +376,9 @@ std::vector<std::vector<std::vector<float>>> run_round(const Model& m, const Arg
             if (!t) return t.error().what;
             const auto& us = uses.at(chunk[k]);
             auto exact_use = [&](const Use& u) { return is_exact(streams[u.stream].arithmetic); };
+            auto needs_codes = [&](const Use& u) { return exact_use(u) || study_starts[u.stream][u.token].has_value(); };
             if (!std::ranges::all_of(us, exact_use)) loaded[k].values = glm53::dequantize_expert(t.value());
-            if (std::ranges::any_of(us, exact_use)) {
+            if (std::ranges::any_of(us, needs_codes)) {
               auto codes = exact::fp4_expert(t.value());
               if (!codes) return where + codes.error().what;
               loaded[k].codes = std::move(codes).value();
@@ -352,6 +421,21 @@ std::vector<std::vector<std::vector<float>>> run_round(const Model& m, const Arg
               const Use& u = job.uses[q];
               routed[u.stream][u.token][u.slot] = std::move(out.value()[q]);
             }
+            // The baseline's arithmetic is listed once and first, so a job in
+            // it serves only baseline tokens: all studied, or none.
+            if (!study_starts[job.uses.front().stream][job.uses.front().token]) return std::nullopt;
+            auto e4m3 = glm53::expert_outputs(config, loaded[job.expert].values->mlp(), inputs, ActivationPrecision::E4m3);
+            if (!e4m3) return where + e4m3.error().what;
+            for (size_t q = 0; q < job.uses.size(); q++) {
+              const Use& u = job.uses[q];
+              study_e4m3[u.stream][u.token][u.slot] = std::move(e4m3.value()[q]);
+              const exact::MoeStart& t = *study_starts[u.stream][u.token];
+              for (auto& [d, halves] : study_halves) {
+                auto h = exact::departed_halves(d, *loaded[job.expert].codes, t.input, t.route.weight[u.slot]);
+                if (!h) return where + h.error().what;
+                halves[u.stream][u.token][u.slot] = std::move(h).value();
+              }
+            }
             return std::nullopt;
           }))
         die(*e);
@@ -364,8 +448,32 @@ std::vector<std::vector<std::vector<float>>> run_round(const Model& m, const Arg
     std::vector<std::pair<size_t, size_t>> items;
     for (size_t s = 0; s < S; s++)
       for (size_t i = 0; i < starts[s].size(); i++) items.emplace_back(s, i);
+    std::vector<std::optional<RoundingRow>> studied(items.size());  // one token each
     if (auto e = parallel_for(items.size(), args.threads, [&](size_t j) -> std::optional<std::string> {
           const auto [s, i] = items[j];
+          if (study_starts[s][i]) {
+            // The feed-forward output alone: finish_layer from a zero residual (0 + x = x).
+            auto moe_output = [&](std::span<const glm53::ExpertOutput> outputs) {
+              glm53::LayerStart probe = starts[s][i];
+              probe.mid.assign(probe.mid.size(), 0.0f);
+              return glm53::finish_layer(config, bound.value(), std::move(probe), outputs);
+            };
+            const auto want = moe_output(routed[s][i]);
+            if (!want) return where + want.error().what;
+            const auto e4m3 = moe_output(study_e4m3[s][i]);
+            if (!e4m3) return where + e4m3.error().what;
+            RoundingRow row;
+            row.tokens = 1;
+            row.reference_sq = squared_norm(want.value().out);
+            row.error_sq[0] = squared_distance(e4m3.value().out, want.value().out);
+            for (size_t c = 0; c < exact::kDepartures.size(); c++) {
+              const auto d = exact::kDepartures[c];
+              auto got = exact::departed_finish(d, *exact_layer, *study_starts[s][i], study_halves.at(halves_of(d))[s][i]);
+              if (!got) return where + got.error().what;
+              row.error_sq[c + 1] = squared_distance(got.value(), want.value().out);
+            }
+            studied[j] = row;
+          }
           auto step = [&]() -> Result<glm53::LayerStep, glm53::StepError> {
             if (!exact_tokens[s][i]) return glm53::finish_layer(config, bound.value(), std::move(starts[s][i]), routed[s][i]);
             exact::MoeStart& t = *exact_tokens[s][i];
@@ -379,6 +487,17 @@ std::vector<std::vector<std::vector<float>>> run_round(const Model& m, const Arg
           return std::nullopt;
         }))
       die(*e);
+    if (study) {
+      RoundingRow row;
+      row.layer = L;
+      for (const auto& t : studied)
+        if (t) {
+          row.tokens += t->tokens;
+          row.reference_sq += t->reference_sq;
+          for (size_t c = 0; c < kCandidates; c++) row.error_sq[c] += t->error_sq[c];
+        }
+      roundings.push_back(row);
+    }
     std::fprintf(stderr,
                  "layer %2d: backbone %5.1f s, attention %6.1f s, %3zu Experts %6.1f s, feed-forward %6.1f s\n", L,
                  load_s, attend_s, ids.size(), experts_s, seconds_since(t3));
@@ -456,7 +575,7 @@ int main(int argc, char** argv) {
   if (!parse_args(argc, argv, args))
     die("usage: --config FILE --backbone DIR --store FILE --prompt ID,ID,... [--prompt ...] "
         "[--activations fp32,bf16,e4m3,mxfp4,exact (distinct; the first is the baseline)] [--generate N] [--threads T] "
-        "[--resident E>=8] [--report FILE]");
+        "[--resident E>=8] [--report FILE] [--moe-roundings FILE (baseline fp32)]");
   const auto t0 = std::chrono::steady_clock::now();
 
   std::ifstream cf(args.config);
@@ -500,7 +619,8 @@ int main(int argc, char** argv) {
   auto stream_of = [&](size_t p, size_t q) { return p * P + q; };
 
   // The prompts, teacher-forced.
-  const auto xs = run_round(m, args, streams, feed);
+  std::vector<RoundingRow> roundings;
+  const auto xs = run_round(m, args, streams, feed, roundings);
   std::vector<Comparison> cmp(P);
   std::vector<std::vector<double>> last(streams.size());
   std::vector<std::ostringstream> positions(streams.size());
@@ -565,7 +685,7 @@ int main(int argc, char** argv) {
       generated[s].push_back(next[s].front());
     }
     if (g + 1 == args.generate) break;
-    const auto x = run_round(m, args, streams, next);
+    const auto x = run_round(m, args, streams, next, roundings);
     for (size_t s = 0; s < streams.size(); s++) last[s] = log_softmax(logits_of(m, args, x[s].front()));
   }
 
@@ -601,6 +721,31 @@ int main(int argc, char** argv) {
               static_cast<long>(std::count(margins.begin(), margins.end(), 0.0f)));
   std::printf("Selections: %zu on Full layers, %zu dropping positions (prompts up to index_topk keep all)\n", selections,
               dropping);
+  if (!args.moe_roundings.empty()) {
+    RoundingRow all;
+    for (const auto& r : roundings) {
+      all.tokens += r.tokens;
+      all.reference_sq += r.reference_sq;
+      for (size_t c = 0; c < kCandidates; c++) all.error_sq[c] += r.error_sq[c];
+    }
+    std::printf("MoE roundings over %zu token-layers, on the baseline's Routes (relative RMS error against its FP32 MoE "
+                "output; error energy relative to e4m3's):\n",
+                all.tokens);
+    for (size_t c = 0; c < kCandidates; c++)
+      std::printf("  %-20s %.5f  %.3f\n", candidate_name(c).c_str(), std::sqrt(all.error_sq[c] / all.reference_sq),
+                  all.error_sq[c] / all.error_sq[0]);
+    std::ofstream f(args.moe_roundings);
+    f.precision(9);
+    f << "layer\ttokens\tfp32_sq";
+    for (size_t c = 0; c < kCandidates; c++) f << "\t" << candidate_name(c) << "_sq";
+    f << "\n";
+    for (const auto& r : roundings) {
+      f << r.layer << "\t" << r.tokens << "\t" << r.reference_sq;
+      for (const double e : r.error_sq) f << "\t" << e;
+      f << "\n";
+    }
+    if (!f) die("cannot write " + args.moe_roundings);
+  }
   std::printf("total %.1f s\n", seconds_since(t0));
 
   if (!args.report.empty()) {

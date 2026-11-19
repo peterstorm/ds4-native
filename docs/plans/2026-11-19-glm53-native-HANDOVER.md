@@ -132,6 +132,14 @@ An independent audit (python, read-only, against the index) found:
    `tests/core/glm53/test_exact_moe.cpp`: change the design doc with it, and rerun
    `tools/glm53-golden/exact-moe-mutation-probe.sh` (in the dev image, from the repo root,
    after a configured build; ~16 rebuilds of one file).
+   **Rounding proxy** (which of the MoE's roundings costs the extra 0.004 nats):
+   `ds4n-glm53-oracle-run --activations fp32 --moe-roundings FILE` with the usual flags. It
+   takes ~43 s per Sparse layer for two prompts (88 tokens) on 30 threads, ~55 min in all. The
+   CPU emulation of the MMA for each candidate dominates, so it is not quick. **Ran
+   2026-11-19** (receipts `docs/bench/glm53-oracle/2026-11-19-moe-roundings.*`): the BF16
+   roundings and the BF16 Exchange cost nothing. The folded weight is worse only on layers
+   76–77's massive values and better on 75. Open: a KL run of `exact` with the weight after
+   down.
 6. **Backbone B (cyber)**: does not fit on rpool next to store + Backbone A (est. 20–30 GiB short). It
    needs a space decision first.
 7. Phases 4–5 per the plan (fifth switch-primary entry `glm-native`, slots ladder, CyberGym).
