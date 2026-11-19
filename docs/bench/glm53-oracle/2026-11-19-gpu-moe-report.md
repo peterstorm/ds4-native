@@ -215,9 +215,12 @@ python3 tools/glm53-golden/kl_paired.py exact 2026-11-19-departures.report.json 
 
 - **Decided:** the folded routing weight stays in the Reference configuration (no change to
   `exact_moe` or `kReferenceBits`).
-- **Open:** BF16 or FP32 Exchange. Decide it on 20+ prompts. FP32 costs 12 KB more per token
-  per Sparse layer over PCIe; at decode rates that is small next to Expert streaming, so if
-  the effect is real, FP32 is cheap.
+- **Open:** BF16 or FP32 Exchange. Decide it on 20+ prompts. **Correction (2026-11-20):** an
+  earlier draft said FP32 costs 12 KB more per token per Sparse layer over PCIe. It does not:
+  the Exchange already moves FP32 partials (`cuda::exchange_add`), and BF16 is only the
+  rounding of their sum. FP32 costs a 12 KB-per-token VRAM buffer and a GLM variant of the sum
+  kernel, which is negligible. It helps only if the residual stream stays FP32, so it is
+  decided together with the residual's precision.
 - **Open:** how much of `exact`'s gap to E4M3 is Route-re-roll noise. Measure it on the same
   larger set.
 

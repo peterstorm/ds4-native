@@ -152,8 +152,12 @@ An independent audit (python, read-only, against the index) found:
    noise floor of re-rolled Routes. **Next:** rerun on a larger prompt set (20+ prompts, new
    ones tokenized like step 2's) to decide BF16 vs FP32 Exchange. Then the attention side's
    kernels (MLA decode, indexer, top-2048).
-6. **Backbone B (cyber)**: does not fit on rpool next to store + Backbone A (est. 20–30 GiB short). It
-   needs a space decision first.
+6. **Backbone B (cyber)**: space freed 2026-11-20. ComfyUI's Krea2 family was deleted at the
+   operator's word (32 GiB; every file sha256-verified against its pinned manifest first; receipt
+   `/models/comfyui/archive-receipt-krea2-2026-11-20.txt`; re-stage with
+   `~/.dotfiles/scripts/comfyui/download-krea2-models.sh`). rpool now has 39.1 GiB free. Build it
+   as a **delta** over Backbone A (≈ 14 GB est.; a full 37 GiB copy does not fit), fetching the
+   source tensors by HTTP range requests.
 7. Phases 4–5 per the plan (fifth switch-primary entry `glm-native`, slots ladder, CyberGym).
 
 ## Environment facts (the things that cost time to rediscover)
@@ -202,6 +206,7 @@ An independent audit (python, read-only, against the index) found:
 | Pinned GLM-5.3 reference + why | `ds4-native/ref/glm-5.3/README.md` |
 | GLM terms (Selection, Full/Shared layer, Latent row, Backbone part, Semantics oracle, Activation precision, Route margin) | `ds4-native/CONTEXT.md`, GLM-5.3 section |
 | GLM-5.3 Reference configuration (MoE fixed; attention by operation) | `ds4-native/docs/design/glm53-reference-configuration.md` |
+| Speed trade-offs (decode and prefill cost model, levers) | `ds4-native/docs/research/2026-11-20-glm53-speed-tradeoffs.md` |
 | Findings reports (one per measurement: method, results, interpretation, receipts) | `ds4-native/docs/bench/glm53-oracle/*-report.md`; latest `2026-11-19-gpu-moe-report.md` (GPU MoE gate + departures KL) |
 | Feasibility base (measured constants) | `ds4-native/docs/research/2026-10-26-feasibility.md` |
 | Serving design / engine internals | `ds4-native/docs/design/{serving,forward-pass,dspark}.md` |

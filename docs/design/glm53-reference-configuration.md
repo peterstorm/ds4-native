@@ -79,8 +79,8 @@ down once, and GLM reuses those definitions wherever its operations have the sam
   both GPUs' heads read every latent). An FP8 latent (DeepSeek-V3.2's form) halves it, measured
   by KL with the Semantics oracle before it is allowed.
 - **Where the MoE's extra 0.004 nats come from** (Gates: 0.0091 against E4M3's 0.0051). The
-  candidates are the BF16 Exchange (an FP32 Exchange costs 12 KB more per token per Sparse layer
-  over PCIe), the BF16 gate/up planes and hidden activations (DS4.1's kernels' form), and the
+  candidates are the BF16 Exchange (the rounding of the exchanged sum: the partials already
+  travel in FP32, so an FP32 Exchange moves no extra bytes over PCIe), the BF16 gate/up planes and hidden activations (DS4.1's kernels' form), and the
   folded weight. One run with each switched off decides whether any is worth a Reference
   configuration change; until then the configuration stays DS4.1's, unchanged. The tool for
   it: `core/glm53/moe_roundings` defines each departure from `exact_moe` (`WeightAfterDown`,
@@ -123,9 +123,13 @@ down once, and GLM reuses those definitions wherever its operations have the sam
   its interval only just excludes zero, and positions within a prompt are correlated, so the
   true interval is wider. Every stream re-rolls about half the Routes (11–12K of 23,625), and
   the weight-after-down stream shows what that alone does to a mean (±0.003 nats). Read that
-  way, this set cannot tell 0.0028 from noise. A larger prompt set decides it. FP32 costs
-  12 KB more per token per Sparse layer over PCIe. Until that run, the Exchange stays BF16
-  (DS4.1's).
+  way, this set cannot tell 0.0028 from noise. A larger prompt set decides it. **FP32 costs no PCIe bytes**: the Exchange already
+  moves FP32 partials (`cuda::exchange_add`, `SweepLink`), and BF16 is only the rounding of their
+  sum. An FP32 Exchange keeps that sum in FP32 (12 KB more per token per Sparse layer, in VRAM)
+  and needs a GLM variant of the sum kernel that writes FP32. Its benefit holds only if the
+  residual stream stays FP32, as in the Semantics oracle: a BF16 residual would round the sum
+  anyway. So the decision goes with the residual's precision (attention side, "By
+  operation"). Until that run, the Exchange stays BF16 (DS4.1's).
 - **Router plane count** if a wider router GEMV wins (DS4.1's runs at 13 µs, "too narrow"): any
   change is a Reference configuration change and must keep the order written here.
 
