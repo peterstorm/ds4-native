@@ -180,7 +180,7 @@ One position's MLA cache entry on one GLM layer: its KV latent (512 values, the 
 _Avoid_: compressed row (DS4.1's compressor), KV head
 
 **Backbone part**:
-The GLM-5.3 Backbone tensors of one kitaniai source shard, copied byte for byte into their own safetensors file (`backbone-NNNNN-of-00282.safetensors`, `core/glm53/backbone`). GLM's Backbone is exactly what its Expert store does not hold (`is_backbone`), which includes the MTP block's own Experts. One part per shard lets a shard leave the disk as soon as both of its halves are verified: its Experts' records, and its part.
+The GLM-5.3 Backbone tensors of one kitaniai source shard, copied byte for byte into their own safetensors file (`backbone-NNNNN-of-00282.safetensors`, `core/glm53/backbone`). GLM's Backbone is exactly what its Expert store does not hold (`is_backbone`), which includes the MTP block's own Experts. One part per shard lets a shard leave the disk as soon as both of its halves are verified: its stored Expert tensors, each against its slice of its record, and its part.
 _Avoid_: backbone shard (a shard is a source file), slice
 
 **Semantics oracle**:
@@ -199,7 +199,7 @@ GLM-5.3's FP32 CPU oracle (`core/glm53/reference`). It agrees with the pinned re
 - Every busy **Lane** has a row in every **Shared Round**; a **Prompt sweep** holds the GPUs alone, the other **Lanes** pausing
 - **Cache-conditional routing** makes outputs depend on **Expert cache** contents; with λ = 0 every policy is **Exact**
 - On GLM-5.3 every **Shared layer** attends the **Selection** of the nearest **Full layer** below it; only **Full layers**' **Latent rows** carry index keys
-- Every tensor of a GLM-5.3 source shard goes to exactly one of an **Expert record** and its shard's **Backbone part**; the shard may be deleted only when every one of them is verified there
+- Every tensor of a GLM-5.3 source shard goes to exactly one of an **Expert record** and its shard's **Backbone part**; the shard may be deleted only when every one of them is verified there — per tensor (equal to its slice of its decoded **Expert record**), never per layer, since a shard may hold two layers' **Experts** and an **Expert** may span two shards
 
 ## Example Dialogue
 

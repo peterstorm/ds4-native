@@ -11,6 +11,7 @@
 // MoE layers (3..77; layers 0-2 are dense), and the matrices are 6144 x 2048
 // both ways, which makes gate, up and down exactly the same size. Bytes per 32
 // weights stay 17. The MTP block (layer 78) stays resident and is not stored.
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -120,26 +121,61 @@ struct Sextuplet {
 
 Result<std::vector<std::byte>, LayoutError> build_record(const Sextuplet& s);
 
+/** One of an Expert's three matrices, and one of a matrix's two source tensors. */
+enum class Matrix : uint8_t { Gate, Up, Down };
+enum class Part : uint8_t { Codes, Scales };  // `.weight` (packed E2M1), `.weight_scale` (E8M0)
+
+/** A routed-Expert source tensor the store holds: which Expert, matrix and part. */
+struct StoredTensor {
+  ExpertId id;
+  Matrix matrix;
+  Part part;
+  friend bool operator==(const StoredTensor&, const StoredTensor&) = default;
+};
+
 /**
- * The model layer of a routed-Expert source tensor the store holds — exactly
+ * Parse a tensor name the store holds — exactly
  * `model.layers.L.mlp.experts.E.{gate,up,down}_proj.{weight,weight_scale}`
  * with L a stored layer (3..77) and E < 256. Anything else is nullopt: the
  * backbone, routers, shared experts, and the MTP block's (layer 78) own
  * Experts, which stay resident and are never stored.
  */
-std::optional<uint32_t> stored_expert_layer(std::string_view tensor_name);
+std::optional<StoredTensor> stored_expert_tensor(std::string_view tensor_name);
+std::string tensor_name(const StoredTensor& t);  // inverse of stored_expert_tensor
+
+/** U8 shape of a stored tensor in kitaniai's checkpoint (codes 2 per byte; one E8M0 scale per 32). */
+std::array<uint64_t, 2> stored_tensor_shape(Matrix m, Part p);
+
+/** An Expert's six source tensors, as decode_record recovers them from its record. */
+struct ExpertTensors {
+  std::array<std::vector<std::byte>, 3> codes, scales;  // indexed by Matrix
+  std::span<const std::byte> get(Matrix m, Part p) const {
+    const auto i = static_cast<size_t>(m);
+    return p == Part::Codes ? std::span<const std::byte>(codes[i]) : std::span<const std::byte>(scales[i]);
+  }
+};
+
+/**
+ * Inverse of build_record: the six source tensors a record holds. Rejects a
+ * record of the wrong size or with non-zero padding, so a record decodes to S
+ * exactly when it is build_record(S). The store therefore holds a tensor when
+ * the tensor equals its slice of the decoded record — whether or not the rest
+ * of its layer's source is still on disk.
+ */
+Result<ExpertTensors, LayoutError> decode_record(std::span<const std::byte> record);
 
 /**
  * Shards whose every tensor is now saved elsewhere, so the shard may leave the
- * disk: each stored-Expert tensor belongs to a layer in `converted` (records
- * written and verified), and each other tensor — the Backbone, MTP included
+ * disk: each stored-Expert tensor is named in `in_store` (equal to its slice of
+ * its verified record), and each other tensor — the Backbone, MTP included
  * (core/glm53/backbone) — sits in a shard listed in `extracted` (its Backbone
- * part verified). A shard with any tensor of an unconverted layer, or Backbone
- * tensors without a verified part, is kept. Both lists must come from verify
- * runs; this function trusts them.
+ * part verified). Anything else keeps its shard. Both must come from verify
+ * runs; this function trusts them. Per tensor, not per layer: 68 of kitaniai's
+ * shards hold two layers' Experts and 181 Experts span two shards, so once a
+ * layer's first shards have left, its source is never all on disk again.
  */
 std::set<uint32_t> deletable_shards(const std::map<std::string, ShardedTensor>& index,
-                                    std::span<const uint32_t> converted, std::span<const uint32_t> extracted);
+                                    const std::set<std::string>& in_store, std::span<const uint32_t> extracted);
 
 /** Store file header (first kHeaderBytes of the file). */
 struct StoreHeader {

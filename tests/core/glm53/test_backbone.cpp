@@ -119,7 +119,7 @@ TEST_CASE("is_backbone is exactly the complement of the Expert store") {
   CHECK(is_backbone("model.embed_tokens.weight"));
   CHECK(is_backbone("lm_head.weight"));
   for (const auto& n : {expert(10, 3, "up_proj.weight"), std::string("model.norm.weight"), expert(2, 0, "up_proj.weight")})
-    CHECK(is_backbone(n) != stored_expert_layer(n).has_value());
+    CHECK(is_backbone(n) != stored_expert_tensor(n).has_value());
 }
 
 TEST_CASE("part_name maps a kitaniai shard to its Backbone part") {

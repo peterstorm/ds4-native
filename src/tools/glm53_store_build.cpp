@@ -5,23 +5,27 @@
 //   ds4n-glm53-store-build --out STORE [--layers A-B] [--threads N] [--min-free-gib G]
 //                          [--verify [--backbone DIR]] SHARD...
 //
-// Layers are converted only when all their sextuplets are present in the given
-// shards, so a partial download converts what it can. The store file is sized
-// to the full layout up front (sparse); a write run first checks that the
+// Convert: every Expert of layers A-B (default all, 3-77) whose six tensors are
+// all in the given shards is written, unless the store already holds it — so a
+// rerun writes nothing twice and a damaged record is rewritten. An Expert split
+// across shards waits until both are given. The store file is sized to the full
+// layout up front (sparse, never truncated); a run first checks that the
 // store's filesystem keeps at least G GiB (default 8) free after the records it
 // is about to write — the pool is shared with the serving stack, and ENOSPC
-// there takes it down.
+// there takes it down — and syncs the store before it reports.
 //
-// A --verify run that finds every record identical prints the shards that may
-// now leave the disk (core/glm53/store deletable_shards): every tensor in them
-// is in a record this run verified, or — with --backbone DIR — in a Backbone
-// part this run verified (ds4n-glm53-backbone-extract writes them). Without
-// --backbone only expert-only shards qualify; 85 of kitaniai's 282 shards
-// interleave Backbone tensors and need their part first (plan, Phase 2). A
-// --verify --backbone run whose shards hold no complete layer (the last, MTP
-// shards) skips the records and releases what its verified parts cover.
+// Verify: every stored-Expert tensor of the given shards in layers A-B is
+// checked against its slice of its record (core/glm53/store decode_record);
+// nothing else of its Expert or layer need still be on disk. A tensor whose
+// record is unwritten (all zero) is reported as not converted yet and keeps its
+// shard; a written record that does not hold the tensor exits 1. Otherwise the
+// run prints the shards that may now leave the disk (core/glm53/store
+// deletable_shards): every tensor in them is a verified stored tensor or —
+// with --backbone DIR — in a Backbone part this run verified
+// (ds4n-glm53-backbone-extract writes them).
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -29,6 +33,7 @@
 #include <cstring>
 #include <filesystem>
 #include <map>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -36,6 +41,7 @@
 #include "core/glm53/store.hpp"
 #include "io/file.hpp"
 #include "io/glm53_backbone.hpp"
+#include "io/glm53_store.hpp"
 
 using namespace ds4n;
 
@@ -74,67 +80,64 @@ bool parse_args(int argc, char** argv, Args& a) {
   std::exit(1);
 }
 
-}  // namespace
+double seconds_since(std::chrono::steady_clock::time_point t0) {
+  return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
 
-int main(int argc, char** argv) {
-  Args args;
-  if (!parse_args(argc, argv, args))
-    die("usage: ds4n-glm53-store-build --out STORE [--layers A-B] [--threads N] [--min-free-gib G] "
-        "[--verify [--backbone DIR]] "
-        "SHARD...");
+// On-disk bytes of one written Half on a zle dataset: the payload, its last
+// block's zero tail dropped, plus block-pointer overhead (measured 0.7%).
+constexpr uint64_t kHalfOnDiskBytes = glm53::kHalfPayloadBytes + glm53::kHalfPayloadBytes / 64;
+
+int convert(const Args& args, const std::map<std::string, glm53::ShardedTensor>& index) {
+  // The Experts whose six tensors are all in the given shards, less those the
+  // store already holds: a rerun writes nothing twice, and a record that does
+  // not hold its Expert is rewritten.
+  std::set<std::string> held;
+  if (std::filesystem::exists(args.out)) {
+    auto check = io::check_store_tensors(args.out, args.shards, index, args.first, args.last, args.threads);
+    if (!check) die(check.error().what);
+    held = std::move(check).value().in_store;
+  }
+  std::vector<glm53::ExpertId> todo;
+  size_t already = 0;
+  for (uint32_t l = args.first; l <= args.last; l++)
+    for (uint32_t e = 0; e < glm53::kExperts; e++) {
+      if (!glm53::expert_source(index, {l, e}).is_ok()) continue;  // not all six tensors given
+      bool in_store = true;
+      for (const auto m : {glm53::Matrix::Gate, glm53::Matrix::Up, glm53::Matrix::Down})
+        for (const auto p : {glm53::Part::Codes, glm53::Part::Scales})
+          in_store = in_store && held.contains(glm53::tensor_name({{l, e}, m, p}));
+      if (in_store) already++;
+      else todo.push_back({l, e});
+    }
+  if (todo.empty()) {
+    std::printf("nothing to convert: %zu complete Experts in the given shards, all already in the store\n", already);
+    return 0;
+  }
+
+  // Free-space preflight: the records about to be written plus the floor.
+  const uint64_t need = todo.size() * glm53::kHalves * kHalfOnDiskBytes;
+  if (auto h = io::ensure_headroom(std::filesystem::path(args.out).parent_path().string(), need,
+                                   args.min_free_gib << 30);
+      !h)
+    die(h.error().what + " (convert fewer shards, or free space)");
 
   std::vector<io::Fd> fds;
-  std::map<std::string, glm53::ShardedTensor> index;
-  for (uint32_t shard = 0; shard < args.shards.size(); shard++) {
-    auto h = io::read_safetensors_header(args.shards[shard]);
-    if (!h) die(h.error().what);
-    for (const auto& [name, tensor] : h.value().tensors)
-      if (!index.emplace(name, glm53::ShardedTensor{shard, tensor}).second)
-        die(name + " appears in two of the given shards (" + args.shards[index.at(name).shard] + ", " +
-            args.shards[shard] + ")");
-    auto fd = io::open_file(args.shards[shard], io::Access::ReadBuffered);
+  for (const auto& path : args.shards) {
+    auto fd = io::open_file(path, io::Access::ReadBuffered);
     if (!fd) die(fd.error().what);
     fds.push_back(std::move(fd).value());
   }
-
-  std::vector<uint32_t> layers;
-  for (uint32_t l = args.first; l <= args.last; l++) {
-    bool complete = true;
-    for (uint32_t e = 0; e < glm53::kExperts && complete; e++)
-      if (!glm53::expert_source(index, {l, e}).is_ok()) complete = false;
-    if (complete) layers.push_back(l);
-    else std::fprintf(stderr, "layer %u: not fully present in the given shards, skipped\n", l);
-  }
-  // A release check of shards without stored Experts (the MTP block's, the
-  // head's) has no layer to verify; it still lists them once their parts verify.
-  if (layers.empty() && !(args.verify && !args.backbone.empty())) die("no complete layers in the given shards");
-
-  if (!args.verify) {
-    // Free-space preflight: the records about to be written (their padding is
-    // zeros, which the compressed dataset does not store) plus the floor.
-    const uint64_t need = layers.size() * uint64_t{glm53::kExperts} * glm53::kHalves * glm53::kHalfPayloadBytes;
-    if (auto h = io::ensure_headroom(std::filesystem::path(args.out).parent_path().string(), need,
-                                     args.min_free_gib << 30);
-        !h)
-      die(h.error().what + " (convert fewer layers, or free space)");
-  }
-
-  auto out = io::open_file(args.out, args.verify ? io::Access::ReadDirect : io::Access::WriteDirect);
+  auto out = io::open_file(args.out, io::Access::WriteDirect);
   if (!out) die(out.error().what);
-  if (!args.verify) {
-    if (::ftruncate(out.value().get(), static_cast<off_t>(glm53::kStoreBytes)) != 0) die("ftruncate store");
-    const auto header = glm53::encode_header(glm53::current_header("kitaniai/GLM-5.3-UNCENSORED-MXFP4"));
-    io::AlignedBuffer hb(header.size());
-    std::memcpy(hb.data(), header.data(), header.size());
-    if (auto w = io::pwrite_exact(out.value(), hb.span(), 0); !w) die(w.error().what);
-  } else {
-    io::AlignedBuffer hb(glm53::kHeaderBytes);
-    if (auto r = io::pread_exact(out.value(), hb.span(), 0); !r) die(r.error().what);
-    if (auto h = glm53::decode_header(hb.span()); !h) die(h.error().what);
-  }
+  if (::ftruncate(out.value().get(), static_cast<off_t>(glm53::kStoreBytes)) != 0) die("ftruncate store");
+  const auto header = glm53::encode_header(glm53::current_header("kitaniai/GLM-5.3-UNCENSORED-MXFP4"));
+  io::AlignedBuffer hb(header.size());
+  std::memcpy(hb.data(), header.data(), header.size());
+  if (auto w = io::pwrite_exact(out.value(), hb.span(), 0); !w) die(w.error().what);
 
-  const uint64_t total = layers.size() * uint64_t{glm53::kExperts};
-  std::atomic<uint64_t> next{0}, done{0}, mismatches{0};
+  const uint64_t total = todo.size();
+  std::atomic<uint64_t> next{0}, done{0};
   std::atomic<bool> failed{false};
   const auto t0 = std::chrono::steady_clock::now();
   auto worker = [&] {
@@ -144,7 +147,7 @@ int main(int argc, char** argv) {
         down_scales(glm53::kDownScaleBytes);
     io::AlignedBuffer record(glm53::kRecordStride);
     for (uint64_t i = next++; i < total && !failed; i = next++) {
-      const glm53::ExpertId id{layers[i / glm53::kExperts], static_cast<uint32_t>(i % glm53::kExperts)};
+      const glm53::ExpertId id = todo[i];
       const auto src = glm53::expert_source(index, id).value();
       struct Read {
         uint32_t shard;
@@ -164,34 +167,23 @@ int main(int argc, char** argv) {
           {src.down.shard, src.down.scale_offset, src.down.scale_bytes,
            reinterpret_cast<std::byte*>(down_scales.data())},
       };
-      for (const auto& r : reads) {
-        const auto src_tensor_bytes = r.bytes;
-        if (auto e = io::pread_exact(fds[r.shard], {r.dst, src_tensor_bytes}, r.offset); !e) {
+      for (const auto& r : reads)
+        if (auto e = io::pread_exact(fds[r.shard], {r.dst, r.bytes}, r.offset); !e) {
           std::fprintf(stderr, "%s\n", e.error().what.c_str());
           failed = true;
           return;
         }
-      }
       auto built = glm53::build_record({gate_codes, up_codes, down_codes, gate_scales, up_scales, down_scales});
       if (!built) {
         std::fprintf(stderr, "expert %u.%u: %s\n", id.layer, id.expert, built.error().what.c_str());
         failed = true;
         return;
       }
-      const uint64_t off = glm53::record_offset(id);
-      if (args.verify) {
-        if (auto r = io::pread_exact(out.value(), record.span(), off); !r) {
-          failed = true;
-          return;
-        }
-        if (std::memcmp(record.data(), built.value().data(), glm53::kRecordStride) != 0) mismatches++;
-      } else {
-        std::memcpy(record.data(), built.value().data(), glm53::kRecordStride);
-        if (auto w = io::pwrite_exact(out.value(), record.span(), off); !w) {
-          std::fprintf(stderr, "%s\n", w.error().what.c_str());
-          failed = true;
-          return;
-        }
+      std::memcpy(record.data(), built.value().data(), glm53::kRecordStride);
+      if (auto w = io::pwrite_exact(out.value(), record.span(), glm53::record_offset(id)); !w) {
+        std::fprintf(stderr, "%s\n", w.error().what.c_str());
+        failed = true;
+        return;
       }
       if (++done % 256 == 0) std::fprintf(stderr, "  %lu / %lu Experts\n", done.load(), total);
     }
@@ -200,31 +192,62 @@ int main(int argc, char** argv) {
   for (unsigned t = 0; t < args.threads; t++) pool.emplace_back(worker);
   for (auto& t : pool) t.join();
   if (failed) die("conversion failed");
-  const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-  std::printf("%s %lu Experts (%u layers) in %.1f s, %.2f GB/s source%s\n", args.verify ? "verified" : "wrote", total,
-              static_cast<unsigned>(layers.size()), secs, total * 3.0 * glm53::kMatrixBytes / secs / 1e9,
-              args.verify ? (mismatches ? ", MISMATCHES FOUND" : ", all records identical") : "");
-  if (args.verify && mismatches) {
-    std::printf("mismatched records: %lu\n", mismatches.load());
+  if (::fdatasync(out.value().get()) != 0) die("fdatasync store");
+  const double secs = seconds_since(t0);
+  std::printf("wrote %lu Experts (%zu already in the store) in %.1f s, %.2f GB/s source\n", total, already, secs,
+              total * 3.0 * glm53::kMatrixBytes / secs / 1e9);
+  return 0;
+}
+
+int verify(const Args& args, const std::map<std::string, glm53::ShardedTensor>& index) {
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto check = io::check_store_tensors(args.out, args.shards, index, args.first, args.last, args.threads);
+  if (!check) die(check.error().what);
+  const auto& c = check.value();
+  std::printf("verified %zu stored tensors of %zu Experts (layers %u-%u) in %.1f s%s\n", c.in_store.size(), c.experts,
+              args.first, args.last, seconds_since(t0), c.mismatched.empty() ? ", all identical" : "");
+  if (!c.absent.empty())
+    std::printf("not converted yet: %zu tensors (unwritten records; their shards stay), e.g. %s\n", c.absent.size(),
+                c.absent.front().c_str());
+  if (!c.mismatched.empty()) {
+    std::printf("MISMATCHES: %zu tensors the store does not hold, e.g.\n", c.mismatched.size());
+    for (size_t i = 0; i < std::min<size_t>(c.mismatched.size(), 10); i++)
+      std::printf("  %s\n", c.mismatched[i].c_str());
     return 1;
   }
-  if (args.verify) {
-    // Proven by this verify run: these layers' records match their sources, and
-    // (with --backbone) these shards' Backbone parts match theirs.
-    std::vector<uint32_t> extracted;
-    if (!args.backbone.empty())
-      for (uint32_t s = 0; s < args.shards.size(); s++) {
-        const auto v = io::verify_backbone_part(args.shards[s], args.backbone);
-        if (v) extracted.push_back(s);
-        else std::fprintf(stderr, "kept %s: %s\n", args.shards[s].c_str(), v.error().what.c_str());
-      }
-    const auto deletable = glm53::deletable_shards(index, layers, extracted);
-    std::printf("deletable shards (every tensor in a verified record%s):",
-                args.backbone.empty() ? "; no --backbone, so only expert-only shards" : " or a verified Backbone part");
-    for (uint32_t s : deletable) std::printf(" %s", args.shards[s].c_str());
-    std::printf("%s\n", deletable.empty() ? " none" : "");
-  } else {
-    std::printf("run the same command with --verify (and --backbone DIR) to list the shards that are now safe to delete\n");
-  }
+  // Proven by this run: these tensors are in their records, and (with
+  // --backbone) these shards' Backbone parts match theirs.
+  std::vector<uint32_t> extracted;
+  if (!args.backbone.empty())
+    for (uint32_t s = 0; s < args.shards.size(); s++) {
+      const auto v = io::verify_backbone_part(args.shards[s], args.backbone);
+      if (v) extracted.push_back(s);
+      else std::fprintf(stderr, "kept %s: %s\n", args.shards[s].c_str(), v.error().what.c_str());
+    }
+  const auto deletable = glm53::deletable_shards(index, c.in_store, extracted);
+  std::printf("deletable shards (every tensor a verified stored tensor%s):",
+              args.backbone.empty() ? "; no --backbone, so only expert-only shards" : " or in a verified Backbone part");
+  for (uint32_t s : deletable) std::printf(" %s", args.shards[s].c_str());
+  std::printf("%s\n", deletable.empty() ? " none" : "");
   return 0;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  Args args;
+  if (!parse_args(argc, argv, args))
+    die("usage: ds4n-glm53-store-build --out STORE [--layers A-B] [--threads N] [--min-free-gib G] "
+        "[--verify [--backbone DIR]] SHARD...");
+
+  std::map<std::string, glm53::ShardedTensor> index;
+  for (uint32_t shard = 0; shard < args.shards.size(); shard++) {
+    auto h = io::read_safetensors_header(args.shards[shard]);
+    if (!h) die(h.error().what);
+    for (const auto& [name, tensor] : h.value().tensors)
+      if (!index.emplace(name, glm53::ShardedTensor{shard, tensor}).second)
+        die(name + " appears in two of the given shards (" + args.shards[index.at(name).shard] + ", " +
+            args.shards[shard] + ")");
+  }
+  return args.verify ? verify(args, index) : convert(args, index);
 }

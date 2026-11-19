@@ -97,7 +97,7 @@ TEST_CASE("a mixed shard's Backbone part is written once, verifies, and any chan
   CHECK(header.value().tensors.contains("model.layers.78.mlp.experts.3.up_proj.weight"));
   CHECK_FALSE(header.value().tensors.contains("model.layers.11.mlp.experts.0.gate_proj.weight"));
 
-  // Retry-safe: a present part is left alone.
+  // Retry-safe: a present part that verifies is left alone.
   const auto again = io::write_backbone_part(shard, plan.value(), out.path.string());
   REQUIRE(again.is_ok());
   CHECK(again.value() == io::Extraction::AlreadyPresent);
@@ -123,6 +123,15 @@ TEST_CASE("a mixed shard's Backbone part is written once, verifies, and any chan
   SUBCASE("a changed source fails verification") {
     flip_byte(shard, plan.value().copies[2].source_offset);
     CHECK_FALSE(io::verify_backbone_part(shard, out.path.string()).is_ok());
+  }
+  SUBCASE("writing again repairs a damaged part") {
+    flip_byte(part, plan.value().copies[0].part_offset);
+    REQUIRE_FALSE(io::verify_backbone_part(shard, out.path.string()).is_ok());
+    const auto fixed = io::write_backbone_part(shard, plan.value(), out.path.string());
+    REQUIRE(fixed.is_ok());
+    CHECK(fixed.value() == io::Extraction::Repaired);
+    CHECK(io::verify_backbone_part(shard, out.path.string()).is_ok());
+    CHECK_FALSE(fs::exists(part + ".partial"));
   }
 }
 

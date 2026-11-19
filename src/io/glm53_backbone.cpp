@@ -62,7 +62,11 @@ Result<Extraction, IoError> write_backbone_part(const std::string& shard_path, c
   using R = Result<Extraction, IoError>;
   if (plan.copies.empty()) return R::ok(Extraction::NoBackbone);
   const auto final_path = part_path(out_dir, plan);
-  if (std::filesystem::exists(final_path)) return R::ok(Extraction::AlreadyPresent);
+  const bool existed = std::filesystem::exists(final_path);
+  // A part under its final name was renamed into place complete, but it may
+  // since have been damaged: only one that verifies is kept; any other is
+  // rewritten and replaced atomically.
+  if (existed && verify_backbone_part(shard_path, out_dir)) return R::ok(Extraction::AlreadyPresent);
 
   auto src = open_file(shard_path, Access::ReadBuffered);
   if (!src) return R::err(std::move(src).error());
@@ -79,7 +83,7 @@ Result<Extraction, IoError> write_backbone_part(const std::string& shard_path, c
   if (::rename(partial.c_str(), final_path.c_str()) != 0) return R::err(sys_error("rename " + partial));
   Fd dir(::open(out_dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
   if (dir.get() < 0 || ::fsync(dir.get()) != 0) return R::err(sys_error("fsync " + out_dir));
-  return R::ok(Extraction::Written);
+  return R::ok(existed ? Extraction::Repaired : Extraction::Written);
 }
 
 Result<VerifiedPart, IoError> verify_backbone_part(const std::string& shard_path, const std::string& out_dir) {

@@ -61,7 +61,7 @@ target_compile_options(ds4n_engine PRIVATE -Wall -Wextra -Wpedantic -Werror)
 add_executable(ds4n-store-build src/tools/store_build.cpp)
 target_link_libraries(ds4n-store-build PRIVATE ds4n_io)
 # GLM-5.3 shell: Backbone part files. Its own library, so ds4n_io (linked by the DS4.1 engine) is unchanged.
-add_library(ds4n_glm53_io STATIC src/io/glm53_backbone.cpp)
+add_library(ds4n_glm53_io STATIC src/io/glm53_backbone.cpp src/io/glm53_store.cpp)
 target_link_libraries(ds4n_glm53_io PUBLIC ds4n_io)
 target_compile_options(ds4n_glm53_io PRIVATE -Wall -Wextra -Wpedantic -Werror)
 add_executable(ds4n-glm53-store-build src/tools/glm53_store_build.cpp)
@@ -183,7 +183,7 @@ target_compile_definitions(ds4n_tests PRIVATE DS4N_SOURCE_DIR="${CMAKE_SOURCE_DI
 add_test(NAME core COMMAND ds4n_tests)
 
 # I/O-boundary tests (temp files): the GLM-5.3 Backbone part writer and verifier.
-add_executable(ds4n_glm53_io_tests tests/main.cpp tests/io/test_glm53_backbone.cpp)
+add_executable(ds4n_glm53_io_tests tests/main.cpp tests/io/test_glm53_backbone.cpp tests/io/test_glm53_store.cpp)
 target_link_libraries(ds4n_glm53_io_tests PRIVATE ds4n_glm53_io doctest::doctest)
 target_compile_options(ds4n_glm53_io_tests PRIVATE -Wall -Wextra)
 add_test(NAME glm53_io COMMAND ds4n_glm53_io_tests)

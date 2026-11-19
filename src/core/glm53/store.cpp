@@ -18,10 +18,13 @@ uint64_t half_offset(ExpertId id, uint32_t half) { return record_offset(id) + ui
 
 namespace {
 
-Result<MatrixSource, LayoutError> matrix_source(const std::map<std::string, ShardedTensor>& index,
-                                                const std::string& weight_name, const std::string& scale_name,
-                                                const uint64_t* weight_shape, size_t weight_rank,
-                                                const uint64_t* scale_shape, size_t scale_rank) {
+bool shape_is(const safetensors::Tensor& t, std::array<uint64_t, 2> shape) {
+  return t.shape == std::vector<uint64_t>(shape.begin(), shape.end());
+}
+
+Result<MatrixSource, LayoutError> matrix_source(const std::map<std::string, ShardedTensor>& index, ExpertId id,
+                                                Matrix m) {
+  const auto weight_name = tensor_name({id, m, Part::Codes}), scale_name = tensor_name({id, m, Part::Scales});
   const auto w = index.find(weight_name);
   if (w == index.end()) return Result<MatrixSource, LayoutError>::err(LayoutError{"missing tensor " + weight_name});
   const auto s = index.find(scale_name);
@@ -32,9 +35,9 @@ Result<MatrixSource, LayoutError> matrix_source(const std::map<std::string, Shar
   if (s->second.tensor.dtype != safetensors::Dtype::U8)
     return Result<MatrixSource, LayoutError>::err(LayoutError{scale_name + ": expected U8 (E8M0), got dtype " +
                                                               std::to_string(static_cast<int>(s->second.tensor.dtype))});
-  if (w->second.tensor.shape != std::vector<uint64_t>(weight_shape, weight_shape + weight_rank))
+  if (!shape_is(w->second.tensor, stored_tensor_shape(m, Part::Codes)))
     return Result<MatrixSource, LayoutError>::err(LayoutError{weight_name + ": unexpected shape"});
-  if (s->second.tensor.shape != std::vector<uint64_t>(scale_shape, scale_shape + scale_rank))
+  if (!shape_is(s->second.tensor, stored_tensor_shape(m, Part::Scales)))
     return Result<MatrixSource, LayoutError>::err(LayoutError{scale_name + ": unexpected shape (scale grouping)"});
   return Result<MatrixSource, LayoutError>::ok(
       MatrixSource{w->second.shard, w->second.tensor.offset, w->second.tensor.bytes, s->second.tensor.offset,
@@ -61,21 +64,24 @@ Result<std::vector<std::byte>, mx::TileError> tile_down_blocks(std::span<const s
 
 }  // namespace
 
+std::array<uint64_t, 2> stored_tensor_shape(Matrix m, Part p) {
+  const bool down = m == Matrix::Down;
+  const uint64_t rows = down ? kHidden : kIntermediate, k = down ? kIntermediate : kHidden;
+  return {rows, p == Part::Codes ? k / 2 : k / kBlockValues};
+}
+
+std::string tensor_name(const StoredTensor& t) {
+  static constexpr const char* kMatrixNames[] = {"gate_proj", "up_proj", "down_proj"};
+  return "model.layers." + std::to_string(t.id.layer) + ".mlp.experts." + std::to_string(t.id.expert) + "." +
+         kMatrixNames[static_cast<size_t>(t.matrix)] + (t.part == Part::Codes ? ".weight" : ".weight_scale");
+}
+
 Result<ExpertSource, LayoutError> expert_source(const std::map<std::string, ShardedTensor>& index, ExpertId id) {
-  const auto layer = std::to_string(id.layer), expert = std::to_string(id.expert);
-  const std::string base = "model.layers." + layer + ".mlp.experts." + expert + ".";
-  const uint64_t gate_up_shape[] = {kIntermediate, kHidden / 2};
-  const uint64_t gate_up_scale_shape[] = {kIntermediate, kGateUpBlocks};
-  const uint64_t down_shape[] = {kHidden, kIntermediate / 2};
-  const uint64_t down_scale_shape[] = {kHidden, kDownBlocks};
-  auto gate = matrix_source(index, base + "gate_proj.weight", base + "gate_proj.weight_scale", gate_up_shape, 2,
-                            gate_up_scale_shape, 2);
+  auto gate = matrix_source(index, id, Matrix::Gate);
   if (!gate) return Result<ExpertSource, LayoutError>::err(std::move(gate).error());
-  auto up = matrix_source(index, base + "up_proj.weight", base + "up_proj.weight_scale", gate_up_shape, 2,
-                          gate_up_scale_shape, 2);
+  auto up = matrix_source(index, id, Matrix::Up);
   if (!up) return Result<ExpertSource, LayoutError>::err(std::move(up).error());
-  auto down = matrix_source(index, base + "down_proj.weight", base + "down_proj.weight_scale", down_shape, 2,
-                            down_scale_shape, 2);
+  auto down = matrix_source(index, id, Matrix::Down);
   if (!down) return Result<ExpertSource, LayoutError>::err(std::move(down).error());
   return Result<ExpertSource, LayoutError>::ok(
       ExpertSource{std::move(gate).value(), std::move(up).value(), std::move(down).value()});
@@ -103,27 +109,32 @@ bool take(std::string_view& s, std::string_view prefix) {
 
 }  // namespace
 
-std::optional<uint32_t> stored_expert_layer(std::string_view name) {
+std::optional<StoredTensor> stored_expert_tensor(std::string_view name) {
   if (!take(name, "model.layers.")) return std::nullopt;
   const auto layer = take_number(name);
   if (!layer || !take(name, ".mlp.experts.")) return std::nullopt;
   const auto expert = take_number(name);
   if (!expert || *expert >= kExperts || !take(name, ".")) return std::nullopt;
-  if (!take(name, "gate_proj.") && !take(name, "up_proj.") && !take(name, "down_proj.")) return std::nullopt;
-  if (name != "weight" && name != "weight_scale") return std::nullopt;
+  Matrix matrix;
+  if (take(name, "gate_proj.")) matrix = Matrix::Gate;
+  else if (take(name, "up_proj.")) matrix = Matrix::Up;
+  else if (take(name, "down_proj.")) matrix = Matrix::Down;
+  else return std::nullopt;
+  Part part;
+  if (name == "weight") part = Part::Codes;
+  else if (name == "weight_scale") part = Part::Scales;
+  else return std::nullopt;
   if (*layer < kFirstMoeLayer || *layer > kLastMoeLayer) return std::nullopt;
-  return layer;
+  return StoredTensor{{*layer, *expert}, matrix, part};
 }
 
 std::set<uint32_t> deletable_shards(const std::map<std::string, ShardedTensor>& index,
-                                    std::span<const uint32_t> converted, std::span<const uint32_t> extracted) {
-  const std::set<uint32_t> done(converted.begin(), converted.end());
+                                    const std::set<std::string>& in_store, std::span<const uint32_t> extracted) {
   const std::set<uint32_t> parts(extracted.begin(), extracted.end());
   std::set<uint32_t> seen, keep;
   for (const auto& [name, st] : index) {
     seen.insert(st.shard);
-    const auto layer = stored_expert_layer(name);
-    const bool saved = layer ? done.contains(*layer) : parts.contains(st.shard);
+    const bool saved = stored_expert_tensor(name) ? in_store.contains(name) : parts.contains(st.shard);
     if (!saved) keep.insert(st.shard);
   }
   std::set<uint32_t> out;
@@ -171,6 +182,50 @@ Result<std::vector<std::byte>, LayoutError> build_record(const Sextuplet& s) {
     }
   }
   return Result<std::vector<std::byte>, LayoutError>::ok(std::move(record));
+}
+
+namespace {
+
+/** Inverse of mx::ggml_from_packed_e2m1: GGML blocks -> packed E2M1 codes (2j low, 2j+1 high) + E8M0 scales. */
+void packed_from_ggml(std::span<const std::byte> ggml, std::vector<std::byte>& codes, std::vector<std::byte>& scales) {
+  const size_t blocks = ggml.size() / kBlockBytes;
+  codes.assign(blocks * 16, std::byte{0});
+  scales.assign(blocks, std::byte{0});
+  for (size_t b = 0; b < blocks; b++) {
+    const auto* block = reinterpret_cast<const uint8_t*>(ggml.data()) + b * kBlockBytes;
+    scales[b] = static_cast<std::byte>(block[0]);
+    // GGML byte i holds element i (low) and i + 16 (high).
+    auto element = [block](size_t e) { return static_cast<uint8_t>(e < 16 ? block[1 + e] & 0x0F : block[1 + e - 16] >> 4); };
+    for (size_t j = 0; j < 16; j++)
+      codes[b * 16 + j] = static_cast<std::byte>(element(2 * j) | element(2 * j + 1) << 4);
+  }
+}
+
+}  // namespace
+
+Result<ExpertTensors, LayoutError> decode_record(std::span<const std::byte> record) {
+  using R = Result<ExpertTensors, LayoutError>;
+  if (record.size() != kRecordStride) return R::err(LayoutError{"record size"});
+  std::vector<std::byte> gate(kMatrixBytes), up(kMatrixBytes), down(kMatrixBytes);  // GGML row-major blocks
+  for (uint32_t h = 0; h < kHalves; h++) {
+    const auto half = record.subspan(uint64_t{h} * kHalfStride, kHalfStride);
+    const auto padding = half.subspan(kHalfPayloadBytes);
+    if (std::any_of(padding.begin(), padding.end(), [](std::byte b) { return b != std::byte{0}; }))
+      return R::err(LayoutError{"non-zero padding in Half " + std::to_string(h)});
+    auto gate_rows = mx::untile_matrix(half.subspan(0, kHalfPartBytes), kHalfRows, kGateUpBlocks);
+    auto up_rows = mx::untile_matrix(half.subspan(kHalfPartBytes, kHalfPartBytes), kHalfRows, kGateUpBlocks);
+    auto down_blocks = mx::untile_matrix(half.subspan(2 * kHalfPartBytes, kHalfPartBytes), kHidden, kHalfDownBlocks);
+    if (!gate_rows || !up_rows || !down_blocks) return R::err(LayoutError{"untile Half " + std::to_string(h)});
+    std::memcpy(gate.data() + h * kHalfPartBytes, gate_rows.value().data(), kHalfPartBytes);
+    std::memcpy(up.data() + h * kHalfPartBytes, up_rows.value().data(), kHalfPartBytes);
+    const uint64_t slice = kHalfDownBlocks * kBlockBytes;
+    for (uint64_t r = 0; r < kHidden; r++)
+      std::memcpy(down.data() + r * kDownRowBytes + h * slice, down_blocks.value().data() + r * slice, slice);
+  }
+  ExpertTensors out;
+  for (const auto& [m, ggml] : {std::pair{Matrix::Gate, &gate}, {Matrix::Up, &up}, {Matrix::Down, &down}})
+    packed_from_ggml(*ggml, out.codes[static_cast<size_t>(m)], out.scales[static_cast<size_t>(m)]);
+  return R::ok(std::move(out));
 }
 
 namespace {

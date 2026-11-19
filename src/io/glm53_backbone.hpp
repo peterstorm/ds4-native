@@ -5,7 +5,8 @@
 //
 // Writing is retry-safe: a part is written to "<name>.partial", fsynced and
 // renamed into place, so a part file under its final name is always complete.
-// An existing final part is left alone; verify_backbone_part is what proves it.
+// An existing final part is kept only when it verifies; a damaged one is
+// rewritten and replaced the same way.
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -19,7 +20,7 @@ namespace ds4n::io {
 /** Read a source shard's header and plan its Backbone part. */
 Result<glm53::BackbonePart, IoError> plan_backbone_part(const std::string& shard_path);
 
-enum class Extraction { Written, AlreadyPresent, NoBackbone };
+enum class Extraction { Written, Repaired, AlreadyPresent, NoBackbone };
 
 /** Write `plan` (from plan_backbone_part(shard_path)) into `out_dir`. */
 Result<Extraction, IoError> write_backbone_part(const std::string& shard_path, const glm53::BackbonePart& plan,

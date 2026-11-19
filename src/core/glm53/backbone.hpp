@@ -21,7 +21,7 @@ namespace ds4n::glm53 {
 
 /**
  * True for a tensor Backbone A holds. Defined as the complement of
- * `stored_expert_layer`, so every source tensor belongs to exactly one of the
+ * `stored_expert_tensor`, so every source tensor belongs to exactly one of the
  * Expert store and the Backbone: nothing is dropped and nothing is kept twice.
  */
 bool is_backbone(std::string_view tensor_name);

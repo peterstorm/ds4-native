@@ -1,4 +1,4 @@
-# HANDOVER: GLM-5.3 full uncensored on ds4-native — session state 2026-11-19 (updated 15:10)
+# HANDOVER: GLM-5.3 full uncensored on ds4-native — session state 2026-11-19 (updated 16:30)
 
 Resume point for any fresh session. Companion to
 [`2026-11-19-glm53-native.md`](2026-11-19-glm53-native.md) (the plan — read it first; its
@@ -16,7 +16,7 @@ backbone differs (119 bf16 residual-writer tensors). Speed expectation est. 15�
 30–50 with cache-conditional routing + RAM tier — a quality/architecture play. Phase 5's measured
 CyberGym verdict decides keep/archive.
 
-## Where things stand (2026-11-19 ~15:10, second session)
+## Where things stand (2026-11-19 ~17:10, second session)
 
 ### Done
 
@@ -26,51 +26,78 @@ CyberGym verdict decides keep/archive.
 | Expert store format + converter + tests | branch `glm53/store-convert` @ `44e0eeb` (pushed); moved to `src/core/glm53/store.*` on `glm53/engine-core` | smoke-proven on real kitaniai bytes |
 | **Semantics oracle (Phase 3 step 1)** | branch `glm53/engine-core` (worktree `~/dev/ds4-native-glm53-engine`, stacked on store-convert + main): `src/core/glm53/{config,reference}`, `ref/glm-5.3/` (pinned transformers 5.16.0 + released config.json), `tools/glm53-golden/{make_golden.py,mutation-probe.sh}`, `tests/data/glm53-golden.safetensors` | golden matches the reference's causal prefill at 1.6e-6 relative, every Selection identical; mutation probe 10/10 killed; 225 tests green at the time |
 | **Backbone extractor + joint release** | same branch: `core/glm53/backbone`, `io/glm53_backbone` (own lib `ds4n_glm53_io`), `ds4n-glm53-backbone-extract`, `store-build --verify --backbone` | per-shard Backbone parts, atomic + verified. Real shards 2–5: 24 tensors bit-identical per the official safetensors reader, mixed shard 2 released, one flipped byte keeps its shard. 230 core + 3 I/O tests; 4/4 mutants killed |
+| **Per-tensor release + consume driver** | same branch: `decode_record` (inverse of `build_record`), `StoredTensor` parse, `io/glm53_store` `check_store_tensors`, `tools/glm53-store/consume.sh` | the per-layer release rule would have stranded the 68 shards that hold two layers' Experts (~100 GiB): once a layer's first shards leave, that layer can never be verified whole again. A stored tensor is now proven against its slice of its decoded record. Driver walks shards in file order with per-Expert convert (skips what the store holds), part repair, and all-zero records read as not converted. Real shards 1–9 through the driver in RAM (shards read-only): all released, then an independent verify of the *original* shards matched all 512 Experts of layers 10–11; canary on real ZFS (3 shards) before the full run. Review by an independent agent: no deletion-safety blocker; its findings (compression, ordering, part repair, crash windows) are fixed. 234 core + 4 I/O tests; 6/6 mutants killed |
 | **Converter safety fix** | same branch, `24b9a6a` | the deletable list could have listed MTP and unconverted shards; now it lists only verified, fully consumed shards and has a free-space preflight. Checked on real layer 10 (RAM tmpfs) |
 | Indexer reference pinning (old step 5) | `ref/glm-5.3/README.md` | **decided: transformers 5.16.0** |
 | Desktop space for the download | /models/voice deleted (operator-approved; TTS weights, re-downloadable), 82 exited containers + `ds4-native-dev:1` removed | `space-guard.sh` armed (pauses the fetch below 6 GiB free) |
-| Fetch tool | `ds4-native` main: `tools/glm53-store/fetch-kitaniai.sh`; deployed desktop-side at `/models/glm53-native/fetch-kitaniai.sh` | running |
+| Fetch tool | `ds4-native` main: `tools/glm53-store/fetch-kitaniai.sh`; deployed desktop-side at `/models/glm53-native/fetch-kitaniai.sh` | download complete 15:26 (`hf exit=0`) |
 | Desktop reclaim (353.3 GB freed) | only export-source `model-*.safetensors` deleted; receipts `/models/glm53-hyperflare/archive-receipt-{fp4-local,uncensored}-shards.json` | done, flare untouched and still serving |
 | Inference reorg (dotfiles) | `.dotfiles` main `a157e3b6` (pushed) | done |
 
-### In flight
+### State of the pool
 
-**Kitaniai download**: `/models/glm53-native/kitaniai` (305 files, 394.65 GiB), resumable
-`hf download`, log `/models/glm53-native/download.log`. At ~14:50: 251/305 files, 61 GiB free
-and ~8 GiB margin expected at the end. **`/models/glm53-native/space-guard.sh`** runs alongside.
-It kills the fetch, which is resumable, if rpool free drops under 6 GiB, and logs to
-`space-guard.log`. If it fired, free space and rerun `fetch-kitaniai.sh`.
+**Download complete** (15:26, `hf exit=0`, 282 shards, 395 GiB; `rpool/models` avail 8.16G).
+At 15:34 another session started a `batch 3-10` conversion that read **`zpool list` FREE
+(65.3G)**. That figure includes ZFS's slop reserve (1/32 of the pool, ~57 GiB here), which no
+dataset can write into. It wrote 8.2 GiB into `experts.ds4n` and hit ENOSPC with every dataset
+at 0 B (home, nix, docker; services failed to write). The partial store was removed by operator
+decision at 16:07 (receipt line in `/models/glm53-native/store-convert-receipt.log`). **Measure
+free space with `zfs list -o avail` or `df`, never `zpool list`.**
+
+**`/models` is `compression=off`** (declared in `.dotfiles/machines/desktop/disks.nix`), so the
+records' zero padding would have cost ~16.4 GiB. The store and parts live in their own dataset,
+**`rpool/models/glm53-store`** (`compression=zle`, `recordsize=1M`, mounted at
+`/models/glm53-store`, created 16:33). zle drops only runs of zeros: model bytes are untouched and
+streaming reads never decompress real data. Measured on real records: 19.15 MiB on disk per
+19.125 MiB payload.
+
+**Consume DONE 16:40–17:03** (`/models/glm53-store/consume.sh`, receipts
+`/models/glm53-store/consume-receipts.log`, output `consume.out`, tools pinned in
+`/models/glm53-store/bin/a86dd14-pertensor-20261119` with their sha256 in the receipts). A 3-shard
+canary came first, then the full run at ~4 s a shard. All 282 shards were deleted, each only
+after its verify. The run had 0 aborts, 0 mismatches and 0 repairs, and the window was never
+wider than 2 shards. Final state:
+- `experts.ds4n`: 360 GiB on disk.
+- `backbone-uncensored/`: 88 parts, 37 GiB.
+- `rpool/models` avail: 7.32 GiB (compressratio 1.04x on glm53-store).
+- `kitaniai/` keeps only the metadata files: index, config, tokenizer, `conversion.json`,
+  manifests.
+
+An independent audit (python, read-only, against the index) found:
+- 115,200 stored-Expert + 2,981 Backbone tensors;
+- the parts hold all 2,981 Backbone tensors exactly once (0 missing, 0 extra);
+- no blank Half among the store's 38,400.
+
+**Pending outside this repo:** the dataset is declared in `.dotfiles` branch
+`desktop/glm53-store-dataset` (worktree `~/.dotfiles-glm53-store`, `machines/desktop/disks.nix`).
+Until that is merged and deployed with `nixos-rebuild`, `mountpoint=legacy` means
+`/models/glm53-store` will not mount after a reboot. The fix by hand is
+`sudo mount -t zfs rpool/models/glm53-store /models/glm53-store`.
 
 ## Next actions, in order
 
-1. **Confirm download complete**: `grep "hf exit=" /models/glm53-native/download.log`, and check
-   `space-guard.log` is empty. If not complete and no `hf download` is running, rerun the fetch
-   script (it resumes).
-2. **Consume kitaniai range by range, in layer order** (every tool exists now). Build
-   `glm53/engine-core` on the desktop (environment notes), then for each range:
+1. **Merge and deploy the dataset declaration** (above), so the store survives a reboot.
+2. **How the consume worked** (`tools/glm53-store/consume.sh`; a rerun is a no-op now):
    ```bash
-   K=/models/glm53-native/kitaniai; BB=/models/glm53-native/backbone-uncensored; ST=/models/glm53-native/experts.ds4n
-   SHARDS=...   # every shard holding any tensor of layers A-B: select by layer in $K/model.safetensors.index.json
-   ./build/ds4n-glm53-backbone-extract --out $BB --min-free-gib 3 $SHARDS        # Backbone parts (mixed shards only)
-   ./build/ds4n-glm53-store-build --out $ST --layers A-B --threads 16 --min-free-gib 3 $SHARDS
-   ./build/ds4n-glm53-backbone-extract --out $BB --verify $SHARDS
-   ./build/ds4n-glm53-store-build --out $ST --layers A-B --threads 16 --verify --backbone $BB $SHARDS | tee -a /models/glm53-native/consume-receipts.log
-   # delete exactly the shards on the "deletable shards" line, nothing else
+   BIN=/models/glm53-store/bin/<pinned> nohup setsid bash /models/glm53-store/consume.sh \
+     > /models/glm53-store/consume.out 2>&1 < /dev/null &
    ```
-   A shard is listed only when this verify run proved both its Experts' records and its
-   Backbone part. A shard holding Experts of a layer outside A–B stays until a later range
-   covers it, so ranges overlap by a shard. **Shard numbers do not follow layer order** (279–281
-   hold layer 9, 270–274 the MTP block), so always select by layer. Shards with no stored Expert
-   (1: embeddings and dense layers; 282: head; the MTP-only ones) release through a
-   `--verify --backbone` run that names no complete layer: it skips the records and lists them
-   once their parts verify (tested on shard 1). The run reads the store header, so do them after
-   the first range has created the store. No release frees space by itself (a part is as big as
-   the Backbone it copies); the flow only keeps the footprint flat.
-   **Floor:** the pool ends where the download left it (~8 GiB free; the steady state equals the download, see
-   the plan's Phase 2), so the default `--min-free-gib 8` refuses even one layer (4.8 GiB). Run
-   with 3 and keep ranges to 1–2 layers: each range's verify-and-delete returns what it wrote, so
-   the floor holds throughout.
-   **Never** convert everything first.
+   It walks the shards in **file order**. At each shard, the window is every shard still on disk
+   up to it (1–2 in practice). For the window it extracts Backbone parts (a part that does not
+   verify is rewritten), converts every Expert whose six tensors are now all on disk unless the
+   store already holds it, verifies every stored tensor and part, and deletes what the verify
+   lists. Each step is idempotent, so there is no state file. The tools see the shards
+   read-only; `flock` keeps it to one run; any store mismatch, a part failing right after
+   extraction, or a tool error stops it with `ABORT:`.
+   **Release is per tensor.** 68 shards hold two layers' Experts and 181 Experts span two
+   shards. A stored tensor is proven against its slice of its decoded record
+   (`decode_record`). An unwritten (all-zero) record holds nothing and keeps its shard
+   (`not converted yet`); a written record that differs is a mismatch.
+   **Why file order:** kitaniai's shards follow the *string* order of layer numbers (…, 19, 2,
+   20, …, 29, 3, 30, …). A numeric layer order would keep shards waiting for distant layers;
+   simulated from the headers, that peaks at 8.9 GiB of duplicated bytes, more than the pool has.
+   **Floor:** `FLOOR=2`. The steady state is the download plus ~0.5 GiB of record overhead.
+   **Never** re-run `hf download` into `kitaniai/` once shards are gone: it would fetch them again.
 3. **Backbone receipts:** the parts are byte copies of the pristine source (each part's metadata
    names its `source_file`), so Backbone A needs no `DERIVATIVE.json`. That pattern is for
    Backbone B, whose tensors differ from kitaniai's on purpose. After the last range, keep

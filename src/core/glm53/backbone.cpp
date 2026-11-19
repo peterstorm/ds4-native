@@ -29,7 +29,7 @@ std::string_view dtype_name(safetensors::Dtype d) {
 
 }  // namespace
 
-bool is_backbone(std::string_view tensor_name) { return !stored_expert_layer(tensor_name).has_value(); }
+bool is_backbone(std::string_view tensor_name) { return !stored_expert_tensor(tensor_name).has_value(); }
 
 std::string part_name(std::string_view source_file) {
   constexpr std::string_view model = "model-";
