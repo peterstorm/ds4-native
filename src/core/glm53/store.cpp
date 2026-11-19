@@ -116,13 +116,15 @@ std::optional<uint32_t> stored_expert_layer(std::string_view name) {
 }
 
 std::set<uint32_t> deletable_shards(const std::map<std::string, ShardedTensor>& index,
-                                    std::span<const uint32_t> converted) {
+                                    std::span<const uint32_t> converted, std::span<const uint32_t> extracted) {
   const std::set<uint32_t> done(converted.begin(), converted.end());
+  const std::set<uint32_t> parts(extracted.begin(), extracted.end());
   std::set<uint32_t> seen, keep;
   for (const auto& [name, st] : index) {
     seen.insert(st.shard);
     const auto layer = stored_expert_layer(name);
-    if (!layer || !done.contains(*layer)) keep.insert(st.shard);
+    const bool saved = layer ? done.contains(*layer) : parts.contains(st.shard);
+    if (!saved) keep.insert(st.shard);
   }
   std::set<uint32_t> out;
   std::set_difference(seen.begin(), seen.end(), keep.begin(), keep.end(), std::inserter(out, out.end()));

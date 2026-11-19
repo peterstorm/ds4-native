@@ -24,7 +24,8 @@ CyberGym verdict decides keep/archive.
 |---|---|---|
 | Plan (5 phases, revised: no probe, no NVMe purchase) | `ds4-native` main `baaf747`, `docs/plans/2026-11-19-glm53-native.md` | committed + pushed; **Phase 2 corrected and Phase 3 progress on `glm53/engine-core`** |
 | Expert store format + converter + tests | branch `glm53/store-convert` @ `44e0eeb` (pushed); moved to `src/core/glm53/store.*` on `glm53/engine-core` | smoke-proven on real kitaniai bytes |
-| **Semantics oracle (Phase 3 step 1)** | branch `glm53/engine-core` (worktree `~/dev/ds4-native-glm53-engine`, stacked on store-convert + main): `src/core/glm53/{config,reference}`, `ref/glm-5.3/` (pinned transformers 5.16.0 + released config.json), `tools/glm53-golden/{make_golden.py,mutation-probe.sh}`, `tests/data/glm53-golden.safetensors` | golden matches the reference's causal prefill at 1.6e-6 relative, every Selection identical; mutation probe 10/10 killed; **225/225 tests green** |
+| **Semantics oracle (Phase 3 step 1)** | branch `glm53/engine-core` (worktree `~/dev/ds4-native-glm53-engine`, stacked on store-convert + main): `src/core/glm53/{config,reference}`, `ref/glm-5.3/` (pinned transformers 5.16.0 + released config.json), `tools/glm53-golden/{make_golden.py,mutation-probe.sh}`, `tests/data/glm53-golden.safetensors` | golden matches the reference's causal prefill at 1.6e-6 relative, every Selection identical; mutation probe 10/10 killed; 225 tests green at the time |
+| **Backbone extractor + joint release** | same branch: `core/glm53/backbone`, `io/glm53_backbone` (own lib `ds4n_glm53_io`), `ds4n-glm53-backbone-extract`, `store-build --verify --backbone` | per-shard Backbone parts, atomic + verified. Real shards 2–5: 24 tensors bit-identical per the official safetensors reader, mixed shard 2 released, one flipped byte keeps its shard. 230 core + 3 I/O tests; 4/4 mutants killed |
 | **Converter safety fix** | same branch, `24b9a6a` | the deletable list could have listed MTP and unconverted shards; now it lists only verified, fully consumed shards and has a free-space preflight. Checked on real layer 10 (RAM tmpfs) |
 | Indexer reference pinning (old step 5) | `ref/glm-5.3/README.md` | **decided: transformers 5.16.0** |
 | Desktop space for the download | /models/voice deleted (operator-approved; TTS weights, re-downloadable), 82 exited containers + `ds4-native-dev:1` removed | `space-guard.sh` armed (pauses the fetch below 6 GiB free) |
@@ -45,23 +46,36 @@ It kills the fetch, which is resumable, if rpool free drops under 6 GiB, and log
 1. **Confirm download complete**: `grep "hf exit=" /models/glm53-native/download.log`, and check
    `space-guard.log` is empty. If not complete and no `hf download` is running, rerun the fetch
    script (it resumes).
-2. **Expert-only shards first** (fits now). Build `glm53/engine-core` on the desktop (see the
-   environment notes). Then, layer range by layer range, in layer order:
+2. **Consume kitaniai range by range, in layer order** (every tool exists now). Build
+   `glm53/engine-core` on the desktop (environment notes), then for each range:
    ```bash
-   # shards for the range: jq over model.safetensors.index.json (every shard holding those layers' Experts)
-   ./build/ds4n-glm53-store-build --out /models/glm53-native/experts.ds4n --layers A-B --threads 16 SHARDS...
-   ./build/ds4n-glm53-store-build --out /models/glm53-native/experts.ds4n --layers A-B --threads 16 --verify SHARDS...
-   # delete exactly the "deletable shards" line (expert-only, verified); receipt it
+   K=/models/glm53-native/kitaniai; BB=/models/glm53-native/backbone-uncensored; ST=/models/glm53-native/experts.ds4n
+   SHARDS=...   # every shard holding any tensor of layers A-B: select by layer in $K/model.safetensors.index.json
+   ./build/ds4n-glm53-backbone-extract --out $BB --min-free-gib 3 $SHARDS        # Backbone parts (mixed shards only)
+   ./build/ds4n-glm53-store-build --out $ST --layers A-B --threads 16 --min-free-gib 3 $SHARDS
+   ./build/ds4n-glm53-backbone-extract --out $BB --verify $SHARDS
+   ./build/ds4n-glm53-store-build --out $ST --layers A-B --threads 16 --verify --backbone $BB $SHARDS | tee -a /models/glm53-native/consume-receipts.log
+   # delete exactly the shards on the "deletable shards" line, nothing else
    ```
-   The preflight refuses a range that would leave under 8 GiB free; take smaller ranges. **Do
-   not** convert everything first. 85 of 282 shards interleave backbone tensors, and doing it in
-   that order ends ~90 GiB short (plan, Phase 2 correction).
-3. **Build the backbone extractor** (Phase 2 tool, missing). Per mixed shard, copy its non-Expert
-   tensors (attention, DSA indexer, router + bias, shared experts, dense layers 0–2,
-   embeddings, head, norms, the layer-78 MTP block *including its 256 Experts*) into
-   `/models/glm53-native/backbone-uncensored/part-NNNNN.safetensors`, byte for byte and verified.
-   Then the shard's Experts are converted and verified, and the shard is deleted. Reuse the
-   `tools/hf-backbone` DERIVATIVE.json pattern naming kitaniai rev `12170112`.
+   A shard is listed only when this verify run proved both its Experts' records and its
+   Backbone part. A shard holding Experts of a layer outside A–B stays until a later range
+   covers it, so ranges overlap by a shard. **Shard numbers do not follow layer order** (279–281
+   hold layer 9, 270–274 the MTP block), so always select by layer. Shards with no stored Expert
+   (1: embeddings and dense layers; 282: head; the MTP-only ones) release through a
+   `--verify --backbone` run that names no complete layer: it skips the records and lists them
+   once their parts verify (tested on shard 1). The run reads the store header, so do them after
+   the first range has created the store. No release frees space by itself (a part is as big as
+   the Backbone it copies); the flow only keeps the footprint flat.
+   **Floor:** the pool ends where the download left it (~8 GiB free; the steady state equals the download, see
+   the plan's Phase 2), so the default `--min-free-gib 8` refuses even one layer (4.8 GiB). Run
+   with 3 and keep ranges to 1–2 layers: each range's verify-and-delete returns what it wrote, so
+   the floor holds throughout.
+   **Never** convert everything first.
+3. **Backbone receipts:** the parts are byte copies of the pristine source (each part's metadata
+   names its `source_file`), so Backbone A needs no `DERIVATIVE.json`. That pattern is for
+   Backbone B, whose tensors differ from kitaniai's on purpose. After the last range, keep
+   `consume-receipts.log`, kitaniai's `conversion.json` and `artifact_manifest.json`, and the
+   index next to the store.
 4. **Real-weights Semantics oracle run** (Phase 3 step 2, CPU): a shell `TensorLookup` over the
    backbone parts (FP8/BF16 → FP32) plus an Expert source dequantizing store records, then a few
    tokens of a real prompt through `glm53::decode_token`. It produces the first real-weights
@@ -69,7 +83,7 @@ It kills the fetch, which is resumable, if rpool free drops under 6 GiB, and log
 5. **Reference configuration decision**: activation precision into MXFP4 linears (the checkpoint
    declares W4A4 MXFP4 inputs; DS4.1's kernels use E4M3), measured as KL against the Semantics
    oracle. Then the bit-exact oracle, then kernels (first GPU window).
-6. **Backbone B (cyber)**: does not fit on rpool next to store + Backbone A (~13 GiB short). It
+6. **Backbone B (cyber)**: does not fit on rpool next to store + Backbone A (est. 20–30 GiB short). It
    needs a space decision first.
 7. Phases 4–5 per the plan (fifth switch-primary entry `glm-native`, slots ladder, CyberGym).
 

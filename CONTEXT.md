@@ -179,6 +179,10 @@ A Full layer runs its own indexer and makes the token's Selection. A Shared laye
 One position's MLA cache entry on one GLM layer: its KV latent (512 values, the `kv_a_layernorm` output) and its rotated shared RoPE key (64), plus its index key (128) on Full layers. Attention reads the latent through each head's slice of `kv_b_proj` (the absorbed form) and never expands it to per-head keys and values.
 _Avoid_: compressed row (DS4.1's compressor), KV head
 
+**Backbone part**:
+The GLM-5.3 Backbone tensors of one kitaniai source shard, copied byte for byte into their own safetensors file (`backbone-NNNNN-of-00282.safetensors`, `core/glm53/backbone`). GLM's Backbone is exactly what its Expert store does not hold (`is_backbone`), which includes the MTP block's own Experts. One part per shard lets a shard leave the disk as soon as both of its halves are verified: its Experts' records, and its part.
+_Avoid_: backbone shard (a shard is a source file), slice
+
 **Semantics oracle**:
 GLM-5.3's FP32 CPU oracle (`core/glm53/reference`). It agrees with the pinned reference to FP32 noise, checked by golden activations (`tests/data/glm53-golden.safetensors`). It is not a Reference configuration: the quantized GPU executor gets its own bit-exact oracle built on top of it, as DS4.1's did.
 
@@ -195,6 +199,7 @@ GLM-5.3's FP32 CPU oracle (`core/glm53/reference`). It agrees with the pinned re
 - Every busy **Lane** has a row in every **Shared Round**; a **Prompt sweep** holds the GPUs alone, the other **Lanes** pausing
 - **Cache-conditional routing** makes outputs depend on **Expert cache** contents; with λ = 0 every policy is **Exact**
 - On GLM-5.3 every **Shared layer** attends the **Selection** of the nearest **Full layer** below it; only **Full layers**' **Latent rows** carry index keys
+- Every tensor of a GLM-5.3 source shard goes to exactly one of an **Expert record** and its shard's **Backbone part**; the shard may be deleted only when every one of them is verified there
 
 ## Example Dialogue
 

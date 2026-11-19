@@ -130,13 +130,16 @@ Result<std::vector<std::byte>, LayoutError> build_record(const Sextuplet& s);
 std::optional<uint32_t> stored_expert_layer(std::string_view tensor_name);
 
 /**
- * Shards that hold nothing the store does not now have: every tensor in them
- * is a stored-Expert tensor of a layer in `converted`. A shard with any other
- * tensor (backbone, MTP, an unconverted layer's Experts) is kept. Only
- * meaningful once those layers are written and verified.
+ * Shards whose every tensor is now saved elsewhere, so the shard may leave the
+ * disk: each stored-Expert tensor belongs to a layer in `converted` (records
+ * written and verified), and each other tensor — the Backbone, MTP included
+ * (core/glm53/backbone) — sits in a shard listed in `extracted` (its Backbone
+ * part verified). A shard with any tensor of an unconverted layer, or Backbone
+ * tensors without a verified part, is kept. Both lists must come from verify
+ * runs; this function trusts them.
  */
 std::set<uint32_t> deletable_shards(const std::map<std::string, ShardedTensor>& index,
-                                    std::span<const uint32_t> converted);
+                                    std::span<const uint32_t> converted, std::span<const uint32_t> extracted);
 
 /** Store file header (first kHeaderBytes of the file). */
 struct StoreHeader {

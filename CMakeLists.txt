@@ -20,6 +20,7 @@ add_library(ds4n_core STATIC
   src/core/moe_reference.cpp
   src/core/safetensors.cpp
   src/core/glm53/store.cpp
+  src/core/glm53/backbone.cpp
   src/core/glm53/config.cpp
   src/core/glm53/reference.cpp
   src/core/indexer.cpp
@@ -59,8 +60,14 @@ target_compile_options(ds4n_engine PRIVATE -Wall -Wextra -Wpedantic -Werror)
 
 add_executable(ds4n-store-build src/tools/store_build.cpp)
 target_link_libraries(ds4n-store-build PRIVATE ds4n_io)
+# GLM-5.3 shell: Backbone part files. Its own library, so ds4n_io (linked by the DS4.1 engine) is unchanged.
+add_library(ds4n_glm53_io STATIC src/io/glm53_backbone.cpp)
+target_link_libraries(ds4n_glm53_io PUBLIC ds4n_io)
+target_compile_options(ds4n_glm53_io PRIVATE -Wall -Wextra -Wpedantic -Werror)
 add_executable(ds4n-glm53-store-build src/tools/glm53_store_build.cpp)
-target_link_libraries(ds4n-glm53-store-build PRIVATE ds4n_io)
+target_link_libraries(ds4n-glm53-store-build PRIVATE ds4n_glm53_io)
+add_executable(ds4n-glm53-backbone-extract src/tools/glm53_backbone_extract.cpp)
+target_link_libraries(ds4n-glm53-backbone-extract PRIVATE ds4n_glm53_io)
 add_executable(ds4n-readbench src/tools/read_bench.cpp)
 target_link_libraries(ds4n-readbench PRIVATE ds4n_io)
 add_executable(ds4n-cache-study src/tools/cache_study.cpp)
@@ -147,6 +154,7 @@ add_executable(ds4n_tests
   tests/core/test_det_math.cpp
   tests/core/test_safetensors.cpp
   tests/core/glm53/test_store.cpp
+  tests/core/glm53/test_backbone.cpp
   tests/core/glm53/test_config.cpp
   tests/core/glm53/test_reference.cpp
   tests/core/test_indexer.cpp
@@ -173,3 +181,9 @@ target_compile_options(ds4n_tests PRIVATE -Wall -Wextra)
 # Tests that read checked-in reference files (ref/, tests/data/) find them from here.
 target_compile_definitions(ds4n_tests PRIVATE DS4N_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 add_test(NAME core COMMAND ds4n_tests)
+
+# I/O-boundary tests (temp files): the GLM-5.3 Backbone part writer and verifier.
+add_executable(ds4n_glm53_io_tests tests/main.cpp tests/io/test_glm53_backbone.cpp)
+target_link_libraries(ds4n_glm53_io_tests PRIVATE ds4n_glm53_io doctest::doctest)
+target_compile_options(ds4n_glm53_io_tests PRIVATE -Wall -Wextra)
+add_test(NAME glm53_io COMMAND ds4n_glm53_io_tests)

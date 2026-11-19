@@ -239,47 +239,68 @@ std::vector<std::string> join(std::vector<std::string> a, const std::vector<std:
 
 }  // namespace
 
-TEST_CASE("deletable_shards keeps every shard holding anything the store lacks") {
+TEST_CASE("deletable_shards keeps every shard holding anything not yet saved") {
   const auto index = shard_index({
       {0, join(sextuplet(10, 0), sextuplet(10, 1))},                            // layer 10 only
       {1, join(sextuplet(10, 2), sextuplet(11, 0))},                            // spans layers 10-11
-      {2, join(sextuplet(12, 0), {"model.layers.12.self_attn.o_proj.weight"})},  // mixed with backbone
+      {2, join(sextuplet(12, 0), {"model.layers.12.self_attn.o_proj.weight"})},  // mixed with Backbone
       {3, sextuplet(78, 0)},                                                    // the MTP block's Experts
-      {4, {"model.embed_tokens.weight"}},                                       // backbone only
+      {4, {"model.embed_tokens.weight"}},                                       // Backbone only
   });
   const std::vector<uint32_t> none, ten{10}, ten_eleven{10, 11}, all{10, 11, 12, 78};
-  CHECK(deletable_shards(index, none).empty());
-  CHECK(deletable_shards(index, ten) == std::set<uint32_t>{0});
-  CHECK(deletable_shards(index, ten_eleven) == std::set<uint32_t>{0, 1});
-  // Even with every layer named, backbone, mixed and MTP shards stay (78 is never stored).
-  CHECK(deletable_shards(index, all) == std::set<uint32_t>{0, 1});
+  CHECK(deletable_shards(index, none, none).empty());
+  CHECK(deletable_shards(index, ten, none) == std::set<uint32_t>{0});
+  CHECK(deletable_shards(index, ten_eleven, none) == std::set<uint32_t>{0, 1});
+  // Naming every layer saves no Backbone tensor: mixed, MTP and Backbone-only shards stay.
+  CHECK(deletable_shards(index, all, none) == std::set<uint32_t>{0, 1});
+  // A verified Backbone part releases a shard only together with its layers' records.
+  const std::vector<uint32_t> part2{2}, parts{2, 3, 4};
+  CHECK(deletable_shards(index, ten_eleven, part2) == std::set<uint32_t>{0, 1});
+  CHECK(deletable_shards(index, all, part2) == std::set<uint32_t>{0, 1, 2});
+  // The MTP block's Experts are Backbone (never stored), so its part releases it.
+  CHECK(deletable_shards(index, none, parts) == std::set<uint32_t>{3, 4});
+  CHECK(deletable_shards(index, all, parts) == std::set<uint32_t>{0, 1, 2, 3, 4});
+  // A part listed for an expert-only shard changes nothing: its Experts still need their records.
+  const std::vector<uint32_t> part0{0};
+  CHECK(deletable_shards(index, none, part0).empty());
 }
 
-TEST_CASE("deletable_shards only grows as more layers are converted") {
+TEST_CASE("deletable_shards is sound and only grows as more is saved") {
   std::mt19937 rng(17);
+  const std::vector<std::string> backbone_names = {"model.embed_tokens.weight", "model.layers.5.self_attn.o_proj.weight",
+                                                   "model.layers.40.mlp.gate.weight", "lm_head.weight"};
   for (int trial = 0; trial < 200; trial++) {
     std::map<std::string, ShardedTensor> index;
+    const auto put = [&](const std::string& n, uint32_t shard) {
+      index[n] = ShardedTensor{shard, safetensors::Tensor{safetensors::Dtype::U8, {1}, 0, 1}};
+    };
     for (uint32_t shard = 0; shard < 12; shard++) {
       const int pieces = std::uniform_int_distribution<int>(1, 3)(rng);
       for (int p = 0; p < pieces; p++) {
+        // Layers just outside 3..77 land in the Backbone (dense layer 2, the MTP block 78).
         const uint32_t layer = std::uniform_int_distribution<uint32_t>(kFirstMoeLayer - 1, kLastMoeLayer + 1)(rng);
         const uint32_t expert = std::uniform_int_distribution<uint32_t>(0, kExperts - 1)(rng);
-        for (const auto& n : sextuplet(layer, expert))
-          index[n] = ShardedTensor{shard, safetensors::Tensor{safetensors::Dtype::U8, {1}, 0, 1}};
+        for (const auto& n : sextuplet(layer, expert)) put(n, shard);
       }
+      if (std::uniform_int_distribution<int>(0, 2)(rng) == 0)
+        put(backbone_names[shard % backbone_names.size()] + "." + std::to_string(shard), shard);
     }
-    std::vector<uint32_t> converted;
+    std::vector<uint32_t> converted, extracted;
     std::set<uint32_t> before;
-    for (int step = 0; step < 20; step++) {
-      converted.push_back(std::uniform_int_distribution<uint32_t>(kFirstMoeLayer, kLastMoeLayer)(rng));
-      const auto now = deletable_shards(index, converted);
+    for (int step = 0; step < 30; step++) {
+      if (std::uniform_int_distribution<int>(0, 1)(rng))
+        converted.push_back(std::uniform_int_distribution<uint32_t>(kFirstMoeLayer, kLastMoeLayer)(rng));
+      else
+        extracted.push_back(std::uniform_int_distribution<uint32_t>(0, 11)(rng));
+      const auto now = deletable_shards(index, converted, extracted);
       CHECK(std::includes(now.begin(), now.end(), before.begin(), before.end()));
-      // And nothing deletable holds a tensor of a layer that was not converted.
+      // Sound: every tensor of a deletable shard is in a verified record or a verified part.
       for (const auto& [name, st] : index)
         if (now.contains(st.shard)) {
-          const auto layer = stored_expert_layer(name);
-          REQUIRE(layer.has_value());
-          CHECK(std::find(converted.begin(), converted.end(), *layer) != converted.end());
+          if (const auto layer = stored_expert_layer(name))
+            CHECK(std::find(converted.begin(), converted.end(), *layer) != converted.end());
+          else
+            CHECK(std::find(extracted.begin(), extracted.end(), st.shard) != extracted.end());
         }
       before = now;
     }
