@@ -103,6 +103,29 @@ down once, and GLM reuses those definitions wherever its operations have the sam
   E4M3's energy summed without 76–77. Whether folding costs KL is therefore still open: the
   decisive measurement is KL itself, an `exact` stream with the weight after down next to
   the Reference one.
+
+  **KL measured 2026-11-19** (`--activations fp32,exact,exact-weight-after-down,exact-fp32-exchange
+  --gpu 0`, the step-3 prompts; receipts `docs/bench/glm53-oracle/2026-11-19-departures.*`,
+  1,713 s; paired statistics by `tools/glm53-golden/kl_paired.py`, in `…departures.paired.txt`;
+  full findings report `docs/bench/glm53-oracle/2026-11-19-gpu-moe-report.md`).
+  The exact streams ran on the GPU (`cuda/glm53/grouped_moe`); the `exact` stream matches the
+  CPU-only receipt at every one of the 315 positions.
+
+  | Experts | KL mean | vs `exact` | 95% CI (positions) | lower / higher at | per prompt |
+  |---|---|---|---|---|---|
+  | E4M3 in the Semantics oracle | 0.0051 | −44% | [−0.0068, −0.0020] | 181 / 134 | lower on all 5 |
+  | `exact` (this document) | 0.0091 | | | | |
+  | weight after down | 0.0086 | −5% | [−0.0032, +0.0020] | 157 / 158 | mixed |
+  | FP32 Exchange | 0.0063 | −31% | [−0.0056, −0.0003] | 176 / 139 | lower on 3, level on 2 |
+
+  **The folded weight costs no KL: it stays.** The proxy's 1.86× was the last layers' massive
+  values, which do not move the logits. **The BF16 Exchange may cost KL**, against the proxy:
+  its interval only just excludes zero, and positions within a prompt are correlated, so the
+  true interval is wider. Every stream re-rolls about half the Routes (11–12K of 23,625), and
+  the weight-after-down stream shows what that alone does to a mean (±0.003 nats). Read that
+  way, this set cannot tell 0.0028 from noise. A larger prompt set decides it. FP32 costs
+  12 KB more per token per Sparse layer over PCIe. Until that run, the Exchange stays BF16
+  (DS4.1's).
 - **Router plane count** if a wider router GEMV wins (DS4.1's runs at 13 µs, "too narrow"): any
   change is a Reference configuration change and must keep the order written here.
 
@@ -152,12 +175,26 @@ as written.
 
   The FP32 and E4M3 streams reproduce step 3's receipts line for line. `exact_moe` costs more
   than E4M3 alone on every prompt (1.3–2.6×); 3 of 315 positions exceed 0.1 nats. That is a
-  extra noise on every prompt, not one bad site. The rounding proxy ("Open") rules out the BF16
-  roundings and the BF16 Exchange. The remaining suspects are the folded weight, at the last
-  layers' massive values, and the router. Perplexity stays below FP32's (3.849) and within the
+  extra noise on every prompt, not one bad site. The rounding proxy and the KL run
+  ("Open") rule out the BF16 roundings and the folded weight. The BF16 Exchange is the one
+  candidate left, and it is unconfirmed. Perplexity stays below FP32's (3.849) and within the
   prompts' own spread, so the whole-model gate's expectation is **≈ 0.009 nats**, not 0.005.
-- The GPU MoE against `exact_moe`: 100% bit-identical on real Experts at 1, 4 and 8 tokens, as
-  `ds4n-moe-check` gates DS4.1 (first GPU window).
+- The GPU MoE against `exact_moe` (`ds4n-glm53-moe-check`, as `ds4n-moe-check` gates DS4.1):
+  **100% bit-identical on real Experts**, measured 2026-11-19 on layers 3, 40, 75 and 77. The
+  check covers:
+  - the SwiGLU element function on 2^24 random inputs;
+  - Rounds of 1, 5 and 8 tokens: router logits, Routes, the Plan (`core/glm53/moe_plan`, up
+    to 64 jobs), every hidden fragment, both per-GPU partials and the exchanged output;
+  - prompt sweeps of up to 300 tokens through the Grouped MoE (`cuda/glm53/grouped_moe`)
+    under the Reference configuration, weight-after-down and FP32 Exchange, each against
+    its `moe_roundings` oracle.
+
+  The kernels are DS4.1's GEMVs and grouped kernels, unchanged. GLM's router, SwiGLU (no clamp)
+  and combine are in `cuda/glm53/moe`. Rates: one GPU's 8-token Round at 173 µs (layer 3, 22
+  Halves) to 342 µs (layer 77, 50 Halves), 1.3–1.5 TB/s; a 1-token Round in 51 µs. The mutation
+  probe (`tools/glm53-golden/gpu-moe-mutation-probe.sh`) kills all 13 mutants. A Round alone
+  missed a fast-math exp and a reassociated product: E4M3 hides a 1-ulp FP32 difference in all
+  but about one value in 2^20. The element check is there for that.
 - Whole-model: the exact decode's KL against the Semantics oracle on the step-3 prompt set,
   expected near the MoE's own measurement above (0.009 nats) plus whatever the attention
   side's roundings add.

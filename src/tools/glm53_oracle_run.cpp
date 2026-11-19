@@ -1,10 +1,11 @@
 // ds4n-glm53-oracle-run: the GLM-5.3 Semantics oracle (core/glm53/reference)
-// on the real weights, CPU only: the engine's semantics on real prompts, and
-// what each candidate arithmetic for the Experts loses against it.
+// on the real weights: the engine's semantics on real prompts, and what each
+// candidate arithmetic for the Experts loses against it.
 //
 //   ds4n-glm53-oracle-run --config ref/glm-5.3/config.json --backbone DIR --store FILE
-//                         --prompt ID,ID,... [--prompt ID,...]... [--activations fp32,bf16,e4m3,mxfp4,exact]
+//                         --prompt ID,ID,... [--prompt ID,...]... [--activations fp32,bf16,e4m3,mxfp4,exact,...]
 //                         [--generate N] [--threads T] [--resident E] [--report FILE] [--moe-roundings FILE]
+//                         [--gpu N]
 //
 // Each prompt runs once per arithmetic listed — a stream, with its own caches
 // and residual stream — teacher-forced on the prompt's tokens. fp32, bf16,
@@ -12,9 +13,17 @@
 // that precision; `exact` is the Reference configuration's MoE
 // (core/glm53/exact_moe: its router, the Experts' MXFP4 codes on E4M3
 // activations with its roundings and orders, the BF16 exchange) on every
-// Sparse layer, the rest of the model still the Semantics oracle. The first
-// listed (default fp32: the oracle itself) is the baseline every other is
-// compared against.
+// Sparse layer, the rest of the model still the Semantics oracle;
+// `exact-DEPARTURE` is exact_moe with one core/glm53/moe_roundings Departure
+// (exact-weight-after-down, exact-fp32-gate-up-hidden, exact-fp32-exchange).
+// The first listed (default fp32: the oracle itself) is the baseline every
+// other is compared against.
+//
+// Everything runs on the CPU, except with --gpu N (a CUDA build): the exact
+// streams whose Departure the GPU runs (all but fp32-gate-up-hidden) have their
+// Experts run on GPU N as a Grouped MoE (cuda/glm53/grouped_moe), all of a
+// layer's tokens at once, bit for bit what the CPU computes
+// (ds4n-glm53-moe-check gates it).
 //
 // The model does not fit in RAM as FP32 (~66 GB of Backbone, ~1.4 TB of routed
 // Experts), so a run goes a layer at a time over all streams together: bind
@@ -72,6 +81,10 @@
 #include "core/glm53/reference.hpp"
 #include "io/glm53_store.hpp"
 #include "io/glm53_weights.hpp"
+#ifdef DS4N_GLM53_GPU
+#include "core/glm53/expert_tiles.hpp"
+#include "cuda/glm53/grouped_moe.hpp"
+#endif
 
 using namespace ds4n;
 using glm53::ActivationPrecision;
@@ -79,8 +92,12 @@ namespace exact = glm53::exact;
 
 namespace {
 
-/** The Reference configuration's MoE on the Sparse layers (core/glm53/exact_moe). */
+/**
+ * The Reference configuration's MoE on the Sparse layers (core/glm53/exact_moe),
+ * or exact_moe with one core/glm53/moe_roundings Departure.
+ */
 struct ExactMoe {
+  exact::Departure departure = exact::Departure::None;
   friend auto operator<=>(ExactMoe, ExactMoe) = default;
 };
 
@@ -89,16 +106,30 @@ using Arithmetic = std::variant<ActivationPrecision, ExactMoe>;
 
 std::string name_of(const Arithmetic& a) {
   if (const auto* p = std::get_if<ActivationPrecision>(&a)) return std::string(glm53::name_of(*p));
-  return "exact";
+  const auto d = std::get<ExactMoe>(a).departure;
+  return d == exact::Departure::None ? "exact" : "exact-" + std::string(exact::name_of(d));
 }
 
 std::optional<Arithmetic> parse_arithmetic(const std::string& name) {
-  if (name == "exact") return Arithmetic{ExactMoe{}};
+  for (const auto d : exact::kDepartures)
+    if (name == name_of(Arithmetic{ExactMoe{d}})) return Arithmetic{ExactMoe{d}};
   if (const auto p = glm53::parse_activation_precision(name)) return Arithmetic{*p};
   return std::nullopt;
 }
 
 bool is_exact(const Arithmetic& a) { return std::holds_alternative<ExactMoe>(a); }
+
+exact::Departure departure_of(const Arithmetic& a) { return std::get<ExactMoe>(a).departure; }
+
+#ifdef DS4N_GLM53_GPU
+using GpuMoe = cuda::glm53::GroupedMoe;
+constexpr bool kGpuBuild = true;
+bool gpu_runs(exact::Departure d) { return cuda::glm53::runs_on_gpu(d); }
+#else
+struct GpuMoe {};  // a build without CUDA has no GPU path: parse_args refuses --gpu
+constexpr bool kGpuBuild = false;
+bool gpu_runs(exact::Departure) { return false; }
+#endif
 
 struct Args {
   std::string config, backbone, store, report;
@@ -108,6 +139,7 @@ struct Args {
   int generate = 0;
   unsigned threads = 8;
   size_t resident = 64;
+  int gpu = -1;  // the GPU the exact streams' Experts run on, or -1: none
 };
 
 std::vector<std::string> split(const std::string& v) {
@@ -128,6 +160,7 @@ bool parse_args(int argc, char** argv, Args& a) {
     else if (s == "--generate") a.generate = std::stoi(v);
     else if (s == "--threads") a.threads = static_cast<unsigned>(std::stoul(v));
     else if (s == "--resident") a.resident = std::stoul(v);
+    else if (s == "--gpu") a.gpu = std::stoi(v);
     else if (s == "--prompt") {
       std::vector<int32_t> prompt;
       for (const auto& id : split(v)) prompt.push_back(static_cast<int32_t>(std::stol(id)));
@@ -143,7 +176,7 @@ bool parse_args(int argc, char** argv, Args& a) {
   }
   if (a.arithmetics.empty()) a.arithmetics.push_back(ActivationPrecision::Fp32);
   return argc % 2 == 1 && !a.config.empty() && !a.backbone.empty() && !a.store.empty() && !a.prompts.empty() &&
-         a.generate >= 0 && a.threads > 0 && a.resident >= 8 &&
+         a.generate >= 0 && a.threads > 0 && a.resident >= 8 && a.gpu >= -1 && (a.gpu == -1 || kGpuBuild) &&
          (a.moe_roundings.empty() || a.arithmetics.front() == Arithmetic{ActivationPrecision::Fp32});
 }
 
@@ -247,14 +280,18 @@ double squared_norm(std::span<const float> a) {
  * Feeds tokens[s] to stream s, at the positions after what its caches hold,
  * through every layer; returns each new token's residual stream after the last
  * layer, per stream. With --moe-roundings, appends one RoundingRow per Sparse
- * layer to `roundings`.
+ * layer to `roundings`. With `gpu_moe` (--gpu), an exact stream whose Departure
+ * the GPU runs has its Experts run there, all of a layer's tokens at once.
  */
 std::vector<std::vector<std::vector<float>>> run_round(const Model& m, const Args& args, std::vector<Stream>& streams,
                                                        const std::vector<std::vector<int32_t>>& tokens,
-                                                       std::vector<RoundingRow>& roundings) {
+                                                       std::vector<RoundingRow>& roundings, GpuMoe* gpu_moe) {
   const auto& config = m.config;
   const glm53::Dims& d = config.dims();
   const size_t S = streams.size();
+  auto on_gpu = [&](const Stream& st) {
+    return gpu_moe != nullptr && is_exact(st.arithmetic) && gpu_runs(departure_of(st.arithmetic));
+  };
   std::vector<std::vector<std::vector<float>>> x(S);
   std::vector<std::vector<std::vector<int32_t>>> selection(S);
   for (size_t s = 0; s < S; s++) {
@@ -356,8 +393,8 @@ std::vector<std::vector<std::vector<float>>> run_round(const Model& m, const Arg
       for (auto& [d, halves] : study_halves) halves[s].resize(starts[s].size());
       for (size_t i = 0; i < starts[s].size(); i++) {
         const auto& experts = route_of(s, i).expert;
-        if (is_exact(streams[s].arithmetic)) routed_halves[s][i].resize(experts.size());
-        else routed[s][i].resize(experts.size());
+        if (!is_exact(streams[s].arithmetic)) routed[s][i].resize(experts.size());
+        else if (!on_gpu(streams[s])) routed_halves[s][i].resize(experts.size());
         if (study_starts[s][i]) {
           study_e4m3[s][i].resize(experts.size());
           for (auto& [d, halves] : study_halves) halves[s][i].resize(experts.size());
@@ -367,25 +404,46 @@ std::vector<std::vector<std::vector<float>>> run_round(const Model& m, const Arg
     }
     std::vector<int32_t> ids;
     for (const auto& [id, u] : uses) ids.push_back(id);
+#ifdef DS4N_GLM53_GPU
+    std::map<int32_t, exact::ExpertTiles> layer_tiles;  // the GPU streams' Experts, kept for the layer's sweeps
+#endif
     for (size_t first = 0; first < ids.size(); first += args.resident) {
       const std::vector<int32_t> chunk(ids.begin() + static_cast<std::ptrdiff_t>(first),
                                        ids.begin() + static_cast<std::ptrdiff_t>(std::min(first + args.resident, ids.size())));
       std::vector<LoadedExpert> loaded(chunk.size());
+#ifdef DS4N_GLM53_GPU
+      std::vector<std::optional<exact::ExpertTiles>> chunk_tiles(chunk.size());
+#endif
       if (auto e = parallel_for(chunk.size(), args.threads, [&](size_t k) -> std::optional<std::string> {
             auto t = m.store.read_tensors({static_cast<uint32_t>(L), static_cast<uint32_t>(chunk[k])});
             if (!t) return t.error().what;
             const auto& us = uses.at(chunk[k]);
             auto exact_use = [&](const Use& u) { return is_exact(streams[u.stream].arithmetic); };
-            auto needs_codes = [&](const Use& u) { return exact_use(u) || study_starts[u.stream][u.token].has_value(); };
+            auto gpu_use = [&](const Use& u) { return on_gpu(streams[u.stream]); };
+            auto needs_codes = [&](const Use& u) {
+              return (exact_use(u) && !gpu_use(u)) || study_starts[u.stream][u.token].has_value();
+            };
             if (!std::ranges::all_of(us, exact_use)) loaded[k].values = glm53::dequantize_expert(t.value());
-            if (std::ranges::any_of(us, needs_codes)) {
+            const bool tiled = std::ranges::any_of(us, gpu_use);
+            if (tiled || std::ranges::any_of(us, needs_codes)) {
               auto codes = exact::fp4_expert(t.value());
               if (!codes) return where + codes.error().what;
-              loaded[k].codes = std::move(codes).value();
+#ifdef DS4N_GLM53_GPU
+              if (tiled) {
+                auto tiles = exact::expert_tiles(codes.value());
+                if (!tiles) return where + tiles.error().what;
+                chunk_tiles[k] = std::move(tiles).value();
+              }
+#endif
+              if (std::ranges::any_of(us, needs_codes)) loaded[k].codes = std::move(codes).value();
             }
             return std::nullopt;
           }))
         die(*e);
+#ifdef DS4N_GLM53_GPU
+      for (size_t k = 0; k < chunk.size(); k++)
+        if (chunk_tiles[k]) layer_tiles.emplace(chunk[k], std::move(*chunk_tiles[k]));
+#endif
 
       struct Job {
         size_t expert;  // index into chunk
@@ -395,7 +453,8 @@ std::vector<std::vector<std::vector<float>>> run_round(const Model& m, const Arg
       std::vector<Job> jobs;
       for (size_t k = 0; k < chunk.size(); k++) {
         std::map<Arithmetic, std::vector<Use>> by_arithmetic;
-        for (const Use& u : uses.at(chunk[k])) by_arithmetic[streams[u.stream].arithmetic].push_back(u);
+        for (const Use& u : uses.at(chunk[k]))
+          if (!on_gpu(streams[u.stream])) by_arithmetic[streams[u.stream].arithmetic].push_back(u);
         for (auto& [a, us] : by_arithmetic)
           for (size_t j = 0; j < us.size(); j += kTokensPerJob)
             jobs.push_back(Job{k, a, std::vector<Use>(us.begin() + static_cast<std::ptrdiff_t>(j),
@@ -406,7 +465,8 @@ std::vector<std::vector<std::vector<float>>> run_round(const Model& m, const Arg
             if (is_exact(job.arithmetic)) {
               for (const Use& u : job.uses) {
                 const exact::MoeStart& t = *exact_tokens[u.stream][u.token];
-                auto halves = exact::expert_halves(*loaded[job.expert].codes, t.input, t.route.weight[u.slot]);
+                auto halves = exact::departed_halves(departure_of(job.arithmetic), *loaded[job.expert].codes, t.input,
+                                                     t.route.weight[u.slot]);
                 if (!halves) return where + halves.error().what;
                 routed_halves[u.stream][u.token][u.slot] = std::move(halves).value();
               }
@@ -440,6 +500,33 @@ std::vector<std::vector<std::vector<float>>> run_round(const Model& m, const Arg
           }))
         die(*e);
     }
+
+    // The GPU streams: one Grouped MoE per Departure over all of its tokens of the layer.
+    std::vector<std::vector<std::optional<std::vector<float>>>> gpu_out(S);  // the MoE output of a GPU token
+    for (size_t s = 0; s < S; s++) gpu_out[s].resize(starts[s].size());
+    double gpu_s = 0.0;
+#ifdef DS4N_GLM53_GPU
+    std::map<exact::Departure, std::vector<std::pair<size_t, size_t>>> gpu_tokens;
+    for (size_t s = 0; s < S; s++)
+      for (size_t i = 0; i < starts[s].size(); i++)
+        if (exact_tokens[s][i] && on_gpu(streams[s])) gpu_tokens[departure_of(streams[s].arithmetic)].emplace_back(s, i);
+    if (!gpu_tokens.empty()) {
+      const auto tg = std::chrono::steady_clock::now();
+      const auto shared_tiles = exact::expert_tiles(*shared);
+      if (!shared_tiles) die(where + "shared expert: " + shared_tiles.error().what);
+      std::map<int32_t, const exact::ExpertTiles*> tile_of;
+      for (const auto& [id, t] : layer_tiles) tile_of.emplace(id, &t);
+      for (const auto& [dep, items] : gpu_tokens) {
+        std::vector<cuda::glm53::MoeToken> moe_tokens;
+        for (const auto& [s, i] : items) moe_tokens.push_back({starts[s][i].ffn_in, &exact_tokens[s][i]->route});
+        auto out = gpu_moe->run(dep, shared_tiles.value(), moe_tokens, tile_of);
+        if (!out) die(where + out.error().what);
+        for (size_t q = 0; q < items.size(); q++)
+          gpu_out[items[q].first][items[q].second] = std::move(out.value()[q].out);
+      }
+      gpu_s = seconds_since(tg);
+    }
+#endif
     const double experts_s = seconds_since(t2);
 
     // The rest of every token's layer: an exact token finishes its MoE
@@ -477,10 +564,15 @@ std::vector<std::vector<std::vector<float>>> run_round(const Model& m, const Arg
           auto step = [&]() -> Result<glm53::LayerStep, glm53::StepError> {
             if (!exact_tokens[s][i]) return glm53::finish_layer(config, bound.value(), std::move(starts[s][i]), routed[s][i]);
             exact::MoeStart& t = *exact_tokens[s][i];
-            auto out = exact::finish_moe(*exact_layer, t, routed_halves[s][i]);
-            if (!out) return Result<glm53::LayerStep, glm53::StepError>::err({out.error().what});
-            return glm53::finish_layer(config, std::move(starts[s][i]),
-                                       glm53::FeedForward{std::move(out).value().out, std::move(t.route)});
+            std::vector<float> out;
+            if (gpu_out[s][i]) {
+              out = std::move(*gpu_out[s][i]);
+            } else {
+              auto o = exact::departed_finish(departure_of(streams[s].arithmetic), *exact_layer, t, routed_halves[s][i]);
+              if (!o) return Result<glm53::LayerStep, glm53::StepError>::err({o.error().what});
+              out = std::move(o).value();
+            }
+            return glm53::finish_layer(config, std::move(starts[s][i]), glm53::FeedForward{std::move(out), std::move(t.route)});
           }();
           if (!step) return where + step.error().what;
           x[s][i] = std::move(step).value().out;
@@ -499,8 +591,9 @@ std::vector<std::vector<std::vector<float>>> run_round(const Model& m, const Arg
       roundings.push_back(row);
     }
     std::fprintf(stderr,
-                 "layer %2d: backbone %5.1f s, attention %6.1f s, %3zu Experts %6.1f s, feed-forward %6.1f s\n", L,
-                 load_s, attend_s, ids.size(), experts_s, seconds_since(t3));
+                 "layer %2d: backbone %5.1f s, attention %6.1f s, %3zu Experts %6.1f s (GPU %5.1f s), feed-forward "
+                 "%6.1f s\n",
+                 L, load_s, attend_s, ids.size(), experts_s, gpu_s, seconds_since(t3));
   }
   return x;
 }
@@ -574,8 +667,9 @@ int main(int argc, char** argv) {
   Args args;
   if (!parse_args(argc, argv, args))
     die("usage: --config FILE --backbone DIR --store FILE --prompt ID,ID,... [--prompt ...] "
-        "[--activations fp32,bf16,e4m3,mxfp4,exact (distinct; the first is the baseline)] [--generate N] [--threads T] "
-        "[--resident E>=8] [--report FILE] [--moe-roundings FILE (baseline fp32)]");
+        "[--activations fp32,bf16,e4m3,mxfp4,exact,exact-DEPARTURE (distinct; the first is the baseline)] "
+        "[--generate N] [--threads T] [--resident E>=8] [--report FILE] [--moe-roundings FILE (baseline fp32)] "
+        "[--gpu N (CUDA builds)]");
   const auto t0 = std::chrono::steady_clock::now();
 
   std::ifstream cf(args.config);
@@ -618,9 +712,24 @@ int main(int argc, char** argv) {
     }
   auto stream_of = [&](size_t p, size_t q) { return p * P + q; };
 
+  // The GPU path, when asked for and some exact stream's Departure runs there.
+  std::optional<GpuMoe> gpu_moe;
+#ifdef DS4N_GLM53_GPU
+  if (args.gpu >= 0) {
+    auto opened = GpuMoe::open(args.gpu);
+    if (!opened) die(opened.error().what);
+    gpu_moe.emplace(std::move(opened).value());
+    for (const auto& a : args.arithmetics)
+      if (is_exact(a))
+        std::fprintf(stderr, "%s: Experts on %s\n", name_of(a).c_str(),
+                     gpu_runs(departure_of(a)) ? ("GPU " + std::to_string(args.gpu)).c_str() : "the CPU");
+  }
+#endif
+  GpuMoe* const gpu_moe_ptr = gpu_moe ? &*gpu_moe : nullptr;
+
   // The prompts, teacher-forced.
   std::vector<RoundingRow> roundings;
-  const auto xs = run_round(m, args, streams, feed, roundings);
+  const auto xs = run_round(m, args, streams, feed, roundings, gpu_moe_ptr);
   std::vector<Comparison> cmp(P);
   std::vector<std::vector<double>> last(streams.size());
   std::vector<std::ostringstream> positions(streams.size());
@@ -685,7 +794,7 @@ int main(int argc, char** argv) {
       generated[s].push_back(next[s].front());
     }
     if (g + 1 == args.generate) break;
-    const auto x = run_round(m, args, streams, next, roundings);
+    const auto x = run_round(m, args, streams, next, roundings, gpu_moe_ptr);
     for (size_t s = 0; s < streams.size(); s++) last[s] = log_softmax(logits_of(m, args, x[s].front()));
   }
 

@@ -107,7 +107,7 @@ The last `kDecoderTail` (3,053 = 640 + 19 × 127) rows of a prompt read, the onl
 _Avoid_: YOCO skip, replay trim (DeepSeek's lossy 128-row form)
 
 **Grouped MoE**:
-A prompt sweep's MoE per layer: each routed Expert run once over all the Cohort's tokens it serves, in groups of 8 token columns, accumulated in the Round's combine order (`core/moe_groups`). An Expert's consecutive groups (an **Expert run**) share one GEMV job, each weight read feeding all of them; the accumulation runs per token, its columns in group order.
+A prompt sweep's MoE per layer: each routed Expert run once over all the Cohort's tokens it serves, in groups of 8 token columns, accumulated in the Round's combine order (`core/moe_groups`). An Expert's consecutive groups (an **Expert run**) share one GEMV job, each weight read feeding all of them; the accumulation runs per token, its columns in group order. GLM-5.3's is `cuda/glm53/grouped_moe` (`GroupedMoe`): its groups come from `core/glm53/moe_plan` `group_tokens`, the shared Expert's after the routed ones, and it runs the Reference configuration or a `moe_roundings` Departure (the oracle tool's `--gpu`).
 
 **Exchange**:
 The two GPUs' sum of a tensor-parallel FP32 partial (attention output, MoE output, Engram KV): both end with bf16(GPU 0's + GPU 1's), the same bits whichever way it travels. The kernel exchange pushes over P2P and spins on the peer's flags (decode, Engram KV); a prompt sweep's attention and MoE exchanges go by the copy engines on a link stream beside compute (`SweepLink`).

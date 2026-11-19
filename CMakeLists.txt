@@ -27,6 +27,8 @@ add_library(ds4n_core STATIC
   src/core/glm53/precision.cpp
   src/core/glm53/exact_moe.cpp
   src/core/glm53/moe_roundings.cpp
+  src/core/glm53/moe_plan.cpp
+  src/core/glm53/expert_tiles.cpp
   src/core/indexer.cpp
   src/core/compressor.cpp
   src/core/layer_reference.cpp
@@ -88,7 +90,7 @@ if(DS4N_CUDA)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
   set(CMAKE_CUDA_ARCHITECTURES OFF)
   set(DS4N_CUDA_FLAGS -gencode=arch=compute_120a,code=sm_120a -lineinfo -Xcompiler=-Wall)
-  add_library(ds4n_cuda STATIC src/cuda/mx_gemv.cu src/cuda/glue.cu src/cuda/attn.cu src/cuda/moe.cu src/cuda/exchange.cu src/cuda/indexer.cu src/cuda/select.cu src/cuda/compressor.cu src/cuda/engram.cu src/cuda/planes.cu src/cuda/resolve.cu src/cuda/fused.cu src/cuda/dspark.cu src/cuda/chunk.cu)
+  add_library(ds4n_cuda STATIC src/cuda/mx_gemv.cu src/cuda/glue.cu src/cuda/attn.cu src/cuda/moe.cu src/cuda/exchange.cu src/cuda/indexer.cu src/cuda/select.cu src/cuda/compressor.cu src/cuda/engram.cu src/cuda/planes.cu src/cuda/resolve.cu src/cuda/fused.cu src/cuda/dspark.cu src/cuda/chunk.cu src/cuda/glm53/moe.cu src/cuda/glm53/grouped_moe.cu)
   target_compile_options(ds4n_cuda PRIVATE ${DS4N_CUDA_FLAGS})
   target_link_libraries(ds4n_cuda PUBLIC ds4n_core)
   add_executable(ds4n-mx-check src/tools/mx_check.cu)
@@ -141,6 +143,12 @@ if(DS4N_CUDA)
   add_executable(ds4n-moe-check src/tools/moe_check.cu)
   target_compile_options(ds4n-moe-check PRIVATE ${DS4N_CUDA_FLAGS})
   target_link_libraries(ds4n-moe-check PRIVATE ds4n_cuda ds4n_io)
+  add_executable(ds4n-glm53-moe-check src/tools/glm53_moe_check.cu)
+  target_compile_options(ds4n-glm53-moe-check PRIVATE ${DS4N_CUDA_FLAGS})
+  target_link_libraries(ds4n-glm53-moe-check PRIVATE ds4n_cuda ds4n_glm53_io)
+  # The oracle tool gains its GPU path (--gpu) in a CUDA build.
+  target_link_libraries(ds4n-glm53-oracle-run PRIVATE ds4n_cuda CUDA::cudart)
+  target_compile_definitions(ds4n-glm53-oracle-run PRIVATE DS4N_GLM53_GPU)
 endif()
 
 enable_testing()
@@ -168,6 +176,8 @@ add_executable(ds4n_tests
   tests/core/glm53/test_precision.cpp
   tests/core/glm53/test_exact_moe.cpp
   tests/core/glm53/test_moe_roundings.cpp
+  tests/core/glm53/test_moe_plan.cpp
+  tests/core/glm53/test_expert_tiles.cpp
   tests/core/test_indexer.cpp
   tests/core/test_compressor.cpp
   tests/core/test_compare.cpp

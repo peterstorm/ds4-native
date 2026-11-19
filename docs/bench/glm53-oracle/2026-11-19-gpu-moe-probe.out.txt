@@ -1,0 +1,17 @@
+# tools/glm53-golden/gpu-moe-mutation-probe.sh /store/backbone-uncensored /store/experts.ds4n
+# GPU 1, 2026-11-19 (third run: with the SwiGLU element check; the first, without it, left fast-silu and weight-reassoc alive)
+baseline: PASS
+fast-sigmoid: killed
+logit-plane-lost: killed
+biased-weight: killed
+no-route-scale: killed
+weight-sum-eps: killed
+selection-order: killed
+gate-not-bf16: killed
+fast-silu: killed
+weight-reassoc: killed
+hidden-not-bf16: killed
+shared-weighted: killed
+no-shared: killed
+last-job-dropped: killed
+exit 0

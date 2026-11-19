@@ -1,4 +1,4 @@
-# HANDOVER: GLM-5.3 full uncensored on ds4-native — session state 2026-11-19 (updated 21:30)
+# HANDOVER: GLM-5.3 full uncensored on ds4-native — session state 2026-11-19 (updated 23:55)
 
 Resume point for any fresh session. Companion to
 [`2026-11-19-glm53-native.md`](2026-11-19-glm53-native.md) (the plan — read it first; its
@@ -16,7 +16,7 @@ backbone differs (119 bf16 residual-writer tensors). Speed expectation est. 15�
 30–50 with cache-conditional routing + RAM tier — a quality/architecture play. Phase 5's measured
 CyberGym verdict decides keep/archive.
 
-## Where things stand (2026-11-19 ~21:30, second session)
+## Where things stand (2026-11-19 ~23:55, second session)
 
 ### Done
 
@@ -30,6 +30,7 @@ CyberGym verdict decides keep/archive.
 | **First real-weights run (Phase 3 step 2)** | same branch: `begin_layer`/`finish_layer`/`bind_layer` (the oracle's seam at the routed Experts), `core/glm53/{dequant,precision}`, `io/glm53_weights` `BackboneParts`, `io/glm53_store` `StoreReader`, `ds4n-glm53-oracle-run`; receipts `docs/bench/glm53-oracle/2026-11-19-capitals.*` | 21-token prompt on CPU, 478 s, beside the live flare deployment: " Rome" at p 0.994, " Paris"/" Berlin" top-1. Route margins median 3.5e-3 (≈ one BF16 step), 9/1,725 within 1e-5. Feed-forward input error: W4A4 11.6%, E4M3 2.65%. Layer-major decoding bit-identical to `decode_token` on the golden; mutation probe 11/11. 245 core + 7 I/O tests |
 | **Activation precision measured (Phase 3 step 3)** | same branch: `core/glm53/precision` `ActivationPrecision` (MXFP4 with Quark's "even" scale, read from amd-quark 0.13), `expert_outputs` + `finish_layer` over `ExpertOutput`s (the seam at the routed Experts' outputs), oracle-run `--prompt`×N `--activations`; receipts `docs/bench/glm53-oracle/2026-11-19-activations.*` | 5 prompts, 315 positions, 1,961 s on 30 threads with flare stopped (operator-approved; **left stopped** at the operator's word: `docker start glm53-flash-hyperflare-tp2-uncensored` brings it back, ~1 min to load). Mean KL vs FP32: W4A4 0.0616, E4M3 0.0051, BF16 0.0036; perplexity 3.975 / 3.805 / 3.826 vs 3.849. **E4M3 decided** (operator; plan settled decision 8). Prompt 0 at FP32 reproduces step 2's output exactly; mutation probe 12/12; 249 core + 7 I/O tests |
 | **The MoE's Reference configuration (Phase 3 step 4)** | same branch: `docs/design/glm53-reference-configuration.md`, `core/glm53/exact_moe` (bit-exact MoE oracle on the Expert codes, from DS4.1's primitives unchanged), `StoreReader::read_tensors`, `BackboneParts::load_shared_expert`, `finish_layer(FeedForward)`, oracle-run `--activations exact`, `tools/glm53-golden/exact-moe-mutation-probe.sh`; receipts `docs/bench/glm53-oracle/2026-11-19-exact-moe.*` | router 6 planes, Halves, split-K 2, no clamp, weight folded before down, ascending-id combine then shared, then the Exchange. Pinned by `kReferenceBits` (512 tokens incl. hidden fragments) plus a double-precision spec witness (< 1e-3); mutation probe 16/16. Real weights, 5 prompts, 3,582 s: mean KL vs FP32 **0.0091** (E4M3 alone 0.0051; FP32/E4M3 streams reproduce step 3 exactly), top-1 306/315, perplexity 3.816. The extra ~0.004 is uniform (BF16 roundings + folded weight, not isolated yet: design "Open"). 266 core + 8 I/O tests |
+| **The GPU MoE (Phase 3 step 5, first GPU window)** | same branch: `core/glm53/{moe_plan,expert_tiles}`, `cuda/glm53/{moe,grouped_moe}`, `ds4n-glm53-moe-check`, oracle-run `--gpu N` and `--activations exact-DEPARTURE`, `tools/glm53-golden/{gpu-moe-mutation-probe.sh,kl_paired.py}`; receipts `docs/bench/glm53-oracle/2026-11-19-departures.*` | **100% bit-identical** to `exact_moe` on real Experts. Checked: the SwiGLU element function on 2^24 inputs; Rounds of 1–8 tokens (logits, Routes, Plan, hidden fragments, partials, Exchange); sweeps of up to 300 tokens under each GPU Departure; layers 3/40/75/77. GPU mutation probe 13/13. DS4.1's kernels are reused unchanged and DS4.1's sources are untouched. One GPU's 8-token Round takes 173–342 µs (1.3–1.5 TB/s). KL run (4 streams, `--gpu 0`) took 1,713 s, against 3,582 s for 3 streams on the CPU; `exact` is identical at all 315 positions. **Folded weight: no KL cost, it stays.** **FP32 Exchange: −31% (0.0063 vs 0.0091), at the noise floor**, not decided (design "Open") |
 | **Converter safety fix** | same branch, `24b9a6a` | the deletable list could have listed MTP and unconverted shards; now it lists only verified, fully consumed shards and has a free-space preflight. Checked on real layer 10 (RAM tmpfs) |
 | Indexer reference pinning (old step 5) | `ref/glm-5.3/README.md` | **decided: transformers 5.16.0** |
 | Desktop space for the download | /models/voice deleted (operator-approved; TTS weights, re-downloadable), 82 exited containers + `ds4-native-dev:1` removed | `space-guard.sh` armed (pauses the fetch below 6 GiB free) |
@@ -138,8 +139,19 @@ An independent audit (python, read-only, against the index) found:
    CPU emulation of the MMA for each candidate dominates, so it is not quick. **Ran
    2026-11-19** (receipts `docs/bench/glm53-oracle/2026-11-19-moe-roundings.*`): the BF16
    roundings and the BF16 Exchange cost nothing. The folded weight is worse only on layers
-   76–77's massive values and better on 75. Open: a KL run of `exact` with the weight after
-   down.
+   76–77's massive values and better on 75.
+   **GPU MoE: done** (Done table, step 5). The GPU MoE is gated bit-exact by
+   `ds4n-glm53-moe-check`; any kernel change reruns it and
+   `tools/glm53-golden/gpu-moe-mutation-probe.sh` (about 45 min, one GPU, on a copy of the tree).
+   Exact streams on a GPU: `ds4n-glm53-oracle-run ... --activations
+   fp32,exact,exact-weight-after-down,exact-fp32-exchange --gpu 0` (a CUDA build), about 21 s per
+   Sparse layer for 5 prompts × 4 streams. The FP32 Semantics stream and attention stay on the CPU
+   and now set the pace. Compare streams with `tools/glm53-golden/kl_paired.py exact REPORT...`;
+   it also proves that a stream repeated across reports is identical.
+   **KL verdict:** the folded weight stays (no KL cost). The FP32 Exchange measured −31% at the
+   noise floor of re-rolled Routes. **Next:** rerun on a larger prompt set (20+ prompts, new
+   ones tokenized like step 2's) to decide BF16 vs FP32 Exchange. Then the attention side's
+   kernels (MLA decode, indexer, top-2048).
 6. **Backbone B (cyber)**: does not fit on rpool next to store + Backbone A (est. 20–30 GiB short). It
    needs a space decision first.
 7. Phases 4–5 per the plan (fifth switch-primary entry `glm-native`, slots ladder, CyberGym).
@@ -175,6 +187,9 @@ An independent audit (python, read-only, against the index) found:
   `flare-home/.cache/flare/cores/models/*` — the `glm53-fp4-local` / `glm53-uncensored`
   checkpoint dirs are now metadata-only re-derivation sources (shards deleted with receipts).
 - One GPU-owning process at a time; `switch-primary.sh status` shows who owns :8000.
+- GPU checks run beside each other on the two GPUs (`--gpus device=N`); a CPU-oracle-bound
+  check slows the 30-thread KL runs only a little. List containers and kill only your own:
+  never a blanket `docker kill` over the dev image (other sessions share it).
 - ssh desktop: `scp` is broken (sftp channel) — pipe files: `ssh desktop 'cat > path' < local`.
 - `/models` root-owned: `sudo mkdir/chown` (passwordless sudo works); user is peterstorm.
 
@@ -187,6 +202,7 @@ An independent audit (python, read-only, against the index) found:
 | Pinned GLM-5.3 reference + why | `ds4-native/ref/glm-5.3/README.md` |
 | GLM terms (Selection, Full/Shared layer, Latent row, Backbone part, Semantics oracle, Activation precision, Route margin) | `ds4-native/CONTEXT.md`, GLM-5.3 section |
 | GLM-5.3 Reference configuration (MoE fixed; attention by operation) | `ds4-native/docs/design/glm53-reference-configuration.md` |
+| Findings reports (one per measurement: method, results, interpretation, receipts) | `ds4-native/docs/bench/glm53-oracle/*-report.md`; latest `2026-11-19-gpu-moe-report.md` (GPU MoE gate + departures KL) |
 | Feasibility base (measured constants) | `ds4-native/docs/research/2026-10-26-feasibility.md` |
 | Serving design / engine internals | `ds4-native/docs/design/{serving,forward-pass,dspark}.md` |
 | Inference map (primaries, runbooks) | `.dotfiles/scripts/inference/INDEX.md` |
