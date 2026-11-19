@@ -40,18 +40,25 @@ session just re-checks the log (`grep "hf exit=" download.log`) or reruns
 
 1. **Confirm download complete** (desktop): `grep "hf exit=" /models/glm53-native/download.log`
    — if absent and no `hf download` process, rerun the fetch script; it resumes.
-2. **Full convert + verify** (desktop, ~3–6 min CPU at measured 2.1 GB/s; sync the worktree
-   first if the branch moved):
+2. **Full convert + verify — INCREMENTAL, the only feasible flow** (pool free was ~65G at
+   completion; store 384.6G + full source 395G can never coexist). The tool converts complete
+   layers only and its deletable-shards report is converted-aware, so run 8-layer batches:
+   convert → verify → delete exactly the shards the tool lists → next batch. This ran to
+   completion on 2026-11-19 (see `store-convert-receipt.log`); the recipe, should it ever need
+   rerunning from source:
    ```bash
-   cd /tmp/ds4n-glm53-build   # synced copy of ds4-native-glm53 worktree (rebuild if needed)
-   docker run --rm -v /models:/models -v /tmp/ds4n-glm53-build:/src -w /src ds4-native-dev:2 bash -c \
-     "ls /models/glm53-native/kitaniai/model-*.safetensors | xargs ./build/ds4n-glm53-store-build \
-      --out /models/glm53-native/experts.ds4n --threads 16" \
-     # then the identical command with --verify; expect 'all records identical'
+   for batch in 3-10 11-18 19-26 27-34 35-42 43-50 51-58 59-66 67-74 75-77; do
+     shards=$(ls /models/glm53-native/kitaniai/model-*.safetensors)
+     docker run --rm -v /models:/models -v /tmp/ds4n-glm53-build:/src -w /src ds4-native-dev:2 \
+       ./build/ds4n-glm53-store-build --out /models/glm53-native/experts.ds4n \
+       --layers $batch --threads 16 $shards        # then same + --verify; expect 'all records identical'
+     # delete the tool's 'deletable shards' list between batches
+   done
    ```
-   Then **delete the source shards** the tool lists as expert-only (`deletable shards:` line) to
-   reclaim ~365G — keep every non-expert file (config, tokenizer, receipts) for the backbones.
-   Receipt the deletion the way the hyperflare archive receipts were written.
+   Each batch's verify rebuilds every record from source bytes and memcmps — the exactness bar is
+   per batch; deleted shards are gone, so a full-store verify needs a re-download. Source shards
+   holding backbone/MTP tensors (83 mixed shards, ~33G) are never deletable — they are Backbone
+   A's input.
 3. **Backbone A (uncensored)**: extract all non-expert tensors (attention, DSA indexer, router,
    shared experts, dense layers 0–2, embeddings, head, norms, layer-78 MTP block) from the
    remaining kitaniai files into `/models/glm53-native/backbone-uncensored.safetensors`; reuse
