@@ -26,12 +26,35 @@ float swiglu(float g, float u) {
   return silu * u;
 }
 
-std::vector<float> mlp_forward(const Mlp& m, std::span<const float> x) {
-  const auto g = linear(m.gate, x);
-  const auto u = linear(m.up, x);
-  std::vector<float> h(g.size());
-  for (size_t i = 0; i < h.size(); i++) h[i] = swiglu(g[i], u[i]);
-  return linear(m.down, h);
+/** linear over several inputs, each weight row read once for all: each output is linear's, bit for bit. */
+std::vector<std::vector<float>> linear_batch(const Matrix& m, std::span<const std::vector<float>> xs) {
+  std::vector<std::vector<float>> ys(xs.size(), std::vector<float>(static_cast<size_t>(m.rows)));
+  for (int r = 0; r < m.rows; r++) {
+    const auto row = row_of(m, r);
+    for (size_t j = 0; j < xs.size(); j++) ys[j][static_cast<size_t>(r)] = static_cast<float>(dot(row, xs[j]));
+  }
+  return ys;
+}
+
+/** The SwiGLU feed-forward of each input, every linear reading its input at precision p. */
+std::vector<std::vector<float>> mlp_forward(const Mlp& m, std::span<const std::span<const float>> xs,
+                                            ActivationPrecision p) {
+  std::vector<std::vector<float>> in;
+  for (const auto x : xs) in.push_back(round_trip(p, x));
+  const auto g = linear_batch(m.gate, in);
+  const auto u = linear_batch(m.up, in);
+  std::vector<std::vector<float>> h(xs.size());
+  for (size_t j = 0; j < h.size(); j++) {
+    std::vector<float> a(g[j].size());
+    for (size_t i = 0; i < a.size(); i++) a[i] = swiglu(g[j][i], u[j][i]);
+    h[j] = round_trip(p, a);
+  }
+  return linear_batch(m.down, h);
+}
+
+std::vector<float> mlp_forward(const Mlp& m, std::span<const float> x, ActivationPrecision p) {
+  const std::span<const float> one[] = {x};
+  return std::move(mlp_forward(m, one, p).front());
 }
 
 // ---- binding ---------------------------------------------------------------
@@ -151,6 +174,15 @@ bool fits(const Matrix& m, int rows, int cols) {
 bool is_expert(const Dims& d, const Mlp& m) {
   return fits(m.gate, d.moe_intermediate, d.hidden) && fits(m.up, d.moe_intermediate, d.hidden) &&
          fits(m.down, d.hidden, d.moe_intermediate);
+}
+
+/** Whether every linear input of `m` (gate/up read cols wide, down reads the inner width) fits p's blocks. */
+bool fits_mlp(const Mlp& m, ActivationPrecision p) {
+  return fits_blocks(p, static_cast<size_t>(m.gate.cols)) && fits_blocks(p, static_cast<size_t>(m.down.cols));
+}
+
+std::string block_misfit(ActivationPrecision p) {
+  return std::string(name_of(p)) + " activations need widths in whole blocks of " + std::to_string(kActivationBlock);
 }
 
 std::optional<std::string> layer_out_of_range(const Dims& d, int layer) {
@@ -290,19 +322,22 @@ Attended attend(const Dims& d, const AttentionWeights& w, std::span<const float>
   return Attended{linear(w.o, heads_out), std::move(row), std::move(selection)};
 }
 
-/** The feed-forward of `h`; on a Sparse layer `routed` are the Mlps of `r.expert`, in order. */
+/**
+ * The feed-forward of `h`; on a Sparse layer `routed` are the outputs of
+ * `r.expert`'s Experts, in order, and the shared expert runs at `p`.
+ */
 std::vector<float> feed_forward(const Dims& d, const std::variant<Mlp, MoeWeights>& mlp, std::span<const float> h,
-                                const Route& r, std::span<const Mlp> routed) {
-  if (const auto* dense = std::get_if<Mlp>(&mlp)) return mlp_forward(*dense, h);
+                                const Route& r, std::span<const ExpertOutput> routed, ActivationPrecision p) {
+  if (const auto* dense = std::get_if<Mlp>(&mlp)) return mlp_forward(*dense, h, ActivationPrecision::Fp32);
   const auto& moe = std::get<MoeWeights>(mlp);
   // The reference accumulates each chosen Expert's weighted output into a zero
   // tensor in ascending Expert id, then adds the shared expert's.
   std::vector<double> acc(static_cast<size_t>(d.hidden), 0.0);
   for (size_t k = 0; k < r.expert.size(); k++) {
-    const auto y = mlp_forward(routed[k], h);
+    const auto& y = routed[k].values;
     for (size_t i = 0; i < acc.size(); i++) acc[i] += static_cast<double>(y[i] * r.weight[k]);
   }
-  const auto shared = mlp_forward(moe.shared, h);
+  const auto shared = mlp_forward(moe.shared, h, p);
   std::vector<float> out(acc.size());
   for (size_t i = 0; i < out.size(); i++) out[i] = static_cast<float>(static_cast<float>(acc[i]) + shared[i]);
   return out;
@@ -470,16 +505,36 @@ Result<LayerStart, StepError> begin_layer(const Config& config, const LayerWeigh
   return R::ok(std::move(start));
 }
 
+Result<std::vector<ExpertOutput>, StepError> expert_outputs(const Config& config, const Mlp& expert,
+                                                            std::span<const std::span<const float>> ffn_in,
+                                                            ActivationPrecision precision) {
+  using R = Result<std::vector<ExpertOutput>, StepError>;
+  const Dims& d = config.dims();
+  if (!is_expert(d, expert)) return R::err(StepError{"a routed Expert has the wrong shape"});
+  if (!fits_mlp(expert, precision)) return R::err(StepError{block_misfit(precision)});
+  for (const auto x : ffn_in)
+    if (x.size() != static_cast<size_t>(d.hidden)) return R::err(StepError{"a feed-forward input is not hidden_size"});
+  std::vector<ExpertOutput> out;
+  for (auto& y : mlp_forward(expert, ffn_in, precision)) out.push_back(ExpertOutput{std::move(y), precision});
+  return R::ok(std::move(out));
+}
+
 Result<LayerStep, StepError> finish_layer(const Config& config, const LayerWeights& w, LayerStart start,
-                                          std::span<const Mlp> routed) {
+                                          std::span<const ExpertOutput> routed) {
   using R = Result<LayerStep, StepError>;
   const Dims& d = config.dims();
   if (routed.size() != start.route.expert.size())
-    return R::err(StepError{"expected " + std::to_string(start.route.expert.size()) + " routed Experts, got " +
+    return R::err(StepError{"expected " + std::to_string(start.route.expert.size()) + " routed Experts' outputs, got " +
                             std::to_string(routed.size())});
-  for (const auto& m : routed)
-    if (!is_expert(d, m)) return R::err(StepError{"a routed Expert has the wrong shape"});
-  const auto out = feed_forward(d, w.mlp, start.ffn_in, start.route, routed);
+  const auto precision = routed.empty() ? ActivationPrecision::Fp32 : routed.front().precision;
+  for (const auto& y : routed) {
+    if (y.values.size() != static_cast<size_t>(d.hidden))
+      return R::err(StepError{"a routed Expert's output is not hidden_size"});
+    if (y.precision != precision) return R::err(StepError{"the routed Experts ran at different precisions"});
+  }
+  if (const auto* moe = std::get_if<MoeWeights>(&w.mlp); moe && !fits_mlp(moe->shared, precision))
+    return R::err(StepError{block_misfit(precision)});
+  const auto out = feed_forward(d, w.mlp, start.ffn_in, start.route, routed, precision);
   return R::ok(LayerStep{add(start.mid, out), std::move(start.row), std::move(start.selection), std::move(start.route)});
 }
 
@@ -490,8 +545,13 @@ Result<LayerStep, StepError> decode_layer(const Config& config, const ModelWeigh
   if (auto bad = layer_out_of_range(config.dims(), layer)) return R::err(StepError{*bad});
   auto start = begin_layer(config, weights.layer(layer), layer, past, x, shared_selection);
   if (!start) return R::err(start.error());
-  std::vector<Mlp> routed;
-  for (int32_t e : start.value().route.expert) routed.push_back(weights.experts(layer)[static_cast<size_t>(e)]);
+  const std::span<const float> h[] = {start.value().ffn_in};
+  std::vector<ExpertOutput> routed;
+  for (int32_t e : start.value().route.expert) {
+    auto y = expert_outputs(config, weights.experts(layer)[static_cast<size_t>(e)], h, ActivationPrecision::Fp32);
+    if (!y) return R::err(y.error());
+    routed.push_back(std::move(y.value().front()));
+  }
   return finish_layer(config, weights.layer(layer), std::move(start).value(), routed);
 }
 

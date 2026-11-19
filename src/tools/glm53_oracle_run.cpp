@@ -1,25 +1,34 @@
 // ds4n-glm53-oracle-run: the GLM-5.3 Semantics oracle (core/glm53/reference)
-// on the real weights, CPU only — the first real-weights check of the engine's
-// semantics, and the first real numbers for the Reference configuration.
+// on the real weights, CPU only: the engine's semantics on real prompts, and
+// what each candidate activation precision for the Experts loses against it.
 //
 //   ds4n-glm53-oracle-run --config ref/glm-5.3/config.json --backbone DIR --store FILE
-//                         --prompt ID,ID,... [--generate N] [--threads T] [--resident E] [--report FILE]
+//                         --prompt ID,ID,... [--prompt ID,...]... [--activations fp32,bf16,e4m3,mxfp4]
+//                         [--generate N] [--threads T] [--resident E] [--report FILE]
 //
-// The model does not fit in RAM as FP32 (~66 GB of Backbone, ~1.4 TB of
-// routed Experts), so the run goes a layer at a time: bind one layer's
-// Backbone (io::BackboneParts, dequantized exactly), run every pending token
-// through attention and routing in position order (begin_layer, growing the
-// layer's cache), read the routed Experts those Routes name from the store in
-// groups of at most E (default 64, ~150 MB each in FP32), and finish the
-// tokens in parallel (finish_layer). The prompt is one batch; each generated
-// token (greedy) is another, so the Backbone is read once per batch.
+// Each prompt runs once per activation precision listed — a stream, with its
+// own caches and residual stream — teacher-forced on the prompt's tokens. The
+// first precision (default fp32: the oracle itself) is the baseline every
+// other is compared against.
 //
-// Reported (stdout, and --report as JSON): per prompt position the log-prob and
-// rank of the prompt's next token and the top 10; the greedy continuation; the
-// Route margins (how close each token's Expert choice is to a tie); and the
-// relative error MXFP4 (W4A4) and E4M3 activations would add to every
-// feed-forward input — the inputs of every routed and shared Expert's gate and
-// up projections. Token ids only: decode them with the checkpoint's tokenizer.
+// The model does not fit in RAM as FP32 (~66 GB of Backbone, ~1.4 TB of routed
+// Experts), so a run goes a layer at a time over all streams together: bind
+// the layer's Backbone (io::BackboneParts, dequantized exactly); run each
+// stream's pending tokens through attention and routing in position order
+// (begin_layer, growing the stream's cache; streams in parallel); read the
+// union of the Experts the Routes name from the store once, at most E at a
+// time (default 64, ~150 MB each in FP32), running each over every token that
+// routes to it at that token's stream's precision (expert_outputs); then
+// finish every token (finish_layer). The prompts are one round; each generated
+// token (greedy, per stream) is another.
+//
+// Reported (stdout, and --report as JSON): for the baseline, per prompt
+// position the log-prob and rank of the prompt's next token and the top 10,
+// the perplexity, the Route margins and the Selections; for every other
+// precision, per position KL(baseline ‖ precision) over the full vocabulary,
+// whether its top token agrees, its perplexity, and how many of its Routes
+// differ from the baseline's; and every stream's greedy continuation. Token
+// ids only: decode them with the checkpoint's tokenizer.
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -32,7 +41,6 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
-#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -45,16 +53,25 @@
 #include "io/glm53_weights.hpp"
 
 using namespace ds4n;
+using glm53::ActivationPrecision;
 
 namespace {
 
 struct Args {
   std::string config, backbone, store, report;
-  std::vector<int32_t> prompt;
+  std::vector<std::vector<int32_t>> prompts;
+  std::vector<ActivationPrecision> precisions;  // the first is the baseline
   int generate = 0;
   unsigned threads = 8;
   size_t resident = 64;
 };
+
+std::vector<std::string> split(const std::string& v) {
+  std::vector<std::string> out;
+  std::stringstream ss(v);
+  for (std::string item; std::getline(ss, item, ',');) out.push_back(item);
+  return out;
+}
 
 bool parse_args(int argc, char** argv, Args& a) {
   for (int i = 1; i + 1 < argc; i += 2) {
@@ -67,11 +84,20 @@ bool parse_args(int argc, char** argv, Args& a) {
     else if (s == "--threads") a.threads = static_cast<unsigned>(std::stoul(v));
     else if (s == "--resident") a.resident = std::stoul(v);
     else if (s == "--prompt") {
-      std::stringstream ss(v);
-      for (std::string id; std::getline(ss, id, ',');) a.prompt.push_back(static_cast<int32_t>(std::stol(id)));
+      std::vector<int32_t> prompt;
+      for (const auto& id : split(v)) prompt.push_back(static_cast<int32_t>(std::stol(id)));
+      if (prompt.empty()) return false;
+      a.prompts.push_back(std::move(prompt));
+    } else if (s == "--activations") {
+      for (const auto& name : split(v)) {
+        const auto p = glm53::parse_activation_precision(name);
+        if (!p || std::find(a.precisions.begin(), a.precisions.end(), *p) != a.precisions.end()) return false;
+        a.precisions.push_back(*p);
+      }
     } else return false;
   }
-  return argc % 2 == 1 && !a.config.empty() && !a.backbone.empty() && !a.store.empty() && !a.prompt.empty() &&
+  if (a.precisions.empty()) a.precisions.push_back(ActivationPrecision::Fp32);
+  return argc % 2 == 1 && !a.config.empty() && !a.backbone.empty() && !a.store.empty() && !a.prompts.empty() &&
          a.generate >= 0 && a.threads > 0 && a.resident >= 8;
 }
 
@@ -114,98 +140,157 @@ struct Model {
   std::vector<float> final_norm;
 };
 
-/** Accumulated measurements. */
-struct Stats {
-  std::vector<float> route_margins;
-  std::vector<double> mxfp4_error, e4m3_error;
-  size_t selections = 0, selections_dropping = 0;
+/** One prompt at one activation precision: its caches, its Routes, and what the baseline measures. */
+struct Stream {
+  size_t prompt = 0;
+  ActivationPrecision precision = ActivationPrecision::Fp32;
+  bool baseline = false;
+  std::vector<glm53::LayerCache> caches;                  // [layer]
+  std::vector<std::vector<std::vector<int32_t>>> routes;  // [layer][position] the Route's Experts (Sparse layers)
+  std::vector<float> route_margins;                       // baseline only
+  size_t selections = 0, selections_dropping = 0;         // baseline only
 };
 
+/** A routed Expert's use: token `token` of stream `stream`, in slot `slot` of its Route. */
+struct Use {
+  size_t stream, token, slot;
+};
+
+/** Tokens a group of one Expert's uses runs over at once: enough to read each weight row once for many. */
+constexpr size_t kTokensPerJob = 16;
+
 /**
- * Every token of `tokens` (positions caches.length onward) through every
- * layer, appending its cache rows; returns each token's residual stream after
- * the last layer.
+ * Feeds tokens[s] to stream s, at the positions after what its caches hold,
+ * through every layer; returns each new token's residual stream after the last
+ * layer, per stream.
  */
-std::vector<std::vector<float>> run_batch(const Model& m, const Args& args, std::vector<glm53::LayerCache>& caches,
-                                          const std::vector<int32_t>& tokens, Stats& stats) {
+std::vector<std::vector<std::vector<float>>> run_round(const Model& m, const Args& args, std::vector<Stream>& streams,
+                                                       const std::vector<std::vector<int32_t>>& tokens) {
   const auto& config = m.config;
   const glm53::Dims& d = config.dims();
-  std::vector<std::vector<float>> x(tokens.size());
-  std::vector<std::vector<int32_t>> selection(tokens.size());
-  for (size_t i = 0; i < tokens.size(); i++) {
-    auto row = m.parts.load_row("model.embed_tokens.weight", static_cast<uint64_t>(tokens[i]));
-    if (!row) die(row.error().what);
-    x[i] = std::move(row).value();
+  const size_t S = streams.size();
+  std::vector<std::vector<std::vector<float>>> x(S);
+  std::vector<std::vector<std::vector<int32_t>>> selection(S);
+  for (size_t s = 0; s < S; s++) {
+    for (int32_t t : tokens[s]) {
+      auto row = m.parts.load_row("model.embed_tokens.weight", static_cast<uint64_t>(t));
+      if (!row) die(row.error().what);
+      x[s].push_back(std::move(row).value());
+    }
+    selection[s].resize(tokens[s].size());
   }
 
   for (int L = 0; L < d.layers; L++) {
+    const auto where = "layer " + std::to_string(L) + ": ";
     const auto t0 = std::chrono::steady_clock::now();
     const auto weights = m.parts.load_layer(L, args.threads);
     if (!weights) die(weights.error().what);
     const auto bound = glm53::bind_layer(config, L, io::lookup_of(weights.value()));
-    if (!bound) die("layer " + std::to_string(L) + ": " + bound.error().what);
+    if (!bound) die(where + bound.error().what);
     const double load_s = seconds_since(t0);
 
-    // Attention and routing, in position order: each token's row joins the
-    // cache before the next token attends.
+    // Attention and routing, each stream's tokens in position order (a row
+    // joins the cache before the next token attends), streams in parallel.
     const auto t1 = std::chrono::steady_clock::now();
-    std::vector<std::optional<glm53::LayerStart>> starts(tokens.size());
-    for (size_t i = 0; i < tokens.size(); i++) {
-      auto s = glm53::begin_layer(config, bound.value(), L, caches[static_cast<size_t>(L)], x[i], selection[i]);
-      if (!s) die("layer " + std::to_string(L) + ": " + s.error().what);
-      glm53::append(caches[static_cast<size_t>(L)], s.value().row);
-      if (config.indexer(L) == glm53::IndexerKind::Full) {
-        selection[i] = s.value().selection;
-        stats.selections++;
-        if (selection[i].size() < static_cast<size_t>(caches[static_cast<size_t>(L)].length)) stats.selections_dropping++;
-      }
-      if (!s.value().route.expert.empty()) {
-        const auto& in = s.value().ffn_in;
-        stats.route_margins.push_back(s.value().route.margin);
-        stats.mxfp4_error.push_back(glm53::relative_error(glm53::mxfp4_round_trip(in), in));
-        stats.e4m3_error.push_back(glm53::relative_error(glm53::e4m3_round_trip(in), in));
-      }
-      starts[i] = std::move(s).value();
-    }
+    std::vector<std::vector<glm53::LayerStart>> starts(S);
+    if (auto e = parallel_for(S, args.threads, [&](size_t s) -> std::optional<std::string> {
+          Stream& st = streams[s];
+          auto& cache = st.caches[static_cast<size_t>(L)];
+          for (size_t i = 0; i < tokens[s].size(); i++) {
+            auto r = glm53::begin_layer(config, bound.value(), L, cache, x[s][i], selection[s][i]);
+            if (!r) return where + r.error().what;
+            glm53::append(cache, r.value().row);
+            if (config.indexer(L) == glm53::IndexerKind::Full) {
+              selection[s][i] = r.value().selection;
+              if (st.baseline) {
+                st.selections++;
+                if (selection[s][i].size() < static_cast<size_t>(cache.length)) st.selections_dropping++;
+              }
+            }
+            if (!r.value().route.expert.empty()) {
+              st.routes[static_cast<size_t>(L)].push_back(r.value().route.expert);
+              if (st.baseline) st.route_margins.push_back(r.value().route.margin);
+            }
+            starts[s].push_back(std::move(r).value());
+          }
+          return std::nullopt;
+        }))
+      die(*e);
     const double attend_s = seconds_since(t1);
 
-    // The feed-forward, in groups of tokens whose routed Experts fit the budget.
+    // The routed Experts, Expert-major: the union of every Route's Experts,
+    // read at most `resident` at a time, each run over all the tokens it serves.
     const auto t2 = std::chrono::steady_clock::now();
-    size_t experts_read = 0;
-    for (size_t first = 0; first < tokens.size();) {
-      std::set<int32_t> needed;
-      size_t last = first;
-      for (; last < tokens.size(); last++) {
-        std::set<int32_t> with = needed;
-        with.insert(starts[last]->route.expert.begin(), starts[last]->route.expert.end());
-        if (with.size() > args.resident && last > first) break;
-        needed = std::move(with);
+    std::map<int32_t, std::vector<Use>> uses;
+    std::vector<std::vector<std::vector<glm53::ExpertOutput>>> routed(S);
+    for (size_t s = 0; s < S; s++) {
+      routed[s].resize(starts[s].size());
+      for (size_t i = 0; i < starts[s].size(); i++) {
+        const auto& experts = starts[s][i].route.expert;
+        routed[s][i].resize(experts.size());
+        for (size_t k = 0; k < experts.size(); k++) uses[experts[k]].push_back(Use{s, i, k});
       }
-      const std::vector<int32_t> ids(needed.begin(), needed.end());
-      std::vector<glm53::ExpertValues> values(ids.size());
-      if (auto e = parallel_for(ids.size(), args.threads, [&](size_t k) -> std::optional<std::string> {
-            auto v = m.store.read({static_cast<uint32_t>(L), static_cast<uint32_t>(ids[k])});
+    }
+    std::vector<int32_t> ids;
+    for (const auto& [id, u] : uses) ids.push_back(id);
+    for (size_t first = 0; first < ids.size(); first += args.resident) {
+      const std::vector<int32_t> chunk(ids.begin() + static_cast<std::ptrdiff_t>(first),
+                                       ids.begin() + static_cast<std::ptrdiff_t>(std::min(first + args.resident, ids.size())));
+      std::vector<glm53::ExpertValues> values(chunk.size());
+      if (auto e = parallel_for(chunk.size(), args.threads, [&](size_t k) -> std::optional<std::string> {
+            auto v = m.store.read({static_cast<uint32_t>(L), static_cast<uint32_t>(chunk[k])});
             if (!v) return v.error().what;
             values[k] = std::move(v).value();
             return std::nullopt;
           }))
         die(*e);
-      experts_read += ids.size();
-      if (auto e = parallel_for(last - first, args.threads, [&](size_t j) -> std::optional<std::string> {
-            const size_t i = first + j;
-            std::vector<glm53::Mlp> routed;
-            for (int32_t id : starts[i]->route.expert)
-              routed.push_back(values[static_cast<size_t>(std::lower_bound(ids.begin(), ids.end(), id) - ids.begin())].mlp());
-            auto step = glm53::finish_layer(config, bound.value(), std::move(*starts[i]), routed);
-            if (!step) return "layer " + std::to_string(L) + ": " + step.error().what;
-            x[i] = std::move(step).value().out;
+
+      struct Job {
+        size_t expert;  // index into chunk
+        ActivationPrecision precision;
+        std::vector<Use> uses;
+      };
+      std::vector<Job> jobs;
+      for (size_t k = 0; k < chunk.size(); k++) {
+        std::map<ActivationPrecision, std::vector<Use>> by_precision;
+        for (const Use& u : uses.at(chunk[k])) by_precision[streams[u.stream].precision].push_back(u);
+        for (auto& [p, us] : by_precision)
+          for (size_t j = 0; j < us.size(); j += kTokensPerJob)
+            jobs.push_back(Job{k, p, std::vector<Use>(us.begin() + static_cast<std::ptrdiff_t>(j),
+                                                      us.begin() + static_cast<std::ptrdiff_t>(std::min(j + kTokensPerJob, us.size())))});
+      }
+      if (auto e = parallel_for(jobs.size(), args.threads, [&](size_t j) -> std::optional<std::string> {
+            const Job& job = jobs[j];
+            std::vector<std::span<const float>> inputs;
+            for (const Use& u : job.uses) inputs.push_back(starts[u.stream][u.token].ffn_in);
+            auto out = glm53::expert_outputs(config, values[job.expert].mlp(), inputs, job.precision);
+            if (!out) return where + out.error().what;
+            for (size_t q = 0; q < job.uses.size(); q++) {
+              const Use& u = job.uses[q];
+              routed[u.stream][u.token][u.slot] = std::move(out.value()[q]);
+            }
             return std::nullopt;
           }))
         die(*e);
-      first = last;
     }
-    std::fprintf(stderr, "layer %2d: backbone %5.1f s, attention %6.1f s, %3zu Experts + feed-forward %6.1f s\n", L,
-                 load_s, attend_s, experts_read, seconds_since(t2));
+    const double experts_s = seconds_since(t2);
+
+    // The rest of every token's layer.
+    const auto t3 = std::chrono::steady_clock::now();
+    std::vector<std::pair<size_t, size_t>> items;
+    for (size_t s = 0; s < S; s++)
+      for (size_t i = 0; i < starts[s].size(); i++) items.emplace_back(s, i);
+    if (auto e = parallel_for(items.size(), args.threads, [&](size_t j) -> std::optional<std::string> {
+          const auto [s, i] = items[j];
+          auto step = glm53::finish_layer(config, bound.value(), std::move(starts[s][i]), routed[s][i]);
+          if (!step) return where + step.error().what;
+          x[s][i] = std::move(step).value().out;
+          return std::nullopt;
+        }))
+      die(*e);
+    std::fprintf(stderr,
+                 "layer %2d: backbone %5.1f s, attention %6.1f s, %3zu Experts %6.1f s, feed-forward %6.1f s\n", L,
+                 load_s, attend_s, ids.size(), experts_s, seconds_since(t3));
   }
   return x;
 }
@@ -247,25 +332,39 @@ std::vector<int32_t> best(const std::vector<double>& lp, size_t k) {
   return idx;
 }
 
-struct Summary {
-  double mean = 0, max = 0;
-};
-
-Summary summarize(const std::vector<double>& v) {
-  Summary s;
-  for (double x : v) {
-    s.mean += x / static_cast<double>(v.size());
-    s.max = std::max(s.max, x);
-  }
-  return s;
+/** KL(p ‖ q) in nats from log-probabilities over the same vocabulary. */
+double kl_divergence(const std::vector<double>& lp, const std::vector<double>& lq) {
+  double kl = 0.0;
+  for (size_t i = 0; i < lp.size(); i++) kl += std::exp(lp[i]) * (lp[i] - lq[i]);
+  return kl;
 }
+
+double mean_of(const std::vector<double>& v) {
+  return v.empty() ? 0.0 : std::accumulate(v.begin(), v.end(), 0.0) / static_cast<double>(v.size());
+}
+
+/** The q-quantile of v (nearest rank below), 0 if empty. */
+double quantile(std::vector<double> v, double q) {
+  if (v.empty()) return 0.0;
+  std::sort(v.begin(), v.end());
+  return v[static_cast<size_t>(q * static_cast<double>(v.size() - 1))];
+}
+
+/** One precision's comparison with the baseline, over every prompt position of every prompt. */
+struct Comparison {
+  std::vector<double> kl;
+  size_t agree = 0;
+  double nll = 0.0;
+  size_t scored = 0, routes = 0, routes_differing = 0;
+};
 
 }  // namespace
 
 int main(int argc, char** argv) {
   Args args;
   if (!parse_args(argc, argv, args))
-    die("usage: --config FILE --backbone DIR --store FILE --prompt ID,ID,... [--generate N] [--threads T] "
+    die("usage: --config FILE --backbone DIR --store FILE --prompt ID,ID,... [--prompt ...] "
+        "[--activations fp32,bf16,e4m3,mxfp4 (distinct; the first is the baseline)] [--generate N] [--threads T] "
         "[--resident E>=8] [--report FILE]");
   const auto t0 = std::chrono::steady_clock::now();
 
@@ -274,8 +373,9 @@ int main(int argc, char** argv) {
   const std::string json((std::istreambuf_iterator<char>(cf)), std::istreambuf_iterator<char>());
   auto config = glm53::parse_config(json);
   if (!config) die(args.config + ": " + config.error().what);
-  for (int32_t t : args.prompt)
-    if (t < 0 || t >= config.value().dims().vocab) die("prompt token " + std::to_string(t) + " is outside the vocabulary");
+  for (const auto& prompt : args.prompts)
+    for (int32_t t : prompt)
+      if (t < 0 || t >= config.value().dims().vocab) die("prompt token " + std::to_string(t) + " is outside the vocabulary");
 
   auto parts = io::BackboneParts::open(args.backbone);
   if (!parts) die(parts.error().what);
@@ -290,80 +390,159 @@ int main(int argc, char** argv) {
   std::fprintf(stderr, "loaded %zu Backbone tensors' index and the head in %.1f s\n", m.parts.tensors(),
                seconds_since(t0));
 
+  // Streams: prompt-major, the baseline precision first within each prompt.
   const glm53::Dims& d = m.config.dims();
-  std::vector<glm53::LayerCache> caches(static_cast<size_t>(d.layers));
-  Stats stats;
-  std::ostringstream positions;
+  const size_t P = args.precisions.size();
+  std::vector<Stream> streams;
+  std::vector<std::vector<int32_t>> feed;
+  for (size_t p = 0; p < args.prompts.size(); p++)
+    for (size_t q = 0; q < P; q++) {
+      Stream s;
+      s.prompt = p;
+      s.precision = args.precisions[q];
+      s.baseline = q == 0;
+      s.caches.resize(static_cast<size_t>(d.layers));
+      s.routes.resize(static_cast<size_t>(d.layers));
+      streams.push_back(std::move(s));
+      feed.push_back(args.prompts[p]);
+    }
+  auto stream_of = [&](size_t p, size_t q) { return p * P + q; };
 
-  // The prompt, teacher-forced: how likely the model finds each next prompt token.
-  const auto xs = run_batch(m, args, caches, args.prompt, stats);
-  double nll = 0.0;
-  int top1 = 0;
-  std::vector<double> last;
-  for (size_t p = 0; p < xs.size(); p++) {
-    const auto lp = log_softmax(logits_of(m, args, xs[p]));
-    const auto top = best(lp, 10);
-    std::printf("position %zu token %d: top", p, args.prompt[p]);
-    positions << (p ? "," : "") << "{\"position\":" << p << ",\"token\":" << args.prompt[p] << ",\"top\":[";
-    for (size_t k = 0; k < top.size(); k++) {
-      std::printf(" %d(%.3f)", top[k], lp[static_cast<size_t>(top[k])]);
-      positions << (k ? "," : "") << "[" << top[k] << "," << lp[static_cast<size_t>(top[k])] << "]";
+  // The prompts, teacher-forced.
+  const auto xs = run_round(m, args, streams, feed);
+  std::vector<Comparison> cmp(P);
+  std::vector<std::vector<double>> last(streams.size());
+  std::vector<std::ostringstream> positions(streams.size());
+  for (size_t p = 0; p < args.prompts.size(); p++) {
+    const auto& prompt = args.prompts[p];
+    for (size_t i = 0; i < prompt.size(); i++) {
+      std::vector<std::vector<double>> lp(P);
+      for (size_t q = 0; q < P; q++) lp[q] = log_softmax(logits_of(m, args, xs[stream_of(p, q)][i]));
+      const int32_t base_top = best(lp[0], 1).front();
+      for (size_t q = 0; q < P; q++) {
+        auto& out = positions[stream_of(p, q)];
+        out << (i ? "," : "") << "{\"position\":" << i << ",\"token\":" << prompt[i];
+        if (q == 0) {
+          const auto top = best(lp[0], 10);
+          std::printf("prompt %zu position %zu token %d: top", p, i, prompt[i]);
+          out << ",\"top\":[";
+          for (size_t k = 0; k < top.size(); k++) {
+            std::printf(" %d(%.3f)", top[k], lp[0][static_cast<size_t>(top[k])]);
+            out << (k ? "," : "") << "[" << top[k] << "," << lp[0][static_cast<size_t>(top[k])] << "]";
+          }
+          out << "]";
+        } else {
+          const double kl = kl_divergence(lp[0], lp[q]);
+          const int32_t top = best(lp[q], 1).front();
+          cmp[q].kl.push_back(kl);
+          cmp[q].agree += top == base_top;
+          out << ",\"kl\":" << kl << ",\"argmax\":" << top;
+        }
+        if (i + 1 < prompt.size()) {
+          const auto next = static_cast<size_t>(prompt[i + 1]);
+          const auto rank = std::count_if(lp[q].begin(), lp[q].end(), [&](double v) { return v > lp[q][next]; });
+          cmp[q].nll -= lp[q][next];
+          cmp[q].scored++;
+          if (q == 0) std::printf("; next %zu log-prob %.3f rank %ld", next, lp[0][next], static_cast<long>(rank));
+          out << ",\"next\":" << next << ",\"next_logprob\":" << lp[q][next] << ",\"next_rank\":" << rank;
+        }
+        out << "}";
+      }
+      std::printf("\n");
+      if (i + 1 == prompt.size())
+        for (size_t q = 0; q < P; q++) last[stream_of(p, q)] = std::move(lp[q]);
     }
-    positions << "]";
-    if (p + 1 < xs.size()) {
-      const auto next = static_cast<size_t>(args.prompt[p + 1]);
-      const auto rank = std::count_if(lp.begin(), lp.end(), [&](double v) { return v > lp[next]; });
-      nll -= lp[next];
-      top1 += rank == 0;
-      std::printf("; next %zu log-prob %.3f rank %ld", next, lp[next], static_cast<long>(rank));
-      positions << ",\"next\":" << next << ",\"next_logprob\":" << lp[next] << ",\"next_rank\":" << rank;
+    // Routes against the baseline's, over the prompt's positions.
+    const Stream& base = streams[stream_of(p, 0)];
+    for (size_t q = 1; q < P; q++) {
+      const Stream& other = streams[stream_of(p, q)];
+      for (size_t L = 0; L < base.routes.size(); L++)
+        for (size_t i = 0; i < base.routes[L].size(); i++) {
+          cmp[q].routes++;
+          cmp[q].routes_differing += base.routes[L][i] != other.routes[L][i];
+        }
     }
-    positions << "}";
-    std::printf("\n");
-    last = lp;
   }
-  const size_t scored = args.prompt.size() - 1;
-  if (scored > 0)
-    std::printf("prompt: %zu next tokens scored, perplexity %.3f, top-1 %d/%zu\n", scored,
-                std::exp(nll / static_cast<double>(scored)), top1, scored);
+  std::fflush(stdout);
 
-  // Greedy continuation, one token per batch.
-  std::vector<int32_t> generated;
+  // Greedy continuation, one token per stream per round.
+  std::vector<std::vector<int32_t>> generated(streams.size());
   for (int g = 0; g < args.generate; g++) {
-    const int32_t next = best(last, 1).front();
-    generated.push_back(next);
-    std::printf("generated %d\n", next);
-    std::fflush(stdout);
+    std::vector<std::vector<int32_t>> next(streams.size());
+    for (size_t s = 0; s < streams.size(); s++) {
+      next[s] = {best(last[s], 1).front()};
+      generated[s].push_back(next[s].front());
+    }
     if (g + 1 == args.generate) break;
-    const auto x = run_batch(m, args, caches, {next}, stats);
-    last = log_softmax(logits_of(m, args, x.front()));
+    const auto x = run_round(m, args, streams, next);
+    for (size_t s = 0; s < streams.size(); s++) last[s] = log_softmax(logits_of(m, args, x[s].front()));
   }
 
-  const auto mx = summarize(stats.mxfp4_error), e4 = summarize(stats.e4m3_error);
-  const auto margins = stats.route_margins;
+  // Summaries.
+  std::vector<float> margins;
+  size_t selections = 0, dropping = 0;
+  for (const Stream& s : streams)
+    if (s.baseline) {
+      margins.insert(margins.end(), s.route_margins.begin(), s.route_margins.end());
+      selections += s.selections;
+      dropping += s.selections_dropping;
+    }
   const auto below = [&](float t) { return std::count_if(margins.begin(), margins.end(), [&](float v) { return v < t; }); };
   const float min_margin = margins.empty() ? 0.0f : *std::min_element(margins.begin(), margins.end());
+  const auto perplexity = [](const Comparison& c) { return c.scored ? std::exp(c.nll / static_cast<double>(c.scored)) : 0.0; };
+  const std::string base_name(glm53::name_of(args.precisions[0]));
+  std::printf("%s: perplexity %.4f over %zu next tokens\n", base_name.c_str(), perplexity(cmp[0]), cmp[0].scored);
+  for (size_t q = 1; q < P; q++) {
+    const auto& c = cmp[q];
+    std::printf("%s vs %s: KL mean %.4g median %.4g p90 %.4g max %.4g nats over %zu positions; top-1 agrees %zu/%zu; "
+                "perplexity %.4f; Routes differing %zu/%zu\n",
+                std::string(glm53::name_of(args.precisions[q])).c_str(), base_name.c_str(), mean_of(c.kl), quantile(c.kl, 0.5),
+                quantile(c.kl, 0.9), quantile(c.kl, 1.0), c.kl.size(), c.agree, c.kl.size(), perplexity(c), c.routes_differing,
+                c.routes);
+  }
+  for (size_t s = 0; s < streams.size() && args.generate > 0; s++) {
+    std::printf("prompt %zu %s generated", streams[s].prompt, std::string(glm53::name_of(streams[s].precision)).c_str());
+    for (int32_t t : generated[s]) std::printf(" %d", t);
+    std::printf("\n");
+  }
   std::printf("routes: %zu, min margin %.3g, below 1e-3: %ld, below 1e-5: %ld, ties: %ld\n", margins.size(),
               min_margin, static_cast<long>(below(1e-3f)), static_cast<long>(below(1e-5f)),
               static_cast<long>(std::count(margins.begin(), margins.end(), 0.0f)));
-  std::printf("Selections: %zu on Full layers, %zu dropping positions (prompts up to index_topk keep all)\n",
-              stats.selections, stats.selections_dropping);
-  std::printf("feed-forward input, relative error: MXFP4 mean %.4f max %.4f; E4M3 mean %.4f max %.4f\n", mx.mean,
-              mx.max, e4.mean, e4.max);
+  std::printf("Selections: %zu on Full layers, %zu dropping positions (prompts up to index_topk keep all)\n", selections,
+              dropping);
   std::printf("total %.1f s\n", seconds_since(t0));
 
   if (!args.report.empty()) {
     std::ofstream r(args.report);
     r.precision(9);
-    r << "{\"prompt\":[";
-    for (size_t i = 0; i < args.prompt.size(); i++) r << (i ? "," : "") << args.prompt[i];
-    r << "],\"positions\":[" << positions.str() << "],\"generated\":[";
-    for (size_t i = 0; i < generated.size(); i++) r << (i ? "," : "") << generated[i];
-    r << "],\"route_margins\":[";
+    r << "{\"baseline\":\"" << base_name << "\",\"streams\":[";
+    for (size_t s = 0; s < streams.size(); s++) {
+      r << (s ? "," : "") << "{\"prompt\":" << streams[s].prompt << ",\"precision\":\""
+        << glm53::name_of(streams[s].precision) << "\",\"positions\":[" << positions[s].str() << "],\"generated\":[";
+      for (size_t i = 0; i < generated[s].size(); i++) r << (i ? "," : "") << generated[s][i];
+      r << "]}";
+    }
+    r << "],\"prompts\":[";
+    for (size_t p = 0; p < args.prompts.size(); p++) {
+      r << (p ? "," : "") << "[";
+      for (size_t i = 0; i < args.prompts[p].size(); i++) r << (i ? "," : "") << args.prompts[p][i];
+      r << "]";
+    }
+    r << "],\"summary\":{";
+    for (size_t q = 0; q < P; q++) {
+      const auto& c = cmp[q];
+      r << (q ? "," : "") << "\"" << glm53::name_of(args.precisions[q]) << "\":{\"perplexity\":" << perplexity(c)
+        << ",\"scored\":" << c.scored;
+      if (q > 0)
+        r << ",\"kl_mean\":" << mean_of(c.kl) << ",\"kl_median\":" << quantile(c.kl, 0.5) << ",\"kl_p90\":" << quantile(c.kl, 0.9)
+          << ",\"kl_max\":" << quantile(c.kl, 1.0) << ",\"top1_agree\":" << c.agree << ",\"positions\":" << c.kl.size()
+          << ",\"routes\":" << c.routes << ",\"routes_differing\":" << c.routes_differing;
+      r << "}";
+    }
+    r << "},\"route_margins\":[";
     for (size_t i = 0; i < margins.size(); i++) r << (i ? "," : "") << margins[i];
-    r << "],\"selections\":" << stats.selections << ",\"selections_dropping\":" << stats.selections_dropping
-      << ",\"ffn_in_error\":{\"mxfp4\":{\"mean\":" << mx.mean << ",\"max\":" << mx.max << "},\"e4m3\":{\"mean\":"
-      << e4.mean << ",\"max\":" << e4.max << "}},\"seconds\":" << seconds_since(t0) << "}\n";
+    r << "],\"selections\":" << selections << ",\"selections_dropping\":" << dropping
+      << ",\"seconds\":" << seconds_since(t0) << "}\n";
     if (!r) die("cannot write " + args.report);
   }
   return 0;

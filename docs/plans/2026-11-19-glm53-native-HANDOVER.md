@@ -1,4 +1,4 @@
-# HANDOVER: GLM-5.3 full uncensored on ds4-native — session state 2026-11-19 (updated 18:00)
+# HANDOVER: GLM-5.3 full uncensored on ds4-native — session state 2026-11-19 (updated 20:15)
 
 Resume point for any fresh session. Companion to
 [`2026-11-19-glm53-native.md`](2026-11-19-glm53-native.md) (the plan — read it first; its
@@ -16,7 +16,7 @@ backbone differs (119 bf16 residual-writer tensors). Speed expectation est. 15�
 30–50 with cache-conditional routing + RAM tier — a quality/architecture play. Phase 5's measured
 CyberGym verdict decides keep/archive.
 
-## Where things stand (2026-11-19 ~18:00, second session)
+## Where things stand (2026-11-19 ~20:15, second session)
 
 ### Done
 
@@ -28,6 +28,7 @@ CyberGym verdict decides keep/archive.
 | **Backbone extractor + joint release** | same branch: `core/glm53/backbone`, `io/glm53_backbone` (own lib `ds4n_glm53_io`), `ds4n-glm53-backbone-extract`, `store-build --verify --backbone` | per-shard Backbone parts, atomic + verified. Real shards 2–5: 24 tensors bit-identical per the official safetensors reader, mixed shard 2 released, one flipped byte keeps its shard. 230 core + 3 I/O tests; 4/4 mutants killed |
 | **Per-tensor release + consume driver** | same branch: `decode_record` (inverse of `build_record`), `StoredTensor` parse, `io/glm53_store` `check_store_tensors`, `tools/glm53-store/consume.sh` | the per-layer release rule would have stranded the 68 shards that hold two layers' Experts (~100 GiB): once a layer's first shards leave, that layer can never be verified whole again. A stored tensor is now proven against its slice of its decoded record. Driver walks shards in file order with per-Expert convert (skips what the store holds), part repair, and all-zero records read as not converted. Real shards 1–9 through the driver in RAM (shards read-only): all released, then an independent verify of the *original* shards matched all 512 Experts of layers 10–11; canary on real ZFS (3 shards) before the full run. Review by an independent agent: no deletion-safety blocker; its findings (compression, ordering, part repair, crash windows) are fixed. 234 core + 4 I/O tests; 6/6 mutants killed |
 | **First real-weights run (Phase 3 step 2)** | same branch: `begin_layer`/`finish_layer`/`bind_layer` (the oracle's seam at the routed Experts), `core/glm53/{dequant,precision}`, `io/glm53_weights` `BackboneParts`, `io/glm53_store` `StoreReader`, `ds4n-glm53-oracle-run`; receipts `docs/bench/glm53-oracle/2026-11-19-capitals.*` | 21-token prompt on CPU, 478 s, beside the live flare deployment: " Rome" at p 0.994, " Paris"/" Berlin" top-1. Route margins median 3.5e-3 (≈ one BF16 step), 9/1,725 within 1e-5. Feed-forward input error: W4A4 11.6%, E4M3 2.65%. Layer-major decoding bit-identical to `decode_token` on the golden; mutation probe 11/11. 245 core + 7 I/O tests |
+| **Activation precision measured (Phase 3 step 3)** | same branch: `core/glm53/precision` `ActivationPrecision` (MXFP4 with Quark's "even" scale, read from amd-quark 0.13), `expert_outputs` + `finish_layer` over `ExpertOutput`s (the seam at the routed Experts' outputs), oracle-run `--prompt`×N `--activations`; receipts `docs/bench/glm53-oracle/2026-11-19-activations.*` | 5 prompts, 315 positions, 1,961 s on 30 threads with flare stopped (operator-approved; **left stopped** at the operator's word: `docker start glm53-flash-hyperflare-tp2-uncensored` brings it back, ~1 min to load). Mean KL vs FP32: W4A4 0.0616, E4M3 0.0051, BF16 0.0036; perplexity 3.975 / 3.805 / 3.826 vs 3.849. **E4M3 decided** (operator; plan settled decision 8). Prompt 0 at FP32 reproduces step 2's output exactly; mutation probe 12/12; 249 core + 7 I/O tests |
 | **Converter safety fix** | same branch, `24b9a6a` | the deletable list could have listed MTP and unconverted shards; now it lists only verified, fully consumed shards and has a free-space preflight. Checked on real layer 10 (RAM tmpfs) |
 | Indexer reference pinning (old step 5) | `ref/glm-5.3/README.md` | **decided: transformers 5.16.0** |
 | Desktop space for the download | /models/voice deleted (operator-approved; TTS weights, re-downloadable), 82 exited containers + `ds4-native-dev:1` removed | `space-guard.sh` armed (pauses the fetch below 6 GiB free) |
@@ -115,13 +116,16 @@ An independent audit (python, read-only, against the index) found:
    ```
    ~5 s per layer for a 21-token batch (attention is sequential per token; the Experts of a batch
    run in parallel), ~15 s per generated token. The Selection tie rate is still open: it needs a
-   prompt over 2048 tokens.
-5. **Reference configuration decision**: activation precision into MXFP4 linears (the checkpoint
-   declares W4A4 MXFP4 inputs; DS4.1's kernels use E4M3). First numbers: W4A4 adds 11.6% relative
-   error at the feed-forward inputs, E4M3 2.65%. Decide by KL against the Semantics oracle over a
-   prompt set (add a precision switch to the oracle-run's feed-forward). Fix the router's
-   reduction order too: real Route margins are within 1e-5 for 9 of 1,725 routes. Then the
-   bit-exact oracle, then kernels (first GPU window).
+   prompt over 2048 tokens. For a precision comparison, repeat `--prompt` and add
+   `--activations fp32,bf16,e4m3,mxfp4` (the first is the baseline). Step 3 ran 5 prompts × 4
+   precisions with `--cpus 30 --memory 52g --threads 30 --resident 160` while flare was stopped:
+   ~25 s per layer, 33 min in all.
+5. **Reference configuration decision**: activation precision **measured** (plan Phase 3
+   step 3): W4A4 as the checkpoint declares it costs mean KL 0.0616 nats and 3.3% perplexity
+   against FP32; E4M3 costs 0.0051, BF16 0.0036. **Decided: E4M3 activations for routed and
+   shared Experts** (plan settled decision 8; decode is weight-bandwidth bound either way).
+   Next, fix the router's reduction order (82 of 23,625 real routes within 1e-5, 6 exact ties),
+   write the bit-exact oracle, then the kernels (first GPU window).
 6. **Backbone B (cyber)**: does not fit on rpool next to store + Backbone A (est. 20–30 GiB short). It
    needs a space decision first.
 7. Phases 4–5 per the plan (fifth switch-primary entry `glm-native`, slots ladder, CyberGym).
@@ -167,7 +171,7 @@ An independent audit (python, read-only, against the index) found:
 | The plan (phases, decisions, budget of truth) | `ds4-native/docs/plans/2026-11-19-glm53-native.md` |
 | This handover | `ds4-native/docs/plans/2026-11-19-glm53-native-HANDOVER.md` |
 | Pinned GLM-5.3 reference + why | `ds4-native/ref/glm-5.3/README.md` |
-| GLM terms (Selection, Full/Shared layer, Latent row, Backbone part, Semantics oracle, Route margin) | `ds4-native/CONTEXT.md`, GLM-5.3 section |
+| GLM terms (Selection, Full/Shared layer, Latent row, Backbone part, Semantics oracle, Activation precision, Route margin) | `ds4-native/CONTEXT.md`, GLM-5.3 section |
 | Feasibility base (measured constants) | `ds4-native/docs/research/2026-10-26-feasibility.md` |
 | Serving design / engine internals | `ds4-native/docs/design/{serving,forward-pass,dspark}.md` |
 | Inference map (primaries, runbooks) | `.dotfiles/scripts/inference/INDEX.md` |
@@ -184,7 +188,7 @@ An independent audit (python, read-only, against the index) found:
 - ~~`e_score_correction_bias` + sigmoid routing tie-breaking: match ONE reference to the bit~~:
   the reference is pinned (transformers 5.16.0) and the Semantics oracle breaks ties to the lower
   Expert id / position. The bit-level match is the Reference configuration's job (next actions 5).
-- Activation precision into MXFP4 linears (W4A4 as declared vs E4M3), RoPE angle rounding at long
+- ~~Activation precision~~ (decided: E4M3, plan settled decision 8). RoPE angle rounding at long
   context, and the Selection tie rate: plan, Open items.
 - MTP fragility: dealignai reports stock-vLLM breakage; our engine owns the path, but budget
   MTP as stretch, not dependency.

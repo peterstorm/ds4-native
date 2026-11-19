@@ -171,10 +171,11 @@ TEST_CASE("decoding token by token reproduces the reference's causal prefill") {
                                           << worst_latent << ", index key " << worst_key);
 }
 
-// The real-weights run cannot hold the model: it binds one layer at a time and
-// runs every token of a batch through begin_layer before finishing any, with
-// the routed Experts supplied from outside. That order must change nothing.
-TEST_CASE("layer-major decoding with per-layer binding is bit-identical to decode_token") {
+// The real-weights run cannot hold the model: it binds one layer at a time,
+// runs every token of a batch through begin_layer before finishing any, and
+// runs each routed Expert once over all the tokens it serves (Expert-major,
+// as it reads them from the store). That order must change nothing.
+TEST_CASE("layer-major, Expert-major decoding with per-layer binding is bit-identical to decode_token") {
   const Golden& g = golden();
   const Config config = golden_config();
   const Dims& d = config.dims();
@@ -211,10 +212,25 @@ TEST_CASE("layer-major decoding with per-layer binding is bit-identical to decod
       if (config.indexer(L) == IndexerKind::Full) selection[p] = s.value().selection;
       starts.push_back(std::move(s).value());
     }
+    // Each Expert once, over every (token, route slot) that names it.
+    std::vector<std::vector<ExpertOutput>> routed(ids.size());
+    for (size_t p = 0; p < ids.size(); p++) routed[p].resize(starts[p].route.expert.size());
+    for (int e = 0; e < static_cast<int>(bound.value().experts(L).size()); e++) {
+      std::vector<std::pair<size_t, size_t>> served;
+      std::vector<std::span<const float>> inputs;
+      for (size_t p = 0; p < ids.size(); p++)
+        for (size_t k = 0; k < starts[p].route.expert.size(); k++)
+          if (starts[p].route.expert[k] == e) {
+            served.emplace_back(p, k);
+            inputs.push_back(starts[p].ffn_in);
+          }
+      auto out = expert_outputs(config, bound.value().experts(L)[static_cast<size_t>(e)], inputs,
+                                ActivationPrecision::Fp32);
+      REQUIRE(out.is_ok());
+      for (size_t j = 0; j < served.size(); j++) routed[served[j].first][served[j].second] = out.value()[j];
+    }
     for (size_t p = 0; p < ids.size(); p++) {
-      std::vector<Mlp> routed;
-      for (int32_t e : starts[p].route.expert) routed.push_back(bound.value().experts(L)[static_cast<size_t>(e)]);
-      auto step = finish_layer(config, layer.value(), std::move(starts[p]), routed);
+      auto step = finish_layer(config, layer.value(), std::move(starts[p]), routed[p]);
       REQUIRE(step.is_ok());
       const LayerStep& w = want[p].layers[static_cast<size_t>(L)];
       CHECK(step.value().out == w.out);
@@ -232,7 +248,7 @@ TEST_CASE("layer-major decoding with per-layer binding is bit-identical to decod
   }
 }
 
-TEST_CASE("finish_layer takes exactly the routed Experts its Route names, in an Expert's shape") {
+TEST_CASE("finish_layer takes exactly its Route's Experts' outputs, at one precision; expert_outputs an Expert's shape") {
   const Golden& g = golden();
   const Config config = golden_config();
   const Dims& d = config.dims();
@@ -250,14 +266,38 @@ TEST_CASE("finish_layer takes exactly the routed Experts its Route names, in an 
   REQUIRE(s.route.expert.size() == static_cast<size_t>(d.experts_per_token));
   CHECK(s.route.margin >= 0.0f);
 
-  std::vector<Mlp> routed;
-  for (int32_t e : s.route.expert) routed.push_back(bound.value().experts(sparse)[static_cast<size_t>(e)]);
+  const auto experts = bound.value().experts(sparse);
+  const std::span<const float> h[] = {s.ffn_in};
+  auto output_of = [&](const Mlp& m, ActivationPrecision p) { return expert_outputs(config, m, h, p); };
+  std::vector<ExpertOutput> routed;
+  for (int32_t e : s.route.expert) routed.push_back(output_of(experts[static_cast<size_t>(e)], ActivationPrecision::Fp32).value().front());
   CHECK(finish_layer(config, layer.value(), start(), routed).is_ok());
   CHECK_FALSE(finish_layer(config, layer.value(), start(), std::span(routed).first(routed.size() - 1)).is_ok());
   CHECK_FALSE(finish_layer(config, layer.value(), start(), {}).is_ok());
-  std::vector<Mlp> wrong(routed);
-  std::swap(wrong.front().gate, wrong.front().down);  // a down projection where the gate goes
-  CHECK_FALSE(finish_layer(config, layer.value(), start(), wrong).is_ok());
+  std::vector<ExpertOutput> narrow(routed);
+  narrow.front().values.pop_back();
+  CHECK_FALSE(finish_layer(config, layer.value(), start(), narrow).is_ok());
+  std::vector<ExpertOutput> mixed(routed);
+  mixed.back() = output_of(experts[static_cast<size_t>(s.route.expert.back())], ActivationPrecision::Bf16).value().front();
+  CHECK_FALSE(finish_layer(config, layer.value(), start(), mixed).is_ok());
+  for (auto& y : mixed) y = ExpertOutput{y.values, ActivationPrecision::Bf16};
+  CHECK(finish_layer(config, layer.value(), start(), mixed).is_ok());
+
+  Mlp wrong = experts.front();
+  std::swap(wrong.gate, wrong.down);  // a down projection where the gate goes
+  CHECK_FALSE(output_of(wrong, ActivationPrecision::Fp32).is_ok());
+  const std::vector<float> short_input(static_cast<size_t>(d.hidden) - 1, 0.25f);
+  const std::span<const float> bad[] = {s.ffn_in, short_input};
+  CHECK_FALSE(expert_outputs(config, experts.front(), bad, ActivationPrecision::Fp32).is_ok());
+  CHECK(expert_outputs(config, experts.front(), {}, ActivationPrecision::Fp32).value().empty());
+
+  // The golden Experts are 24 wide inside: no whole MXFP4 or E4M3 blocks, so
+  // neither a routed Expert nor the shared one can take a block precision.
+  REQUIRE(d.moe_intermediate % 32 != 0);
+  CHECK_FALSE(output_of(experts.front(), ActivationPrecision::Mxfp4).is_ok());
+  CHECK_FALSE(output_of(experts.front(), ActivationPrecision::E4m3).is_ok());
+  for (auto& y : mixed) y.precision = ActivationPrecision::Mxfp4;
+  CHECK_FALSE(finish_layer(config, layer.value(), start(), mixed).is_ok());
 
   // A Dense layer takes none.
   const auto dense = bind_layer(config, 0, g.lookup());
@@ -271,6 +311,103 @@ TEST_CASE("finish_layer takes exactly the routed Experts its Route names, in an 
 
   CHECK_FALSE(bind_layer(config, d.layers, g.lookup()).is_ok());
   CHECK_FALSE(bind_layer(config, -1, g.lookup()).is_ok());
+}
+
+namespace {
+
+/** The golden config with Experts 32 wide inside, so block precisions fit (hidden is 64). */
+Config blocked_config() {
+  std::string json = golden().metadata.at("config_json");
+  const std::string from = "\"moe_intermediate_size\": 24";
+  const auto at = json.find(from);
+  REQUIRE(at != std::string::npos);
+  json.replace(at, from.size(), "\"moe_intermediate_size\": 32");
+  auto c = parse_config(json);
+  REQUIRE(c.is_ok());
+  REQUIRE(c.value().dims().moe_intermediate == 32);
+  return c.value();
+}
+
+/** Random weights for an Mlp of `hidden` -> `inner` -> `hidden`, kept alive by `store`. */
+Mlp random_mlp(std::mt19937& rng, std::vector<std::vector<float>>& store, int hidden, int inner) {
+  auto matrix = [&](int rows, int cols) {
+    store.push_back(random_vector(rng, static_cast<size_t>(rows) * static_cast<size_t>(cols), 0.2f));
+    return Matrix{store.back(), rows, cols};
+  };
+  const Matrix gate = matrix(inner, hidden), up = matrix(inner, hidden), down = matrix(hidden, inner);
+  return Mlp{gate, up, down};
+}
+
+/** The SwiGLU feed-forward written out, both linear inputs through precision p. */
+std::vector<float> swiglu_at(const Mlp& m, std::span<const float> x, ActivationPrecision p) {
+  const auto in = round_trip(p, x);
+  const auto g = linear(m.gate, in), u = linear(m.up, in);
+  std::vector<float> a(g.size());
+  for (size_t i = 0; i < a.size(); i++) a[i] = g[i] / (1.0f + static_cast<float>(std::exp(-static_cast<double>(g[i])))) * u[i];
+  return linear(m.down, round_trip(p, a));
+}
+
+}  // namespace
+
+// An Expert at an activation precision is the SwiGLU feed-forward with both
+// of its linear inputs -- the feed-forward input, and silu(gate) * up before
+// down_proj -- rounded through that precision, as W4A4 quantizes every linear
+// input of a routed or shared Expert. The shared expert follows the routed
+// outputs' precision; a Dense layer's MLP stays FP32.
+TEST_CASE("Experts at an activation precision round both linear inputs; the shared expert follows the routed ones") {
+  const Config config = blocked_config();
+  const Dims& d = config.dims();
+  std::mt19937 rng(17);
+  std::vector<std::vector<float>> store;  // moving a vector keeps its buffer, so the views stay valid
+  const Mlp expert = random_mlp(rng, store, d.hidden, d.moe_intermediate);
+  const Mlp shared = random_mlp(rng, store, d.hidden, d.shared_intermediate());
+  std::vector<std::vector<float>> xs;
+  for (int t = 0; t < 5; t++) xs.push_back(random_vector(rng, static_cast<size_t>(d.hidden), 2.0f));
+  const std::vector<std::span<const float>> inputs(xs.begin(), xs.end());
+
+  for (auto p : {ActivationPrecision::Fp32, ActivationPrecision::Bf16, ActivationPrecision::E4m3,
+                 ActivationPrecision::Mxfp4}) {
+    CAPTURE(name_of(p));
+    const auto out = expert_outputs(config, expert, inputs, p);
+    REQUIRE(out.is_ok());
+    REQUIRE(out.value().size() == xs.size());
+    for (size_t t = 0; t < xs.size(); t++) {
+      CHECK(out.value()[t].precision == p);
+      CHECK(out.value()[t].values == swiglu_at(expert, xs[t], p));
+      // A batch of one gives the same bits as the batch.
+      const std::span<const float> one[] = {xs[t]};
+      CHECK(expert_outputs(config, expert, one, p).value().front().values == out.value()[t].values);
+    }
+    if (p != ActivationPrecision::Fp32) CHECK(out.value()[0].values != swiglu_at(expert, xs[0], ActivationPrecision::Fp32));
+
+    // finish_layer: mid + (Σ_k weight_k y_k, accumulated in double) + shared(ffn_in) at the routed precision.
+    LayerWeights w;
+    w.mlp = MoeWeights{Matrix{}, {}, shared};
+    LayerStart start;
+    start.mid = random_vector(rng, static_cast<size_t>(d.hidden));
+    start.ffn_in = xs[0];
+    start.route.expert = {1, 4};
+    start.route.weight = {0.75f, 1.5f};
+    const std::vector<ExpertOutput> routed{out.value()[1], out.value()[2]};
+    const auto step = finish_layer(config, w, start, routed);
+    REQUIRE(step.is_ok());
+    const auto shared_y = swiglu_at(shared, xs[0], p);
+    for (size_t i = 0; i < start.mid.size(); i++) {
+      const double acc = static_cast<double>(routed[0].values[i] * 0.75f) + static_cast<double>(routed[1].values[i] * 1.5f);
+      CHECK(step.value().out[i] == start.mid[i] + static_cast<float>(static_cast<float>(acc) + shared_y[i]));
+    }
+  }
+
+  // A Dense layer's MLP is FP32 whatever precision the Experts run at.
+  LayerWeights dense;
+  dense.mlp = shared;
+  LayerStart start;
+  start.mid = random_vector(rng, static_cast<size_t>(d.hidden));
+  start.ffn_in = xs[1];
+  const auto step = finish_layer(config, dense, start, {});
+  REQUIRE(step.is_ok());
+  const auto y = swiglu_at(shared, xs[1], ActivationPrecision::Fp32);
+  for (size_t i = 0; i < y.size(); i++) CHECK(step.value().out[i] == start.mid[i] + y[i]);
 }
 
 TEST_CASE("the Session caches index keys on Full layers only") {

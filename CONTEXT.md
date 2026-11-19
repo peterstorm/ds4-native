@@ -184,7 +184,11 @@ The GLM-5.3 Backbone tensors of one kitaniai source shard, copied byte for byte 
 _Avoid_: backbone shard (a shard is a source file), slice
 
 **Semantics oracle**:
-GLM-5.3's FP32 CPU oracle (`core/glm53/reference`). It agrees with the pinned reference to FP32 noise, checked by golden activations (`tests/data/glm53-golden.safetensors`), and runs the real weights a layer at a time (`ds4n-glm53-oracle-run`): a layer is begun (attention and routing, `begin_layer`) and finished with exactly the routed Experts its Route names (`finish_layer`), so no more than one layer's Backbone and the Experts in use are ever held. It is not a Reference configuration: the quantized GPU executor gets its own bit-exact oracle built on top of it, as DS4.1's did.
+GLM-5.3's FP32 CPU oracle (`core/glm53/reference`). It agrees with the pinned reference to FP32 noise, checked by golden activations (`tests/data/glm53-golden.safetensors`), and runs the real weights a layer at a time (`ds4n-glm53-oracle-run`): a layer is begun (attention and routing, `begin_layer`), each Expert the Routes name is read once and run over every token it serves (`expert_outputs`), and the layer is finished with its Route's outputs (`finish_layer`), so no more than one layer's Backbone and the Experts in use are ever held. It is not a Reference configuration: the quantized GPU executor gets its own bit-exact oracle built on top of it, as DS4.1's did.
+
+**Activation precision**:
+The number format a GLM-5.3 Expert's linears read their inputs in (the feed-forward input, and silu(gate) × up before down_proj), for routed and shared Experts alike (`core/glm53/precision`): FP32 (the Semantics oracle), BF16 (W4A16), E4M3 (DS4.1's kernels) or MXFP4 (W4A4, as kitaniai's checkpoint declares it, with Quark's "even" scale). Attention, routers, indexers and the Dense layers' MLPs are not Experts and stay out of it. Choosing it is a Reference configuration decision, measured as KL against FP32 (`ds4n-glm53-oracle-run --activations`). The engine's is **E4M3** (plan, settled decision 8).
+_Avoid_: "A4"/"A8" alone (say which format), activation dtype
 
 **Route margin**:
 How close one token's Expert choice on one Sparse GLM layer is to a tie: the worst chosen Expert's biased router score (sigmoid + `e_score_correction_bias`) minus the best unchosen one's (`Route::margin`). A route whose margin is within an engine's arithmetic noise can choose differently in that engine; on real weights the median is ~3.5e-3, about one BF16 step.

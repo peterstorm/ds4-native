@@ -8,7 +8,9 @@
 //
 // This is the *semantics* anchor, not yet a Reference configuration: the GPU
 // executor's quantized arithmetic (MXFP4 Experts, FP8/BF16 Backbone) gets its
-// own bit-exact oracle on top of these functions, as DS4.1's did.
+// own bit-exact oracle on top of these functions, as DS4.1's did. What the
+// oracle can already vary is the Experts' activation precision
+// (expert_outputs, finish_layer), to measure what each candidate loses.
 //
 // Two places where the oracle's form differs from the reference's text but not
 // its mathematics:
@@ -31,6 +33,7 @@
 #include <vector>
 
 #include "core/glm53/config.hpp"
+#include "core/glm53/precision.hpp"
 #include "core/result.hpp"
 
 namespace ds4n::glm53 {
@@ -244,14 +247,35 @@ Result<LayerStart, StepError> begin_layer(const Config& config, const LayerWeigh
                                           const LayerCache& past, std::span<const float> x,
                                           std::span<const int32_t> shared_selection);
 
+/** One routed Expert's unweighted output for one token, and the activation precision it ran at. */
+struct ExpertOutput {
+  std::vector<float> values;  // [hidden]
+  ActivationPrecision precision = ActivationPrecision::Fp32;
+};
+
 /**
- * The rest of the layer: the feed-forward, given `routed`, the Mlps of
- * start.route.expert in that order (none on a Dense layer).
+ * One routed Expert over every token it serves (the shape of a Grouped MoE):
+ * its output for each feed-forward input in `ffn_in`, its linears reading
+ * their inputs — the feed-forward input, and silu(gate) * up before
+ * down_proj — at `precision`. Each output is exactly what that token alone
+ * would get, so a caller may run the Experts in any order and any grouping.
+ * Fails if `expert` is not Expert-shaped, an input is not hidden_size wide,
+ * or a block precision does not fit the widths.
+ */
+Result<std::vector<ExpertOutput>, StepError> expert_outputs(const Config& config, const Mlp& expert,
+                                                            std::span<const std::span<const float>> ffn_in,
+                                                            ActivationPrecision precision);
+
+/**
+ * The rest of the layer: the feed-forward, given `routed`, the outputs of
+ * start.route.expert's Experts in that order (none on a Dense layer). The
+ * shared expert runs at the routed outputs' precision, which must agree; a
+ * Dense layer's MLP is FP32, as kitaniai's checkpoint leaves it out of W4A4.
  */
 Result<LayerStep, StepError> finish_layer(const Config& config, const LayerWeights& w, LayerStart start,
-                                          std::span<const Mlp> routed);
+                                          std::span<const ExpertOutput> routed);
 
-/** begin_layer and finish_layer with the routed Experts from `weights`. */
+/** begin_layer and finish_layer in FP32 with the routed Experts from `weights`: the Semantics oracle. */
 Result<LayerStep, StepError> decode_layer(const Config& config, const ModelWeights& weights, int layer,
                                           const LayerCache& past, std::span<const float> x,
                                           std::span<const int32_t> shared_selection);
