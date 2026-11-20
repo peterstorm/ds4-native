@@ -59,6 +59,8 @@ cmake --build build-cuda --target ds4n-glm53-moe-check -j "$(nproc)" >/dev/null 
 if check >/dev/null 2>&1; then echo "baseline: PASS"; else echo "baseline: FAILS (fix that first)"; exit 1; fi
 
 # Router: score, selection, weights.
+probe cc-bonus-ignored  "if (p.resident_bonus != 0.0f && p.resident[e] >= 0)" "if (false && p.resident[e] >= 0)"
+probe cc-bonus-inverted "if (p.resident_bonus != 0.0f && p.resident[e] >= 0)" "if (p.resident_bonus != 0.0f && p.resident[e] < 0)"
 probe fast-sigmoid      "det::div(1.0f, det::add(1.0f, det::exp(-logit)))" "1.0f / (1.0f + __expf(-logit))"
 probe logit-plane-lost  "for (int s = 1; s < logit_splits; s++) l =" "for (int s = 1; s < logit_splits - 1; s++) l ="
 probe biased-weight     "det::div(sig[n][sel[k]], denom)" "det::div(choice[n][sel[k]], denom)"

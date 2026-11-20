@@ -42,6 +42,12 @@ constexpr int kJobSlots = moe_plan::kMaxJobs + 1;  // routed slots, then the sha
 struct RouterParams {
   const float* bias;   // e_score_correction_bias, [256]
   float routed_scale;  // routed_scaling_factor
+  // Cache-conditional routing (exact::RouteChoice::bonus): `resident_bonus` is added in FP32 to the
+  // selection score (sigmoid + bias) of every Expert `resident` (the layer's row of the Slot table,
+  // [256], -1: no Slot) names resident; the weights stay the chosen sigmoids'. 0 keeps routing
+  // exact and the table is not read.
+  const int32_t* resident = nullptr;
+  float resident_bonus = 0.0f;
 };
 
 /**

@@ -81,6 +81,7 @@ __global__ void __launch_bounds__(kExperts) route_kernel(const float* __restrict
     finite = finite && isfinite(l);
     sig[n][e] = sigmoid(l);
     choice[n][e] = det::add(sig[n][e], p.bias[e]);
+    if (p.resident_bonus != 0.0f && p.resident[e] >= 0) choice[n][e] = det::add(choice[n][e], p.resident_bonus);
   }
   if (!finite) atomicOr(&failed, 1);
   __syncthreads();

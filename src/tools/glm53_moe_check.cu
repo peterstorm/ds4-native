@@ -20,7 +20,11 @@
 //   through cuda/glm53/grouped_moe (the oracle tool's GPU path: DS4.1's grouped
 //   kernels on moe_plan::group_tokens) under every moe_roundings Departure the
 //   GPU runs, each checked against that Departure's oracle the same way, and
-//   requires the one it does not run to be refused. Any difference exits 1.
+//   requires the one it does not run to be refused. Then cache-conditional
+//   routing (RouterParams::resident_bonus): 4 Rounds each at λ 0.03 and 0.2 with
+//   a random third of the Experts resident, Routes and Plan against
+//   exact::begin_moe with that RouteChoice, requiring the bonus to move some
+//   Routes. Any difference exits 1.
 //   --iters times one GPU's Round (default 20).
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -248,6 +252,13 @@ std::span<const float> row(const std::vector<float>& m, size_t n) { return std::
  * the logits (planes added in split order, as the route kernel does) bit for bit against
  * exact::router_logits, the Route against exact::begin_moe's. Returns the oracle's starts.
  */
+/** Cache-conditional routing for a check: the bonus, the resident mask, and its Slot-table row on the device. */
+struct CacheConditional {
+  float bonus = 0.0f;
+  std::vector<uint8_t> resident;  // [experts]
+  int32_t* d_slots = nullptr;     // [experts]: e's Slot, or -1
+};
+
 struct Routed {
   std::vector<exact::MoeStart> starts;
   std::vector<glm53::Route> gpu_routes;
@@ -255,7 +266,8 @@ struct Routed {
 };
 
 Routed route_and_check(const glm53::Dims& d, const Layer& l, const exact::MoeLayer& layer, const std::vector<float>& xf,
-                       int tokens, int planes, moe_plan::Plan* d_plans, const char* what) {
+                       int tokens, int planes, moe_plan::Plan* d_plans, const char* what,
+                       const CacheConditional* cc = nullptr) {
   const int groups = cuda::column_groups(tokens);
   const size_t plane = static_cast<size_t>(d.experts) * cuda::kMaxTokens;
   auto* d_xf = upload(xf.data(), xf.size());
@@ -263,7 +275,12 @@ Routed route_and_check(const glm53::Dims& d, const Layer& l, const exact::MoeLay
   auto* d_experts = device_alloc<int32_t>(static_cast<size_t>(tokens) * moe_plan::kTopK);
   auto* d_weights = device_alloc<float>(static_cast<size_t>(tokens) * moe_plan::kTopK);
   cuda::bf16_gemv(l.d_router, d_xf, d.experts, kDim, tokens, planes, d_logits, nullptr);
-  gpu::route(d_logits, planes, tokens, {l.d_bias, d.routed_scale}, d_experts, d_weights, d_plans, nullptr);
+  gpu::RouterParams params{l.d_bias, d.routed_scale};
+  if (cc) {
+    params.resident = cc->d_slots;
+    params.resident_bonus = cc->bonus;
+  }
+  gpu::route(d_logits, planes, tokens, params, d_experts, d_weights, d_plans, nullptr);
   ck(cudaDeviceSynchronize(), "route");
   const auto logits = download(d_logits, static_cast<size_t>(groups) * planes * plane);
   const auto experts = download(d_experts, static_cast<size_t>(tokens) * moe_plan::kTopK);
@@ -284,7 +301,9 @@ Routed route_and_check(const glm53::Dims& d, const Layer& l, const exact::MoeLay
     const auto want = exact::router_logits(layer.router, row(xf, static_cast<size_t>(n)));
     if (!want) die(want.error().what);
     logit_bits.add(got, want.value());
-    auto start = exact::begin_moe(d, layer, row(xf, static_cast<size_t>(n)));
+    exact::RouteChoice choice;
+    if (cc) choice.bonus = exact::ResidentBonus{cc->bonus, cc->resident};
+    auto start = exact::begin_moe(d, layer, row(xf, static_cast<size_t>(n)), choice);
     if (!start) die(start.error().what);
     glm53::Route gr;
     gr.expert.assign(experts.begin() + n * moe_plan::kTopK, experts.begin() + (n + 1) * moe_plan::kTopK);
@@ -573,6 +592,51 @@ int main(int argc, char** argv) {
   };
   const RoundRun first = check_round(0);
   for (int i = 1; i < rounds; i++) check_round(i);
+
+  // ---- Cache-conditional routing (exact::RouteChoice::bonus): the router alone, on fresh Rounds with
+  // a random third of the Experts resident, at the deployed λ and a large one; Routes and Plan bit for
+  // bit, and how many Routes the bonus moved (a check that moves none proves nothing).
+  {
+    CacheConditional cc;
+    std::bernoulli_distribution resident(1.0 / 3.0);
+    std::vector<int32_t> slots(static_cast<size_t>(d.experts), -1);
+    cc.resident.resize(static_cast<size_t>(d.experts));
+    for (int e = 0, next = 0; e < d.experts; e++)
+      if (resident(rng)) {
+        cc.resident[static_cast<size_t>(e)] = 1;
+        slots[static_cast<size_t>(e)] = next++;
+      }
+    cc.d_slots = upload(slots.data(), slots.size());
+    for (const float bonus : {0.03f, 0.2f}) {
+      cc.bonus = bonus;
+      size_t moved = 0, routes = 0;
+      for (int i = 0; i < 4; i++) {
+        const auto xf = random_inputs(rng, l.norm, tokens);
+        char what[64];
+        std::snprintf(what, sizeof what, "cc %.2g Round %d", static_cast<double>(bonus), i);
+        const auto routed = route_and_check(d, l, layer, xf, tokens, *planes, d_plan, what, &cc);
+        ok = ok && routed.identical;
+        const auto want_plan = moe_plan::plan(routed.gpu_routes);
+        if (!want_plan) die(want_plan.error().what);
+        const bool plan_same = same_plan(download(d_plan, 1)[0], want_plan.value());
+        if (!plan_same) std::printf("%s: Plan DIFFERS\n", what);
+        ok = ok && plan_same;
+        for (int n = 0; n < tokens; n++) {
+          const auto exact_start = exact::begin_moe(d, layer, row(xf, static_cast<size_t>(n)));
+          if (!exact_start) die(exact_start.error().what);
+          moved += exact_start.value().route.expert != routed.starts[static_cast<size_t>(n)].route.expert;
+          routes++;
+        }
+      }
+      std::printf("cache-conditional λ %.2g: %zu of %zu Routes moved by the bonus\n", static_cast<double>(bonus), moved,
+                  routes);
+      if (moved == 0) {
+        std::printf("cache-conditional λ %.2g: no Route moved: the check saw nothing\n", static_cast<double>(bonus));
+        ok = false;
+      }
+    }
+    cudaFree(cc.d_slots);
+  }
 
   // ---- A prompt sweep of `chunk` tokens through cuda/glm53/grouped_moe, the oracle tool's GPU path (DS4.1's
   // grouped kernels over moe_plan::group_tokens), under each Departure the GPU runs.
