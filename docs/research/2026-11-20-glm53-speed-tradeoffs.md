@@ -15,7 +15,9 @@ the plan (settled decision 3: "15–25 tok/s exact, 30–50 with cache-condition
    8). The miss rate decides whether decode runs at 6 or 45 tok/s. **Measured later the same
    day** (`docs/bench/glm53-locality/2026-11-20-locality-report.md`): **~29% misses at 33%
    residency, so ~5 tok/s exact**, not 15–25. GLM's routing is far less local than DS4.1's. The
-   lever that can change this is cache-conditional routing (§4), not arithmetic.
+   lever that can change this is cache-conditional routing (§4), not arithmetic. **Measured
+   too** (`docs/bench/glm53-cc/2026-11-20-cc-report.md`): λ 0.03 ~10 tok/s at KL 0.068, λ 0.1
+   ~23 tok/s at KL 0.124, against a 0.045 floor any rounding-only change costs.
 3. **Prefill touches most of the store even for short prompts** (measured: 168 of 256 Experts
    per layer for 64 tokens). Time-to-first-token is NVMe-bound at **≈ 5–10 s per turn**
    (est.), almost regardless of message length. That is the user-visible cost to plan for.
@@ -92,7 +94,7 @@ because its residency is about twice as high.
 
 | Lever | Speed | Costs | How to measure it before building |
 |---|---|---|---|
-| **Cache-conditional routing** (λ > 0: prefer resident Experts among near-ties) | DS4.1: 52–73% fewer misses, so roughly 2× decode (plan: 30–50 tok/s) | **Not exact**: outputs depend on cache contents. KL cost unmeasured on GLM. Route margins are tiny (median 3.5e-3, one BF16 step), so many swaps are cheap, but which ones is the question. | An oracle-run arithmetic that re-routes against a simulated cache, scored by KL like every other stream |
+| **Cache-conditional routing** (λ > 0: prefer resident Experts among near-ties) | **Measured on GLM:** λ 0.03 halves misses (~10 tok/s), λ 0.1 cuts them to 6.7% (~23 tok/s); DS4.1: 52–73% fewer | **Not exact**: outputs depend on cache contents. **KL measured:** 0.068 (λ 0.03), 0.124 (λ 0.1), floor 0.045. Route margins are tiny (median 3.5e-3, one BF16 step), so many swaps are cheap, but which ones is the question. | An oracle-run arithmetic that re-routes against a simulated cache, scored by KL like every other stream |
 | **MTP drafting** (kitaniai carries layer 78) | Exact (verified rows); 1.5–2× decode if acceptance is good (est.) | A verify Round of k rows routes to more distinct Experts, so it has more misses per step. The gain depends on acceptance × locality. The plan keeps it a stretch goal (fragile upstream). | Acceptance rate from the oracle (MTP head on the Semantics oracle); misses per verify Round from the same simulator |
 | **More Experts in VRAM** | Each +10% residency cuts `m` substantially (shape unmeasured) | Comes out of Latent cache and workspace. The **FP8 Latent** (design "Open") halves the Latent cache: at 200K positions that is ~9 GB per GPU, about 900 more Halves, and costs KL (unmeasured). | KL stream for the FP8 Latent; the simulator for the residency gain |
 | **RAM victim tier** | Turns a 1.6 ms miss into 0.35 ms | 70 GB of the desktop's 91 GB RAM; competes with everything else on the box | Simulator |
@@ -102,8 +104,9 @@ because its residency is about twice as high.
 ## 5. What to measure next (speed)
 
 **Done 2026-11-20:** steps 1 and 2 below (`--routes`, `tools/glm53-golden/expert_locality.py`),
-on a 2,800-position corpus and the chat test. Result in the locality report. The next speed
-measurement is cache-conditional routing's KL cost and miss reduction (§4, first row).
+on a 2,800-position corpus and the chat test. Result in the locality report. Cache-conditional
+routing's KL cost and miss reduction: done the same day (`docs/bench/glm53-cc/`), with Expert
+pruning measured and dominated (`docs/bench/glm53-slim/`). Next: free generation at λ 0.03–0.2.
 
 **GLM Expert locality from real routes.** `ds4n-glm53-oracle-run --generate N` produces genuine
 decode Routes (Expert ids per token per layer). Steps:
