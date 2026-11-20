@@ -109,6 +109,18 @@ __global__ void index_key_norm_kernel(__nv_bfloat16* __restrict__ keys, const fl
   }
 }
 
+__global__ void index_head_weights_kernel(const __nv_bfloat16* __restrict__ projected, int n, float scale,
+                                          float* __restrict__ w) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) w[i] = __fmul_rn(__bfloat162float(projected[i]), scale);
+}
+
+__global__ void residual_kernel(const float* __restrict__ x, const __nv_bfloat16* __restrict__ out, int n,
+                                float* __restrict__ mid) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) mid[i] = __fadd_rn(x[i], __bfloat162float(out[i]));
+}
+
 // ---- Flash decoding over the Selection ----
 
 constexpr int kHeadsPerCta = 16;
@@ -341,6 +353,14 @@ void rope(__nv_bfloat16* x, int tokens, int heads, size_t token_stride, int head
 void index_key_norm(__nv_bfloat16* keys, const float* weight, const float* bias, float eps, int tokens,
                     cudaStream_t stream) {
   index_key_norm_kernel<<<tokens, 32, 0, stream>>>(keys, weight, bias, eps);
+}
+
+void index_head_weights(const __nv_bfloat16* projected, int n, float scale, float* w, cudaStream_t stream) {
+  index_head_weights_kernel<<<(n + 255) / 256, 256, 0, stream>>>(projected, n, scale, w);
+}
+
+void residual(const float* x, const __nv_bfloat16* out, int n, float* mid, cudaStream_t stream) {
+  residual_kernel<<<(n + 255) / 256, 256, 0, stream>>>(x, out, n, mid);
 }
 
 cudaError_t latent_attention(const __nv_bfloat16* queries, const __nv_bfloat16* cache, const int32_t* selection,

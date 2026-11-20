@@ -94,6 +94,12 @@ void rope(__nv_bfloat16* x, int tokens, int heads, size_t token_stride, int head
 void index_key_norm(__nv_bfloat16* keys, const float* weight, const float* bias, float eps, int tokens,
                     cudaStream_t stream);
 
+/** w[i] = bf16 projected[i] * scale, FP32: the indexer's head weights (A7). */
+void index_head_weights(const __nv_bfloat16* projected, int n, float scale, float* w, cudaStream_t stream);
+
+/** mid[i] = x[i] + out[i] in FP32: the residual stream after a sub-block (A1). */
+void residual(const float* x, const __nv_bfloat16* out, int n, float* mid, cudaStream_t stream);
+
 cudaError_t latent_attention(const __nv_bfloat16* queries, const __nv_bfloat16* cache, const int32_t* selection,
                              int n, int stride, int rows, float scale, LatentScratch scratch, __nv_bfloat16* ctx,
                              cudaStream_t stream);

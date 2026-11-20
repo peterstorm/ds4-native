@@ -3,7 +3,7 @@
 // -- the gate the GPU attention must pass before an engine runs on it (plan
 // Phase 3 step 6), as ds4n-glm53-moe-check is the MoE's.
 //
-//   ds4n-glm53-attn-check --config CONFIG [--seed S] [--iters I]
+//   ds4n-glm53-attn-check --config CONFIG [--backbone DIR] [--seed S] [--iters I]
 //
 // The kernels' widths are first checked against the released config (heads per
 // GPU, kv_lora, rope, nope, index_topk). Inputs are random BF16, which covers
@@ -33,12 +33,21 @@
 //                      glm53::top_k;
 //   refusals           latent_attention: n outside 1..2048, rows outside 1..8,
 //                      stride < n; select_top: n, k or rows out of range.
+// With --backbone, whole layers on real weights too (cuda/glm53/attention_layer):
+// a Dense layer, a Sparse Full layer, a Shared layer and the last layer, each
+// at positions 0, 1, 100, 2047, 2048 (the first the indexer selects for) and
+// 3000 over a random past cache, both GPUs' shares run on this GPU and
+// exchanged: each GPU's o_proj partial (FP32), the cache row, the index key and
+// the Selection against exact::attend; mid and ffn_in against
+// exact::begin_layer; the Dense MLP's partials and output against
+// exact::dense_mlp; and the head's logits against exact::logits.
 // Any difference exits 1. --iters times one decode token (rows 1, n 2048) and a
 // Round of 8 (default 50).
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -56,6 +65,9 @@
 #include "core/hc_reference.hpp"
 #include "core/mx_reference.hpp"
 #include "cuda/glm53/attention.cuh"
+#include "cuda/glm53/attention_layer.hpp"
+#include "cuda/moe.cuh"
+#include "io/glm53_weights.hpp"
 #include "cuda/glm53/indexer.cuh"
 
 using namespace ds4n;
@@ -167,7 +179,7 @@ size_t check_absorbed(std::mt19937& rng) {
 
 /** W_v per head inside a kv_b-shaped buffer (head stride (nope + v_head) rows), times spread ctx. */
 bool check_w_v(std::mt19937& rng) {
-  constexpr int kTokens = gpu::kMaxAttentionRows, kVHead = 128, kPerHead = gpu::kNope + kVHead;
+  constexpr int kTokens = gpu::kMaxAttentionRows, kVHead = 256, kPerHead = gpu::kNope + kVHead;  // v_head_dim
   const auto kv_b = random_bf16(rng, static_cast<size_t>(gpu::kHeadsPerGpu) * kPerHead * gpu::kLatent, 0.05f);
   const auto ctx = spread_bf16(rng, static_cast<size_t>(kTokens) * gpu::kHeadsPerGpu * gpu::kLatent);
   auto* d_w = upload(as_bf16(kv_b));
@@ -533,16 +545,180 @@ double time_round(std::mt19937& rng, int rows, int n, int iters) {
   return us;
 }
 
+// ---- Whole layers on real weights ----
+
+template <class T>
+size_t compare_bits(const char* what, std::span<const T> want, const std::vector<T>& got) {
+  size_t bad = 0;
+  for (size_t i = 0; i < want.size(); i++)
+    if (std::memcmp(&want[i], &got[i], sizeof(T)) != 0 && bad++ < 4)
+      std::fprintf(stderr, "  %s[%zu]: GPU %.9g, oracle %.9g\n", what, i, static_cast<double>(got[i]),
+                   static_cast<double>(want[i]));
+  return bad;
+}
+
+std::vector<float> as_float(const std::vector<__nv_bfloat16>& b) {
+  std::vector<float> f(b.size());
+  for (size_t i = 0; i < b.size(); i++) f[i] = __bfloat162float(b[i]);
+  return f;
+}
+
+/** A random past of `length` positions: BF16 rows of the magnitudes the norms give. */
+glm53::LayerCache random_past(std::mt19937& rng, int64_t length, bool full) {
+  glm53::LayerCache c;
+  c.length = length;
+  c.latent = random_bf16(rng, static_cast<size_t>(length) * gpu::kLatent, 1.0f);
+  c.k_rope = random_bf16(rng, static_cast<size_t>(length) * gpu::kKeyRope, 1.0f);
+  if (full) c.index_keys = random_bf16(rng, static_cast<size_t>(length) * gpu::kIndexHeadDim, 1.0f);
+  return c;
+}
+
+/** A residual stream: FP32 values (not BF16) of spread magnitude. */
+std::vector<float> random_residual(std::mt19937& rng, int n) {
+  std::normal_distribution<float> normal(0.0f, 1.0f);
+  std::uniform_int_distribution<int> scale(-3, 3);
+  std::vector<float> x(static_cast<size_t>(n));
+  for (auto& v : x) v = std::ldexp(normal(rng), scale(rng));
+  return x;
+}
+
+/** One layer at several positions: both GPUs' shares against exact::attend / begin_layer / dense_mlp. */
+bool check_layer(const glm53::Config& config, const io::BackboneParts& parts, int L, std::mt19937& rng) {
+  const glm53::Dims& d = config.dims();
+  const auto weights = parts.load_layer(L, 16);
+  if (!weights) die(weights.error().what);
+  const auto bound = glm53::bind_layer(config, L, io::lookup_of(weights.value()));
+  if (!bound) die(bound.error().what);
+  const auto a = exact::attention_layer(config, L, bound.value());
+  if (!a) die(a.error().what);
+  const bool full = config.indexer(L) == glm53::IndexerKind::Full;
+  const auto* dense = std::get_if<glm53::Mlp>(&bound.value().mlp);
+  constexpr int kCapacity = 3001;
+  std::vector<gpu::DeviceAttention> share;
+  std::vector<gpu::DeviceDenseMlp> mlp;
+  for (int g = 0; g < 2; g++) {
+    auto t = gpu::DeviceAttention::upload(a.value(), g, kCapacity);
+    if (!t) die(t.error());
+    share.push_back(std::move(t).value());
+    if (dense) {
+      auto m = gpu::DeviceDenseMlp::upload(*dense, g);
+      if (!m) die(m.error());
+      mlp.push_back(std::move(m).value());
+    }
+  }
+  const size_t H = static_cast<size_t>(d.hidden);
+  auto* d_x = device_alloc<float>(H);
+  std::array<float*, 2> d_partial{device_alloc<float>(H), device_alloc<float>(H)};
+  auto* d_out = device_alloc<__nv_bfloat16>(H);
+  auto* d_mid = device_alloc<float>(H);
+  auto* d_ffn = device_alloc<__nv_bfloat16>(H);
+  auto* d_shared = device_alloc<int32_t>(gpu::kMaxSelection);
+  size_t bad = 0;
+  for (const int64_t pos : {int64_t{0}, int64_t{1}, int64_t{100}, int64_t{2047}, int64_t{2048}, int64_t{3000}}) {
+    const auto past = random_past(rng, pos, full);
+    const auto x = random_residual(rng, d.hidden);
+    std::vector<int32_t> shared;
+    if (!full) {
+      std::vector<int32_t> all(static_cast<size_t>(pos) + 1);
+      std::iota(all.begin(), all.end(), 0);
+      std::shuffle(all.begin(), all.end(), rng);
+      all.resize(std::min<size_t>(all.size(), gpu::kMaxSelection));
+      std::sort(all.begin(), all.end());
+      shared = all;
+    }
+    const auto h = hc::rmsnorm(x, bound.value().input_norm, d.rms_eps);
+    const auto want = exact::attend(a.value(), past, h, shared);
+    if (!want) die(want.error().what);
+    const auto start = exact::begin_layer(a.value(), past, x, shared);
+    if (!start) die(start.error().what);
+    ck(cudaMemcpy(d_x, x.data(), H * sizeof(float), cudaMemcpyHostToDevice), "x");
+    if (!shared.empty())
+      ck(cudaMemcpy(d_shared, shared.data(), shared.size() * sizeof(int32_t), cudaMemcpyHostToDevice), "shared");
+    size_t here = 0;
+    for (int g = 0; g < 2; g++) {
+      if (auto r = share[g].load_cache(past); !r) die(r.error());
+      const auto n = share[g].attend(d_x, pos, d_shared, static_cast<int>(shared.size()), d_partial[g], nullptr);
+      if (!n) die(n.error());
+      ck(cudaDeviceSynchronize(), "attend");
+      here += compare_bits<float>("partial", want.value().o.partial[g], download(d_partial[g], H));
+      const auto row = as_float(download(share[g].cache_row(pos), gpu::kKeyWidth));
+      here += compare_bits<float>("latent", want.value().row.latent, {row.begin(), row.begin() + gpu::kLatent});
+      here += compare_bits<float>("k_rope", want.value().row.k_rope, {row.begin() + gpu::kLatent, row.end()});
+      if (full)
+        here += compare_bits<float>("index key", want.value().row.index_key,
+                                    as_float(download(share[g].index_key(pos), gpu::kIndexHeadDim)));
+      const auto sel = download(share[g].selection(), static_cast<size_t>(n.value()));
+      if (sel != want.value().selection) {
+        here++;
+        std::fprintf(stderr, "  layer %d position %lld: the Selection differs (%d vs %zu entries)\n", L,
+                     static_cast<long long>(pos), n.value(), want.value().selection.size());
+      }
+    }
+    cuda::add_round_bf16(d_partial[0], d_partial[1], H, d_out, nullptr);
+    share[0].finish(d_x, d_out, d_mid, d_ffn, nullptr);
+    ck(cudaDeviceSynchronize(), "finish");
+    here += compare_bits<float>("out", want.value().o.out, as_float(download(d_out, H)));
+    here += compare_bits<float>("mid", start.value().mid, download(d_mid, H));
+    here += compare_bits<float>("ffn_in", start.value().ffn_in, as_float(download(d_ffn, H)));
+    if (dense) {
+      const auto ffn = exact::dense_mlp(*dense, start.value().ffn_in);
+      if (!ffn) die(ffn.error().what);
+      for (int g = 0; g < 2; g++) {
+        mlp[g].run(d_ffn, d_partial[g], nullptr);
+        ck(cudaDeviceSynchronize(), "dense");
+        here += compare_bits<float>("dense partial", ffn.value().partial[g], download(d_partial[g], H));
+      }
+      cuda::add_round_bf16(d_partial[0], d_partial[1], H, d_out, nullptr);
+      here += compare_bits<float>("dense out", ffn.value().out, as_float(download(d_out, H)));
+    }
+    std::printf("layer %2d (%s, %s) position %4lld: Selection %4zu, %zu differ\n", L, full ? "Full" : "Shared",
+                dense ? "Dense" : "Sparse", static_cast<long long>(pos), want.value().selection.size(), here);
+    bad += here;
+  }
+  for (void* p : {static_cast<void*>(d_x), static_cast<void*>(d_partial[0]), static_cast<void*>(d_partial[1]),
+                  static_cast<void*>(d_out), static_cast<void*>(d_mid), static_cast<void*>(d_ffn),
+                  static_cast<void*>(d_shared)})
+    cudaFree(p);
+  return bad == 0;
+}
+
+bool check_head(const glm53::Dims& d, const io::BackboneParts& parts, std::mt19937& rng) {
+  auto head = parts.load("lm_head.weight");
+  if (!head) die(head.error().what);
+  auto norm = parts.load("model.norm.weight");
+  if (!norm) die(norm.error().what);
+  const glm53::Matrix m{head.value().values, d.vocab, d.hidden};
+  auto dev = gpu::DeviceHead::upload(d, norm.value().values, m);
+  if (!dev) die(dev.error());
+  auto* d_x = device_alloc<float>(static_cast<size_t>(d.hidden));
+  auto* d_logits = device_alloc<float>(static_cast<size_t>(d.vocab));
+  size_t bad = 0;
+  for (int t = 0; t < 2; t++) {
+    const auto x = random_residual(rng, d.hidden);
+    ck(cudaMemcpy(d_x, x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice), "x");
+    dev.value().logits(d_x, d_logits, nullptr);
+    ck(cudaDeviceSynchronize(), "logits");
+    const auto want = exact::logits(d, norm.value().values, m, x);
+    if (!want) die(want.error().what);
+    bad += compare_bits<float>("logit", want.value(), download(d_logits, static_cast<size_t>(d.vocab)));
+  }
+  std::printf("head: 2 tokens x %d logits: %zu differ\n", d.vocab, bad);
+  cudaFree(d_x);
+  cudaFree(d_logits);
+  return bad == 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string config_path;
+  std::string config_path, backbone_path;
   unsigned seed = 1;
   int iters = 50;
   for (int i = 1; i < argc; i++) {
     const std::string a = argv[i];
     if (i + 1 >= argc) die("usage: --config CONFIG [--seed S] [--iters I]");
     if (a == "--config") config_path = argv[++i];
+    else if (a == "--backbone") backbone_path = argv[++i];
     else if (a == "--seed") seed = static_cast<unsigned>(std::stoul(argv[++i]));
     else if (a == "--iters") iters = std::stoi(argv[++i]);
     else die("unknown argument " + a);
@@ -588,6 +764,25 @@ int main(int argc, char** argv) {
     ok = check_index(rng, d, rows, n) && ok;
   ok = check_select_built(rng) && ok;
   ok = check_refusals() && ok;
+  if (!backbone_path.empty()) {
+    auto parts = io::BackboneParts::open(backbone_path);
+    if (!parts) die(parts.error().what);
+    const auto& cfg = config.value();
+    std::vector<int> layers;
+    auto first = [&](auto pred) {
+      for (int L = 0; L < d.layers; L++)
+        if (pred(L)) return L;
+      die("no such layer");
+    };
+    layers.push_back(first([&](int L) { return cfg.mlp(L) == glm53::MlpKind::Dense; }));
+    layers.push_back(first([&](int L) {
+      return cfg.mlp(L) == glm53::MlpKind::Sparse && cfg.indexer(L) == glm53::IndexerKind::Full;
+    }));
+    layers.push_back(first([&](int L) { return cfg.indexer(L) == glm53::IndexerKind::Shared; }));
+    layers.push_back(d.layers - 1);
+    for (const int L : layers) ok = check_layer(cfg, parts.value(), L, rng) && ok;
+    ok = check_head(d, parts.value(), rng) && ok;
+  }
   if (iters > 0) {
     std::printf("decode token (rows 1, n 2048): %.1f us; Round of 8 (n 2048): %.1f us  [absorbed + latent, one GPU]\n",
                 time_round(rng, 1, gpu::kMaxSelection, iters), time_round(rng, 8, gpu::kMaxSelection, iters));
