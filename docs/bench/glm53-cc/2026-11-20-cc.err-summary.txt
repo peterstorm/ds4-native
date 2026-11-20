@@ -1,0 +1,8 @@
+attention 8152 s, Experts 346 s, feed-forward 334 s over 78 layers
+loaded 2981 Backbone tensors' index and the head in 1.9 s
+exact: Experts on GPU 0
+exact-cc0.001: Experts on GPU 0
+exact-cc0.002: Experts on GPU 0
+exact-cc0.005: Experts on GPU 0
+exact-cc0.01: Experts on GPU 0
+exact-cc0.03: Experts on GPU 0
