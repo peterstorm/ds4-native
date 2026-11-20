@@ -19,7 +19,13 @@
 //                      by -1, whole padded splits included), peaked queries
 //                      (most probabilities underflow), repeated keys (tied
 //                      scores), each against exact::latent_attention;
-//   refusals           n outside 1..2048, rows outside 1..8, stride < n.
+//   index_scores       Rounds of 1 and 8 rows over 1 .. 5000 positions against
+//                      exact::index_scores, FP32 compared exactly;
+//   select_top         on those scores and on built ones (heavy ties, zeros and
+//                      negative values, n around k, 100,000 positions) against
+//                      glm53::top_k;
+//   refusals           latent_attention: n outside 1..2048, rows outside 1..8,
+//                      stride < n; select_top: n, k or rows out of range.
 // Any difference exits 1. --iters times one decode token (rows 1, n 2048) and a
 // Round of 8 (default 50).
 #include <cuda_bf16.h>
@@ -42,6 +48,7 @@
 #include "core/glm53/exact_attention.hpp"
 #include "core/mx_reference.hpp"
 #include "cuda/glm53/attention.cuh"
+#include "cuda/glm53/indexer.cuh"
 
 using namespace ds4n;
 namespace exact = ds4n::glm53::exact;
@@ -120,7 +127,8 @@ std::vector<float> spread_bf16(std::mt19937& rng, size_t n) {
   return x;
 }
 
-bool check_absorbed(std::mt19937& rng) {
+/** One Round of absorbed queries against the oracle: the number of values that differ. */
+size_t check_absorbed(std::mt19937& rng) {
   constexpr int kRows = gpu::kMaxAttentionRows;
   const auto q = spread_bf16(rng, static_cast<size_t>(kRows) * gpu::kHeadsPerGpu * gpu::kQkHead);
   const auto wk_t = random_bf16(rng, static_cast<size_t>(gpu::kHeadsPerGpu) * gpu::kLatent * gpu::kNope, 0.05f);
@@ -143,12 +151,10 @@ bool check_absorbed(std::mt19937& rng) {
       for (int c = 0; c < gpu::kKeyRope; c++) want[out + gpu::kLatent + c] = q[qh + gpu::kNope + c];
     }
   const size_t bad = compare("query", want, got);
-  std::printf("absorbed_queries: %zu rows x %d heads x %d values: %zu differ\n", static_cast<size_t>(kRows),
-              gpu::kHeadsPerGpu, gpu::kKeyWidth, bad);
   cudaFree(d_q);
   cudaFree(d_w);
   cudaFree(d_out);
-  return bad == 0;
+  return bad;
 }
 
 struct Case {
@@ -220,6 +226,90 @@ bool check_latent(std::mt19937& rng, const Case& c) {
   return bad == 0;
 }
 
+/** The Selections of `rows` rows of `n` scores each, on the GPU, against glm53::top_k. */
+bool check_select(const char* name, const std::vector<float>& scores, int n, int rows, int k) {
+  auto* d_scores = upload(scores);
+  auto* d_out = device_alloc<int32_t>(static_cast<size_t>(rows) * k);
+  ck(gpu::select_top(d_scores, n, k, rows, d_out, nullptr), "select_top");
+  ck(cudaDeviceSynchronize(), "select_top");
+  const auto got = download(d_out, static_cast<size_t>(rows) * k);
+  size_t bad = 0;
+  for (int t = 0; t < rows; t++) {
+    const auto want = glm53::top_k(std::span<const float>(scores).subspan(static_cast<size_t>(t) * n, n), k);
+    for (size_t j = 0; j < want.size(); j++)
+      if (got[static_cast<size_t>(t) * k + j] != want[j] && bad++ < 4)
+        std::fprintf(stderr, "  %s row %d entry %zu: GPU %d, oracle %d\n", name, t, j, got[static_cast<size_t>(t) * k + j],
+                     want[j]);
+  }
+  std::printf("select_top %-26s rows %d, n %6d, k %d: %zu entries differ\n", name, rows, n, k, bad);
+  cudaFree(d_scores);
+  cudaFree(d_out);
+  return bad == 0;
+}
+
+/** index_scores for `rows` rows over n positions against exact::index_scores, then their Selections. */
+bool check_index(std::mt19937& rng, const glm53::Dims& d, int rows, int n) {
+  const auto q = random_bf16(rng, static_cast<size_t>(rows) * gpu::kIndexHeads * gpu::kIndexHeadDim, 1.0f);
+  const auto keys = random_bf16(rng, static_cast<size_t>(n) * gpu::kIndexHeadDim, 1.0f);
+  std::vector<float> w(static_cast<size_t>(rows) * gpu::kIndexHeads);
+  std::normal_distribution<float> normal(0.0f, 1.0f);
+  const float head_scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(gpu::kIndexHeads)));
+  for (auto& v : w) v = mx::round_bf16(normal(rng)) * head_scale;
+  auto* d_q = upload(as_bf16(q));
+  auto* d_w = upload(w);
+  auto* d_keys = upload(as_bf16(keys));
+  auto* d_scores = device_alloc<float>(static_cast<size_t>(rows) * n);
+  gpu::index_scores(d_q, d_w, d_keys, n, rows, d_scores, nullptr);
+  ck(cudaDeviceSynchronize(), "index_scores");
+  const auto got = download(d_scores, static_cast<size_t>(rows) * n);
+  size_t bad = 0;
+  for (int t = 0; t < rows; t++) {
+    const auto want = exact::index_scores(
+        d, std::span<const float>(q).subspan(static_cast<size_t>(t) * gpu::kIndexHeads * gpu::kIndexHeadDim,
+                                             static_cast<size_t>(gpu::kIndexHeads) * gpu::kIndexHeadDim),
+        std::span<const float>(w).subspan(static_cast<size_t>(t) * gpu::kIndexHeads, gpu::kIndexHeads), keys);
+    for (int p = 0; p < n; p++) {
+      const float g = got[static_cast<size_t>(t) * n + p];
+      if (bits(g) != bits(want[p]) && bad++ < 4)
+        std::fprintf(stderr, "  score row %d position %d: GPU %.9g, oracle %.9g\n", t, p, static_cast<double>(g),
+                     static_cast<double>(want[p]));
+    }
+  }
+  std::printf("index_scores rows %d, n %5d: %zu of %zu differ\n", rows, n, bad, got.size());
+  cudaFree(d_q);
+  cudaFree(d_w);
+  cudaFree(d_keys);
+  cudaFree(d_scores);
+  return check_select("(on those scores)", got, n, rows, gpu::kMaxSelection) && bad == 0;
+}
+
+/** Built scores for the Selection's edges: heavy ties, zeros (every head's dot negative), negative values. */
+bool check_select_built(std::mt19937& rng) {
+  bool ok = true;
+  std::uniform_int_distribution<int> level(-6, 9);
+  auto tied = [&](int n, int rows) {
+    std::vector<float> v(static_cast<size_t>(n) * rows);
+    for (auto& x : v) {
+      const int l = level(rng);
+      x = l <= 0 ? (l == 0 ? 0.0f : -0.25f * static_cast<float>(l * l)) : 0.5f * static_cast<float>(l);
+    }
+    return v;
+  };
+  ok = check_select("ties, zeros, negatives", tied(5000, 3), 5000, 3, gpu::kMaxSelection) && ok;
+  ok = check_select("all equal", std::vector<float>(3000, 1.5f), 3000, 1, gpu::kMaxSelection) && ok;
+  std::vector<float> signed_zeros(4000);
+  for (size_t i = 0; i < signed_zeros.size(); i++) signed_zeros[i] = (i % 3 == 0) ? -0.0f : (i % 3 == 1 ? 0.0f : -1.0f);
+  ok = check_select("signed zeros", signed_zeros, 4000, 1, gpu::kMaxSelection) && ok;
+  for (const int n : {1, 2047, 2048, 2049})
+    ok = check_select(("n " + std::to_string(n)).c_str(), tied(n, 1), n, 1, gpu::kMaxSelection) && ok;
+  std::normal_distribution<float> normal(0.0f, 1.0f);
+  std::vector<float> long_context(100000);
+  for (auto& x : long_context) x = normal(rng);
+  ok = check_select("100,000 positions", long_context, 100000, 1, gpu::kMaxSelection) && ok;
+  ok = check_select("small k", tied(777, 2), 777, 2, 5) && ok;
+  return ok;
+}
+
 bool check_refusals() {
   gpu::LatentScratch none{nullptr, nullptr, nullptr};
   bool ok = true;
@@ -235,9 +325,42 @@ bool check_refusals() {
   refused("rows 0", 64, 64, 0);
   refused("rows 9", 64, 64, gpu::kMaxAttentionRows + 1);
   refused("stride < n", 64, 63, 1);
+  auto select_refused = [&](const char* what, int n, int k, int rows) {
+    const cudaError_t e = gpu::select_top(nullptr, n, k, rows, nullptr, nullptr);
+    if (e != cudaErrorInvalidValue) {
+      std::fprintf(stderr, "  select %s: not refused (%s)\n", what, cudaGetErrorString(e));
+      ok = false;
+    }
+  };
+  select_refused("n 0", 0, 2048, 1);
+  select_refused("k 0", 100, 0, 1);
+  select_refused("rows 9", 100, 2048, gpu::kMaxIndexRows + 1);
   cudaGetLastError();
   std::printf("refusals: %s\n", ok ? "all refused" : "FAILED");
   return ok;
+}
+
+/** Mean microseconds of index_scores + select_top for one row over n positions. */
+double time_indexer(std::mt19937& rng, int n, int iters) {
+  auto* d_q = upload(as_bf16(random_bf16(rng, static_cast<size_t>(gpu::kIndexHeads) * gpu::kIndexHeadDim, 1.0f)));
+  auto* d_w = upload(random_bf16(rng, gpu::kIndexHeads, 0.2f));
+  auto* d_keys = upload(as_bf16(random_bf16(rng, static_cast<size_t>(n) * gpu::kIndexHeadDim, 1.0f)));
+  auto* d_scores = device_alloc<float>(static_cast<size_t>(n));
+  auto* d_out = device_alloc<int32_t>(gpu::kMaxSelection);
+  auto once = [&] {
+    gpu::index_scores(d_q, d_w, d_keys, n, 1, d_scores, nullptr);
+    ck(gpu::select_top(d_scores, n, gpu::kMaxSelection, 1, d_out, nullptr), "select_top");
+  };
+  once();
+  ck(cudaDeviceSynchronize(), "warm-up");
+  const auto t0 = std::chrono::steady_clock::now();
+  for (int i = 0; i < iters; i++) once();
+  ck(cudaDeviceSynchronize(), "timing");
+  const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / iters;
+  for (void* p : {static_cast<void*>(d_q), static_cast<void*>(d_w), static_cast<void*>(d_keys),
+                  static_cast<void*>(d_scores), static_cast<void*>(d_out)})
+    cudaFree(p);
+  return us;
 }
 
 /** Mean microseconds of absorbed_queries + latent_attention for `rows` rows over Selections of n. */
@@ -296,14 +419,19 @@ int main(int argc, char** argv) {
   const auto config = glm53::parse_config(std::string((std::istreambuf_iterator<char>(cf)), std::istreambuf_iterator<char>()));
   if (!config) die(config.error().what);
   const glm53::Dims& d = config.value().dims();
-  if (d.heads != 2 * gpu::kHeadsPerGpu || d.kv_lora != gpu::kLatent || d.rope != gpu::kKeyRope || d.nope != gpu::kNope ||
+  if (d.index_heads != gpu::kIndexHeads || d.index_head_dim != gpu::kIndexHeadDim ||
+      d.heads != 2 * gpu::kHeadsPerGpu || d.kv_lora != gpu::kLatent || d.rope != gpu::kKeyRope || d.nope != gpu::kNope ||
       d.index_topk != gpu::kMaxSelection || exact::kSplitRows != gpu::kLatentSplitRows ||
       static_cast<float>(1.0 / std::sqrt(static_cast<double>(d.qk_head()))) != kScale)
     die("the kernels' widths do not match the config");
 
   std::mt19937 rng(seed);
-  bool ok = true;
-  for (int r = 0; r < 16; r++) ok = check_absorbed(rng) && ok;
+  constexpr int kAbsorbedRounds = 16;
+  size_t absorbed_bad = 0;
+  for (int r = 0; r < kAbsorbedRounds; r++) absorbed_bad += check_absorbed(rng);
+  std::printf("absorbed_queries: %d Rounds x %d rows x %d heads x %d values: %zu differ\n", kAbsorbedRounds,
+              gpu::kMaxAttentionRows, gpu::kHeadsPerGpu, gpu::kKeyWidth, absorbed_bad);
+  bool ok = absorbed_bad == 0;
   const std::vector<Case> cases = {
       {"one entry", {1}},          {"two entries", {2}},       {"63", {63}},       {"one split", {64}},
       {"65", {65}},                {"two splits", {128}},      {"129", {129}},     {"1000", {1000}},
@@ -313,10 +441,17 @@ int main(int argc, char** argv) {
       {"repeated keys", {2048, 64}, 1.0f, true},
   };
   for (const auto& c : cases) ok = check_latent(rng, c) && ok;
+  for (const auto& [rows, n] : std::vector<std::pair<int, int>>{{1, 1}, {1, 63}, {1, 64}, {1, 65}, {1, 2048}, {1, 5000},
+                                                               {8, 3001}})
+    ok = check_index(rng, d, rows, n) && ok;
+  ok = check_select_built(rng) && ok;
   ok = check_refusals() && ok;
   if (iters > 0) {
     std::printf("decode token (rows 1, n 2048): %.1f us; Round of 8 (n 2048): %.1f us  [absorbed + latent, one GPU]\n",
                 time_round(rng, 1, gpu::kMaxSelection, iters), time_round(rng, 8, gpu::kMaxSelection, iters));
+    for (const int n : {4096, 32768, 131072})
+      std::printf("indexer, one token over %6d positions: %.1f us  [scores + Selection, one GPU]\n", n,
+                  time_indexer(rng, n, iters));
   }
   std::printf("%s\n", ok ? "PASS: bit-identical" : "FAIL");
   return ok ? 0 : 1;
