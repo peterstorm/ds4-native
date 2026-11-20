@@ -166,9 +166,8 @@ An independent audit (python, read-only, against the index) found:
    `/models/glm53-native/dealignai-cyber/delta`) may be deleted at the operator's word; it can be
    re-fetched from the pinned plan. rpool: 19.2 GiB free.
 6a. **Speed question: answered 2026-11-20** (Done table; `docs/bench/glm53-cc/`): the full λ
-   curve 0.001–0.2, the KL floor, free generation at λ 0.03 / 0.1 / 0.2. Recommended λ 0.1
-   (~23 tok/s est.), 0.05 conservative. **Operator's call:** which λ to build for, and whether
-   that rate justifies the attention port (weeks). The engine's router already has DS4.1's bonus
+   curve 0.001–0.2, the KL floor, free generation at λ 0.03 / 0.1 / 0.2. **Decided
+   (operator): λ 0.03 default (~10 tok/s est.), and the attention port goes ahead** (item 6b). The engine's router already has DS4.1's bonus
    (`cuda/moe.cu`); GLM needs it in its own router kernel plus the host's one-table rule.
 7. Phases 4–5 per the plan (fifth switch-primary entry `glm-native`, slots ladder, CyberGym).
 
