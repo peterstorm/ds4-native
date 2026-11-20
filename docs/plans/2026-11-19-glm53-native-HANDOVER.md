@@ -195,8 +195,14 @@ An independent audit (python, read-only, against the index) found:
      covers only its own prefix (`select_top`'s per-row `RowLengths`). A decode token is a
      Round of 1.
    - **Next:**
-     - The two-GPU exchange_add.
-     - The decode loop with the Expert cache (Phase 4).
+     - ~~The two-GPU exchange and the decode loop~~: done, item 6c.
+6c. **The decoder on two GPUs: done 2026-11-20** (`engine/glm53/decoder`, plan step 7).
+   - **Run:** `ds4n-glm53-decode --config ref/glm-5.3/config.json --backbone DIR --store FILE
+     --prompt "IDS" [--generate N] [--lambda 0.03] [--check]`.
+   - **Docker flags:** `--security-opt seccomp=unconfined` (io_uring) and `--ulimit memlock=-1`.
+   - **Gate:** `--check` replays every layer of every token on the CPU oracle, bit for bit.
+     Results in `docs/bench/glm53-decode/`.
+   - **Next:** speed. The engine computes a token in ~25 ms; the rest is waiting on the store.
 7. Phases 4–5 per the plan (fifth switch-primary entry `glm-native`, slots ladder, CyberGym).
 
 ## Environment facts (the things that cost time to rediscover)

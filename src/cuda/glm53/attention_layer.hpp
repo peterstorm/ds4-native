@@ -95,6 +95,9 @@ class DeviceAttention {
               cudaStream_t stream) const;
 
   /** Row p of the Latent rows ([latent | k_rope], device BF16) and of the index keys (Full layers). */
+  /** Full: this layer makes its Selections; Shared: it attends the nearest Full layer's. */
+  ds4n::glm53::IndexerKind indexer() const { return kind_; }
+
   const __nv_bfloat16* cache_row(int64_t p) const;
   const __nv_bfloat16* index_key(int64_t p) const;
 

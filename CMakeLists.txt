@@ -152,6 +152,13 @@ if(DS4N_CUDA)
   add_executable(ds4n-glm53-moe-check src/tools/glm53_moe_check.cu)
   target_compile_options(ds4n-glm53-moe-check PRIVATE ${DS4N_CUDA_FLAGS})
   target_link_libraries(ds4n-glm53-moe-check PRIVATE ds4n_cuda ds4n_glm53_io)
+  # GLM-5.3's engine: the decoder on two GPUs, and its gate.
+  add_library(ds4n_glm53_engine STATIC src/engine/glm53/decoder.cu)
+  target_compile_options(ds4n_glm53_engine PRIVATE ${DS4N_CUDA_FLAGS})
+  target_link_libraries(ds4n_glm53_engine PUBLIC ds4n_cuda ds4n_glm53_io ds4n_io)
+  add_executable(ds4n-glm53-decode src/tools/glm53_decode.cu)
+  target_compile_options(ds4n-glm53-decode PRIVATE ${DS4N_CUDA_FLAGS})
+  target_link_libraries(ds4n-glm53-decode PRIVATE ds4n_glm53_engine)
   # The oracle tool gains its GPU path (--gpu) in a CUDA build.
   target_link_libraries(ds4n-glm53-oracle-run PRIVATE ds4n_cuda CUDA::cudart)
   target_compile_definitions(ds4n-glm53-oracle-run PRIVATE DS4N_GLM53_GPU)

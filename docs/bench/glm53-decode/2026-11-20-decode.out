@@ -1,0 +1,5 @@
+open: 72.6 s, 102 Slots per Sparse layer (40% of the Experts), capacity 4096, λ 0
+prompt: 21 tokens in 10.23 s (2.1 tok/s); misses 64.6% of 7913 picks, store wait 10.01 s
+generate: 6 tokens in 1.47 s (4.09 tok/s); misses 15.2% (91.3 per token), store wait 1.32 s
+generated: 21666 13 576 6722 315 17664
+exit=0
