@@ -17,12 +17,15 @@
 // Sparse layer, the rest of the model still the Semantics oracle;
 // `exact-DEPARTURE` is exact_moe with one core/glm53/moe_roundings Departure
 // (exact-weight-after-down, exact-fp32-gate-up-hidden, exact-fp32-exchange).
-// Two approximate departures of the router's choice (exact::RouteChoice) may
+// `-attn` after it runs the attention side in the Reference configuration too
+// (core/glm53/exact_attention: attention, the indexer and its Selection, the
+// Dense layers' MLP and the head), so `exact-attn` is the whole model as the
+// engine computes it. Two approximate departures of the router's choice (exact::RouteChoice) may
 // follow, in this order: `-pruned`, Expert pruning, each Sparse layer routing
 // only among the Experts --kept FILE keeps (core/glm53/pruning; GLM-5.3-SLIM-
 // E192's, tools/glm53-store/slim_kept_experts.py); and `-ccλ`, cache-conditional
 // routing, a resident Expert's selection score gaining λ, resident meaning in
-// that stream's Expert cache model (below). exact-pruned-cc0.005 is both.
+// that stream's Expert cache model (below). exact-attn-pruned-cc0.005 is all three.
 // The first listed (default fp32: the oracle itself) is the baseline every
 // other is compared against.
 //
@@ -93,6 +96,7 @@
 
 #include "core/glm53/config.hpp"
 #include "core/glm53/dequant.hpp"
+#include "core/glm53/exact_attention.hpp"
 #include "core/glm53/exact_moe.hpp"
 #include "core/glm53/layer_expert_cache.hpp"
 #include "core/glm53/moe_roundings.hpp"
@@ -120,6 +124,7 @@ namespace {
  */
 struct ExactMoe {
   exact::Departure departure = exact::Departure::None;
+  bool attention = false;  // the attention side in the Reference configuration too (-attn)
   bool pruned = false;
   std::optional<float> resident_bonus;
   friend auto operator<=>(const ExactMoe&, const ExactMoe&) = default;
@@ -128,7 +133,8 @@ struct ExactMoe {
 /** How a stream runs its Experts: the Semantics oracle at an activation precision, or the Reference configuration. */
 using Arithmetic = std::variant<ActivationPrecision, ExactMoe>;
 
-/** The suffixes of a pruned and a cache-conditional exact arithmetic: exact-pruned-cc0.05. */
+/** The suffixes of an exact arithmetic, in this order: exact-attn-pruned-cc0.05. */
+constexpr std::string_view kAttention = "-attn";
 constexpr std::string_view kPruned = "-pruned";
 constexpr std::string_view kCacheConditional = "-cc";
 
@@ -136,6 +142,7 @@ std::string name_of(const Arithmetic& a) {
   if (const auto* p = std::get_if<ActivationPrecision>(&a)) return std::string(glm53::name_of(*p));
   const auto& e = std::get<ExactMoe>(a);
   std::string name = e.departure == exact::Departure::None ? "exact" : "exact-" + std::string(exact::name_of(e.departure));
+  if (e.attention) name += kAttention;
   if (e.pruned) name += kPruned;
   if (e.resident_bonus) {
     std::ostringstream bonus;
@@ -157,15 +164,37 @@ std::optional<Arithmetic> parse_arithmetic(std::string name) {
   }
   const bool pruned = name.ends_with(kPruned);
   if (pruned) name.resize(name.size() - kPruned.size());
+  const bool attention = name.ends_with(kAttention);
+  if (attention) name.resize(name.size() - kAttention.size());
   for (const auto d : exact::kDepartures)
-    if (name == name_of(Arithmetic{ExactMoe{d}})) return Arithmetic{ExactMoe{d, pruned, bonus}};
-  if (const auto p = glm53::parse_activation_precision(name); p && !pruned && !bonus) return Arithmetic{*p};
+    if (name == name_of(Arithmetic{ExactMoe{d}})) return Arithmetic{ExactMoe{d, attention, pruned, bonus}};
+  if (const auto p = glm53::parse_activation_precision(name); p && !attention && !pruned && !bonus) return Arithmetic{*p};
   return std::nullopt;
 }
 
 bool is_pruned(const Arithmetic& a) { return std::holds_alternative<ExactMoe>(a) && std::get<ExactMoe>(a).pruned; }
 
 bool is_exact(const Arithmetic& a) { return std::holds_alternative<ExactMoe>(a); }
+
+bool exact_attention(const Arithmetic& a) { return is_exact(a) && std::get<ExactMoe>(a).attention; }
+
+/**
+ * A token's layer begun in its stream's arithmetic: the Semantics oracle's
+ * attention, or with `attention` (an -attn stream) the Reference configuration's.
+ */
+Result<glm53::LayerStart, std::string> begin_token(const glm53::Config& config, const glm53::LayerWeights& w, int layer,
+                                                   const exact::AttentionLayer* attention, const glm53::LayerCache& cache,
+                                                   std::span<const float> x, std::span<const int32_t> selection) {
+  using R = Result<glm53::LayerStart, std::string>;
+  if (attention) {
+    auto r = exact::begin_layer(*attention, cache, x, selection);
+    if (!r) return R::err(r.error().what);
+    return R::ok(std::move(r).value());
+  }
+  auto r = glm53::begin_layer(config, w, layer, cache, x, selection);
+  if (!r) return R::err(r.error().what);
+  return R::ok(std::move(r).value());
+}
 
 exact::Departure departure_of(const Arithmetic& a) { return std::get<ExactMoe>(a).departure; }
 
@@ -385,6 +414,12 @@ std::vector<std::vector<std::vector<float>>> run_round(const Model& m, const Arg
       shared = std::move(codes).value();
       exact_layer.emplace(exact::MoeLayer{moe->router, moe->bias, *shared});
     }
+    std::optional<exact::AttentionLayer> attention;  // -attn streams: the attention side's Reference configuration
+    if (std::ranges::any_of(streams, [](const Stream& s) { return exact_attention(s.arithmetic); })) {
+      auto a = exact::attention_layer(config, L, bound.value());
+      if (!a) die(where + a.error().what);
+      attention.emplace(std::move(a).value());
+    }
     const double load_s = seconds_since(t0);
 
     // Attention and routing, each stream's tokens in position order (a row
@@ -400,8 +435,9 @@ std::vector<std::vector<std::vector<float>>> run_round(const Model& m, const Arg
           exact_tokens[s].resize(tokens[s].size());
           study_starts[s].resize(tokens[s].size());
           for (size_t i = 0; i < tokens[s].size(); i++) {
-            auto r = glm53::begin_layer(config, bound.value(), L, cache, x[s][i], selection[s][i]);
-            if (!r) return where + r.error().what;
+            auto r = begin_token(config, bound.value(), L, exact_attention(st.arithmetic) ? &*attention : nullptr, cache,
+                                 x[s][i], selection[s][i]);
+            if (!r) return where + r.error();
             glm53::append(cache, r.value().row);
             if (config.indexer(L) == glm53::IndexerKind::Full) {
               selection[s][i] = r.value().selection;
@@ -630,6 +666,11 @@ std::vector<std::vector<std::vector<float>>> run_round(const Model& m, const Arg
             studied[j] = row;
           }
           auto step = [&]() -> Result<glm53::LayerStep, glm53::StepError> {
+            if (!exact_tokens[s][i] && exact_attention(streams[s].arithmetic)) {  // a Dense layer, A8
+              auto ffn = exact::dense_mlp(std::get<glm53::Mlp>(bound.value().mlp), starts[s][i].ffn_in);
+              if (!ffn) return Result<glm53::LayerStep, glm53::StepError>::err({ffn.error().what});
+              return glm53::finish_layer(config, std::move(starts[s][i]), glm53::FeedForward{std::move(ffn).value().out, {}});
+            }
             if (!exact_tokens[s][i]) return glm53::finish_layer(config, bound.value(), std::move(starts[s][i]), routed[s][i]);
             exact::MoeStart& t = *exact_tokens[s][i];
             std::vector<float> out;
@@ -666,21 +707,31 @@ std::vector<std::vector<std::vector<float>>> run_round(const Model& m, const Arg
   return x;
 }
 
-/** Logits of the residual stream `x`: final norm, then the head in row chunks on all threads. */
-std::vector<float> logits_of(const Model& m, const Args& args, const std::vector<float>& x) {
+/**
+ * Logits of the residual stream `x`: final norm, then the head in row chunks on
+ * all threads; with `exact_head` (an -attn stream) the Reference configuration's (A9).
+ */
+std::vector<float> logits_of(const Model& m, const Args& args, const std::vector<float>& x, bool exact_head) {
   const glm53::Dims& d = m.config.dims();
-  const auto normed = glm53::rms_norm(x, m.final_norm, d.rms_eps);
+  const auto normed = exact_head ? std::vector<float>{} : glm53::rms_norm(x, m.final_norm, d.rms_eps);
   std::vector<float> out(static_cast<size_t>(d.vocab));
   constexpr size_t kChunk = 4096;
   const size_t chunks = (out.size() + kChunk - 1) / kChunk, H = static_cast<size_t>(d.hidden);
-  parallel_for(chunks, args.threads, [&](size_t c) -> std::optional<std::string> {
+  const auto failed = parallel_for(chunks, args.threads, [&](size_t c) -> std::optional<std::string> {
     const size_t r0 = c * kChunk, rows = std::min(kChunk, out.size() - r0);
     const glm53::Matrix part{std::span<const float>(m.head.values).subspan(r0 * H, rows * H), static_cast<int>(rows),
                              d.hidden};
+    if (exact_head) {
+      auto y = exact::logits(d, m.final_norm, part, x);
+      if (!y) return y.error().what;
+      std::copy(y.value().begin(), y.value().end(), out.begin() + static_cast<std::ptrdiff_t>(r0));
+      return std::nullopt;
+    }
     const auto y = glm53::linear(part, normed);
     std::copy(y.begin(), y.end(), out.begin() + static_cast<std::ptrdiff_t>(r0));
     return std::nullopt;
   });
+  if (failed) die("head: " + *failed);
   return out;
 }
 
@@ -739,7 +790,7 @@ int main(int argc, char** argv) {
   Args args;
   if (!parse_args(argc, argv, args))
     die("usage: --config FILE --backbone DIR --store FILE --prompt ID,ID,... [--prompt ...] "
-        "[--activations fp32,bf16,e4m3,mxfp4,exact[-DEPARTURE][-pruned][-ccλ] (distinct; the first is the baseline)] "
+        "[--activations fp32,bf16,e4m3,mxfp4,exact[-DEPARTURE][-attn][-pruned][-ccλ] (distinct; the first is the baseline)] "
         "[--generate N] [--threads T] [--resident E>=8] [--report FILE] [--routes FILE] "
         "[--moe-roundings FILE (baseline fp32)] [--slots N (per Sparse layer)] [--warm N] "
         "[--kept FILE (with and only with -pruned)] [--gpu N (CUDA builds)]");
@@ -823,7 +874,8 @@ int main(int argc, char** argv) {
     const auto& prompt = args.prompts[p];
     for (size_t i = 0; i < prompt.size(); i++) {
       std::vector<std::vector<double>> lp(P);
-      for (size_t q = 0; q < P; q++) lp[q] = log_softmax(logits_of(m, args, xs[stream_of(p, q)][i]));
+      for (size_t q = 0; q < P; q++)
+        lp[q] = log_softmax(logits_of(m, args, xs[stream_of(p, q)][i], exact_attention(streams[stream_of(p, q)].arithmetic)));
       const int32_t base_top = best(lp[0], 1).front();
       for (size_t q = 0; q < P; q++) {
         auto& out = positions[stream_of(p, q)];
@@ -881,7 +933,8 @@ int main(int argc, char** argv) {
     }
     if (g + 1 == args.generate) break;
     const auto x = run_round(m, args, streams, next, roundings, gpu_moe_ptr);
-    for (size_t s = 0; s < streams.size(); s++) last[s] = log_softmax(logits_of(m, args, x[s].front()));
+    for (size_t s = 0; s < streams.size(); s++)
+      last[s] = log_softmax(logits_of(m, args, x[s].front(), exact_attention(streams[s].arithmetic)));
   }
 
   // The Expert cache model's misses, per arithmetic, prompt and generated tokens apart.
