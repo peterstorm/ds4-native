@@ -2,6 +2,7 @@
 """Quality against speed per arithmetic of one oracle run (stdlib only).
 
     route_choice_table.py REPORT.json ROUTES.tsv [--ram 0.18] [--warm 0.25]
+                          [--t-base 7.6] [--c-ram 0.35] [--c-ssd 1.6]
 
 REPORT.json and ROUTES.tsv come from one `ds4n-glm53-oracle-run --report --routes` run whose
 arithmetics depart from the baseline's choice of Experts (-pruned, -ccλ). One Markdown row per
