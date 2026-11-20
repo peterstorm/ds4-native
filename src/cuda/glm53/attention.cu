@@ -4,29 +4,109 @@
 namespace ds4n::cuda::glm53 {
 namespace {
 
-// ---- The absorbed query ----
+// ---- Per-head GEMVs, norms, RoPE ----
 
-/** One warp per (row, head, latent column): exact::gemv_row of W_k^T in one plane of 192. */
-__global__ void __launch_bounds__(256) absorbed_kernel(const __nv_bfloat16* __restrict__ q,
-                                                       const __nv_bfloat16* __restrict__ wk_t, int rows,
-                                                       __nv_bfloat16* __restrict__ queries) {
+constexpr int kIndexKey = 128;  // index_head_dim: the LayerNorm's width (one warp, 4 values a lane)
+
+/** One warp per (token, head, row): reduce::bf16_gemv in one plane. */
+__global__ void __launch_bounds__(256) head_gemv_kernel(const __nv_bfloat16* __restrict__ w, size_t w_head_stride,
+                                                        int rows, int k, const __nv_bfloat16* __restrict__ x,
+                                                        int x_stride, int tokens, __nv_bfloat16* __restrict__ out,
+                                                        int out_stride) {
   const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
-  if (warp >= rows * kHeadsPerGpu * kLatent) return;
-  const int c = warp % kLatent, h = (warp / kLatent) % kHeadsPerGpu, t = warp / (kLatent * kHeadsPerGpu);
-  const __nv_bfloat16* qh = q + (static_cast<size_t>(t) * kHeadsPerGpu + h) * kQkHead;
+  if (warp >= tokens * kHeadsPerGpu * rows) return;
+  const int r = warp % rows, h = (warp / rows) % kHeadsPerGpu, t = warp / (rows * kHeadsPerGpu);
+  const __nv_bfloat16* wr = w + h * w_head_stride + static_cast<size_t>(r) * k;
+  const __nv_bfloat16* xh = x + (static_cast<size_t>(t) * kHeadsPerGpu + h) * x_stride;
   float acc = 0.0f;
-  if (lane * 8 < kNope) {
-    const uint4 wr = __ldg(reinterpret_cast<const uint4*>(wk_t + (static_cast<size_t>(h) * kLatent + c) * kNope) + lane);
-    const uint4 xr = __ldg(reinterpret_cast<const uint4*>(qh) + lane);
-    const __nv_bfloat16* wv = reinterpret_cast<const __nv_bfloat16*>(&wr);
-    const __nv_bfloat16* xv = reinterpret_cast<const __nv_bfloat16*>(&xr);
+  for (int base = lane * 8; base < k; base += 256) {
+    const uint4 wq = __ldg(reinterpret_cast<const uint4*>(wr + base));
+    const uint4 xq = __ldg(reinterpret_cast<const uint4*>(xh + base));
+    const __nv_bfloat16* wv = reinterpret_cast<const __nv_bfloat16*>(&wq);
+    const __nv_bfloat16* xv = reinterpret_cast<const __nv_bfloat16*>(&xq);
 #pragma unroll
     for (int e = 0; e < 8; e++) acc = __fmaf_rn(__bfloat162float(wv[e]), __bfloat162float(xv[e]), acc);
   }
   for (int o = 16; o > 0; o >>= 1) acc = __fadd_rn(acc, __shfl_xor_sync(0xFFFFFFFFu, acc, o));
-  __nv_bfloat16* out = queries + (static_cast<size_t>(t) * kHeadsPerGpu + h) * kKeyWidth;
-  if (lane == 0) out[c] = __float2bfloat16_rn(acc);
-  if (lane == 1 && c < kKeyRope) out[kLatent + c] = qh[kNope + c];  // q_rope as it is
+  if (lane == 0) out[(static_cast<size_t>(t) * kHeadsPerGpu + h) * out_stride + r] = __float2bfloat16_rn(acc);
+}
+
+/** q_rope into each query's last kKeyRope values, as it is. */
+__global__ void rope_copy_kernel(const __nv_bfloat16* __restrict__ q, int rows, __nv_bfloat16* __restrict__ queries) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= rows * kHeadsPerGpu * kKeyRope) return;
+  const int c = i % kKeyRope, th = i / kKeyRope;
+  queries[static_cast<size_t>(th) * kKeyWidth + kLatent + c] = q[static_cast<size_t>(th) * kQkHead + kNope + c];
+}
+
+constexpr int kNormThreads = 256;  // hc::rmsnorm's block
+
+__device__ __forceinline__ float value_of(float v) { return v; }
+__device__ __forceinline__ float value_of(__nv_bfloat16 v) { return __bfloat162float(v); }
+
+template <class In>
+__global__ void __launch_bounds__(kNormThreads) rmsnorm_kernel(const In* __restrict__ x, const float* __restrict__ w,
+                                                              int dim, float eps, __nv_bfloat16* __restrict__ out) {
+  __shared__ float part[kNormThreads];
+  const In* row = x + static_cast<size_t>(blockIdx.x) * dim;
+  float sq = 0.0f;
+  for (int i = threadIdx.x; i < dim; i += kNormThreads) {
+    const float v = value_of(row[i]);
+    sq = __fmaf_rn(v, v, sq);
+  }
+  part[threadIdx.x] = sq;
+  __syncthreads();
+  for (int s = kNormThreads / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) part[threadIdx.x] = __fadd_rn(part[threadIdx.x], part[threadIdx.x + s]);
+    __syncthreads();
+  }
+  const float r = det::rsqrt(__fadd_rn(__fdiv_rn(part[0], static_cast<float>(dim)), eps));
+  for (int i = threadIdx.x; i < dim; i += kNormThreads)
+    out[static_cast<size_t>(blockIdx.x) * dim + i] = __float2bfloat16_rn(__fmul_rn(w[i], __fmul_rn(value_of(row[i]), r)));
+}
+
+/** One warp per (token, head): lane i rotates pair i, reading both values before any lane writes. */
+__global__ void rope_kernel(__nv_bfloat16* __restrict__ x, int heads, size_t token_stride, int head_stride, int offset,
+                            const float* __restrict__ freqs, const int64_t* __restrict__ positions) {
+  constexpr int kPairs = kKeyRope / 2;
+  static_assert(kPairs == 32, "a lane per pair");
+  const int t = blockIdx.y, h = blockIdx.x, i = threadIdx.x;
+  __nv_bfloat16* v = x + t * token_stride + static_cast<size_t>(h) * head_stride + offset;
+  const float x1 = __bfloat162float(v[2 * i]), x2 = __bfloat162float(v[2 * i + 1]);
+  const float angle = __fmul_rn(static_cast<float>(positions[t]), freqs[i]);
+  const float c = det::cos(angle), s = det::sin(angle);
+  __syncwarp();
+  v[i] = __float2bfloat16_rn(__fsub_rn(__fmul_rn(x1, c), __fmul_rn(x2, s)));
+  v[kPairs + i] = __float2bfloat16_rn(__fadd_rn(__fmul_rn(x2, c), __fmul_rn(x1, s)));
+}
+
+/** One warp per token: lane l adds elements l, l + 32, ... in order, then the xor tree (A7's order). */
+__global__ void index_key_norm_kernel(__nv_bfloat16* __restrict__ keys, const float* __restrict__ weight,
+                                      const float* __restrict__ bias, float eps) {
+  constexpr int kPer = kIndexKey / 32;
+  __nv_bfloat16* k = keys + static_cast<size_t>(blockIdx.x) * kIndexKey;
+  const int lane = threadIdx.x;
+  float x[kPer];
+#pragma unroll
+  for (int j = 0; j < kPer; j++) x[j] = __bfloat162float(k[lane + 32 * j]);
+  float sum = 0.0f;
+#pragma unroll
+  for (int j = 0; j < kPer; j++) sum = __fadd_rn(sum, x[j]);
+  for (int o = 16; o > 0; o >>= 1) sum = __fadd_rn(sum, __shfl_xor_sync(0xFFFFFFFFu, sum, o));
+  const float n = static_cast<float>(kIndexKey), mean = __fdiv_rn(sum, n);
+  float var = 0.0f;
+#pragma unroll
+  for (int j = 0; j < kPer; j++) {
+    const float dx = __fsub_rn(x[j], mean);
+    var = __fmaf_rn(dx, dx, var);
+  }
+  for (int o = 16; o > 0; o >>= 1) var = __fadd_rn(var, __shfl_xor_sync(0xFFFFFFFFu, var, o));
+  const float r = det::rsqrt(__fadd_rn(__fdiv_rn(var, n), eps));
+#pragma unroll
+  for (int j = 0; j < kPer; j++) {
+    const int i = lane + 32 * j;
+    k[i] = __float2bfloat16_rn(__fadd_rn(__fmul_rn(__fmul_rn(__fsub_rn(x[j], mean), r), weight[i]), bias[i]));
+  }
 }
 
 // ---- Flash decoding over the Selection ----
@@ -229,10 +309,38 @@ __global__ void __launch_bounds__(kLatent) combine_kernel(int splits, LatentScra
 
 }  // namespace
 
+void head_gemv(const __nv_bfloat16* w, size_t w_head_stride, int rows, int k, const __nv_bfloat16* x, int x_stride,
+               int tokens, __nv_bfloat16* out, int out_stride, cudaStream_t stream) {
+  const int warps = tokens * kHeadsPerGpu * rows;
+  head_gemv_kernel<<<(warps * 32 + 255) / 256, 256, 0, stream>>>(w, w_head_stride, rows, k, x, x_stride, tokens, out,
+                                                                 out_stride);
+}
+
 void absorbed_queries(const __nv_bfloat16* q, const __nv_bfloat16* wk_t, int rows, __nv_bfloat16* queries,
                       cudaStream_t stream) {
-  const int warps = rows * kHeadsPerGpu * kLatent;
-  absorbed_kernel<<<(warps * 32 + 255) / 256, 256, 0, stream>>>(q, wk_t, rows, queries);
+  head_gemv(wk_t, static_cast<size_t>(kLatent) * kNope, kLatent, kNope, q, kQkHead, rows, queries, kKeyWidth, stream);
+  const int n = rows * kHeadsPerGpu * kKeyRope;
+  rope_copy_kernel<<<(n + 255) / 256, 256, 0, stream>>>(q, rows, queries);
+}
+
+void rmsnorm(const float* x, const float* w, int dim, int tokens, float eps, __nv_bfloat16* out, cudaStream_t stream) {
+  rmsnorm_kernel<float><<<tokens, kNormThreads, 0, stream>>>(x, w, dim, eps, out);
+}
+
+void rmsnorm(const __nv_bfloat16* x, const float* w, int dim, int tokens, float eps, __nv_bfloat16* out,
+             cudaStream_t stream) {
+  rmsnorm_kernel<__nv_bfloat16><<<tokens, kNormThreads, 0, stream>>>(x, w, dim, eps, out);
+}
+
+void rope(__nv_bfloat16* x, int tokens, int heads, size_t token_stride, int head_stride, int offset,
+          const float* freqs, const int64_t* positions, cudaStream_t stream) {
+  rope_kernel<<<dim3(heads, tokens), kKeyRope / 2, 0, stream>>>(x, heads, token_stride, head_stride, offset, freqs,
+                                                                positions);
+}
+
+void index_key_norm(__nv_bfloat16* keys, const float* weight, const float* bias, float eps, int tokens,
+                    cudaStream_t stream) {
+  index_key_norm_kernel<<<tokens, 32, 0, stream>>>(keys, weight, bias, eps);
 }
 
 cudaError_t latent_attention(const __nv_bfloat16* queries, const __nv_bfloat16* cache, const int32_t* selection,

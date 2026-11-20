@@ -14,6 +14,13 @@
 //                      the queries' magnitudes spread over 2^-8 .. 2^8, so sums
 //                      cancel and an FP32-ulp slip (an element order) reaches the
 //                      BF16 result often enough to see;
+//   head_gemv          W_v (K = 512) laid out as in kv_b, a Round of 8;
+//   rmsnorm            512 rows of the FP32 residual (6144, values not BF16) and
+//                      of BF16 latents (2048, 512) against hc::rmsnorm;
+//   rope               the query heads' (offset 192 of 256), the index query's
+//                      (offset 0 of 128) and k_rope, 256 tokens at positions up to 200,000
+//                      against exact::rope;
+//   index_key_norm     4,096 keys against exact::index_key_norm;
 //   latent_attention   Selection lengths at the split edges (1, 63, 64, 65, ...,
 //                      2047, 2048), a Round of 8 rows of mixed lengths (padding
 //                      by -1, whole padded splits included), peaked queries
@@ -46,6 +53,7 @@
 
 #include "core/glm53/config.hpp"
 #include "core/glm53/exact_attention.hpp"
+#include "core/hc_reference.hpp"
 #include "core/mx_reference.hpp"
 #include "cuda/glm53/attention.cuh"
 #include "cuda/glm53/indexer.cuh"
@@ -155,6 +163,132 @@ size_t check_absorbed(std::mt19937& rng) {
   cudaFree(d_w);
   cudaFree(d_out);
   return bad;
+}
+
+/** W_v per head inside a kv_b-shaped buffer (head stride (nope + v_head) rows), times spread ctx. */
+bool check_w_v(std::mt19937& rng) {
+  constexpr int kTokens = gpu::kMaxAttentionRows, kVHead = 128, kPerHead = gpu::kNope + kVHead;
+  const auto kv_b = random_bf16(rng, static_cast<size_t>(gpu::kHeadsPerGpu) * kPerHead * gpu::kLatent, 0.05f);
+  const auto ctx = spread_bf16(rng, static_cast<size_t>(kTokens) * gpu::kHeadsPerGpu * gpu::kLatent);
+  auto* d_w = upload(as_bf16(kv_b));
+  auto* d_x = upload(as_bf16(ctx));
+  auto* d_out = device_alloc<__nv_bfloat16>(static_cast<size_t>(kTokens) * gpu::kHeadsPerGpu * kVHead);
+  gpu::head_gemv(d_w + static_cast<size_t>(gpu::kNope) * gpu::kLatent, static_cast<size_t>(kPerHead) * gpu::kLatent,
+                 kVHead, gpu::kLatent, d_x, gpu::kLatent, kTokens, d_out, kVHead, nullptr);
+  ck(cudaDeviceSynchronize(), "head_gemv");
+  const auto got = download(d_out, static_cast<size_t>(kTokens) * gpu::kHeadsPerGpu * kVHead);
+  std::vector<float> want(got.size());
+  const glm53::Matrix w{kv_b, gpu::kHeadsPerGpu * kPerHead, gpu::kLatent};
+  for (int t = 0; t < kTokens; t++)
+    for (int h = 0; h < gpu::kHeadsPerGpu; h++) {
+      const size_t th = static_cast<size_t>(t) * gpu::kHeadsPerGpu + h;
+      const auto x = std::span<const float>(ctx).subspan(th * gpu::kLatent, gpu::kLatent);
+      for (int v = 0; v < kVHead; v++)
+        want[th * kVHead + v] = mx::round_bf16(exact::gemv_row(w, h * kPerHead + gpu::kNope + v, x));
+    }
+  const size_t bad = compare("W_v", want, got);
+  std::printf("head_gemv (W_v): %d tokens x %d heads x %d values: %zu differ\n", kTokens, gpu::kHeadsPerGpu, kVHead, bad);
+  cudaFree(d_w);
+  cudaFree(d_x);
+  cudaFree(d_out);
+  return bad == 0;
+}
+
+/** hc::rmsnorm of `tokens` rows: FP32 input (any values) or BF16. */
+bool check_rmsnorm(std::mt19937& rng, int dim, bool fp32_input) {
+  constexpr int kTokens = 512;  // a 1-ulp slip of r shows through BF16 in about one row in ten
+  std::normal_distribution<float> normal(0.0f, 1.0f);
+  std::uniform_real_distribution<float> scale(-6.0f, 6.0f);
+  std::vector<float> x(static_cast<size_t>(kTokens) * dim);
+  for (auto& v : x) v = std::ldexp(normal(rng), static_cast<int>(scale(rng)));  // a residual: FP32, wide range
+  if (!fp32_input)
+    for (auto& v : x) v = mx::round_bf16(v);
+  std::vector<float> w(static_cast<size_t>(dim));
+  for (auto& v : w) v = mx::round_bf16(1.0f + 0.3f * normal(rng));
+  auto* d_w = upload(w);
+  auto* d_out = device_alloc<__nv_bfloat16>(x.size());
+  void* d_x = nullptr;
+  if (fp32_input) {
+    auto* p = upload(x);
+    gpu::rmsnorm(p, d_w, dim, kTokens, 1e-5f, d_out, nullptr);
+    d_x = p;
+  } else {
+    auto* p = upload(as_bf16(x));
+    gpu::rmsnorm(p, d_w, dim, kTokens, glm53::kLatentNormEps, d_out, nullptr);
+    d_x = p;
+  }
+  ck(cudaDeviceSynchronize(), "rmsnorm");
+  const auto got = download(d_out, x.size());
+  std::vector<float> want(x.size());
+  for (int t = 0; t < kTokens; t++) {
+    const auto y = hc::rmsnorm(std::span<const float>(x).subspan(static_cast<size_t>(t) * dim, dim), w,
+                               fp32_input ? 1e-5f : glm53::kLatentNormEps);
+    std::copy(y.begin(), y.end(), want.begin() + static_cast<std::ptrdiff_t>(t) * dim);
+  }
+  const size_t bad = compare("rmsnorm", want, got);
+  std::printf("rmsnorm (%s, %d): %d tokens: %zu differ\n", fp32_input ? "FP32" : "BF16", dim, kTokens, bad);
+  cudaFree(d_x);
+  cudaFree(d_w);
+  cudaFree(d_out);
+  return bad == 0;
+}
+
+/** exact::rope on `heads` heads per token at `offset` of each `head_stride`, positions up to 200,000. */
+bool check_rope(std::mt19937& rng, const glm53::Dims& d, const char* what, int heads, int head_stride, int offset) {
+  constexpr int kTokens = 256;  // enough pairs for a product's rounding slip to show through BF16
+  const size_t token_stride = static_cast<size_t>(heads) * head_stride;
+  const auto x = random_bf16(rng, kTokens * token_stride, 1.0f);
+  std::vector<int64_t> pos = {0, 1, 2, 4095, 4096, 65537, 131071, 199999};
+  std::uniform_int_distribution<int64_t> any(0, 199999);
+  while (pos.size() < kTokens) pos.push_back(any(rng));
+  const auto freqs = exact::rope_freqs(d.rope, d.rope_theta);
+  auto* d_x = upload(as_bf16(x));
+  auto* d_freqs = upload(freqs);
+  auto* d_pos = upload(pos);
+  gpu::rope(d_x, kTokens, heads, token_stride, head_stride, offset, d_freqs, d_pos, nullptr);
+  ck(cudaDeviceSynchronize(), "rope");
+  const auto got = download(d_x, x.size());
+  std::vector<float> want = x;
+  for (int t = 0; t < kTokens; t++)
+    for (int h = 0; h < heads; h++) {
+      const size_t at = t * token_stride + static_cast<size_t>(h) * head_stride + offset;
+      const auto y = exact::rope(std::span<const float>(x).subspan(at, gpu::kKeyRope), pos[t], freqs);
+      std::copy(y.begin(), y.end(), want.begin() + static_cast<std::ptrdiff_t>(at));
+    }
+  const size_t bad = compare("rope", want, got);
+  std::printf("rope (%s): %d tokens x %d heads: %zu differ\n", what, kTokens, heads, bad);
+  cudaFree(d_x);
+  cudaFree(d_freqs);
+  cudaFree(d_pos);
+  return bad == 0;
+}
+
+bool check_index_key_norm(std::mt19937& rng) {
+  constexpr int kTokens = 4096;
+  const auto keys = spread_bf16(rng, static_cast<size_t>(kTokens) * gpu::kIndexHeadDim);
+  std::normal_distribution<float> normal(0.0f, 1.0f);
+  std::vector<float> weight(gpu::kIndexHeadDim), bias(gpu::kIndexHeadDim);
+  for (auto& v : weight) v = mx::round_bf16(1.0f + 0.3f * normal(rng));
+  for (auto& v : bias) v = mx::round_bf16(0.1f * normal(rng));
+  auto* d_keys = upload(as_bf16(keys));
+  auto* d_w = upload(weight);
+  auto* d_b = upload(bias);
+  gpu::index_key_norm(d_keys, d_w, d_b, glm53::kIndexKeyNormEps, kTokens, nullptr);
+  ck(cudaDeviceSynchronize(), "index_key_norm");
+  const auto got = download(d_keys, keys.size());
+  std::vector<float> want(keys.size());
+  for (int t = 0; t < kTokens; t++) {
+    const auto y = exact::index_key_norm(
+        std::span<const float>(keys).subspan(static_cast<size_t>(t) * gpu::kIndexHeadDim, gpu::kIndexHeadDim), weight,
+        bias);
+    std::copy(y.begin(), y.end(), want.begin() + static_cast<std::ptrdiff_t>(t) * gpu::kIndexHeadDim);
+  }
+  const size_t bad = compare("index_key_norm", want, got);
+  std::printf("index_key_norm: %d keys: %zu differ\n", kTokens, bad);
+  cudaFree(d_keys);
+  cudaFree(d_w);
+  cudaFree(d_b);
+  return bad == 0;
 }
 
 struct Case {
@@ -419,7 +553,7 @@ int main(int argc, char** argv) {
   const auto config = glm53::parse_config(std::string((std::istreambuf_iterator<char>(cf)), std::istreambuf_iterator<char>()));
   if (!config) die(config.error().what);
   const glm53::Dims& d = config.value().dims();
-  if (d.index_heads != gpu::kIndexHeads || d.index_head_dim != gpu::kIndexHeadDim ||
+  if (d.qk_head() != gpu::kQkHead || d.index_heads != gpu::kIndexHeads || d.index_head_dim != gpu::kIndexHeadDim ||
       d.heads != 2 * gpu::kHeadsPerGpu || d.kv_lora != gpu::kLatent || d.rope != gpu::kKeyRope || d.nope != gpu::kNope ||
       d.index_topk != gpu::kMaxSelection || exact::kSplitRows != gpu::kLatentSplitRows ||
       static_cast<float>(1.0 / std::sqrt(static_cast<double>(d.qk_head()))) != kScale)
@@ -432,6 +566,14 @@ int main(int argc, char** argv) {
   std::printf("absorbed_queries: %d Rounds x %d rows x %d heads x %d values: %zu differ\n", kAbsorbedRounds,
               gpu::kMaxAttentionRows, gpu::kHeadsPerGpu, gpu::kKeyWidth, absorbed_bad);
   bool ok = absorbed_bad == 0;
+  ok = check_w_v(rng) && ok;
+  ok = check_rmsnorm(rng, d.hidden, true) && ok;
+  ok = check_rmsnorm(rng, d.q_lora, false) && ok;
+  ok = check_rmsnorm(rng, d.kv_lora, false) && ok;
+  ok = check_rope(rng, d, "query heads", gpu::kHeadsPerGpu, gpu::kQkHead, gpu::kNope) && ok;
+  ok = check_rope(rng, d, "index query", gpu::kIndexHeads, gpu::kIndexHeadDim, 0) && ok;
+  ok = check_rope(rng, d, "k_rope", 1, gpu::kKeyRope, 0) && ok;
+  ok = check_index_key_norm(rng) && ok;
   const std::vector<Case> cases = {
       {"one entry", {1}},          {"two entries", {2}},       {"63", {63}},       {"one split", {64}},
       {"65", {65}},                {"two splits", {128}},      {"129", {129}},     {"1000", {1000}},

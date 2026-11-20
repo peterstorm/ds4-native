@@ -12,6 +12,8 @@
 # Equivalent (not probed): an FMA for a multiply-add wherever both factors are
 # BF16 (the absorbed query's GEMV): a product of two 8-bit mantissas is exact in
 # FP32, so fma(a, b, c) and fl(a b) + c round the same sum.
+# The kernels that read FP32 (the residual's rmsnorm, RoPE) have non-BF16
+# products, so there the FMA mutations are live and probed.
 #
 # Run from the repo root inside the dev image on a GPU, after a CUDA build in build-cuda:
 #   docker run --rm --gpus device=1 -v $PWD:/src -w /src ds4-native-dev:2 \
@@ -62,11 +64,25 @@ if check >/dev/null 2>&1; then echo "baseline: PASS"; else echo "baseline: FAILS
 
 mutate_in src/cuda/glm53/attention.cu
 # The absorbed query.
-probe absorbed-reversed  "for (int e = 0; e < 8; e++) acc = __fmaf_rn(" "for (int e = 7; e >= 0; e--) acc = __fmaf_rn("
-probe absorbed-short-k   "if (lane * 8 < kNope) {" "if (lane * 8 < kNope - 8) {"
-probe absorbed-tree      "for (int o = 16; o > 0; o >>= 1) acc = __fadd_rn(acc, __shfl_xor_sync(0xFFFFFFFFu, acc, o));" \
+probe gemv-reversed      "for (int e = 0; e < 8; e++) acc = __fmaf_rn(" "for (int e = 7; e >= 0; e--) acc = __fmaf_rn("
+probe gemv-one-chunk     "for (int base = lane * 8; base < k; base += 256) {" "for (int base = lane * 8; base < k && base < 256; base += 256) {"
+probe gemv-chunks-down   "for (int base = lane * 8; base < k; base += 256) {" "for (int base = lane * 8 + (k - 1) / 256 * 256; base >= 0; base -= 256) if (base < k) {"
+probe gemv-tree          "for (int o = 16; o > 0; o >>= 1) acc = __fadd_rn(acc, __shfl_xor_sync(0xFFFFFFFFu, acc, o));" \
                          "for (int o = 1; o < 32; o <<= 1) acc = __fadd_rn(acc, __shfl_xor_sync(0xFFFFFFFFu, acc, o));"
-probe rope-copy-swapped  "out[kLatent + c] = qh[kNope + c];" "out[kLatent + c] = qh[kNope + (c ^ 1)];"
+probe rope-copy-swapped  "+ kLatent + c] = q[static_cast<size_t>(th) * kQkHead + kNope + c];" \
+                         "+ kLatent + c] = q[static_cast<size_t>(th) * kQkHead + kNope + (c ^ 1)];"
+# The norms and RoPE.
+probe norm-sq-mul-add    "sq = __fmaf_rn(v, v, sq);" "sq = __fadd_rn(__fmul_rn(v, v), sq);"
+probe norm-tree-up       "for (int s = kNormThreads / 2; s > 0; s >>= 1) {" "for (int s = 1; s < kNormThreads; s <<= 1) {"
+probe norm-w-last        "__float2bfloat16_rn(__fmul_rn(w[i], __fmul_rn(value_of(row[i]), r)));" \
+                         "__float2bfloat16_rn(__fmul_rn(__fmul_rn(w[i], value_of(row[i])), r));"
+probe rope-interleaved   "v[kPairs + i] = __float2bfloat16_rn(" "v[2 * i + 1] = __float2bfloat16_rn("
+probe rope-fma           "v[i] = __float2bfloat16_rn(__fsub_rn(__fmul_rn(x1, c), __fmul_rn(x2, s)));" \
+                         "v[i] = __float2bfloat16_rn(__fmaf_rn(x1, c, -__fmul_rn(x2, s)));"
+probe rope-fast-cos      "const float c = det::cos(angle), s = det::sin(angle);" "const float c = __cosf(angle), s = det::sin(angle);"
+probe key-norm-var-mul-add "var = __fmaf_rn(dx, dx, var);" "var = __fadd_rn(__fmul_rn(dx, dx), var);"
+probe key-norm-bias-first "__float2bfloat16_rn(__fadd_rn(__fmul_rn(__fmul_rn(__fsub_rn(x[j], mean), r), weight[i]), bias[i]));" \
+                         "__float2bfloat16_rn(__fadd_rn(__fmul_rn(__fsub_rn(x[j], mean), __fmul_rn(r, weight[i])), bias[i]));"
 # The split.
 probe head-group-0       "(static_cast<size_t>(row) * kHeadsPerGpu + group * kHeadsPerCta) * kKeyWidth;" \
                          "(static_cast<size_t>(row) * kHeadsPerGpu + 0 * kHeadsPerCta) * kKeyWidth;"
