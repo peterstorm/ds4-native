@@ -12,8 +12,10 @@ the plan (settled decision 3: "15–25 tok/s exact, 30–50 with cache-condition
    still open (E4M3, the folded weight, the Exchange's rounding) moves decode by under 1%.
 2. **Speed is decided by where the Experts are.** The store is 375 GiB. The fast tiers hold
    about half of it (est.), and decode reads 600 routed Experts per token (75 Sparse layers ×
-   8). The miss rate decides whether decode runs at 6 or 45 tok/s. That number is **unmeasured
-   for GLM**, and measuring it is the next speed step (below).
+   8). The miss rate decides whether decode runs at 6 or 45 tok/s. **Measured later the same
+   day** (`docs/bench/glm53-locality/2026-11-20-locality-report.md`): **~29% misses at 33%
+   residency, so ~5 tok/s exact**, not 15–25. GLM's routing is far less local than DS4.1's. The
+   lever that can change this is cache-conditional routing (§4), not arithmetic.
 3. **Prefill touches most of the store even for short prompts** (measured: 168 of 256 Experts
    per layer for 64 tokens). Time-to-first-token is NVMe-bound at **≈ 5–10 s per turn**
    (est.), almost regardless of message length. That is the user-visible cost to plan for.
@@ -58,7 +60,9 @@ about a third of misses hit RAM (`r` = 0.35; est.):
 | 20% | 120 | 147 ms | **~7** |
 
 The plan's 15–25 tok/s corresponds to `m` ≈ 4.5–9%. **This is the number that decides the
-speed.** It is unknown for GLM. GLM's VRAM residency (~33%) is half of DS4.1's (61–69%), and
+speed.** It was unknown for GLM when this was written. **Measured (2026-11-20, 2,800-position
+trace, DS4.1's decay policy): m = 28.9% at 33% residency (5.4 tok/s with the RAM tier), 16.0% at
+50%, 10.9% at 60%.** Belady's optimum at 33% is 12.8%. See the locality report. GLM's VRAM residency (~33%) is half of DS4.1's (61–69%), and
 DS4.1's static hit rates at its own size were already 3.9–8.7% misses before locality helped
 (2–4×). Whether GLM's routing is as local as DS4.1's has not been measured.
 
@@ -97,6 +101,10 @@ because its residency is about twice as high.
 
 ## 5. What to measure next (speed)
 
+**Done 2026-11-20:** steps 1 and 2 below (`--routes`, `tools/glm53-golden/expert_locality.py`),
+on a 2,800-position corpus and the chat test. Result in the locality report. The next speed
+measurement is cache-conditional routing's KL cost and miss reduction (§4, first row).
+
 **GLM Expert locality from real routes.** `ds4n-glm53-oracle-run --generate N` produces genuine
 decode Routes (Expert ids per token per layer). Steps:
 
@@ -121,3 +129,8 @@ Backbone B stored as a **delta** over Backbone A needs about 14 GB (est.): 66 BF
 (37 GiB, like Backbone A) does not fit with any safe headroom. The source tensors can be fetched
 by HTTP range requests (the safetensors header gives each tensor's offsets), so no full shards
 need to land on disk.
+
+**Measured (later 2026-11-20):** Backbone B costs **12.9 GiB** as a ZFS reflink of Backbone A
+plus its rewritten blocks. The cyber source delta kept on disk is 7.0 GiB, and rpool has 19.2 GiB
+free after both. Whole shards were fetched one at a time instead of ranges, so every byte is
+checked against a published hash (`docs/bench/glm53-backbone-b/2026-11-20-backbone-b-report.md`).

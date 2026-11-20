@@ -1,4 +1,4 @@
-# HANDOVER: GLM-5.3 full uncensored on ds4-native — session state 2026-11-19 (updated 23:55)
+# HANDOVER: GLM-5.3 full uncensored on ds4-native — session state 2026-11-20 (updated 05:30)
 
 Resume point for any fresh session. Companion to
 [`2026-11-19-glm53-native.md`](2026-11-19-glm53-native.md) (the plan — read it first; its
@@ -12,9 +12,11 @@ the ds4-native engine (expert streaming from NVMe), as the engine's second archi
 DeepSeek-V4.1. Target weights: `kitaniai/GLM-5.3-UNCENSORED-MXFP4` (v2 CRACK surgery rev
 `12170112`, MXFP4 experts + FP8/BF16 backbone, 394.65 GiB). VARIANT design: `glm-uncensored` and
 `glm-cyber` share ONE expert store (both CRACK variants leave routed experts unchanged); only the
-backbone differs (119 bf16 residual-writer tensors). Speed expectation est. 15–25 tok/s exact,
-30–50 with cache-conditional routing + RAM tier — a quality/architecture play. Phase 5's measured
-CyberGym verdict decides keep/archive.
+backbone differs (124 residual-writer tensors; Backbone B built 2026-11-20). **Speed, measured
+2026-11-20: ~5 tok/s exact** (GLM misses ~29% of Expert picks at the ~33% VRAM residency two
+cards allow; the plan's 15–25 assumed DS4.1's locality). Cache-conditional routing is the lever
+that decides usable speed (est. 11–17 tok/s), at an unmeasured KL cost. A quality/architecture
+play; Phase 5's measured CyberGym verdict decides keep/archive.
 
 ## Where things stand (2026-11-19 ~23:55, second session)
 
@@ -31,6 +33,9 @@ CyberGym verdict decides keep/archive.
 | **Activation precision measured (Phase 3 step 3)** | same branch: `core/glm53/precision` `ActivationPrecision` (MXFP4 with Quark's "even" scale, read from amd-quark 0.13), `expert_outputs` + `finish_layer` over `ExpertOutput`s (the seam at the routed Experts' outputs), oracle-run `--prompt`×N `--activations`; receipts `docs/bench/glm53-oracle/2026-11-19-activations.*` | 5 prompts, 315 positions, 1,961 s on 30 threads with flare stopped (operator-approved; **left stopped** at the operator's word: `docker start glm53-flash-hyperflare-tp2-uncensored` brings it back, ~1 min to load). Mean KL vs FP32: W4A4 0.0616, E4M3 0.0051, BF16 0.0036; perplexity 3.975 / 3.805 / 3.826 vs 3.849. **E4M3 decided** (operator; plan settled decision 8). Prompt 0 at FP32 reproduces step 2's output exactly; mutation probe 12/12; 249 core + 7 I/O tests |
 | **The MoE's Reference configuration (Phase 3 step 4)** | same branch: `docs/design/glm53-reference-configuration.md`, `core/glm53/exact_moe` (bit-exact MoE oracle on the Expert codes, from DS4.1's primitives unchanged), `StoreReader::read_tensors`, `BackboneParts::load_shared_expert`, `finish_layer(FeedForward)`, oracle-run `--activations exact`, `tools/glm53-golden/exact-moe-mutation-probe.sh`; receipts `docs/bench/glm53-oracle/2026-11-19-exact-moe.*` | router 6 planes, Halves, split-K 2, no clamp, weight folded before down, ascending-id combine then shared, then the Exchange. Pinned by `kReferenceBits` (512 tokens incl. hidden fragments) plus a double-precision spec witness (< 1e-3); mutation probe 16/16. Real weights, 5 prompts, 3,582 s: mean KL vs FP32 **0.0091** (E4M3 alone 0.0051; FP32/E4M3 streams reproduce step 3 exactly), top-1 306/315, perplexity 3.816. The extra ~0.004 is uniform (BF16 roundings + folded weight, not isolated yet: design "Open"). 266 core + 8 I/O tests |
 | **The GPU MoE (Phase 3 step 5, first GPU window)** | same branch: `core/glm53/{moe_plan,expert_tiles}`, `cuda/glm53/{moe,grouped_moe}`, `ds4n-glm53-moe-check`, oracle-run `--gpu N` and `--activations exact-DEPARTURE`, `tools/glm53-golden/{gpu-moe-mutation-probe.sh,kl_paired.py}`; receipts `docs/bench/glm53-oracle/2026-11-19-departures.*` | **100% bit-identical** to `exact_moe` on real Experts. Checked: the SwiGLU element function on 2^24 inputs; Rounds of 1–8 tokens (logits, Routes, Plan, hidden fragments, partials, Exchange); sweeps of up to 300 tokens under each GPU Departure; layers 3/40/75/77. GPU mutation probe 13/13. DS4.1's kernels are reused unchanged and DS4.1's sources are untouched. One GPU's 8-token Round takes 173–342 µs (1.3–1.5 TB/s). KL run (4 streams, `--gpu 0`) took 1,713 s, against 3,582 s for 3 streams on the CPU; `exact` is identical at all 315 positions. **Folded weight: no KL cost, it stays.** **FP32 Exchange: −31% (0.0063 vs 0.0091), at the noise floor**, not decided (design "Open") |
+| **First chat answers (Backbone A)** | receipts + report `docs/bench/glm53-chat/2026-11-20-*` | 3 chat prompts (kitaniai's template, effort Low, no thinking), 64 greedy tokens, `fp32` and `exact` (GPU): coherent, correct, uncensored on the lock-picking probe; turn ends with EOS `<|user|>`; `exact` = `fp32` for 45–47 tokens, then near-ties diverge. 6,528 s (~14 s per token per stream; CPU reference). KL on chat positions 0.043 vs 0.009 on plain text: open question |
+| **Backbone B (cyber) built** | `tools/glm53-store/{fetch-cyber-delta,kitani_recipe}.py`; `/models/glm53-store/backbone-cyber` (+ `VARIANT.json`); receipts + report `docs/bench/glm53-backbone-b/` | 69 shards fetched and sha256-checked against LFS, 248 target tensors kept (7.0 GiB, `/models/glm53-native/dealignai-cyber/delta`). kitaniai's Quark recipe restated and proven **bit-exact on 29 unedited weights** (FP8 recovery to BF16; MXFP4 from the FP32 dequantization with Quark's "even" scale). Built as a reflink of A with the 124 targets in whole ZFS records, every byte re-read: 12.9 GiB. The first build's re-read caught a lost partial-record update on a cloned block (ZFS 2.4.4); fixed by record-aligned writes. **Not yet run through the oracle** (queued) |
+| **GLM Expert locality measured** | `oracle-run --routes`, `tools/glm53-golden/expert_locality.py`; receipts + report `docs/bench/glm53-locality/` | 2,800-position corpus (4 sessions, teacher-forced) + the chat test's decode: **~29% misses at 33% residency** (DS4.1's policy; LRU the same; Belady 12.8%; static 37.6%), 16% at 50%, 11% at 60% → ~5.4 tok/s with the RAM tier. 19,162 of 19,200 Experts used in 2,800 tokens. Plan settled decision 3 corrected |
 | **Converter safety fix** | same branch, `24b9a6a` | the deletable list could have listed MTP and unconverted shards; now it lists only verified, fully consumed shards and has a free-space preflight. Checked on real layer 10 (RAM tmpfs) |
 | Indexer reference pinning (old step 5) | `ref/glm-5.3/README.md` | **decided: transformers 5.16.0** |
 | Desktop space for the download | /models/voice deleted (operator-approved; TTS weights, re-downloadable), 82 exited containers + `ds4-native-dev:1` removed | `space-guard.sh` armed (pauses the fetch below 6 GiB free) |
@@ -152,12 +157,15 @@ An independent audit (python, read-only, against the index) found:
    noise floor of re-rolled Routes. **Next:** rerun on a larger prompt set (20+ prompts, new
    ones tokenized like step 2's) to decide BF16 vs FP32 Exchange. Then the attention side's
    kernels (MLA decode, indexer, top-2048).
-6. **Backbone B (cyber)**: space freed 2026-11-20. ComfyUI's Krea2 family was deleted at the
-   operator's word (32 GiB; every file sha256-verified against its pinned manifest first; receipt
-   `/models/comfyui/archive-receipt-krea2-2026-11-20.txt`; re-stage with
-   `~/.dotfiles/scripts/comfyui/download-krea2-models.sh`). rpool now has 39.1 GiB free. Build it
-   as a **delta** over Backbone A (≈ 14 GB est.; a full 37 GiB copy does not fit), fetching the
-   source tensors by HTTP range requests.
+6. **Backbone B (cyber): BUILT 2026-11-20** (Done table). Its first oracle run (the chat
+   prompts, `exact`, 24 tokens, `/tmp/glm53-kl/chat-b/`) was queued behind the locality run.
+   Check `chat-b.decoded`/report, and add the result to the Backbone B report. The cyber delta
+   source (7.0 GiB) may then be deleted at the operator's word; it can be re-fetched from the
+   pinned plan. rpool: 19.2 GiB free.
+6a. **Decide the speed question first** (locality report, "Next"): an oracle arithmetic that
+   routes against a simulated cache (cache-conditional routing, λ > 0). Score its KL like every
+   stream, and replay its Routes through `expert_locality.py` for the miss reduction. It takes
+   days, against weeks for the attention port, and decides whether that port is worth doing.
 7. Phases 4–5 per the plan (fifth switch-primary entry `glm-native`, slots ladder, CyberGym).
 
 ## Environment facts (the things that cost time to rediscover)
@@ -207,7 +215,7 @@ An independent audit (python, read-only, against the index) found:
 | GLM terms (Selection, Full/Shared layer, Latent row, Backbone part, Semantics oracle, Activation precision, Route margin) | `ds4-native/CONTEXT.md`, GLM-5.3 section |
 | GLM-5.3 Reference configuration (MoE fixed; attention by operation) | `ds4-native/docs/design/glm53-reference-configuration.md` |
 | Speed trade-offs (decode and prefill cost model, levers) | `ds4-native/docs/research/2026-11-20-glm53-speed-tradeoffs.md` |
-| Findings reports (one per measurement: method, results, interpretation, receipts) | `ds4-native/docs/bench/glm53-oracle/*-report.md`; latest `2026-11-19-gpu-moe-report.md` (GPU MoE gate + departures KL) |
+| Findings reports (one per measurement: method, results, interpretation, receipts) | `ds4-native/docs/bench/glm53-*/*-report.md`: `glm53-oracle/2026-11-19-gpu-moe-report.md` (GPU MoE gate + departures KL), `glm53-chat/2026-11-20-chat-report.md` (first answers), `glm53-backbone-b/2026-11-20-backbone-b-report.md` (cyber Backbone), `glm53-locality/2026-11-20-locality-report.md` (Expert miss rate → decode speed) |
 | Feasibility base (measured constants) | `ds4-native/docs/research/2026-10-26-feasibility.md` |
 | Serving design / engine internals | `ds4-native/docs/design/{serving,forward-pass,dspark}.md` |
 | Inference map (primaries, runbooks) | `.dotfiles/scripts/inference/INDEX.md` |
@@ -218,9 +226,10 @@ An independent audit (python, read-only, against the index) found:
 
 - kitaniai vLLM-0.30 "repetitive output" warning — engine bug on their side, but our kernels
   must pass their `runtime_smoke_results.json` semantics early (Phase 3 first GPU window).
-- Quark E8M0 scale grouping beyond the shape check: confirm scale bytes are per-32 *and* whether
-  the tensor layout interleaves any tile structure the piper must know (one-day check with the
-  CPU oracle).
+- ~~Quark E8M0 scale grouping beyond the shape check~~: settled 2026-11-20 by
+  `kitani_recipe.py` reproducing kitaniai's shared-expert MXFP4 bytes exactly. Scales are per 32
+  along the input dimension, row-major `[rows][k/32]`, with no tile interleave. Codes are packed
+  two per byte, element 2k in the low nibble. The scale is Quark's "even" mode.
 - ~~`e_score_correction_bias` + sigmoid routing tie-breaking: match ONE reference to the bit~~:
   the reference is pinned (transformers 5.16.0) and the Semantics oracle breaks ties to the lower
   Expert id / position. The bit-level match is the Reference configuration's job (next actions 5).
