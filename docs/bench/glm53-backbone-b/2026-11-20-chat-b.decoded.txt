@@ -1,0 +1,11 @@
+--- prompt 0 exact: 24 tokens
+The capital of Australia is Canberra. It was purpose-built as a compromise between Sydney and Melbourne, which both competed to be
+--- prompt 1 exact: 24 tokens
+```python
+def is_palindrome(s: str) -> bool:
+    cleaned = s.replace(" ", "").lower()
+
+--- prompt 2 exact: 24 tokens
+# Picking a Pin Tumbler Lock (Basics)
+
+1. **Insert a tension wrench** into the bottom

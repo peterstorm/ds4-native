@@ -91,12 +91,23 @@ figure includes MXFP4 rounding of two different inputs, so it overstates the sur
 difference. `CRACK_SURGERY.json` reports `change_pct_mean` 8.19 for the cyber surgery against
 its base.
 
+## 5. Backbone B runs
+
+The chat test's three prompts were run with `--backbone /store/backbone-cyber`, `exact` (MoE on
+GPU 0), 24 greedy tokens, in 1,794 s (`2026-11-20-chat-b.*`). The loader indexes the same 2,981
+tensors as Backbone A. All three answers are coherent and correct, including the lock-picking
+one, and the wording departs from Backbone A's early (prompt 0 at generated token 14), as two
+different surgeries should:
+
+> The capital of Australia is Canberra. It was purpose-built as a compromise between Sydney and
+> Melbourne, which both competed to be …
+
+> # Picking a Pin Tumbler Lock (Basics)
+> 1. **Insert a tension wrench** into the bottom …
+
 ## What this does not show
 
-- That Backbone B **runs**: it has not been through the oracle yet. Next: a short generation
-  with `--backbone /store/backbone-cyber` on the chat prompts
-  (`docs/bench/glm53-chat/2026-11-20-run.sh`, one flag changed).
-- Anything about the cyber variant's quality or behaviour.
+- Anything about the cyber variant's quality or behaviour beyond three short answers.
 - `attn_layers` in `CRACK_SURGERY.json` lists 0–77, yet the targets are 12–77. The bit-exact
   match of `o_proj` 0–11 against Backbone A shows those layers are unedited in **both** variants
   (or edited identically, which the receipts do not suggest).
