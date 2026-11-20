@@ -32,6 +32,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import urllib.request
 
 import numpy as np
@@ -228,6 +229,46 @@ def verify(backbone_a, names, weight_map):
     return failures
 
 
+def record_spans(writes, record, file_size):
+    """[(offset, length)] -> sorted, disjoint [(start, end)] covering every write in whole records.
+
+    Each span starts on a record boundary and ends on one, or at the end of the file; overlapping
+    or touching spans merge. (Pure: the planner of build's writes.)
+    """
+    spans = sorted((o // record * record, min(-(-(o + n) // record) * record, file_size)) for o, n in writes)
+    merged = []
+    for s, e in spans:
+        if merged and s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+    return merged
+
+
+def write_all(fd, data, offset):
+    """pwrite until every byte is written (a short write is not an error, ignoring it is)."""
+    view = memoryview(data)
+    while view:
+        n = os.pwrite(fd, view, offset)
+        if n <= 0:
+            raise SystemExit(f"ABORT: pwrite wrote {n} bytes at {offset}")
+        view, offset = view[n:], offset + n
+
+
+def settled_free(path, interval=2.0, limit=120.0):
+    """Free bytes once they stop rising: ZFS releases a deleted file's blocks over later transaction groups."""
+    os.sync()
+    last, waited = shutil.disk_usage(path).free, 0.0
+    while waited < limit:
+        time.sleep(interval)
+        waited += interval
+        now = shutil.disk_usage(path).free
+        if now <= last:
+            return now
+        last = now
+    return last
+
+
 def reflink(src, dst_dir):
     """A copy-on-write clone (ZFS block cloning); fails rather than fall back to a full copy."""
     subprocess.run(["cp", "--reflink=always", src, dst_dir], check=True)
@@ -235,6 +276,11 @@ def reflink(src, dst_dir):
 
 def build(delta_dir, backbone_a, out_dir, expected, clone=reflink, min_free=MIN_FREE):
     """Backbone B: every part of Backbone A reflinked, the targets rewritten in place, every byte re-read.
+
+    Writes cover whole filesystem records (`record_spans`): each span is filled from Backbone A's
+    pristine part, then overlaid with the targets in it. A partial-record write into a freshly
+    cloned block lost its update once on ZFS 2.4.4 (2026-11-20: 1 of 124 targets, its last record
+    reverted to the clone's content); whole-record writes never read-modify-write a cloned block.
 
     Returns the staging directory, re-read and verified, and the per-target receipts; the caller
     moves it to `out_dir` (nothing is at `out_dir` until then).
@@ -246,38 +292,63 @@ def build(delta_dir, backbone_a, out_dir, expected, clone=reflink, min_free=MIN_
     if set(targets) != set(expected):
         raise SystemExit(f"the delta holds {len(targets)} targets, the surgery names {len(expected)}; "
                          f"missing e.g. {sorted(set(expected) - set(targets))[:3]}")
+    tmp = out_dir + ".tmp"
+    if os.path.exists(tmp):  # an earlier run's staging: measure free space without it
+        shutil.rmtree(tmp)
+        settled_free(os.path.dirname(os.path.abspath(out_dir)))
     free = shutil.disk_usage(os.path.dirname(os.path.abspath(out_dir))).free
     need = sum(a.size(n) for n in targets) + min_free
     if free < need:
         raise SystemExit(f"{free / 2**30:.1f} GiB free, need {need / 2**30:.1f}")
-    tmp = out_dir + ".tmp"
-    shutil.rmtree(tmp, ignore_errors=True)
     os.makedirs(tmp)
     parts = sorted({path for path, _, _ in a.where.values()})
     for path in parts:  # copy-on-write: the clone shares Backbone A's blocks, A is never written
         clone(path, tmp)
-    written, receipts = {}, []
-    for i, name in enumerate(targets, 1):
-        out = converted(name, as_array(*delta.tensor(name)), as_array(*delta.tensor(name + "_scale_inv")))
-        before = {t: a.tensor(t) for t in out}
-        for tname, (dtype, shape, raw) in out.items():
-            path, meta, base = a.where[tname]
-            if (dtype, shape, len(raw)) != (meta["dtype"], meta["shape"], a.size(tname)):
-                raise SystemExit(f"ABORT: {tname}: {dtype} {shape} does not fit Backbone A's {meta['dtype']} {meta['shape']}")
-            fd = os.open(os.path.join(tmp, os.path.basename(path)), os.O_WRONLY)
+    os.sync()  # the clones are committed before any block of them is rewritten
+    by_part = {}
+    for name in targets:
+        by_part.setdefault(a.where[name][0], []).append(name)
+    written, receipts, done = {}, [], 0
+    for path, names in sorted(by_part.items()):
+        writes = []
+        for name in names:
+            out = converted(name, as_array(*delta.tensor(name)), as_array(*delta.tensor(name + "_scale_inv")))
+            before = {t: a.tensor(t) for t in out}
+            for tname, (dtype, shape, raw) in out.items():
+                t_path, meta, base = a.where[tname]
+                if t_path != path:
+                    raise SystemExit(f"ABORT: {tname} is not in {os.path.basename(path)} with its weight")
+                if (dtype, shape, len(raw)) != (meta["dtype"], meta["shape"], a.size(tname)):
+                    raise SystemExit(f"ABORT: {tname}: {dtype} {shape} does not fit Backbone A's {meta['dtype']} {meta['shape']}")
+                writes.append((base + meta["data_offsets"][0], raw))
+                written[tname] = hashlib.sha256(raw).hexdigest()
+            new, old = weight_values(out, name), weight_values(before, name)
+            change = float(np.linalg.norm(new - old) / np.linalg.norm(old))
+            if not (np.all(np.isfinite(new)) and np.isfinite(change)):
+                raise SystemExit(f"ABORT: {name}: non-finite values")
+            receipts.append({"tensor": name, "part": os.path.basename(path),
+                             "sha256": {t: written[t] for t in out}, "relative_change_vs_backbone_a": change})
+            done += 1
+            print(f"[{done}/{len(targets)}] {name}: converted, ||B - A|| / ||A|| = {change:.4f}", flush=True)
+        dst = os.path.join(tmp, os.path.basename(path))
+        record = os.stat(dst).st_blksize
+        spans = record_spans([(o, len(raw)) for o, raw in writes], record, os.path.getsize(path))
+        with open(path, "rb") as pristine:
+            fd = os.open(dst, os.O_WRONLY)
             try:
-                os.pwrite(fd, raw, base + meta["data_offsets"][0])
+                for s, e in spans:
+                    pristine.seek(s)
+                    buf = bytearray(pristine.read(e - s))
+                    for o, raw in writes:
+                        lo, hi = max(o, s), min(o + len(raw), e)
+                        if lo < hi:
+                            buf[lo - s:hi - s] = raw[lo - o:hi - o]
+                    write_all(fd, buf, s)
                 os.fsync(fd)
             finally:
                 os.close(fd)
-            written[tname] = hashlib.sha256(raw).hexdigest()
-        new, old = weight_values(out, name), weight_values(before, name)
-        change = float(np.linalg.norm(new - old) / np.linalg.norm(old))
-        if not (np.all(np.isfinite(new)) and np.isfinite(change)):
-            raise SystemExit(f"ABORT: {name}: non-finite values")
-        receipts.append({"tensor": name, "part": os.path.basename(a.where[name][0]),
-                         "sha256": {t: written[t] for t in out}, "relative_change_vs_backbone_a": change})
-        print(f"[{i}/{len(targets)}] {name}: written, ||B - A|| / ||A|| = {change:.4f}", flush=True)
+        print(f"  {os.path.basename(path)}: {len(spans)} record-aligned spans written", flush=True)
+    os.sync()
     # Re-read every byte: headers and untouched tensors must be Backbone A's, targets what was written.
     for path in parts:
         with open(path, "rb") as fa, open(os.path.join(tmp, os.path.basename(path)), "rb") as fb:
@@ -310,6 +381,25 @@ def write_safetensors(path, tensors):
     head += b" " * (-len(head) % 8)
     with open(path, "wb") as f:
         f.write(len(head).to_bytes(8, "little") + head + b"".join(raw for _, _, raw in tensors.values()))
+
+
+def spans_test(rng):
+    """record_spans: aligned, disjoint, sorted, covering, and no wider than the records written."""
+    for _ in range(2000):
+        record = int(rng.choice([8, 64, 4096]))
+        size = int(rng.integers(1, 40 * record))
+        writes = []
+        for _ in range(int(rng.integers(1, 6))):
+            o = int(rng.integers(0, size))
+            writes.append((o, int(rng.integers(1, size - o + 1))))
+        spans = record_spans(writes, record, size)
+        for s, e in spans:
+            assert s % record == 0 and (e % record == 0 or e == size) and s < e <= size
+        assert all(e1 < s2 for (_, e1), (s2, _) in zip(spans, spans[1:]))  # disjoint, not touching
+        for o, n in writes:
+            assert any(s <= o and o + n <= e for s, e in spans)
+        touched = {i // record for o, n in writes for i in range(o, o + n)}
+        assert sum(-(-(e - s) // record) for s, e in spans) == len(touched)
 
 
 def build_test(rng):
@@ -409,6 +499,7 @@ def self_test():
     m = converted("model.layers.40.mlp.shared_experts.down_proj.weight", codes, sc)
     pk, scl = mxfp4_rtn(fp8_dequant(codes, sc))
     assert np.array_equal(weight_values(m, "model.layers.40.mlp.shared_experts.down_proj.weight"), mxfp4_values(pk, scl))
+    spans_test(rng)
     build_test(rng)
     print("self-test: ok")
 
