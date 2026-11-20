@@ -4,7 +4,8 @@
 //
 //   ds4n-glm53-oracle-run --config ref/glm-5.3/config.json --backbone DIR --store FILE
 //                         --prompt ID,ID,... [--prompt ID,...]... [--activations fp32,bf16,e4m3,mxfp4,exact,...]
-//                         [--generate N] [--threads T] [--resident E] [--report FILE] [--moe-roundings FILE]
+//                         [--generate N] [--threads T] [--resident E] [--report FILE] [--routes FILE]
+//                         [--moe-roundings FILE]
 //                         [--gpu N]
 //
 // Each prompt runs once per arithmetic listed — a stream, with its own caches
@@ -44,6 +45,8 @@
 // whether its top token agrees, its perplexity, and how many of its Routes
 // differ from the baseline's; and every stream's greedy continuation. Token
 // ids only: decode them with the checkpoint's tokenizer.
+// --routes FILE writes every stream's Route at every Sparse layer and position as
+// TSV (prefill rows, then decode rows): the input an Expert cache simulator replays.
 //
 // --moe-roundings FILE (the baseline must be fp32): what each rounding of the
 // Reference configuration's MoE costs, on real activations, without a stream
@@ -133,6 +136,7 @@ bool gpu_runs(exact::Departure) { return false; }
 
 struct Args {
   std::string config, backbone, store, report;
+  std::string routes;  // FILE, or empty: no Route dump
   std::string moe_roundings;  // FILE, or empty: no MoE rounding study
   std::vector<std::vector<int32_t>> prompts;
   std::vector<Arithmetic> arithmetics;  // the first is the baseline
@@ -156,6 +160,7 @@ bool parse_args(int argc, char** argv, Args& a) {
     else if (s == "--backbone") a.backbone = v;
     else if (s == "--store") a.store = v;
     else if (s == "--report") a.report = v;
+    else if (s == "--routes") a.routes = v;
     else if (s == "--moe-roundings") a.moe_roundings = v;
     else if (s == "--generate") a.generate = std::stoi(v);
     else if (s == "--threads") a.threads = static_cast<unsigned>(std::stoul(v));
@@ -668,8 +673,8 @@ int main(int argc, char** argv) {
   if (!parse_args(argc, argv, args))
     die("usage: --config FILE --backbone DIR --store FILE --prompt ID,ID,... [--prompt ...] "
         "[--activations fp32,bf16,e4m3,mxfp4,exact,exact-DEPARTURE (distinct; the first is the baseline)] "
-        "[--generate N] [--threads T] [--resident E>=8] [--report FILE] [--moe-roundings FILE (baseline fp32)] "
-        "[--gpu N (CUDA builds)]");
+        "[--generate N] [--threads T] [--resident E>=8] [--report FILE] [--routes FILE] "
+        "[--moe-roundings FILE (baseline fp32)] [--gpu N (CUDA builds)]");
   const auto t0 = std::chrono::steady_clock::now();
 
   std::ifstream cf(args.config);
@@ -889,6 +894,23 @@ int main(int argc, char** argv) {
     r << "],\"selections\":" << selections << ",\"selections_dropping\":" << dropping
       << ",\"seconds\":" << seconds_since(t0) << "}\n";
     if (!r) die("cannot write " + args.report);
+  }
+  if (!args.routes.empty()) {
+    // Every stream's Route at every Sparse layer and position, the prompt's (prefill) then the
+    // generated tokens' (decode): what an Expert cache simulator replays.
+    std::ofstream r(args.routes);
+    r << "stream\tprompt\tarithmetic\tlayer\tposition\tphase\texperts\n";
+    for (size_t s = 0; s < streams.size(); s++) {
+      const size_t prompt_len = args.prompts[streams[s].prompt].size();
+      for (size_t L = 0; L < streams[s].routes.size(); L++)
+        for (size_t i = 0; i < streams[s].routes[L].size(); i++) {
+          r << s << "\t" << streams[s].prompt << "\t" << name_of(streams[s].arithmetic) << "\t" << L << "\t" << i << "\t"
+            << (i < prompt_len ? "prefill" : "decode") << "\t";
+          for (size_t k = 0; k < streams[s].routes[L][i].size(); k++) r << (k ? "," : "") << streams[s].routes[L][i][k];
+          r << "\n";
+        }
+    }
+    if (!r) die("cannot write " + args.routes);
   }
   return 0;
 }
