@@ -2,10 +2,12 @@
 // blocks, losslessly (untile_matrix gives the Fp4Expert's GGML bytes back).
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <random>
 #include <vector>
 
 #include "core/glm53/expert_tiles.hpp"
+#include "core/glm53/store.hpp"
 #include "core/mx_tiles.hpp"
 #include "exact_fixtures.hpp"
 
@@ -68,4 +70,27 @@ TEST_CASE("half_tiles: refuses a third Half and widths that do not tile") {
   CHECK_FALSE(exact::half_tiles(tiles.expert(), 2));
   const Packed narrow = random_packed(rng, 64, 64);  // gate K of 2 blocks: not a multiple of 4
   CHECK_FALSE(exact::half_tiles(narrow.expert(), 0));
+}
+
+TEST_CASE("a store record's Halves are half_tiles of its Expert, byte for byte") {
+  // The engine copies a Half's payload from the store into a VRAM Slot unchanged, and the GPU MoE is
+  // gated on half_tiles: the two must be the same bytes, at GLM-5.3's real widths.
+  std::mt19937 rng(47);
+  const size_t gate_bytes = kIntermediate * kHidden / 2, down_bytes = kHidden * kIntermediate / 2;
+  const auto gate = random_codes(rng, gate_bytes), up = random_codes(rng, gate_bytes), down = random_codes(rng, down_bytes);
+  const auto gs = random_scales(rng, kIntermediate * kGateUpBlocks, 100, 140);
+  const auto us = random_scales(rng, kIntermediate * kGateUpBlocks, 100, 140);
+  const auto ds = random_scales(rng, kHidden * kDownBlocks, 100, 140);
+  const Sextuplet s{gate, up, down, gs, us, ds};
+  const auto record = build_record(s);
+  REQUIRE(record);
+  const auto e = exact::fp4_expert(s, static_cast<int>(kHidden), static_cast<int>(kIntermediate));
+  REQUIRE(e);
+  for (uint32_t h = 0; h < kHalves; h++) {
+    const auto t = exact::half_tiles(e.value(), h);
+    REQUIRE(t);
+    REQUIRE(t.value().bytes.size() == kHalfPayloadBytes);
+    const auto payload = std::span<const std::byte>(record.value()).subspan(h * kHalfStride, kHalfPayloadBytes);
+    CHECK(std::equal(payload.begin(), payload.end(), t.value().bytes.begin()));
+  }
 }
