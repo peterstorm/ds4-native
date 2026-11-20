@@ -169,6 +169,30 @@ An independent audit (python, read-only, against the index) found:
    curve 0.001–0.2, the KL floor, free generation at λ 0.03 / 0.1 / 0.2. **Decided
    (operator): λ 0.03 default (~10 tok/s est.), and the attention port goes ahead** (item 6b). The engine's router already has DS4.1's bonus
    (`cuda/moe.cu`); GLM needs it in its own router kernel plus the host's one-table rule.
+   **GLM's router bonus: done 2026-11-20** (`dbc532a`): `RouterParams::resident` /
+   `resident_bonus`, gated by `ds4n-glm53-moe-check`'s cache-conditional pass (λ 0.03 and 0.2,
+   Routes and Plans bit-identical to `exact::RouteChoice`). Still open: the host's one-table rule.
+6b. **The attention port: CPU oracle and GPU kernels done 2026-11-20.**
+   - **Design:** A1–A9 in `docs/design/glm53-reference-configuration.md`, "The attention side".
+   - **CPU oracle:** `core/glm53/exact_attention` (10 tests; mutation probe 20/20).
+   - **GPU kernels:** `cuda/glm53/attention` (absorbed MLA, head GEMV, norms, RoPE) and
+     `cuda/glm53/indexer` (FP32 scores, 32-bit top-k).
+   - **Executor:** `cuda/glm53/attention_layer` (`DeviceAttention`, `DeviceDenseMlp`,
+     `DeviceHead`), one GPU's share of a layer outside the MoE.
+   - **Gate:** `ds4n-glm53-attn-check --config ref/glm-5.3/config.json [--backbone DIR]`.
+     - Without `--backbone`: the kernels on random inputs, 4 s.
+     - With it: whole real layers 0, 6, 3 and 77 at positions 0 to 3000, plus the head, all
+       bit-identical, 44 s.
+     - `tools/glm53-golden/gpu-attention-mutation-probe.sh` kills 38/38.
+   - **One GPU, one token:** attention takes 14–20 µs per layer at a 2048-entry Selection. The
+     indexer takes 22 µs at 4K context and 218 µs at 128K.
+   - **Whole-model KL with the attention side exact:** `ds4n-glm53-oracle-run --activations
+     ...,exact-attn`, run `docs/bench/glm53-attn/`.
+   - **Next:**
+     - Rounds of 8 tokens in `DeviceAttention`: cache rows in before any token attends, and
+       per-row Selection lengths.
+     - The two-GPU exchange_add.
+     - The decode loop with the Expert cache (Phase 4).
 7. Phases 4–5 per the plan (fifth switch-primary entry `glm-native`, slots ladder, CyberGym).
 
 ## Environment facts (the things that cost time to rediscover)

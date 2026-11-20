@@ -1,0 +1,15 @@
+mean KL vs fp32 per prompt
+                                    0        1        2        3        4       all
+exact                         0.02514  0.01459  0.00175  0.01072  0.00518   0.00912
+e4m3                          0.01318  0.00563  0.00134  0.00740  0.00333   0.00508
+exact-attn                    0.01222  0.01176  0.00174  0.01447  0.00456   0.00870
+exact-attn-cc0.03             0.05162  0.02737  0.00517  0.01910  0.01430   0.01822
+exact-fp32-exchange           0.01155  0.00667  0.00203  0.01041  0.00314   0.00628
+exact-weight-after-down       0.01623  0.01196  0.00216  0.01254  0.00511   0.00863
+
+paired against exact (315 positions)
+e4m3                         -0.00404 (-44%)  95% CI [-0.00679, -0.00198]  lower at 181, higher at 134  trimmed -0.00267
+exact-attn                   -0.00042 (-5%)  95% CI [-0.00388, +0.00354]  lower at 156, higher at 159  trimmed -0.00111
+exact-attn-cc0.03            +0.00910 (+100%)  95% CI [+0.00498, +0.01346]  lower at 84, higher at 231  trimmed +0.00830
+exact-fp32-exchange          -0.00284 (-31%)  95% CI [-0.00558, -0.00024]  lower at 176, higher at 139  trimmed -0.00244
+exact-weight-after-down      -0.00049 (-5%)  95% CI [-0.00317, +0.00193]  lower at 157, higher at 158  trimmed -0.00024
