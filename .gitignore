@@ -11,3 +11,4 @@ build/
 .claude/cortex-memory.local.md
 .pi/cortex-memory.local.md
 .claude/reviews/
+__pycache__/
