@@ -1,5 +1,6 @@
 #include "core/det_math.hpp"
 #include "cuda/glm53/attention.cuh"
+#include "cuda/glm53/mma_bf16.cuh"
 
 namespace ds4n::cuda::glm53 {
 namespace {
@@ -140,27 +141,6 @@ static_assert(kSplitSmem <= 101376 - 1024, "the split kernel must fit sm_120's o
 static_assert(kKeyWidth % 32 == 0 && kLatent == kSplitWarps * 64 && kLatentSplitRows == kSplitWarps * 8,
               "the warp tiling covers the key in k32 pairs, the rows in 8s and the values in 64s");
 static_assert(kLatentSplitRows * kRowQuads % kSplitThreads == 0, "the gather is whole loads per thread");
-
-__device__ __forceinline__ void mma_bf16(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
-  asm volatile(
-      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-}
-
-/** Four 8x8 BF16 tiles into MMA fragments, lane l naming row l % 8 of tile l / 8 (as cuda/attn.cu). */
-__device__ __forceinline__ void ldmatrix_x4(uint32_t (&r)[4], const __nv_bfloat16* row) {
-  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-               : "r"(static_cast<unsigned>(__cvta_generic_to_shared(row))));
-}
-
-/** The same with each tile transposed (V's B fragments). */
-__device__ __forceinline__ void ldmatrix_x4_trans(uint32_t (&r)[4], const __nv_bfloat16* row) {
-  asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-               : "r"(static_cast<unsigned>(__cvta_generic_to_shared(row))));
-}
 
 /**
  * One CTA per (split of 64 Selection entries, query row, 16 heads): gather the split's Latent rows

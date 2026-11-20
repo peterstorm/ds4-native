@@ -1,4 +1,5 @@
 #include "cuda/glm53/indexer.cuh"
+#include "cuda/glm53/mma_bf16.cuh"
 
 #include <cmath>
 
@@ -13,19 +14,6 @@ constexpr int kScorePositions = kScoreWarps * 8;  // a CTA's positions
 constexpr int kRowStride = kIndexHeadDim + 8;     // BF16 per shared row (16-byte rows, banks apart)
 constexpr int kRowQuads = kIndexHeadDim / 8;
 static_assert(kIndexHeads == 32 && kIndexHeadDim % 32 == 0, "two head tiles, k32 pairs");
-
-__device__ __forceinline__ void mma_bf16(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
-  asm volatile(
-      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-}
-
-__device__ __forceinline__ void ldmatrix_x4(uint32_t (&r)[4], const __nv_bfloat16* row) {
-  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-               : "r"(static_cast<unsigned>(__cvta_generic_to_shared(row))));
-}
 
 /**
  * CTA (64 positions, query row): the row's 32 x 128 query and the positions' keys in shared
