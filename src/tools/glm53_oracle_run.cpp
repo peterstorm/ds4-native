@@ -5,7 +5,7 @@
 //   ds4n-glm53-oracle-run --config ref/glm-5.3/config.json --backbone DIR --store FILE
 //                         --prompt ID,ID,... [--prompt ID,...]... [--activations fp32,bf16,e4m3,mxfp4,exact,...]
 //                         [--generate N] [--threads T] [--resident E] [--report FILE] [--routes FILE]
-//                         [--moe-roundings FILE] [--slots N] [--warm N]
+//                         [--moe-roundings FILE] [--slots N] [--warm N] [--kept FILE]
 //                         [--gpu N]
 //
 // Each prompt runs once per arithmetic listed — a stream, with its own caches
@@ -17,9 +17,12 @@
 // Sparse layer, the rest of the model still the Semantics oracle;
 // `exact-DEPARTURE` is exact_moe with one core/glm53/moe_roundings Departure
 // (exact-weight-after-down, exact-fp32-gate-up-hidden, exact-fp32-exchange).
-// Any exact arithmetic may end in `-ccλ` (exact-cc0.05): cache-conditional
-// routing, approximate (exact::ResidentBonus): a resident Expert's selection
-// score gains λ, resident meaning in that stream's Expert cache model (below).
+// Two approximate departures of the router's choice (exact::RouteChoice) may
+// follow, in this order: `-pruned`, Expert pruning, each Sparse layer routing
+// only among the Experts --kept FILE keeps (core/glm53/pruning; GLM-5.3-SLIM-
+// E192's, tools/glm53-store/slim_kept_experts.py); and `-ccλ`, cache-conditional
+// routing, a resident Expert's selection score gaining λ, resident meaning in
+// that stream's Expert cache model (below). exact-pruned-cc0.005 is both.
 // The first listed (default fp32: the oracle itself) is the baseline every
 // other is compared against.
 //
@@ -94,6 +97,7 @@
 #include "core/glm53/layer_expert_cache.hpp"
 #include "core/glm53/moe_roundings.hpp"
 #include "core/glm53/precision.hpp"
+#include "core/glm53/pruning.hpp"
 #include "core/glm53/reference.hpp"
 #include "io/glm53_store.hpp"
 #include "io/glm53_weights.hpp"
@@ -110,11 +114,13 @@ namespace {
 
 /**
  * The Reference configuration's MoE on the Sparse layers (core/glm53/exact_moe),
- * or exact_moe with one core/glm53/moe_roundings Departure; with a resident
- * bonus (finite, > 0), its router is cache-conditional (exact::ResidentBonus).
+ * or exact_moe with one core/glm53/moe_roundings Departure; pruned, its router
+ * chooses only kept Experts; with a resident bonus (finite, > 0), it is
+ * cache-conditional (exact::RouteChoice).
  */
 struct ExactMoe {
   exact::Departure departure = exact::Departure::None;
+  bool pruned = false;
   std::optional<float> resident_bonus;
   friend auto operator<=>(const ExactMoe&, const ExactMoe&) = default;
 };
@@ -122,13 +128,15 @@ struct ExactMoe {
 /** How a stream runs its Experts: the Semantics oracle at an activation precision, or the Reference configuration. */
 using Arithmetic = std::variant<ActivationPrecision, ExactMoe>;
 
-/** The suffix of a cache-conditional exact arithmetic: exact-cc0.05. */
+/** The suffixes of a pruned and a cache-conditional exact arithmetic: exact-pruned-cc0.05. */
+constexpr std::string_view kPruned = "-pruned";
 constexpr std::string_view kCacheConditional = "-cc";
 
 std::string name_of(const Arithmetic& a) {
   if (const auto* p = std::get_if<ActivationPrecision>(&a)) return std::string(glm53::name_of(*p));
   const auto& e = std::get<ExactMoe>(a);
   std::string name = e.departure == exact::Departure::None ? "exact" : "exact-" + std::string(exact::name_of(e.departure));
+  if (e.pruned) name += kPruned;
   if (e.resident_bonus) {
     std::ostringstream bonus;
     bonus << *e.resident_bonus;  // %g: 0.05 reads back as the same float
@@ -137,20 +145,25 @@ std::string name_of(const Arithmetic& a) {
   return name;
 }
 
-std::optional<Arithmetic> parse_arithmetic(const std::string& name) {
+std::optional<Arithmetic> parse_arithmetic(std::string name) {
+  std::optional<float> bonus;
+  if (const auto cc = name.rfind(kCacheConditional); cc != std::string::npos) {
+    const std::string text = name.substr(cc + kCacheConditional.size());
+    char* end = nullptr;
+    const float b = std::strtof(text.c_str(), &end);
+    if (text.empty() || end != text.c_str() + text.size() || !std::isfinite(b) || !(b > 0.0f)) return std::nullopt;
+    bonus = b;
+    name.resize(cc);
+  }
+  const bool pruned = name.ends_with(kPruned);
+  if (pruned) name.resize(name.size() - kPruned.size());
   for (const auto d : exact::kDepartures)
-    if (name == name_of(Arithmetic{ExactMoe{d, std::nullopt}})) return Arithmetic{ExactMoe{d, std::nullopt}};
-  if (const auto p = glm53::parse_activation_precision(name)) return Arithmetic{*p};
-  const auto cc = name.rfind(kCacheConditional);
-  if (cc == std::string::npos) return std::nullopt;
-  const auto base = parse_arithmetic(name.substr(0, cc));
-  if (!base || !std::holds_alternative<ExactMoe>(*base) || std::get<ExactMoe>(*base).resident_bonus) return std::nullopt;
-  const std::string text = name.substr(cc + kCacheConditional.size());
-  char* end = nullptr;
-  const float bonus = std::strtof(text.c_str(), &end);
-  if (text.empty() || end != text.c_str() + text.size() || !std::isfinite(bonus) || !(bonus > 0.0f)) return std::nullopt;
-  return Arithmetic{ExactMoe{std::get<ExactMoe>(*base).departure, bonus}};
+    if (name == name_of(Arithmetic{ExactMoe{d}})) return Arithmetic{ExactMoe{d, pruned, bonus}};
+  if (const auto p = glm53::parse_activation_precision(name); p && !pruned && !bonus) return Arithmetic{*p};
+  return std::nullopt;
 }
+
+bool is_pruned(const Arithmetic& a) { return std::holds_alternative<ExactMoe>(a) && std::get<ExactMoe>(a).pruned; }
 
 bool is_exact(const Arithmetic& a) { return std::holds_alternative<ExactMoe>(a); }
 
@@ -170,6 +183,7 @@ struct Args {
   std::string config, backbone, store, report;
   std::string routes;  // FILE, or empty: no Route dump
   std::string moe_roundings;  // FILE, or empty: no MoE rounding study
+  std::string kept;           // FILE: the pruned streams' kept Experts (required by and only with them)
   int slots = 84;             // the Expert cache model's Slots per Sparse layer
   size_t warm = 32;           // positions before the cache model's misses count
   std::vector<std::vector<int32_t>> prompts;
@@ -201,6 +215,7 @@ bool parse_args(int argc, char** argv, Args& a) {
     else if (s == "--resident") a.resident = std::stoul(v);
     else if (s == "--slots") a.slots = std::stoi(v);
     else if (s == "--warm") a.warm = std::stoul(v);
+    else if (s == "--kept") a.kept = v;
     else if (s == "--gpu") a.gpu = std::stoi(v);
     else if (s == "--prompt") {
       std::vector<int32_t> prompt;
@@ -218,7 +233,8 @@ bool parse_args(int argc, char** argv, Args& a) {
   if (a.arithmetics.empty()) a.arithmetics.push_back(ActivationPrecision::Fp32);
   return argc % 2 == 1 && !a.config.empty() && !a.backbone.empty() && !a.store.empty() && !a.prompts.empty() &&
          a.generate >= 0 && a.threads > 0 && a.resident >= 8 && a.gpu >= -1 && (a.gpu == -1 || kGpuBuild) &&
-         (a.moe_roundings.empty() || a.arithmetics.front() == Arithmetic{ActivationPrecision::Fp32});
+         (a.moe_roundings.empty() || a.arithmetics.front() == Arithmetic{ActivationPrecision::Fp32}) &&
+         a.kept.empty() != std::ranges::any_of(a.arithmetics, is_pruned);
 }
 
 [[noreturn]] void die(const std::string& msg) {
@@ -258,6 +274,7 @@ struct Model {
   io::StoreReader store;
   io::WeightValues head;
   std::vector<float> final_norm;
+  std::optional<glm53::Pruning> pruning;  // with --kept
 };
 
 /** One prompt in one arithmetic: its caches, its Routes, and what the baseline measures. */
@@ -395,10 +412,11 @@ std::vector<std::vector<std::vector<float>>> run_round(const Model& m, const Arg
             }
             auto& expert_cache = st.expert_caches[static_cast<size_t>(L)];
             if (exact_layer && is_exact(st.arithmetic)) {
-              std::optional<exact::ResidentBonus> bonus;
-              if (const auto b = std::get<ExactMoe>(st.arithmetic).resident_bonus)
-                bonus = exact::ResidentBonus{*b, expert_cache.resident()};
-              auto begun = exact::begin_moe(d, *exact_layer, r.value().ffn_in, bonus);
+              const auto& e = std::get<ExactMoe>(st.arithmetic);
+              exact::RouteChoice choice;
+              if (e.resident_bonus) choice.bonus = exact::ResidentBonus{*e.resident_bonus, expert_cache.resident()};
+              if (e.pruned) choice.kept = m.pruning->kept(L);
+              auto begun = exact::begin_moe(d, *exact_layer, r.value().ffn_in, choice);
               if (!begun) return where + begun.error().what;
               exact_tokens[s][i] = std::move(begun).value();
             }
@@ -721,10 +739,10 @@ int main(int argc, char** argv) {
   Args args;
   if (!parse_args(argc, argv, args))
     die("usage: --config FILE --backbone DIR --store FILE --prompt ID,ID,... [--prompt ...] "
-        "[--activations fp32,bf16,e4m3,mxfp4,exact,exact-DEPARTURE,exact[-DEPARTURE]-ccλ (distinct; the first is the "
-        "baseline)] "
+        "[--activations fp32,bf16,e4m3,mxfp4,exact[-DEPARTURE][-pruned][-ccλ] (distinct; the first is the baseline)] "
         "[--generate N] [--threads T] [--resident E>=8] [--report FILE] [--routes FILE] "
-        "[--moe-roundings FILE (baseline fp32)] [--slots N (per Sparse layer)] [--warm N] [--gpu N (CUDA builds)]");
+        "[--moe-roundings FILE (baseline fp32)] [--slots N (per Sparse layer)] [--warm N] "
+        "[--kept FILE (with and only with -pruned)] [--gpu N (CUDA builds)]");
   const auto t0 = std::chrono::steady_clock::now();
 
   std::ifstream cf(args.config);
@@ -744,8 +762,17 @@ int main(int argc, char** argv) {
   if (!head) die(head.error().what);
   auto norm = parts.value().load("model.norm.weight");
   if (!norm) die(norm.error().what);
-  const Model m{config.value(), std::move(parts).value(), std::move(store).value(), std::move(head).value(),
-                std::move(norm).value().values};
+  std::optional<glm53::Pruning> pruning;
+  if (!args.kept.empty()) {
+    std::ifstream kf(args.kept);
+    if (!kf) die("cannot read " + args.kept);
+    const std::string text((std::istreambuf_iterator<char>(kf)), std::istreambuf_iterator<char>());
+    auto parsed = glm53::parse_pruning(text, config.value());
+    if (!parsed) die(args.kept + ": " + parsed.error().what);
+    pruning = std::move(parsed).value();
+  }
+  const Model m{config.value(),           std::move(parts).value(), std::move(store).value(), std::move(head).value(),
+                std::move(norm).value().values, std::move(pruning)};
   std::fprintf(stderr, "loaded %zu Backbone tensors' index and the head in %.1f s\n", m.parts.tensors(),
                seconds_since(t0));
 

@@ -1,5 +1,6 @@
 #include "core/glm53/exact_moe.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 
@@ -115,24 +116,30 @@ Result<std::vector<float>, MoeError> router_logits(const Matrix& router, std::sp
 }
 
 Result<Route, MoeError> route(const Dims& d, std::span<const float> logits, std::span<const float> bias,
-                              std::optional<ResidentBonus> bonus) {
+                              const RouteChoice& choice) {
   using R = Result<Route, MoeError>;
   const auto experts = static_cast<size_t>(d.experts);
   if (logits.size() != experts || bias.size() != experts) return R::err({"logits and bias must be one per Expert"});
   if (d.experts_per_token <= 0 || d.experts_per_token > d.experts)
     return R::err({"experts_per_token must be in [1, experts]"});
+  const auto& bonus = choice.bonus;
   if (bonus && bonus->resident.size() != experts) return R::err({"the resident mask must be one per Expert"});
   if (bonus && !(std::isfinite(bonus->bonus) && bonus->bonus > 0.0f))
     return R::err({"a resident bonus must be finite and positive"});
-  std::vector<float> sig(experts), choice(experts);
+  const auto& kept = choice.kept;
+  if (!kept.empty() && kept.size() != experts) return R::err({"the kept mask must be one per Expert"});
+  if (!kept.empty() && std::ranges::count_if(kept, [](uint8_t k) { return k != 0; }) < d.experts_per_token)
+    return R::err({"fewer kept Experts than experts_per_token"});
+  std::vector<float> sig(experts), score(experts);
   for (size_t e = 0; e < experts; e++) {
     sig[e] = det::div(1.0f, det::add(1.0f, det::exp(-logits[e])));
-    choice[e] = det::add(sig[e], bias[e]);
-    if (bonus && bonus->resident[e]) choice[e] = det::add(choice[e], bonus->bonus);
+    score[e] = det::add(sig[e], bias[e]);
+    if (bonus && bonus->resident[e]) score[e] = det::add(score[e], bonus->bonus);
+    if (!kept.empty() && !kept[e]) score[e] = -std::numeric_limits<float>::infinity();
   }
   Route r;
-  r.expert = top_k(choice, d.experts_per_token);  // ascending id
-  r.margin = route_margin(choice, r.expert);
+  r.expert = top_k(score, d.experts_per_token);  // ascending id
+  r.margin = route_margin(score, r.expert);
   float sum = 0.0f;
   for (int32_t e : r.expert) sum = det::add(sum, sig[static_cast<size_t>(e)]);
   const float denom = det::add(sum, kRouteWeightSumEps);
@@ -175,11 +182,11 @@ Result<MoeOutput, MoeError> combine(std::span<const Halves> routed, const Halves
 }
 
 Result<MoeStart, MoeError> begin_moe(const Dims& d, const MoeLayer& layer, std::span<const float> ffn_in,
-                                     std::optional<ResidentBonus> bonus) {
+                                     const RouteChoice& choice) {
   using R = Result<MoeStart, MoeError>;
   auto logits = router_logits(layer.router, ffn_in);
   if (!logits) return R::err(logits.error());
-  auto r = exact::route(d, logits.value(), layer.bias, bonus);  // qualified: ADL on Dims also finds glm53::route
+  auto r = exact::route(d, logits.value(), layer.bias, choice);  // qualified: ADL on Dims also finds glm53::route
   if (!r) return R::err(r.error());
   auto x = expert_input(ffn_in);
   if (!x) return R::err(x.error());

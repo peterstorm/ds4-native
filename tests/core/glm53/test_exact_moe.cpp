@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <numeric>
 #include <random>
 #include <vector>
 
@@ -217,7 +218,7 @@ TEST_CASE("route with a resident bonus: never fewer resident Experts, weights st
     for (auto& r : resident) r = static_cast<uint8_t>(rng() % 3 == 0);  // about a third resident
     const float bonus = std::uniform_real_distribution<float>(1e-4f, 0.2f)(rng);
     const Route plain = exact::route(d, logits, bias).value();
-    const Route cc = exact::route(d, logits, bias, exact::ResidentBonus{bonus, resident}).value();
+    const Route cc = exact::route(d, logits, bias, exact::RouteChoice{exact::ResidentBonus{bonus, resident}, {}}).value();
     auto resident_in = [&](const Route& r) {
       return std::ranges::count_if(r.expert, [&](int32_t e) { return resident[static_cast<size_t>(e)] != 0; });
     };
@@ -245,19 +246,82 @@ TEST_CASE("route: an empty resident set changes nothing; a dominant bonus choose
   const auto bias = random_vector(rng, 256, 0.02f);
   const Route plain = exact::route(d, logits, bias).value();
   const std::vector<uint8_t> none(256, 0);
-  const Route same = exact::route(d, logits, bias, exact::ResidentBonus{0.5f, none}).value();
+  const Route same = exact::route(d, logits, bias, exact::RouteChoice{exact::ResidentBonus{0.5f, none}, {}}).value();
   CHECK(same.expert == plain.expert);
   CHECK(same.weight == plain.weight);
   CHECK(same.margin == plain.margin);
   // Sigmoid + bias spans less than 1.1, so a bonus of 10 puts every resident Expert first.
   std::vector<uint8_t> twelve(256, 0);
   for (int e = 100; e < 112; e++) twelve[static_cast<size_t>(e)] = 1;
-  const Route forced = exact::route(d, logits, bias, exact::ResidentBonus{10.0f, twelve}).value();
+  const Route forced = exact::route(d, logits, bias, exact::RouteChoice{exact::ResidentBonus{10.0f, twelve}, {}}).value();
   for (int32_t e : forced.expert) CHECK(twelve[static_cast<size_t>(e)] == 1);
-  CHECK_FALSE(exact::route(d, logits, bias, exact::ResidentBonus{0.1f, std::vector<uint8_t>(255, 0)}).is_ok());
-  CHECK_FALSE(exact::route(d, logits, bias, exact::ResidentBonus{0.0f, none}).is_ok());
-  CHECK_FALSE(exact::route(d, logits, bias, exact::ResidentBonus{-0.1f, none}).is_ok());
-  CHECK_FALSE(exact::route(d, logits, bias, exact::ResidentBonus{std::nanf(""), none}).is_ok());
+  CHECK_FALSE(exact::route(d, logits, bias, exact::RouteChoice{exact::ResidentBonus{0.1f, std::vector<uint8_t>(255, 0)}, {}}).is_ok());
+  CHECK_FALSE(exact::route(d, logits, bias, exact::RouteChoice{exact::ResidentBonus{0.0f, none}, {}}).is_ok());
+  CHECK_FALSE(exact::route(d, logits, bias, exact::RouteChoice{exact::ResidentBonus{-0.1f, none}, {}}).is_ok());
+  CHECK_FALSE(exact::route(d, logits, bias, exact::RouteChoice{exact::ResidentBonus{std::nanf(""), none}, {}}).is_ok());
+}
+
+// Pruning's witness: the same router over only the kept Experts (as a pruned
+// model stores them, GLM-5.3-SLIM-E192), ids mapped back.
+TEST_CASE("route with a kept mask is routing the kept Experts alone: same Experts, weights and margin, bit for bit") {
+  for (unsigned seed = 0; seed < 300; seed++) {
+    std::mt19937 rng(seed);
+    Dims d{};
+    d.experts = 256;
+    d.experts_per_token = 8;
+    d.routed_scale = 2.5f;
+    const auto logits = random_vector(rng, 256, 2.0f);
+    const auto bias = random_vector(rng, 256, 0.02f);
+    std::vector<uint8_t> kept(256, 0);
+    std::vector<int32_t> ids;
+    const int keep = 8 + static_cast<int>(rng() % 249);  // 8 .. 256
+    std::vector<int32_t> all(256);
+    std::iota(all.begin(), all.end(), 0);
+    std::shuffle(all.begin(), all.end(), rng);
+    for (int k = 0; k < keep; k++) kept[static_cast<size_t>(all[static_cast<size_t>(k)])] = 1;
+    std::vector<float> small_logits, small_bias;
+    for (int32_t e = 0; e < 256; e++)
+      if (kept[static_cast<size_t>(e)]) {
+        ids.push_back(e);
+        small_logits.push_back(logits[static_cast<size_t>(e)]);
+        small_bias.push_back(bias[static_cast<size_t>(e)]);
+      }
+    const Route pruned = exact::route(d, logits, bias, exact::RouteChoice{std::nullopt, kept}).value();
+    Dims small = d;
+    small.experts = keep;
+    const Route alone = exact::route(small, small_logits, small_bias).value();
+    std::vector<int32_t> mapped;
+    for (int32_t e : alone.expert) mapped.push_back(ids[static_cast<size_t>(e)]);
+    CHECK(pruned.expert == mapped);
+    CHECK(pruned.weight == alone.weight);
+    if (keep > 8) CHECK(pruned.margin == alone.margin);  // with nothing unchosen, both are +inf - (-inf)
+  }
+}
+
+TEST_CASE("route with a kept mask: keeping all is the Reference choice; too few kept or a wrong width is refused") {
+  Dims d{};
+  d.experts = 256;
+  d.experts_per_token = 8;
+  d.routed_scale = 2.5f;
+  std::mt19937 rng(11);
+  const auto logits = random_vector(rng, 256, 2.0f);
+  const auto bias = random_vector(rng, 256, 0.02f);
+  const Route plain = exact::route(d, logits, bias).value();
+  const std::vector<uint8_t> all(256, 1);
+  const Route same = exact::route(d, logits, bias, exact::RouteChoice{std::nullopt, all}).value();
+  CHECK(same.expert == plain.expert);
+  CHECK(same.weight == plain.weight);
+  CHECK(same.margin == plain.margin);
+  std::vector<uint8_t> seven(256, 0);
+  for (int e = 0; e < 7; e++) seven[static_cast<size_t>(e)] = 1;
+  CHECK_FALSE(exact::route(d, logits, bias, exact::RouteChoice{std::nullopt, seven}).is_ok());
+  CHECK_FALSE(exact::route(d, logits, bias, exact::RouteChoice{std::nullopt, std::vector<uint8_t>(255, 1)}).is_ok());
+  // With a bonus as well, the Route stays inside the kept Experts.
+  std::vector<uint8_t> half(256, 0), resident(256, 0);
+  for (int e = 0; e < 256; e += 2) half[static_cast<size_t>(e)] = 1;
+  for (int e = 1; e < 256; e += 4) resident[static_cast<size_t>(e)] = 1;  // resident but removed: never chosen
+  const Route both = exact::route(d, logits, bias, exact::RouteChoice{exact::ResidentBonus{10.0f, resident}, half}).value();
+  for (int32_t e : both.expert) CHECK(half[static_cast<size_t>(e)] == 1);
 }
 
 TEST_CASE("expert_halves: the two Halves add up to the Expert's output times its routing weight") {
