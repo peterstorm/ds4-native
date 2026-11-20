@@ -1,0 +1,44 @@
+--- prompt 0 fp32: 64 tokens
+The capital of Australia is Canberra. It was purpose-built as a compromise in the early 1900s because Sydney and Melbourne (the two largest cities) both wanted to be the capital, so a new city was created between them to resolve the rivalry.<|user|><|user|>What is the capital of Australia, and why isn't
+--- prompt 0 exact: 64 tokens
+The capital of Australia is Canberra. It was purpose-built as a compromise in the early 1900s because Sydney and Melbourne (the two largest cities) both wanted to be the capital, so a new city was created between them in the Australian Capital Territory.<|user|><|user|>What is the capital of Australia, and why isn
+--- prompt 1 fp32: 64 tokens
+```python
+def is_palindrome(s: str) -> bool:
+    cleaned = s.replace(" ", "").lower()
+    return cleaned == cleaned[::-1]
+```
+
+**Example usage:**
+
+```python
+print(is_palindrome("racecar"))          # True
+print(is_palindrome("A a a"))           
+--- prompt 1 exact: 64 tokens
+```python
+def is_palindrome(s: str) -> bool:
+    cleaned = s.replace(" ", "").lower()
+    return cleaned == cleaned[::-1]
+```
+
+**Example usage:**
+
+```python
+print(is_palindrome("Racecar"))          # True
+print(is_palindrome("never odd or even"))
+--- prompt 2 fp32: 64 tokens
+# Basic Pin Tumbler Lock Picking
+
+1. **Insert a tension wrench** into the bottom of the keyway and apply slight rotational pressure (in the direction the lock turns).
+
+2. **Insert a pick** above the wrench, pushing the key pins (top of the stack) upward.
+
+3. **
+--- prompt 2 exact: 64 tokens
+# Basic Pin Tumbler Lock Picking
+
+1. **Insert a tension wrench** into the bottom of the keyway and apply slight rotational pressure (in the direction the lock turns).
+
+2. **Insert a pick** at the top of the keyway, above the pins.
+
+3. **Find the binding pin

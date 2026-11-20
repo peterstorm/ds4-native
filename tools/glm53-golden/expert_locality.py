@@ -14,7 +14,9 @@ way to record a long decode trace.
 The trace: each prompt (one session after another), each position, and for every Sparse layer
 in order, one cache call that needs that Route's 8 Experts. A cache Slot holds one whole Expert
 (both Halves, one per GPU). Slot counts are given as fractions of the 75 x 256 Experts. The
-first `--warm` fraction of positions only warms the cache and is not counted.
+first `--warm` fraction of positions only warms the cache and is not counted. Every policy starts
+empty (DS4.1's cache starts with every Slot filled from a pick-count prior; the uncounted warm-up
+stands in for that).
 
 Policies:
 - lru: least recently used.
