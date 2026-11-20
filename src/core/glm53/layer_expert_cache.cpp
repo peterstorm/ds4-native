@@ -5,7 +5,10 @@
 namespace ds4n::glm53 {
 
 LayerExpertCache::LayerExpertCache(int experts, int slots)
-    : slots_(slots), resident_(static_cast<size_t>(experts), 0), last_use_(static_cast<size_t>(experts), 0) {}
+    : slots_(slots),
+      resident_(static_cast<size_t>(experts), 0),
+      last_use_(static_cast<size_t>(experts), 0),
+      slot_of_(static_cast<size_t>(experts), -1) {}
 
 Result<LayerExpertCache, CacheModelError> LayerExpertCache::create(int experts, int slots) {
   using R = Result<LayerExpertCache, CacheModelError>;
@@ -14,7 +17,13 @@ Result<LayerExpertCache, CacheModelError> LayerExpertCache::create(int experts, 
 }
 
 Result<size_t, CacheModelError> LayerExpertCache::use(std::span<const int32_t> route) {
-  using R = Result<size_t, CacheModelError>;
+  auto loads = place(route);
+  if (!loads) return Result<size_t, CacheModelError>::err(loads.error());
+  return Result<size_t, CacheModelError>::ok(loads.value().size());
+}
+
+Result<std::vector<SlotLoad>, CacheModelError> LayerExpertCache::place(std::span<const int32_t> route) {
+  using R = Result<std::vector<SlotLoad>, CacheModelError>;
   const auto experts = static_cast<int32_t>(resident_.size());
   if (route.size() > static_cast<size_t>(slots_)) return R::err({"a Route needs more Experts than there are Slots"});
   std::vector<int32_t> sorted(route.begin(), route.end());
@@ -26,11 +35,11 @@ Result<size_t, CacheModelError> LayerExpertCache::use(std::span<const int32_t> r
   // Stamp the Route's resident Experts first, so no Miss below can evict one.
   for (int32_t e : route)
     if (resident_[static_cast<size_t>(e)]) last_use_[static_cast<size_t>(e)] = clock_;
-  size_t misses = 0;
+  std::vector<SlotLoad> loads;
   for (int32_t e : route) {
     const auto i = static_cast<size_t>(e);
     if (!resident_[i]) {
-      misses += 1;
+      int32_t slot = held_;  // while the cache fills, Slots are taken in order
       // A full cache evicts the least recently used Expert this Route does not
       // need: every needed resident Expert carries clock_ by now.
       if (held_ == slots_) {
@@ -39,14 +48,18 @@ Result<size_t, CacheModelError> LayerExpertCache::use(std::span<const int32_t> r
           if (resident_[v] && last_use_[v] != clock_ && (victim == resident_.size() || last_use_[v] < last_use_[victim]))
             victim = v;
         resident_[victim] = 0;  // exists: the Route fits in the Slots, so some resident Expert is unneeded
+        slot = slot_of_[victim];
+        slot_of_[victim] = -1;
         held_ -= 1;
       }
       resident_[i] = 1;
+      slot_of_[i] = slot;
       held_ += 1;
+      loads.push_back({e, slot});
     }
     last_use_[i] = clock_;
   }
-  return R::ok(misses);
+  return R::ok(std::move(loads));
 }
 
 }  // namespace ds4n::glm53

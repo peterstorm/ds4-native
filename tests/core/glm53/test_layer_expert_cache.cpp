@@ -1,7 +1,9 @@
 // glm53/layer_expert_cache: one Sparse layer's LRU Expert cache model. The
 // properties are relations the code does not compute directly: LRU's stack
 // property (more Slots never miss more), cold misses only when everything fits,
-// and a Route is resident right after it is used.
+// and a Route is resident right after it is used; and the Slots: the map from
+// resident Experts to Slots is one to one, a resident Expert never moves, and a
+// Load's Slot is where its Expert is found afterwards.
 #include <doctest/doctest.h>
 
 #include <algorithm>
@@ -106,4 +108,51 @@ TEST_CASE("LayerExpertCache refuses bad shapes and bad Routes, changing nothing"
   CHECK_FALSE(cache.use(std::vector<int32_t>{-1}).is_ok());
   CHECK_FALSE(cache.use(std::vector<int32_t>{0, 1, 2, 3, 4}).is_ok());
   CHECK(std::ranges::count(cache.resident(), 1) == 0);
+}
+
+TEST_CASE("LayerExpertCache Slots: one to one onto [0, slots), and a resident Expert never moves") {
+  for (unsigned seed = 0; seed < 20; seed++) {
+    constexpr int kSlots = 12;
+    auto cache = LayerExpertCache::create(64, kSlots).value();
+    for (const auto& r : random_routes(seed, 300)) {
+      const auto before = cache.slot_of();
+      const auto loads = cache.place(r).value();
+      const auto& after = cache.slot_of();
+      std::set<int32_t> taken;
+      for (size_t e = 0; e < after.size(); e++) {
+        CHECK((after[e] >= 0) == (cache.resident()[e] == 1));
+        if (after[e] < 0) continue;
+        CHECK(after[e] < kSlots);
+        CHECK(taken.insert(after[e]).second);  // no two resident Experts share a Slot
+        if (before[e] >= 0) CHECK(after[e] == before[e]);  // stayed resident: same Slot
+      }
+      for (const SlotLoad& l : loads) {
+        CHECK(before[static_cast<size_t>(l.expert)] == -1);  // a Load is a Miss
+        CHECK(after[static_cast<size_t>(l.expert)] == l.slot);
+      }
+    }
+  }
+}
+
+TEST_CASE("LayerExpertCache Slots: place and use agree, and a failed Route changes nothing") {
+  const auto routes = random_routes(5, 200);
+  auto a = LayerExpertCache::create(64, 16).value();
+  auto b = LayerExpertCache::create(64, 16).value();
+  for (const auto& r : routes) {
+    CHECK(a.place(r).value().size() == b.use(r).value());
+    CHECK(a.slot_of() == b.slot_of());
+  }
+  const auto kept = a.slot_of();
+  CHECK(!a.place(std::vector<int32_t>{1, 1}));
+  CHECK(!a.place(std::vector<int32_t>{64}));
+  CHECK(a.slot_of() == kept);
+}
+
+TEST_CASE("LayerExpertCache Slots: filling takes Slots in order, an eviction hands its Slot on") {
+  auto cache = LayerExpertCache::create(16, 4).value();
+  CHECK(cache.place(std::vector<int32_t>{5, 9}).value() == std::vector<SlotLoad>{{5, 0}, {9, 1}});
+  CHECK(cache.place(std::vector<int32_t>{2, 3}).value() == std::vector<SlotLoad>{{2, 2}, {3, 3}});
+  // Full: 7 evicts the least recently used unneeded Expert, 5 (Slot 0), and takes its Slot.
+  CHECK(cache.place(std::vector<int32_t>{9, 7}).value() == std::vector<SlotLoad>{{7, 0}});
+  CHECK(cache.slot_of()[5] == -1);
 }
