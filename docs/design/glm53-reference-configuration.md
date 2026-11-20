@@ -1,9 +1,8 @@
 # GLM-5.3 Reference configuration
 
 Status: **MoE half fixed, implemented and pinned** (`core/glm53/exact_moe`, 2026-11-19; see
-"How the bits are pinned"). Attention and
-the indexer are specified by operation below, and their exact orders are fixed with their
-kernels (first GPU window). Companion to the plan (`docs/plans/2026-11-19-glm53-native.md`,
+"How the bits are pinned"). **Attention side fixed 2026-11-20** ("The attention side"), its CPU
+oracle `core/glm53/exact_attention`; the GPU kernels are gated against it. Companion to the plan (`docs/plans/2026-11-19-glm53-native.md`,
 Phase 3) and to DS4.1's [`forward-pass.md`](forward-pass.md), whose primitives this reuses.
 
 ## What "exact" means here
@@ -59,18 +58,88 @@ down once, and GLM reuses those definitions wherever its operations have the sam
    6144 values, and it keeps the stream closer to the Semantics oracle than the reference's own
    BF16 residual would.
 
+## The attention side
+
+Everything outside the MoE, fixed 2026-11-20 so the whole token has one CPU oracle before the
+GPU executor exists. The aim is the MoE's: the Semantics oracle's mathematics, every rounding
+point where a GPU kernel would round anyway, every order one a kernel can keep. Where the pinned
+reference rounds more often (its BF16 RoPE and residual), this rounds less.
+
+A1. **The residual stream is FP32** (decision 6), from the embedding row's BF16 values. Each
+    sub-block adds its exchanged BF16 output with one FP32 add.
+
+A2. **RMSNorm is `hc::rmsnorm`** (256-thread FMA chains, halving tree, `det::rsqrt`, BF16 out):
+    input and post-attention norms on the FP32 stream (eps `rms_norm_eps`), `q_a_layernorm` and
+    `kv_a_layernorm` on their BF16 projections (eps 1e-6), the final norm.
+
+A3. **Every BF16 linear is `reduce::bf16_gemv`** over BF16 inputs, in planes of at most 1024
+    (`exact::gemv_planes`, the router's rule: 6144 → 6, 2048 → 2, 8192 → 8, 512 and 192 → 1).
+    Outputs are FP32 and rounded to BF16 wherever the reference holds BF16: q_a, q_b, kv_a, the
+    absorbed query, the value projection, the indexer's projections, the dense gate/up.
+    Row splits between the GPUs change no value; K splits do, and are named here.
+
+A4. **RoPE**: the reference's FP32 frequencies `1 / powf(theta, 2i / 64)` as a host table; angle
+    `float(pos) × freq` (one FP32 product); `det::cos`/`det::sin`; each output one FP32 product
+    pair and one add/sub (`det::` ops: no contraction), rounded to BF16. Pairs are interleaved
+    in, and laid out as the reference returns them: the pairs' first components, then their
+    second. Queries and keys share the layout. The reference rounds cos and sin to BF16 first;
+    this does not.
+
+A5. **MLA, absorbed, per head:**
+    - `q_lat = bf16(W_kᵀ q_nope)`: K = 192 in one plane (lanes 24–31 idle, the same bits as a
+      zero-padded 256-wide plane);
+    - query `[q_lat | q_rope]` and cached key `[latent | k_rope]`, 576 BF16 values each; the
+      value is the latent, the key's first 512;
+    - **flash decoding over the Selection in ascending position**, splits of 64 positions:
+      scores on the BF16 MMA (`mma_step_bf16`, 36 k16 steps in element order) × 1/16 (exact:
+      qk_head is 256); the split's max; `p = det::exp(s − m_s)` summed unrounded in order and
+      rounded to BF16; P·V on the BF16 MMA over the split's rows (k16 steps, rows past the end
+      zero) for each of the 512 latent columns. Splits combine in order rescaled by
+      `det::exp(m_s − m)`; there is no sink. `ctx = bf16(o / l)`. This is DS4.1's
+      `attn::sparse_attn` with 576-wide keys, 512-wide values, every row valid, and no sink;
+    - `out_h = bf16(W_v ctx)`, K = 512 in one plane.
+
+A6. **Heads split 32/32**: GPU g holds heads [32g, 32g + 32), so o_proj's K range
+    [8192g, 8192g + 8192) in 8 planes; `attn_out = bf16(GPU 0 + GPU 1)` (the Exchange).
+    q_a, kv_a and the indexer are replicated: both GPUs compute the same bits.
+
+A7. **The indexer (Full layers), FP32 like the reference** (`q.float() @ k.float()`, FP32 head
+    weights; DS4.1's FP4 indexer is not reused):
+    - queries `bf16(wq_b q_resid)`, 32 heads of 128, RoPE (A4) on each head's first 64;
+    - key `bf16(wk h)`, then LayerNorm: mean and variance each as one warp's sum (lane l adds
+      elements l, l + 32, l + 64, l + 96 in order, FMA for the squares, then the xor tree), / 128,
+      `r = det::rsqrt(var + 1e-6)`, `bf16((d × r) × w + b)` in separate ops; RoPE on its first
+      64; cached as BF16;
+    - head weights `float(bf16(weights_proj h)) × fl(32^-0.5)`;
+    - score of position t: for heads 0..31 in order, `acc = fma(w_h, relu(dot_h × fl(128^-0.5)),
+      acc)` from +0, `dot_h` on the BF16 MMA (8 k16 steps). FP32, never rounded;
+    - **Selection**: the index_topk best of positions [0, pos], ties to the lower position,
+      ascending; every position while pos + 1 ≤ index_topk. Ties in FP32 are rare, unlike
+      DS4.1's BF16 scores, so the GPU needs a 32-bit radix select (DS4.1's `select_top` keys
+      16 bits).
+    Shared layers attend the nearest Full layer's Selection, as the reference.
+
+A8. **Dense MLP (layers 0–2)**: gate and up `bf16(gemv)`, 6 planes each; `mx::swiglu(gate, up,
+    1, ∞)` (the MoE's element function at weight 1); down K-split between the GPUs
+    ([6144g, 6144g + 6144), 6 planes); `out = bf16(GPU 0 + GPU 1)`. The checkpoint leaves these
+    layers out of W4A4, so they stay BF16, without E4M3.
+
+A9. **Head**: the final norm (A2), then `bf16_gemv` in 6 planes; logits FP32 (vocab rows split).
+
+**Cached per position and layer:** 576 BF16 (latent, k_rope), plus 128 on Full layers.
+
 ## By operation
 
 | Operation | Pinned reference | Reference configuration | Status |
 |---|---|---|---|
 | Router logits, route, weights | FP32 linear on BF16 weights; `topk(sorted=False)`; torch sum | Decision 2 | **fixed** (`exact_moe`) |
 | Routed + shared Experts, combine | BF16 linears, weight after down, BF16 sum | Decisions 1, 3, 4, 5 | **fixed** (`exact_moe`) |
-| Dense MLP (layers 0–2) | BF16 | BF16 GEMVs (`reduce::bf16_gemv`); silu × up with `det::exp` in FP32, rounded to BF16; rows split across the GPUs, down K-split + Exchange | with the kernels |
-| RMSNorms (input, post-attention, q_a, kv_a, final) | FP32 inside, BF16 out | `hc::rmsnorm`; BF16 where a BF16 GEMV reads it | with the kernels |
-| q_a, q_b, kv_a, o_proj, indexer projections, head | BF16 linears | `reduce::bf16_gemv`, splits chosen with the kernels; heads split 32/32, o_proj K-split + Exchange; head vocab-split | with the kernels |
-| RoPE | FP32 angle `pos × inv_freq` | the reference's FP32 angle, `det::cos/sin` | with the kernels |
-| MLA (absorbed, over the Selection) | expanded K/V, softmax over masked scores | latent and RoPE key cached in BF16 (576 values per position per layer); scores and `Σ p·latent` on the BF16 MMA (`mma_step_bf16`), DS4.1's flash-decoding decomposition (64-slot chunks, ordered combine) widened to 576-wide keys and 512-wide values | with the kernel (first GPU window) |
-| DSA indexer, Selection | model dtype (BF16): **no FP4/FP8**, unlike DS4.1's indexer | BF16 keys (128 per position, Full layers only), scores on the BF16 MMA, heads summed in ascending order, top-2048 ties to the lower position (DS4.1's radix top-k) | with the kernel; the Selection tie rate is still to measure (plan, Open items) |
+| Dense MLP (layers 0–2) | BF16 | A8 | **fixed** (`exact_attention`) |
+| RMSNorms (input, post-attention, q_a, kv_a, final) | FP32 inside, BF16 out | A2 | **fixed** |
+| q_a, q_b, kv_a, o_proj, indexer projections, head | BF16 linears | A3, A6, A9 | **fixed** |
+| RoPE | FP32 angle `pos × inv_freq`, BF16 cos/sin | A4 | **fixed** |
+| MLA (absorbed, over the Selection) | expanded K/V, softmax over masked scores | A5 | **fixed** |
+| DSA indexer, Selection | FP32 scores of BF16 queries and keys | A7: FP32 scores, a 32-bit top-k | **fixed** |
 
 ## Open, with numbers to decide them
 

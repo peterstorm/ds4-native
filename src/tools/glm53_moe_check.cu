@@ -458,7 +458,7 @@ int main(int argc, char** argv) {
     die("layer " + std::to_string(layer_id) + " is not a Sparse layer");
   if (d.experts != moe_plan::kExperts || d.experts_per_token != moe_plan::kTopK || d.hidden != kDim)
     die("the configuration is not GLM-5.3's MoE shape");
-  const auto planes = exact::router_planes(d.hidden);
+  const auto planes = exact::gemv_planes(d.hidden);
   if (!planes) die("no router planes for this width");
 
   auto parts = io::BackboneParts::open(backbone_path);

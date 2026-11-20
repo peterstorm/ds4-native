@@ -63,15 +63,15 @@ constexpr uint64_t kReferenceBits = 0x20922a80e99434d8ull;
 
 }  // namespace
 
-TEST_CASE("router_planes: equal planes of at most 1024 values, each a multiple of 8") {
-  CHECK(exact::router_planes(6144) == 6);  // GLM-5.3
-  CHECK(exact::router_planes(5120) == 5);  // DS4.1's router plane width
-  CHECK(exact::router_planes(2048) == 2);
-  CHECK(exact::router_planes(1024) == 1);
-  CHECK(exact::router_planes(64) == 1);
-  CHECK_FALSE(exact::router_planes(1028).has_value());  // 2 planes of 514
-  CHECK_FALSE(exact::router_planes(12).has_value());
-  CHECK_FALSE(exact::router_planes(0).has_value());
+TEST_CASE("gemv_planes: equal planes of at most 1024 values, each a multiple of 8") {
+  CHECK(exact::gemv_planes(6144) == 6);  // GLM-5.3
+  CHECK(exact::gemv_planes(5120) == 5);  // DS4.1's router plane width
+  CHECK(exact::gemv_planes(2048) == 2);
+  CHECK(exact::gemv_planes(1024) == 1);
+  CHECK(exact::gemv_planes(64) == 1);
+  CHECK_FALSE(exact::gemv_planes(1028).has_value());  // 2 planes of 514
+  CHECK_FALSE(exact::gemv_planes(12).has_value());
+  CHECK_FALSE(exact::gemv_planes(0).has_value());
 }
 
 // The codes are the engine's input, not their values (the MMA aligns products

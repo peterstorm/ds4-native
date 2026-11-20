@@ -53,10 +53,10 @@ moe::HalfWeights half_weights(const Fp4Expert& e, size_t h) {
 
 }  // namespace
 
-std::optional<int> router_planes(int hidden) {
-  if (hidden <= 0) return std::nullopt;
-  const int planes = (hidden + kRouterPlaneWidth - 1) / kRouterPlaneWidth;
-  if (hidden % planes != 0 || (hidden / planes) % 8 != 0) return std::nullopt;
+std::optional<int> gemv_planes(int k) {
+  if (k <= 0) return std::nullopt;
+  const int planes = (k + kPlaneWidth - 1) / kPlaneWidth;
+  if (k % planes != 0 || (k / planes) % 8 != 0) return std::nullopt;
   return planes;
 }
 
@@ -106,7 +106,7 @@ Result<std::vector<float>, MoeError> router_logits(const Matrix& router, std::sp
   if (ffn_in.size() != static_cast<size_t>(router.cols) ||
       router.w.size() != static_cast<size_t>(router.rows) * static_cast<size_t>(router.cols))
     return R::err({"the router does not match the feed-forward input"});
-  const auto planes = router_planes(router.cols);
+  const auto planes = gemv_planes(router.cols);
   if (!planes) return R::err({"the hidden width does not split into router planes"});
   const auto x = bf16_all(ffn_in);
   const auto cols = static_cast<size_t>(router.cols);

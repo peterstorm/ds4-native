@@ -41,20 +41,21 @@
 
 namespace ds4n::glm53::exact {
 
-constexpr int kRouterPlaneWidth = 1024;  // the router GEMV's plane width, at most (DS4.1's router: 5 x 1024)
-constexpr int kExpertSplits = 2;         // split-K planes of an Expert Half's gate/up
-constexpr size_t kHalves = 2;            // one per GPU under 2-way tensor parallelism
+constexpr int kPlaneWidth = 1024;  // every BF16 GEMV's plane width, at most (DS4.1's router: 5 x 1024)
+constexpr int kExpertSplits = 2;   // split-K planes of an Expert Half's gate/up
+constexpr size_t kHalves = 2;      // one per GPU under 2-way tensor parallelism
 
 struct MoeError {
   std::string what;
 };
 
 /**
- * The router GEMV's plane count for a hidden width: ceil(hidden / 1024) equal
- * planes, each a multiple of 8 values (the GEMV's lanes read 8 at a time).
- * 6144 -> 6. nullopt when hidden does not split that way.
+ * The plane count of every BF16 GEMV (reduce::bf16_gemv) over a K width: the
+ * router's and the attention side's (design, A3). ceil(k / 1024) equal planes,
+ * each a multiple of 8 values (the GEMV's lanes read 8 at a time): 6144 -> 6,
+ * 2048 -> 2, 192 -> 1. nullopt when k does not split that way.
  */
-std::optional<int> router_planes(int hidden);
+std::optional<int> gemv_planes(int k);
 
 /**
  * One MXFP4 Expert (routed or shared), as GGML row-major blocks: the
@@ -107,9 +108,9 @@ Result<ExpertInput, MoeError> expert_input(std::span<const float> ffn_in);
 
 /**
  * Router logits for one token: row e is reduce::bf16_gemv(router row e,
- * bf16(ffn_in), router_planes(hidden)), never rounded. The router's values
+ * bf16(ffn_in), gemv_planes(hidden)), never rounded. The router's values
  * must be BF16 (kitaniai stores it so); fails on a width mismatch or a hidden
- * width router_planes refuses.
+ * width gemv_planes refuses.
  */
 Result<std::vector<float>, MoeError> router_logits(const Matrix& router, std::span<const float> ffn_in);
 
