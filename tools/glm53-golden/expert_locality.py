@@ -24,6 +24,9 @@ Policies:
   with the lowest (score, last use, key). The score counts picks, halved every `decay_period`
   calls (4096, as DS4.1).
 - belady: optimal eviction (knows the future). It is the lower bound for any policy.
+- lru-layer: LRU within each Sparse layer, each owning an equal share of the Slots. Every layer
+  is called once per token, so this models the global cache well, and it is what the oracle can
+  simulate in its layer-major order (cache-conditional routing streams).
 - static: the best fixed set (the most-picked Experts over the whole trace). It is the most any
   profile-placed, never-moving cache can reach.
 
@@ -197,12 +200,36 @@ def replay_static(calls, slots, tiers, count_from):
                 tiers.evicted(k)  # it ran from scratch; the RAM tier may keep it
 
 
-POLICIES = {"lru": replay_lru, "decay": replay_decay, "belady": replay_belady, "static": replay_static}
+def replay_lru_layer(calls, slots, tiers, count_from, layers=None):
+    """LRU per Sparse layer: each layer owns slots / layers Slots (every layer is called once per token)."""
+    caches = {}
+    per_layer = max(8, slots // (layers or 1))
+    for t, needed in enumerate(calls):
+        counted = t >= count_from
+        if counted:
+            tiers.picks += len(needed)
+        cache = caches.setdefault(needed[0] // EXPERTS, collections.OrderedDict())
+        for k in needed:
+            if k in cache:
+                cache.move_to_end(k)
+                continue
+            tiers.miss(k, counted)
+            cache[k] = None
+        while len(cache) > per_layer:
+            victim, _ = cache.popitem(last=False)
+            tiers.evicted(victim)
 
 
-def run(calls, slots, ram_slots, count_from, policy):
+POLICIES = {"lru": replay_lru, "lru-layer": replay_lru_layer, "decay": replay_decay, "belady": replay_belady,
+            "static": replay_static}
+
+
+def run(calls, slots, ram_slots, count_from, policy, layers=75):
     tiers = Tiers(ram_slots)
-    POLICIES[policy](calls, slots, tiers, count_from)
+    if policy == "lru-layer":
+        replay_lru_layer(calls, slots, tiers, count_from, layers)
+    else:
+        POLICIES[policy](calls, slots, tiers, count_from)
     return tiers
 
 
@@ -215,7 +242,7 @@ def self_test():
              list(dict.fromkeys(rng.choices(range(keys), weights, k=20)))[:8] for _ in range(4000)]
     calls = [c for c in calls if len(c) == 8]
     for slots in (16, 40, 100, 200):
-        m = {p: run(calls, slots, 0, 0, p).misses for p in POLICIES if p != "static"}
+        m = {p: run(calls, slots, 0, 0, p, layers=1).misses for p in POLICIES if p != "static"}
         assert m["belady"] <= m["lru"] and m["belady"] <= m["decay"], (slots, m)
     distinct = len({k for c in calls for k in c})
     for p in ("lru", "decay", "belady"):
@@ -259,7 +286,7 @@ def main(argv):
     for share in (float(s) for s in opts["--slots"].split(",")):
         slots = int(keys * share)
         for policy in POLICIES:
-            r = run(calls, slots, ram_slots, count_from, policy)
+            r = run(calls, slots, ram_slots, count_from, policy, layers)
             per_tok = r.misses / counted_tokens
             ram, store = r.ram_hits / counted_tokens, (r.misses - r.ram_hits) / counted_tokens
             t = t_base + ram * c_ram + store * c_ssd

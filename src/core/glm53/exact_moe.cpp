@@ -1,5 +1,6 @@
 #include "core/glm53/exact_moe.hpp"
 
+#include <cmath>
 #include <limits>
 
 #include "core/det_math.hpp"
@@ -113,16 +114,21 @@ Result<std::vector<float>, MoeError> router_logits(const Matrix& router, std::sp
   return R::ok(std::move(logits));
 }
 
-Result<Route, MoeError> route(const Dims& d, std::span<const float> logits, std::span<const float> bias) {
+Result<Route, MoeError> route(const Dims& d, std::span<const float> logits, std::span<const float> bias,
+                              std::optional<ResidentBonus> bonus) {
   using R = Result<Route, MoeError>;
   const auto experts = static_cast<size_t>(d.experts);
   if (logits.size() != experts || bias.size() != experts) return R::err({"logits and bias must be one per Expert"});
   if (d.experts_per_token <= 0 || d.experts_per_token > d.experts)
     return R::err({"experts_per_token must be in [1, experts]"});
+  if (bonus && bonus->resident.size() != experts) return R::err({"the resident mask must be one per Expert"});
+  if (bonus && !(std::isfinite(bonus->bonus) && bonus->bonus > 0.0f))
+    return R::err({"a resident bonus must be finite and positive"});
   std::vector<float> sig(experts), choice(experts);
   for (size_t e = 0; e < experts; e++) {
     sig[e] = det::div(1.0f, det::add(1.0f, det::exp(-logits[e])));
     choice[e] = det::add(sig[e], bias[e]);
+    if (bonus && bonus->resident[e]) choice[e] = det::add(choice[e], bonus->bonus);
   }
   Route r;
   r.expert = top_k(choice, d.experts_per_token);  // ascending id
@@ -168,11 +174,12 @@ Result<MoeOutput, MoeError> combine(std::span<const Halves> routed, const Halves
   return R::ok(std::move(result));
 }
 
-Result<MoeStart, MoeError> begin_moe(const Dims& d, const MoeLayer& layer, std::span<const float> ffn_in) {
+Result<MoeStart, MoeError> begin_moe(const Dims& d, const MoeLayer& layer, std::span<const float> ffn_in,
+                                     std::optional<ResidentBonus> bonus) {
   using R = Result<MoeStart, MoeError>;
   auto logits = router_logits(layer.router, ffn_in);
   if (!logits) return R::err(logits.error());
-  auto r = exact::route(d, logits.value(), layer.bias);  // qualified: ADL on Dims also finds glm53::route
+  auto r = exact::route(d, logits.value(), layer.bias, bonus);  // qualified: ADL on Dims also finds glm53::route
   if (!r) return R::err(r.error());
   auto x = expert_input(ffn_in);
   if (!x) return R::err(x.error());

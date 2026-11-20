@@ -203,6 +203,63 @@ TEST_CASE("route: equal biased scores go to the lower Expert id, and a tie has m
   CHECK_FALSE(exact::route(d, logits, bias).is_ok());
 }
 
+TEST_CASE("route with a resident bonus: never fewer resident Experts, weights still the chosen sigmoids'") {
+  Dims d{};
+  d.experts = 256;
+  d.experts_per_token = 8;
+  d.routed_scale = 2.5f;
+  int changed = 0;
+  for (unsigned seed = 0; seed < 300; seed++) {
+    std::mt19937 rng(seed);
+    const auto logits = random_vector(rng, 256, 2.0f);
+    const auto bias = random_vector(rng, 256, 0.02f);
+    std::vector<uint8_t> resident(256);
+    for (auto& r : resident) r = static_cast<uint8_t>(rng() % 3 == 0);  // about a third resident
+    const float bonus = std::uniform_real_distribution<float>(1e-4f, 0.2f)(rng);
+    const Route plain = exact::route(d, logits, bias).value();
+    const Route cc = exact::route(d, logits, bias, exact::ResidentBonus{bonus, resident}).value();
+    auto resident_in = [&](const Route& r) {
+      return std::ranges::count_if(r.expert, [&](int32_t e) { return resident[static_cast<size_t>(e)] != 0; });
+    };
+    CHECK(resident_in(cc) >= resident_in(plain));
+    CHECK(std::is_sorted(cc.expert.begin(), cc.expert.end()));
+    double total = 0.0;
+    for (float w : cc.weight) total += w;
+    CHECK(total == doctest::Approx(2.5).epsilon(1e-6));
+    // Only the choice changes: on the same choice the weights are bit-identical.
+    if (cc.expert == plain.expert)
+      CHECK(cc.weight == plain.weight);
+    else
+      changed++;
+  }
+  CHECK(changed > 0);
+}
+
+TEST_CASE("route: an empty resident set changes nothing; a dominant bonus chooses only resident Experts") {
+  Dims d{};
+  d.experts = 256;
+  d.experts_per_token = 8;
+  d.routed_scale = 2.5f;
+  std::mt19937 rng(7);
+  const auto logits = random_vector(rng, 256, 2.0f);
+  const auto bias = random_vector(rng, 256, 0.02f);
+  const Route plain = exact::route(d, logits, bias).value();
+  const std::vector<uint8_t> none(256, 0);
+  const Route same = exact::route(d, logits, bias, exact::ResidentBonus{0.5f, none}).value();
+  CHECK(same.expert == plain.expert);
+  CHECK(same.weight == plain.weight);
+  CHECK(same.margin == plain.margin);
+  // Sigmoid + bias spans less than 1.1, so a bonus of 10 puts every resident Expert first.
+  std::vector<uint8_t> twelve(256, 0);
+  for (int e = 100; e < 112; e++) twelve[static_cast<size_t>(e)] = 1;
+  const Route forced = exact::route(d, logits, bias, exact::ResidentBonus{10.0f, twelve}).value();
+  for (int32_t e : forced.expert) CHECK(twelve[static_cast<size_t>(e)] == 1);
+  CHECK_FALSE(exact::route(d, logits, bias, exact::ResidentBonus{0.1f, std::vector<uint8_t>(255, 0)}).is_ok());
+  CHECK_FALSE(exact::route(d, logits, bias, exact::ResidentBonus{0.0f, none}).is_ok());
+  CHECK_FALSE(exact::route(d, logits, bias, exact::ResidentBonus{-0.1f, none}).is_ok());
+  CHECK_FALSE(exact::route(d, logits, bias, exact::ResidentBonus{std::nanf(""), none}).is_ok());
+}
+
 TEST_CASE("expert_halves: the two Halves add up to the Expert's output times its routing weight") {
   for (unsigned seed = 0; seed < 6; seed++) {
     std::mt19937 rng(100 + seed);

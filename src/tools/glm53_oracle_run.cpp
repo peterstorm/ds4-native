@@ -5,7 +5,7 @@
 //   ds4n-glm53-oracle-run --config ref/glm-5.3/config.json --backbone DIR --store FILE
 //                         --prompt ID,ID,... [--prompt ID,...]... [--activations fp32,bf16,e4m3,mxfp4,exact,...]
 //                         [--generate N] [--threads T] [--resident E] [--report FILE] [--routes FILE]
-//                         [--moe-roundings FILE]
+//                         [--moe-roundings FILE] [--slots N] [--warm N]
 //                         [--gpu N]
 //
 // Each prompt runs once per arithmetic listed — a stream, with its own caches
@@ -17,8 +17,19 @@
 // Sparse layer, the rest of the model still the Semantics oracle;
 // `exact-DEPARTURE` is exact_moe with one core/glm53/moe_roundings Departure
 // (exact-weight-after-down, exact-fp32-gate-up-hidden, exact-fp32-exchange).
+// Any exact arithmetic may end in `-ccλ` (exact-cc0.05): cache-conditional
+// routing, approximate (exact::ResidentBonus): a resident Expert's selection
+// score gains λ, resident meaning in that stream's Expert cache model (below).
 // The first listed (default fp32: the oracle itself) is the baseline every
 // other is compared against.
+//
+// The Expert cache model: every stream keeps, per Sparse layer, an LRU cache of
+// --slots Slots (default 84 per layer: the ~33% of Experts two 96 GB cards
+// hold, docs/bench/glm53-locality), and records each token's Route in it, in
+// position order, prefill as decode (one token at a time, as the engine decodes).
+// Reported per arithmetic: the share of Expert picks that miss it, prompt and
+// generated tokens apart, from position --warm on (default 32: the empty cache
+// filling). For a -cc stream that cache is also what its router favours.
 //
 // Everything runs on the CPU, except with --gpu N (a CUDA build): the exact
 // streams whose Departure the GPU runs (all but fp32-gate-up-hidden) have their
@@ -72,6 +83,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <variant>
 #include <vector>
@@ -79,6 +91,7 @@
 #include "core/glm53/config.hpp"
 #include "core/glm53/dequant.hpp"
 #include "core/glm53/exact_moe.hpp"
+#include "core/glm53/layer_expert_cache.hpp"
 #include "core/glm53/moe_roundings.hpp"
 #include "core/glm53/precision.hpp"
 #include "core/glm53/reference.hpp"
@@ -97,27 +110,46 @@ namespace {
 
 /**
  * The Reference configuration's MoE on the Sparse layers (core/glm53/exact_moe),
- * or exact_moe with one core/glm53/moe_roundings Departure.
+ * or exact_moe with one core/glm53/moe_roundings Departure; with a resident
+ * bonus (finite, > 0), its router is cache-conditional (exact::ResidentBonus).
  */
 struct ExactMoe {
   exact::Departure departure = exact::Departure::None;
-  friend auto operator<=>(ExactMoe, ExactMoe) = default;
+  std::optional<float> resident_bonus;
+  friend auto operator<=>(const ExactMoe&, const ExactMoe&) = default;
 };
 
 /** How a stream runs its Experts: the Semantics oracle at an activation precision, or the Reference configuration. */
 using Arithmetic = std::variant<ActivationPrecision, ExactMoe>;
 
+/** The suffix of a cache-conditional exact arithmetic: exact-cc0.05. */
+constexpr std::string_view kCacheConditional = "-cc";
+
 std::string name_of(const Arithmetic& a) {
   if (const auto* p = std::get_if<ActivationPrecision>(&a)) return std::string(glm53::name_of(*p));
-  const auto d = std::get<ExactMoe>(a).departure;
-  return d == exact::Departure::None ? "exact" : "exact-" + std::string(exact::name_of(d));
+  const auto& e = std::get<ExactMoe>(a);
+  std::string name = e.departure == exact::Departure::None ? "exact" : "exact-" + std::string(exact::name_of(e.departure));
+  if (e.resident_bonus) {
+    std::ostringstream bonus;
+    bonus << *e.resident_bonus;  // %g: 0.05 reads back as the same float
+    name += std::string(kCacheConditional) + bonus.str();
+  }
+  return name;
 }
 
 std::optional<Arithmetic> parse_arithmetic(const std::string& name) {
   for (const auto d : exact::kDepartures)
-    if (name == name_of(Arithmetic{ExactMoe{d}})) return Arithmetic{ExactMoe{d}};
+    if (name == name_of(Arithmetic{ExactMoe{d, std::nullopt}})) return Arithmetic{ExactMoe{d, std::nullopt}};
   if (const auto p = glm53::parse_activation_precision(name)) return Arithmetic{*p};
-  return std::nullopt;
+  const auto cc = name.rfind(kCacheConditional);
+  if (cc == std::string::npos) return std::nullopt;
+  const auto base = parse_arithmetic(name.substr(0, cc));
+  if (!base || !std::holds_alternative<ExactMoe>(*base) || std::get<ExactMoe>(*base).resident_bonus) return std::nullopt;
+  const std::string text = name.substr(cc + kCacheConditional.size());
+  char* end = nullptr;
+  const float bonus = std::strtof(text.c_str(), &end);
+  if (text.empty() || end != text.c_str() + text.size() || !std::isfinite(bonus) || !(bonus > 0.0f)) return std::nullopt;
+  return Arithmetic{ExactMoe{std::get<ExactMoe>(*base).departure, bonus}};
 }
 
 bool is_exact(const Arithmetic& a) { return std::holds_alternative<ExactMoe>(a); }
@@ -138,6 +170,8 @@ struct Args {
   std::string config, backbone, store, report;
   std::string routes;  // FILE, or empty: no Route dump
   std::string moe_roundings;  // FILE, or empty: no MoE rounding study
+  int slots = 84;             // the Expert cache model's Slots per Sparse layer
+  size_t warm = 32;           // positions before the cache model's misses count
   std::vector<std::vector<int32_t>> prompts;
   std::vector<Arithmetic> arithmetics;  // the first is the baseline
   int generate = 0;
@@ -165,6 +199,8 @@ bool parse_args(int argc, char** argv, Args& a) {
     else if (s == "--generate") a.generate = std::stoi(v);
     else if (s == "--threads") a.threads = static_cast<unsigned>(std::stoul(v));
     else if (s == "--resident") a.resident = std::stoul(v);
+    else if (s == "--slots") a.slots = std::stoi(v);
+    else if (s == "--warm") a.warm = std::stoul(v);
     else if (s == "--gpu") a.gpu = std::stoi(v);
     else if (s == "--prompt") {
       std::vector<int32_t> prompt;
@@ -231,6 +267,8 @@ struct Stream {
   bool baseline = false;
   std::vector<glm53::LayerCache> caches;                  // [layer]
   std::vector<std::vector<std::vector<int32_t>>> routes;  // [layer][position] the Route's Experts (Sparse layers)
+  std::vector<glm53::LayerExpertCache> expert_caches;     // [layer] the Expert cache model
+  std::vector<std::vector<uint8_t>> misses;               // [layer][position] the Route's Misses in it
   std::vector<float> route_margins;                       // baseline only
   size_t selections = 0, selections_dropping = 0;         // baseline only
 };
@@ -355,8 +393,12 @@ std::vector<std::vector<std::vector<float>>> run_round(const Model& m, const Arg
                 if (selection[s][i].size() < static_cast<size_t>(cache.length)) st.selections_dropping++;
               }
             }
+            auto& expert_cache = st.expert_caches[static_cast<size_t>(L)];
             if (exact_layer && is_exact(st.arithmetic)) {
-              auto begun = exact::begin_moe(d, *exact_layer, r.value().ffn_in);
+              std::optional<exact::ResidentBonus> bonus;
+              if (const auto b = std::get<ExactMoe>(st.arithmetic).resident_bonus)
+                bonus = exact::ResidentBonus{*b, expert_cache.resident()};
+              auto begun = exact::begin_moe(d, *exact_layer, r.value().ffn_in, bonus);
               if (!begun) return where + begun.error().what;
               exact_tokens[s][i] = std::move(begun).value();
             }
@@ -367,6 +409,9 @@ std::vector<std::vector<std::vector<float>>> run_round(const Model& m, const Arg
             }
             const auto& route = exact_tokens[s][i] ? exact_tokens[s][i]->route : r.value().route;
             if (!route.expert.empty()) {
+              const auto missed = expert_cache.use(route.expert);
+              if (!missed) return where + missed.error().what;
+              st.misses[static_cast<size_t>(L)].push_back(static_cast<uint8_t>(missed.value()));
               st.routes[static_cast<size_t>(L)].push_back(route.expert);
               if (st.baseline) st.route_margins.push_back(route.margin);
             }
@@ -664,7 +709,11 @@ struct Comparison {
   size_t agree = 0;
   double nll = 0.0;
   size_t scored = 0, routes = 0, routes_differing = 0;
+  // The Expert cache model, from position --warm on: [0] prompt tokens, [1] generated tokens.
+  std::array<size_t, 2> picks{}, misses{};
 };
+
+double share(size_t part, size_t whole) { return whole ? static_cast<double>(part) / static_cast<double>(whole) : 0.0; }
 
 }  // namespace
 
@@ -672,9 +721,10 @@ int main(int argc, char** argv) {
   Args args;
   if (!parse_args(argc, argv, args))
     die("usage: --config FILE --backbone DIR --store FILE --prompt ID,ID,... [--prompt ...] "
-        "[--activations fp32,bf16,e4m3,mxfp4,exact,exact-DEPARTURE (distinct; the first is the baseline)] "
+        "[--activations fp32,bf16,e4m3,mxfp4,exact,exact-DEPARTURE,exact[-DEPARTURE]-ccλ (distinct; the first is the "
+        "baseline)] "
         "[--generate N] [--threads T] [--resident E>=8] [--report FILE] [--routes FILE] "
-        "[--moe-roundings FILE (baseline fp32)] [--gpu N (CUDA builds)]");
+        "[--moe-roundings FILE (baseline fp32)] [--slots N (per Sparse layer)] [--warm N] [--gpu N (CUDA builds)]");
   const auto t0 = std::chrono::steady_clock::now();
 
   std::ifstream cf(args.config);
@@ -701,6 +751,8 @@ int main(int argc, char** argv) {
 
   // Streams: prompt-major, the baseline arithmetic first within each prompt.
   const glm53::Dims& d = m.config.dims();
+  const auto expert_cache = glm53::LayerExpertCache::create(d.experts, args.slots);
+  if (!expert_cache) die("--slots: " + expert_cache.error().what);
   const size_t P = args.arithmetics.size();
   std::vector<Stream> streams;
   std::vector<std::vector<int32_t>> feed;
@@ -712,6 +764,8 @@ int main(int argc, char** argv) {
       s.baseline = q == 0;
       s.caches.resize(static_cast<size_t>(d.layers));
       s.routes.resize(static_cast<size_t>(d.layers));
+      s.expert_caches.assign(static_cast<size_t>(d.layers), expert_cache.value());
+      s.misses.resize(static_cast<size_t>(d.layers));
       streams.push_back(std::move(s));
       feed.push_back(args.prompts[p]);
     }
@@ -803,6 +857,18 @@ int main(int argc, char** argv) {
     for (size_t s = 0; s < streams.size(); s++) last[s] = log_softmax(logits_of(m, args, x[s].front()));
   }
 
+  // The Expert cache model's misses, per arithmetic, prompt and generated tokens apart.
+  for (size_t s = 0; s < streams.size(); s++) {
+    const size_t prompt_len = args.prompts[streams[s].prompt].size();
+    auto& c = cmp[s % P];
+    for (const auto& layer : streams[s].misses)
+      for (size_t i = args.warm; i < layer.size(); i++) {
+        const size_t phase = i < prompt_len ? 0 : 1;
+        c.picks[phase] += static_cast<size_t>(d.experts_per_token);
+        c.misses[phase] += layer[i];
+      }
+  }
+
   // Summaries.
   std::vector<float> margins;
   size_t selections = 0, dropping = 0;
@@ -825,6 +891,12 @@ int main(int argc, char** argv) {
                 quantile(c.kl, 0.9), quantile(c.kl, 1.0), c.kl.size(), c.agree, c.kl.size(), perplexity(c), c.routes_differing,
                 c.routes);
   }
+  std::printf("Expert cache model (LRU, %d Slots per Sparse layer, positions %zu on): misses of picks, prompt | generated\n",
+              args.slots, args.warm);
+  for (size_t q = 0; q < P; q++)
+    std::printf("  %-24s %6.2f%% of %zu | %6.2f%% of %zu\n", name_of(args.arithmetics[q]).c_str(),
+                100.0 * share(cmp[q].misses[0], cmp[q].picks[0]), cmp[q].picks[0],
+                100.0 * share(cmp[q].misses[1], cmp[q].picks[1]), cmp[q].picks[1]);
   for (size_t s = 0; s < streams.size() && args.generate > 0; s++) {
     std::printf("prompt %zu %s generated", streams[s].prompt, name_of(streams[s].arithmetic).c_str());
     for (int32_t t : generated[s]) std::printf(" %d", t);
@@ -882,14 +954,15 @@ int main(int argc, char** argv) {
     for (size_t q = 0; q < P; q++) {
       const auto& c = cmp[q];
       r << (q ? "," : "") << "\"" << name_of(args.arithmetics[q]) << "\":{\"perplexity\":" << perplexity(c)
-        << ",\"scored\":" << c.scored;
+        << ",\"scored\":" << c.scored << ",\"cache_picks\":[" << c.picks[0] << "," << c.picks[1]
+        << "],\"cache_misses\":[" << c.misses[0] << "," << c.misses[1] << "]";
       if (q > 0)
         r << ",\"kl_mean\":" << mean_of(c.kl) << ",\"kl_median\":" << quantile(c.kl, 0.5) << ",\"kl_p90\":" << quantile(c.kl, 0.9)
           << ",\"kl_max\":" << quantile(c.kl, 1.0) << ",\"top1_agree\":" << c.agree << ",\"positions\":" << c.kl.size()
           << ",\"routes\":" << c.routes << ",\"routes_differing\":" << c.routes_differing;
       r << "}";
     }
-    r << "},\"route_margins\":[";
+    r << "},\"cache_slots\":" << args.slots << ",\"cache_warm\":" << args.warm << ",\"route_margins\":[";
     for (size_t i = 0; i < margins.size(); i++) r << (i ? "," : "") << margins[i];
     r << "],\"selections\":" << selections << ",\"selections_dropping\":" << dropping
       << ",\"seconds\":" << seconds_since(t0) << "}\n";

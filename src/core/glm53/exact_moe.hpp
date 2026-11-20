@@ -114,11 +114,25 @@ Result<ExpertInput, MoeError> expert_input(std::span<const float> ffn_in);
 Result<std::vector<float>, MoeError> router_logits(const Matrix& router, std::span<const float> ffn_in);
 
 /**
+ * Cache-conditional routing (approximate; off unless given): a resident
+ * Expert's selection score gains `bonus`, as DS4.1's router adds it
+ * ((sigmoid + bias) + bonus, FP32). Only the choice changes: the weights stay
+ * the chosen sigmoids' (see top), and the margin is taken on the scores with
+ * the bonus. Not part of the Reference configuration: a stream that uses it is
+ * no longer bit-comparable to `exact`.
+ */
+struct ResidentBonus {
+  float bonus;                        // finite, > 0
+  std::span<const uint8_t> resident;  // [experts], 1 where resident (glm53::LayerExpertCache::resident)
+};
+
+/**
  * The Route from router logits (see top): experts ascending, their weights,
  * and the margin (worst chosen biased score minus best unchosen one), each an
- * FP32 operation in the stated order.
+ * FP32 operation in the stated order. With `bonus`, cache-conditional (above).
  */
-Result<Route, MoeError> route(const Dims& d, std::span<const float> logits, std::span<const float> bias);
+Result<Route, MoeError> route(const Dims& d, std::span<const float> logits, std::span<const float> bias,
+                              std::optional<ResidentBonus> bonus = std::nullopt);
 
 /**
  * Half `half`'s hidden activations for one token: what GPU `half` holds
@@ -163,7 +177,8 @@ struct MoeStart {
  * every token, runs each routed Expert's expert_halves at the token's weight
  * for its slot, and finishes each with finish_moe.
  */
-Result<MoeStart, MoeError> begin_moe(const Dims& d, const MoeLayer& layer, std::span<const float> ffn_in);
+Result<MoeStart, MoeError> begin_moe(const Dims& d, const MoeLayer& layer, std::span<const float> ffn_in,
+                                     std::optional<ResidentBonus> bonus = std::nullopt);
 
 /**
  * What runs after: the shared expert's Halves (weight 1) and the combine of
