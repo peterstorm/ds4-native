@@ -17,7 +17,8 @@ the plan (settled decision 3: "15–25 tok/s exact, 30–50 with cache-condition
    residency, so ~5 tok/s exact**, not 15–25. GLM's routing is far less local than DS4.1's. The
    lever that can change this is cache-conditional routing (§4), not arithmetic. **Measured
    too** (`docs/bench/glm53-cc/2026-11-20-cc-report.md`): λ 0.03 ~10 tok/s at KL 0.068, λ 0.1
-   ~23 tok/s at KL 0.124, against a 0.045 floor any rounding-only change costs.
+   ~23 tok/s at KL 0.124, λ 0.15 ~34 tok/s at KL 0.161, against a 0.045 floor any
+   rounding-only change costs; the knee is past λ 0.15.
 3. **Prefill touches most of the store even for short prompts** (measured: 168 of 256 Experts
    per layer for 64 tokens). Time-to-first-token is NVMe-bound at **≈ 5–10 s per turn**
    (est.), almost regardless of message length. That is the user-visible cost to plan for.

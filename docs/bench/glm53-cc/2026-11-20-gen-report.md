@@ -60,8 +60,8 @@ top-1 (`../glm53-chat/2026-11-20-chat-report.md`).
 ## What this does not show
 
 - **Task quality at scale:** 3 prompts × 64 tokens is a reading, not a benchmark.
-- **Where exactly the knee is between 0.1 and 0.2:** the second half of the run (λ 0.05 / 0.07 /
-  0.15 / 0.2 on the corpus, `/tmp/glm53-kl/cc2/`) measures it.
+- **Where exactly the knee is:** measured since on the corpus (λ 0.05 / 0.07 / 0.15 / 0.2,
+  `2026-11-20-cc-report.md`): KL grows about linearly to λ 0.15 and steepens at 0.2.
 - **tok/s for this run:** the replay table needs a warm cache across sessions; these sessions
   are too short. The decode miss rates above are the comparable number.
 

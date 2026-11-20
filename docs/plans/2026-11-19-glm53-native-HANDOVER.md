@@ -15,8 +15,9 @@ DeepSeek-V4.1. Target weights: `kitaniai/GLM-5.3-UNCENSORED-MXFP4` (v2 CRACK sur
 backbone differs (124 residual-writer tensors; Backbone B built 2026-11-20). **Speed, measured
 2026-11-20: ~5 tok/s exact** (GLM misses ~29% of Expert picks at the ~33% VRAM residency two
 cards allow; the plan's 15–25 assumed DS4.1's locality). **Cache-conditional routing, measured
-on the oracle:** λ 0.03 ~10 tok/s (KL 0.068), λ 0.1 **~23 tok/s** (KL 0.124), against a 0.045 KL
-floor; Expert pruning (SLIM-E192) is dominated. A quality/architecture play; Phase 5's measured
+on the oracle:** λ 0.03 ~10 tok/s (KL 0.068), λ 0.1 **~23 tok/s** (KL 0.124), λ 0.15 ~34
+(KL 0.161), against a 0.045 KL floor; the knee is past λ 0.15; free generation holds to λ 0.2.
+Expert pruning (SLIM-E192) is dominated. A quality/architecture play; Phase 5's measured
 CyberGym verdict decides keep/archive.
 
 ## Where things stand (2026-11-19 ~23:55, second session)
@@ -37,7 +38,7 @@ CyberGym verdict decides keep/archive.
 | **First chat answers (Backbone A)** | receipts + report `docs/bench/glm53-chat/2026-11-20-*` | 3 chat prompts (kitaniai's template, effort Low, no thinking), 64 greedy tokens, `fp32` and `exact` (GPU): coherent, correct, uncensored on the lock-picking probe; turn ends with EOS `<|user|>`; `exact` = `fp32` for 45–47 tokens, then near-ties diverge. 6,528 s (~14 s per token per stream; CPU reference). KL on chat positions 0.043 vs 0.009 on plain text: open question |
 | **Backbone B (cyber) built** | `tools/glm53-store/{fetch-cyber-delta,kitani_recipe}.py`; `/models/glm53-store/backbone-cyber` (+ `VARIANT.json`); receipts + report `docs/bench/glm53-backbone-b/` | 69 shards fetched and sha256-checked against LFS, 248 target tensors kept (7.0 GiB, `/models/glm53-native/dealignai-cyber/delta`). kitaniai's Quark recipe restated and proven **bit-exact on 29 unedited weights** (FP8 recovery to BF16; MXFP4 from the FP32 dequantization with Quark's "even" scale). Built as a reflink of A with the 124 targets in whole ZFS records, every byte re-read: 12.9 GiB. The first build's re-read caught a lost partial-record update on a cloned block (ZFS 2.4.4); fixed by record-aligned writes. **Runs:** 3 chat prompts, 24 tokens, coherent (1,794 s) |
 | **GLM Expert locality measured** | `oracle-run --routes`, `tools/glm53-golden/expert_locality.py`; receipts + report `docs/bench/glm53-locality/` | 2,800-position corpus (4 sessions, teacher-forced) + the chat test's decode: **~29% misses at 33% residency** (DS4.1's policy; LRU the same; Belady 12.8%; static 37.6%), 16% at 50%, 11% at 60% → ~5.4 tok/s with the RAM tier. 19,162 of 19,200 Experts used in 2,800 tokens. Plan settled decision 3 corrected |
-| **Cache-conditional routing measured** | `exact::RouteChoice` (bonus, kept mask), `glm53::LayerExpertCache`, oracle `exact[-pruned][-ccλ]`, `tools/glm53-golden/route_choice_table.py`; reports `docs/bench/glm53-cc/`, `docs/bench/glm53-slim/` | 2,800 positions, baseline exact, 84 Slots per layer. KL floor 0.045 (control `exact-fp32-exchange`). λ 0.03: misses 15.1%, ~10.2 tok/s, KL 0.068. λ 0.1: 6.7%, ~23.1 tok/s, KL 0.124. |
+| **Cache-conditional routing measured** | `exact::RouteChoice` (bonus, kept mask), `glm53::LayerExpertCache`, oracle `exact[-pruned][-ccλ]`, `tools/glm53-golden/route_choice_table.py`; reports `docs/bench/glm53-cc/`, `docs/bench/glm53-slim/` | 2,800 positions, baseline exact, 84 Slots per layer. KL floor 0.045 (control `exact-fp32-exchange`). λ 0.03: misses 15.1%, ~10.2 tok/s, KL 0.068. λ 0.1: 6.7%, ~23.1 tok/s, KL 0.124. λ 0.15: 4.3%, ~33.8, KL 0.161; λ 0.2: 3.1%, ~44.9, KL 0.228 (knee). Free generation at λ 0.03/0.1/0.2: correct answers. |
 | **SLIM-E192 kept Experts recovered; pruning dominated** | `tools/glm53-store/slim_kept_experts.py`, `core/glm53/pruning`; `docs/bench/glm53-slim/2026-11-20-slim-e192-kept.json` | 75 layers unique, 14,400 router rows bit-identical to ours. Pruned: KL 0.188 for 8.1 tok/s; + λ 0.03: KL 0.196, 16.3 tok/s. Worse on both axes than λ 0.1. |
 | **Converter safety fix** | same branch, `24b9a6a` | the deletable list could have listed MTP and unconverted shards; now it lists only verified, fully consumed shards and has a free-space preflight. Checked on real layer 10 (RAM tmpfs) |
 | Indexer reference pinning (old step 5) | `ref/glm-5.3/README.md` | **decided: transformers 5.16.0** |
@@ -164,12 +165,10 @@ An independent audit (python, read-only, against the index) found:
    prompts answer coherently. The cyber delta source (7.0 GiB,
    `/models/glm53-native/dealignai-cyber/delta`) may be deleted at the operator's word; it can be
    re-fetched from the pinned plan. rpool: 19.2 GiB free.
-6a. **Speed question: answered on proxies 2026-11-20** (Done table): λ 0.1 ~23 tok/s est. at
-   KL 0.124. **Running/queued** (`docs/bench/glm53-cc/2026-11-20-gen-run.sh`, desktop
-   `/tmp/glm53-kl/ccgen-run.sh`): free generation on the chat prompts at λ 0.03 / 0.1 / 0.2
-   (`/tmp/glm53-kl/ccgen/`, decode with its `decode.py`), then λ 0.05 / 0.07 / 0.15 / 0.2 on the
-   corpus (`/tmp/glm53-kl/cc2/`). Record both (`route_choice_table.py REPORT ROUTES` for the
-   table), then choose λ with the operator. The engine's router already has DS4.1's bonus
+6a. **Speed question: answered 2026-11-20** (Done table; `docs/bench/glm53-cc/`): the full λ
+   curve 0.001–0.2, the KL floor, free generation at λ 0.03 / 0.1 / 0.2. Recommended λ 0.1
+   (~23 tok/s est.), 0.05 conservative. **Operator's call:** which λ to build for, and whether
+   that rate justifies the attention port (weeks). The engine's router already has DS4.1's bonus
    (`cuda/moe.cu`); GLM needs it in its own router kernel plus the host's one-table rule.
 7. Phases 4–5 per the plan (fifth switch-primary entry `glm-native`, slots ladder, CyberGym).
 
