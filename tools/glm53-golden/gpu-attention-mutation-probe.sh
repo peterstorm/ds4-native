@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Mutation probe for GLM-5.3's GPU attention kernels (src/cuda/glm53/attention.cu,
-# src/cuda/glm53/indexer.cu):
+# src/cuda/glm53/indexer.cu) and, given a Backbone, the layer executor
+# (src/cuda/glm53/attention_layer.cu: Rounds on real layers):
 # applies one plausible kernel mistake at a time, rebuilds ds4n-glm53-attn-check,
 # and runs it. Every mutation must make the check FAIL: a gate that passes
 # whatever the kernels do proves nothing. Most mutations change bits only (a
@@ -17,11 +18,13 @@
 #
 # Run from the repo root inside the dev image on a GPU, after a CUDA build in build-cuda:
 #   docker run --rm --gpus device=1 -v $PWD:/src -w /src ds4-native-dev:2 \
-#     bash tools/glm53-golden/gpu-attention-mutation-probe.sh
+#     bash tools/glm53-golden/gpu-attention-mutation-probe.sh [BACKBONE_DIR]
+# Without BACKBONE_DIR the executor's probes are skipped (and said so).
 # It edits and rebuilds the tree it runs in: give it a copy no other run is reading.
 set -u
 cd "$(dirname "$0")/../.."
-files=(src/cuda/glm53/attention.cu src/cuda/glm53/indexer.cu)
+backbone=${1:-}
+files=(src/cuda/glm53/attention.cu src/cuda/glm53/indexer.cu src/cuda/glm53/attention_layer.cu)
 src=${files[0]}  # the file `probe` mutates: set by `mutate_in`
 tmp=$(mktemp -d)
 for f in "${files[@]}"; do cp "$f" "$tmp/$(basename "$f")"; done
@@ -31,7 +34,14 @@ mutate_in() { src="$1"; }
 finish() { restore; cmake --build build-cuda --target ds4n-glm53-attn-check -j "$(nproc)" >/dev/null 2>&1; }
 trap finish EXIT
 
-check() { ./build-cuda/ds4n-glm53-attn-check --config ref/glm-5.3/config.json --iters 0; }
+layers=""  # set: the check runs whole layers on $backbone too
+check() {
+  if [ -n "$layers" ]; then
+    ./build-cuda/ds4n-glm53-attn-check --config ref/glm-5.3/config.json --iters 0 --backbone "$backbone"
+  else
+    ./build-cuda/ds4n-glm53-attn-check --config ref/glm-5.3/config.json --iters 0
+  fi
+}
 
 unexpected=0
 probe() {
@@ -126,5 +136,29 @@ probe select-signed-zero "const unsigned bits = v == 0.0f ? 0u : __float_as_uint
 probe select-16-bit      "for (int pass = 0; pass < 4; pass++) {" "for (int pass = 0; pass < 2; pass++) {"
 probe select-take-one-more "take_equal = want - above_prefix;" "take_equal = want - above_prefix + 1;"
 probe select-sign-order  "return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);" "return bits ^ 0x80000000u;"
+# A Round's rows: each sees its own prefix, written at its own output stride.
+probe select-one-length  "const int n = lengths.n[blockIdx.x];" "const int n = lengths.n[0];"
+probe select-out-stride  "out += static_cast<size_t>(blockIdx.x) * out_stride;" "out += static_cast<size_t>(blockIdx.x) * k;"
+
+# The executor, Rounds on real layers (each probe ~2 minutes).
+if [ -z "$backbone" ]; then
+  echo "executor probes: skipped (no BACKBONE_DIR)"
+  exit $unexpected
+fi
+layers=1
+restore  # the last probe's mutant is still built: rebuild from the restored source
+cmake --build build-cuda --target ds4n-glm53-attn-check -j "$(nproc)" >/dev/null 2>&1
+if check >/dev/null 2>&1; then echo "baseline with layers: PASS"; else echo "baseline with layers: FAILS"; exit 1; fi
+mutate_in src/cuda/glm53/attention.cu
+probe iota-short         "out[i] = j <= positions[t] ? j : -1;" "out[i] = j < positions[t] ? j : -1;"
+mutate_in src/cuda/glm53/attention_layer.cu
+probe round-sees-later   "lengths.n[t] = static_cast<int>(first) + t + 1;" "lengths.n[t] = seen_last;"
+probe latent-row-stride  "rmsnorm(ckv_.get(), kKeyWidth, kv_a_norm_.get()," "rmsnorm(ckv_.get(), kLatent, kv_a_norm_.get(),"
+probe k-rope-first-only  "kKeyWidth * sizeof(__nv_bfloat16), kKeyRope * sizeof(__nv_bfloat16), tokens," \
+                         "kKeyWidth * sizeof(__nv_bfloat16), kKeyRope * sizeof(__nv_bfloat16), 1,"
+probe dense-half-pitch   "inter_ * sizeof(float), half * sizeof(float), tokens, cudaMemcpyDeviceToDevice, s);" \
+                         "half * sizeof(float), half * sizeof(float), tokens, cudaMemcpyDeviceToDevice, s);"
+probe head-out-stride    "kLatent, ctx_.get(), kLatent, tokens, heads_.get(), kVHead, s);" \
+                         "kLatent, ctx_.get(), kLatent, 1, heads_.get(), kVHead, s);"
 
 exit $unexpected

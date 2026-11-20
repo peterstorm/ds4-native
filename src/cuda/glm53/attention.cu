@@ -46,10 +46,11 @@ __device__ __forceinline__ float value_of(float v) { return v; }
 __device__ __forceinline__ float value_of(__nv_bfloat16 v) { return __bfloat162float(v); }
 
 template <class In>
-__global__ void __launch_bounds__(kNormThreads) rmsnorm_kernel(const In* __restrict__ x, const float* __restrict__ w,
-                                                              int dim, float eps, __nv_bfloat16* __restrict__ out) {
+__global__ void __launch_bounds__(kNormThreads) rmsnorm_kernel(const In* __restrict__ x, int x_stride,
+                                                              const float* __restrict__ w, int dim, float eps,
+                                                              __nv_bfloat16* __restrict__ out, int out_stride) {
   __shared__ float part[kNormThreads];
-  const In* row = x + static_cast<size_t>(blockIdx.x) * dim;
+  const In* row = x + static_cast<size_t>(blockIdx.x) * x_stride;
   float sq = 0.0f;
   for (int i = threadIdx.x; i < dim; i += kNormThreads) {
     const float v = value_of(row[i]);
@@ -63,7 +64,7 @@ __global__ void __launch_bounds__(kNormThreads) rmsnorm_kernel(const In* __restr
   }
   const float r = det::rsqrt(__fadd_rn(__fdiv_rn(part[0], static_cast<float>(dim)), eps));
   for (int i = threadIdx.x; i < dim; i += kNormThreads)
-    out[static_cast<size_t>(blockIdx.x) * dim + i] = __float2bfloat16_rn(__fmul_rn(w[i], __fmul_rn(value_of(row[i]), r)));
+    out[static_cast<size_t>(blockIdx.x) * out_stride + i] = __float2bfloat16_rn(__fmul_rn(w[i], __fmul_rn(value_of(row[i]), r)));
 }
 
 /** One warp per (token, head): lane i rotates pair i, reading both values before any lane writes. */
@@ -108,6 +109,14 @@ __global__ void index_key_norm_kernel(__nv_bfloat16* __restrict__ keys, const fl
     const int i = lane + 32 * j;
     k[i] = __float2bfloat16_rn(__fadd_rn(__fmul_rn(__fmul_rn(__fsub_rn(x[j], mean), r), weight[i]), bias[i]));
   }
+}
+
+__global__ void all_positions_kernel(const int64_t* __restrict__ positions, int rows, int stride,
+                                     int32_t* __restrict__ out) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= rows * stride) return;
+  const int t = i / stride, j = i % stride;
+  out[i] = j <= positions[t] ? j : -1;
 }
 
 __global__ void index_head_weights_kernel(const __nv_bfloat16* __restrict__ projected, int n, float scale,
@@ -316,12 +325,22 @@ void absorbed_queries(const __nv_bfloat16* q, const __nv_bfloat16* wk_t, int row
 }
 
 void rmsnorm(const float* x, const float* w, int dim, int tokens, float eps, __nv_bfloat16* out, cudaStream_t stream) {
-  rmsnorm_kernel<float><<<tokens, kNormThreads, 0, stream>>>(x, w, dim, eps, out);
+  rmsnorm_kernel<float><<<tokens, kNormThreads, 0, stream>>>(x, dim, w, dim, eps, out, dim);
 }
 
 void rmsnorm(const __nv_bfloat16* x, const float* w, int dim, int tokens, float eps, __nv_bfloat16* out,
              cudaStream_t stream) {
-  rmsnorm_kernel<__nv_bfloat16><<<tokens, kNormThreads, 0, stream>>>(x, w, dim, eps, out);
+  rmsnorm(x, dim, w, dim, tokens, eps, out, dim, stream);
+}
+
+void rmsnorm(const __nv_bfloat16* x, int x_stride, const float* w, int dim, int tokens, float eps, __nv_bfloat16* out,
+             int out_stride, cudaStream_t stream) {
+  rmsnorm_kernel<__nv_bfloat16><<<tokens, kNormThreads, 0, stream>>>(x, x_stride, w, dim, eps, out, out_stride);
+}
+
+void all_positions(const int64_t* positions, int rows, int stride, int32_t* out, cudaStream_t stream) {
+  const int n = rows * stride;
+  all_positions_kernel<<<(n + 255) / 256, 256, 0, stream>>>(positions, rows, stride, out);
 }
 
 void rope(__nv_bfloat16* x, int tokens, int heads, size_t token_stride, int head_stride, int offset,

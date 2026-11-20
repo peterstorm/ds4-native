@@ -80,6 +80,15 @@ struct LatentScratch {
 void rmsnorm(const float* x, const float* w, int dim, int tokens, float eps, __nv_bfloat16* out, cudaStream_t stream);
 void rmsnorm(const __nv_bfloat16* x, const float* w, int dim, int tokens, float eps, __nv_bfloat16* out,
              cudaStream_t stream);
+/** The same with row strides: token t at x + t * x_stride, out + t * out_stride (a latent inside kv_a's rows). */
+void rmsnorm(const __nv_bfloat16* x, int x_stride, const float* w, int dim, int tokens, float eps, __nv_bfloat16* out,
+             int out_stride, cudaStream_t stream);
+
+/**
+ * The Selection of a token that sees no more than index_topk positions: every one. Row t of
+ * `out` ([rows][stride]) = 0 .. positions[t], then -1 to the stride.
+ */
+void all_positions(const int64_t* positions, int rows, int stride, int32_t* out, cudaStream_t stream);
 
 /**
  * exact::rope in place on kKeyRope values of each of `heads` heads per token: token t's head h at

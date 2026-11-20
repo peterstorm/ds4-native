@@ -31,16 +31,23 @@
 //   select_top         on those scores and on built ones (heavy ties, zeros and
 //                      negative values, n around k, 100,000 positions) against
 //                      glm53::top_k;
+//   select Round       8 rows each seeing its own prefix (lengths first + t + 1)
+//                      across index_topk, into a wider output stride: each row
+//                      against glm53::top_k, nothing written past its entries;
 //   refusals           latent_attention: n outside 1..2048, rows outside 1..8,
-//                      stride < n; select_top: n, k or rows out of range.
+//                      stride < n; select_top: n, k or rows out of range, a
+//                      row's length 0 or past the stride.
 // With --backbone, whole layers on real weights too (cuda/glm53/attention_layer):
 // a Dense layer, a Sparse Full layer, a Shared layer and the last layer, each
-// at positions 0, 1, 100, 2047, 2048 (the first the indexer selects for) and
-// 3000 over a random past cache, both GPUs' shares run on this GPU and
-// exchanged: each GPU's o_proj partial (FP32), the cache row, the index key and
-// the Selection against exact::attend; mid and ffn_in against
-// exact::begin_layer; the Dense MLP's partials and output against
-// exact::dense_mlp; and the head's logits against exact::logits.
+// over a random past cache in Rounds: decode tokens at 0, 2047 and 2048 (the
+// first the indexer selects for), and Rounds of 8 at 1, 100, 2044 (crossing
+// index_topk inside the Round) and the cache's end. Both GPUs' shares run on
+// this GPU and are exchanged. The oracle decodes each Round's tokens one by one,
+// each attending the earlier ones' rows: per token, each GPU's o_proj partial
+// (FP32), the cache row, the index key and the Selection against exact::attend;
+// mid and ffn_in against exact::begin_layer; the Dense MLP's partials and output
+// against exact::dense_mlp; and the head's logits (a Round of 2) against
+// exact::logits.
 // Any difference exits 1. --iters times one decode token (rows 1, n 2048) and a
 // Round of 8 (default 50).
 #include <cuda_bf16.h>
@@ -393,6 +400,43 @@ bool check_select(const char* name, const std::vector<float>& scores, int n, int
   return bad == 0;
 }
 
+/**
+ * A Round's Selections as DeviceAttention makes them: 8 rows over one score table, row t seeing its
+ * own prefix (lengths `first + t + 1`), written into rows of a wider stride. Each row against
+ * glm53::top_k of its prefix, and nothing written past its min(k, n_t) entries.
+ */
+bool check_select_round(std::mt19937& rng, int first, int k) {
+  constexpr int kRows = gpu::kMaxIndexRows, kOutStride = gpu::kMaxSelection + 64;
+  const int stride = first + kRows;
+  std::normal_distribution<float> normal(0.0f, 1.0f);
+  std::vector<float> scores(static_cast<size_t>(kRows) * stride);
+  for (auto& v : scores) v = mx::round_bf16(normal(rng));  // BF16 values: ties across positions
+  gpu::RowLengths lengths{};
+  for (int t = 0; t < kRows; t++) lengths.n[t] = first + t + 1;
+  auto* d_scores = upload(scores);
+  std::vector<int32_t> sentinel(static_cast<size_t>(kRows) * kOutStride, -7);
+  auto* d_out = upload(sentinel);
+  ck(gpu::select_top(d_scores, stride, lengths, k, kRows, d_out, kOutStride, nullptr), "select_top");
+  ck(cudaDeviceSynchronize(), "select_top");
+  const auto got = download(d_out, sentinel.size());
+  size_t bad = 0;
+  for (int t = 0; t < kRows; t++) {
+    const auto want =
+        glm53::top_k(std::span<const float>(scores).subspan(static_cast<size_t>(t) * stride, lengths.n[t]), k);
+    const int32_t* row = got.data() + static_cast<size_t>(t) * kOutStride;
+    for (size_t j = 0; j < want.size(); j++)
+      if (row[j] != want[j] && bad++ < 4)
+        std::fprintf(stderr, "  select Round row %d entry %zu: GPU %d, oracle %d\n", t, j, row[j], want[j]);
+    for (size_t j = want.size(); j < kOutStride; j++)
+      if (row[j] != -7 && bad++ < 4) std::fprintf(stderr, "  select Round row %d: wrote past its entries at %zu\n", t, j);
+  }
+  std::printf("select_top Round of %d over %d .. %d positions, k %d: %zu entries differ\n", kRows, first + 1,
+              first + kRows, k, bad);
+  cudaFree(d_scores);
+  cudaFree(d_out);
+  return bad == 0;
+}
+
 /** index_scores for `rows` rows over n positions against exact::index_scores, then their Selections. */
 bool check_index(std::mt19937& rng, const glm53::Dims& d, int rows, int n) {
   const auto q = random_bf16(rng, static_cast<size_t>(rows) * gpu::kIndexHeads * gpu::kIndexHeadDim, 1.0f);
@@ -481,6 +525,18 @@ bool check_refusals() {
   select_refused("n 0", 0, 2048, 1);
   select_refused("k 0", 100, 0, 1);
   select_refused("rows 9", 100, 2048, gpu::kMaxIndexRows + 1);
+  auto lengths_refused = [&](const char* what, int bad_length) {
+    gpu::RowLengths lengths{};
+    for (int& v : lengths.n) v = 100;
+    lengths.n[3] = bad_length;
+    const cudaError_t e = gpu::select_top(nullptr, 100, lengths, 2048, gpu::kMaxIndexRows, nullptr, 2048, nullptr);
+    if (e != cudaErrorInvalidValue) {
+      std::fprintf(stderr, "  select %s: not refused (%s)\n", what, cudaGetErrorString(e));
+      ok = false;
+    }
+  };
+  lengths_refused("a row's n 0", 0);
+  lengths_refused("a row's n past the stride", 101);
   cudaGetLastError();
   std::printf("refusals: %s\n", ok ? "all refused" : "FAILED");
   return ok;
@@ -582,7 +638,10 @@ std::vector<float> random_residual(std::mt19937& rng, int n) {
   return x;
 }
 
-/** One layer at several positions: both GPUs' shares against exact::attend / begin_layer / dense_mlp. */
+/**
+ * One layer's Rounds: both GPUs' shares against exact::attend / begin_layer / dense_mlp run token by
+ * token, each token attending the Round's earlier rows, as decoding them one at a time would.
+ */
 bool check_layer(const glm53::Config& config, const io::BackboneParts& parts, int L, std::mt19937& rng) {
   const glm53::Dims& d = config.dims();
   const auto weights = parts.load_layer(L, 16);
@@ -607,72 +666,119 @@ bool check_layer(const glm53::Config& config, const io::BackboneParts& parts, in
     }
   }
   const size_t H = static_cast<size_t>(d.hidden);
-  auto* d_x = device_alloc<float>(H);
-  std::array<float*, 2> d_partial{device_alloc<float>(H), device_alloc<float>(H)};
-  auto* d_out = device_alloc<__nv_bfloat16>(H);
-  auto* d_mid = device_alloc<float>(H);
-  auto* d_ffn = device_alloc<__nv_bfloat16>(H);
-  auto* d_shared = device_alloc<int32_t>(gpu::kMaxSelection);
+  constexpr size_t R = gpu::kMaxRound;
+  auto* d_x = device_alloc<float>(R * H);
+  std::array<float*, 2> d_partial{device_alloc<float>(R * H), device_alloc<float>(R * H)};
+  auto* d_out = device_alloc<__nv_bfloat16>(R * H);
+  auto* d_mid = device_alloc<float>(R * H);
+  auto* d_ffn = device_alloc<__nv_bfloat16>(R * H);
+  auto* d_shared = device_alloc<int32_t>(R * gpu::kMaxSelection);
   size_t bad = 0;
-  for (const int64_t pos : {int64_t{0}, int64_t{1}, int64_t{100}, int64_t{2047}, int64_t{2048}, int64_t{3000}}) {
-    const auto past = random_past(rng, pos, full);
-    const auto x = random_residual(rng, d.hidden);
-    std::vector<int32_t> shared;
-    if (!full) {
-      std::vector<int32_t> all(static_cast<size_t>(pos) + 1);
-      std::iota(all.begin(), all.end(), 0);
-      std::shuffle(all.begin(), all.end(), rng);
-      all.resize(std::min<size_t>(all.size(), gpu::kMaxSelection));
-      std::sort(all.begin(), all.end());
-      shared = all;
+  // Rounds (first position, tokens): decode at the edges, and Rounds of 8 that start in the cache,
+  // cross index_topk (rows 0-3 keep every position, rows 4-7 select) and end at the capacity.
+  const std::array<std::pair<int64_t, int>, 7> rounds{
+      {{0, 1}, {1, 8}, {100, 8}, {2047, 1}, {2044, 8}, {2048, 1}, {kCapacity - 8, 8}}};
+  for (const auto& [first, tokens] : rounds) {
+    // The oracle decodes the Round's tokens one by one, each attending the rows of those before it.
+    auto past = random_past(rng, first, full);
+    const auto loaded = past;
+    std::vector<float> xs;
+    std::vector<exact::Attention> want;
+    std::vector<glm53::LayerStart> starts;
+    gpu::Selections shared{d_shared, gpu::kMaxSelection, {}};
+    std::vector<int32_t> shared_rows(R * gpu::kMaxSelection, -1);
+    for (int t = 0; t < tokens; t++) {
+      const int64_t pos = first + t;
+      const auto x = random_residual(rng, d.hidden);
+      xs.insert(xs.end(), x.begin(), x.end());
+      std::vector<int32_t> sel;
+      if (!full) {
+        sel.resize(static_cast<size_t>(pos) + 1);
+        std::iota(sel.begin(), sel.end(), 0);
+        std::shuffle(sel.begin(), sel.end(), rng);
+        sel.resize(std::min<size_t>(sel.size(), gpu::kMaxSelection));
+        std::sort(sel.begin(), sel.end());
+        std::copy(sel.begin(), sel.end(), shared_rows.begin() + static_cast<ptrdiff_t>(t) * gpu::kMaxSelection);
+        shared.lengths.push_back(static_cast<int>(sel.size()));
+      }
+      const auto h = hc::rmsnorm(x, bound.value().input_norm, d.rms_eps);
+      auto w = exact::attend(a.value(), past, h, sel);
+      if (!w) die(w.error().what);
+      auto st = exact::begin_layer(a.value(), past, x, sel);
+      if (!st) die(st.error().what);
+      const auto& row = w.value().row;
+      past.latent.insert(past.latent.end(), row.latent.begin(), row.latent.end());
+      past.k_rope.insert(past.k_rope.end(), row.k_rope.begin(), row.k_rope.end());
+      past.index_keys.insert(past.index_keys.end(), row.index_key.begin(), row.index_key.end());
+      past.length++;
+      want.push_back(std::move(w).value());
+      starts.push_back(std::move(st).value());
     }
-    const auto h = hc::rmsnorm(x, bound.value().input_norm, d.rms_eps);
-    const auto want = exact::attend(a.value(), past, h, shared);
-    if (!want) die(want.error().what);
-    const auto start = exact::begin_layer(a.value(), past, x, shared);
-    if (!start) die(start.error().what);
-    ck(cudaMemcpy(d_x, x.data(), H * sizeof(float), cudaMemcpyHostToDevice), "x");
-    if (!shared.empty())
-      ck(cudaMemcpy(d_shared, shared.data(), shared.size() * sizeof(int32_t), cudaMemcpyHostToDevice), "shared");
+    ck(cudaMemcpy(d_x, xs.data(), xs.size() * sizeof(float), cudaMemcpyHostToDevice), "x");
+    if (!full)
+      ck(cudaMemcpy(d_shared, shared_rows.data(), shared_rows.size() * sizeof(int32_t), cudaMemcpyHostToDevice),
+         "shared");
     size_t here = 0;
+    const auto token_of = [&](const std::vector<float>& all, int t) {
+      return std::vector<float>(all.begin() + static_cast<ptrdiff_t>(t) * d.hidden,
+                                all.begin() + static_cast<ptrdiff_t>(t + 1) * d.hidden);
+    };
     for (int g = 0; g < 2; g++) {
-      if (auto r = share[g].load_cache(past); !r) die(r.error());
-      const auto n = share[g].attend(d_x, pos, d_shared, static_cast<int>(shared.size()), d_partial[g], nullptr);
-      if (!n) die(n.error());
+      if (auto r = share[g].load_cache(loaded); !r) die(r.error());
+      const auto sel = share[g].attend(d_x, tokens, first, full ? nullptr : &shared, d_partial[g], nullptr);
+      if (!sel) die(sel.error());
       ck(cudaDeviceSynchronize(), "attend");
-      here += compare_bits<float>("partial", want.value().o.partial[g], download(d_partial[g], H));
-      const auto row = as_float(download(share[g].cache_row(pos), gpu::kKeyWidth));
-      here += compare_bits<float>("latent", want.value().row.latent, {row.begin(), row.begin() + gpu::kLatent});
-      here += compare_bits<float>("k_rope", want.value().row.k_rope, {row.begin() + gpu::kLatent, row.end()});
-      if (full)
-        here += compare_bits<float>("index key", want.value().row.index_key,
-                                    as_float(download(share[g].index_key(pos), gpu::kIndexHeadDim)));
-      const auto sel = download(share[g].selection(), static_cast<size_t>(n.value()));
-      if (sel != want.value().selection) {
-        here++;
-        std::fprintf(stderr, "  layer %d position %lld: the Selection differs (%d vs %zu entries)\n", L,
-                     static_cast<long long>(pos), n.value(), want.value().selection.size());
+      const auto partial = download(d_partial[g], static_cast<size_t>(tokens) * H);
+      for (int t = 0; t < tokens; t++) {
+        const auto& w = want[static_cast<size_t>(t)];
+        here += compare_bits<float>("partial", w.o.partial[g], token_of(partial, t));
+        const auto row = as_float(download(share[g].cache_row(first + t), gpu::kKeyWidth));
+        here += compare_bits<float>("latent", w.row.latent, {row.begin(), row.begin() + gpu::kLatent});
+        here += compare_bits<float>("k_rope", w.row.k_rope, {row.begin() + gpu::kLatent, row.end()});
+        if (full)
+          here += compare_bits<float>("index key", w.row.index_key,
+                                      as_float(download(share[g].index_key(first + t), gpu::kIndexHeadDim)));
+        const auto got = download(sel.value().rows + static_cast<size_t>(t) * sel.value().stride,
+                                  static_cast<size_t>(sel.value().lengths[static_cast<size_t>(t)]));
+        if (got != w.selection) {
+          here++;
+          std::fprintf(stderr, "  layer %d position %lld: the Selection differs (%zu vs %zu entries)\n", L,
+                       static_cast<long long>(first + t), got.size(), w.selection.size());
+        }
       }
     }
-    cuda::add_round_bf16(d_partial[0], d_partial[1], H, d_out, nullptr);
-    share[0].finish(d_x, d_out, d_mid, d_ffn, nullptr);
+    const size_t n = static_cast<size_t>(tokens) * H;
+    cuda::add_round_bf16(d_partial[0], d_partial[1], n, d_out, nullptr);
+    share[0].finish(d_x, d_out, tokens, d_mid, d_ffn, nullptr);
     ck(cudaDeviceSynchronize(), "finish");
-    here += compare_bits<float>("out", want.value().o.out, as_float(download(d_out, H)));
-    here += compare_bits<float>("mid", start.value().mid, download(d_mid, H));
-    here += compare_bits<float>("ffn_in", start.value().ffn_in, as_float(download(d_ffn, H)));
-    if (dense) {
-      const auto ffn = exact::dense_mlp(*dense, start.value().ffn_in);
-      if (!ffn) die(ffn.error().what);
-      for (int g = 0; g < 2; g++) {
-        mlp[g].run(d_ffn, d_partial[g], nullptr);
-        ck(cudaDeviceSynchronize(), "dense");
-        here += compare_bits<float>("dense partial", ffn.value().partial[g], download(d_partial[g], H));
-      }
-      cuda::add_round_bf16(d_partial[0], d_partial[1], H, d_out, nullptr);
-      here += compare_bits<float>("dense out", ffn.value().out, as_float(download(d_out, H)));
+    const auto out = as_float(download(d_out, n)), mid = download(d_mid, n), ffn = as_float(download(d_ffn, n));
+    for (int t = 0; t < tokens; t++) {
+      here += compare_bits<float>("out", want[static_cast<size_t>(t)].o.out, token_of(out, t));
+      here += compare_bits<float>("mid", starts[static_cast<size_t>(t)].mid, token_of(mid, t));
+      here += compare_bits<float>("ffn_in", starts[static_cast<size_t>(t)].ffn_in, token_of(ffn, t));
     }
-    std::printf("layer %2d (%s, %s) position %4lld: Selection %4zu, %zu differ\n", L, full ? "Full" : "Shared",
-                dense ? "Dense" : "Sparse", static_cast<long long>(pos), want.value().selection.size(), here);
+    if (dense) {
+      std::vector<exact::Exchanged> mlp_want;
+      for (int t = 0; t < tokens; t++) {
+        auto e = exact::dense_mlp(*dense, starts[static_cast<size_t>(t)].ffn_in);
+        if (!e) die(e.error().what);
+        mlp_want.push_back(std::move(e).value());
+      }
+      for (int g = 0; g < 2; g++) {
+        ck(mlp[g].run(d_ffn, tokens, d_partial[g], nullptr), "dense");
+        ck(cudaDeviceSynchronize(), "dense");
+        const auto partial = download(d_partial[g], n);
+        for (int t = 0; t < tokens; t++)
+          here += compare_bits<float>("dense partial", mlp_want[static_cast<size_t>(t)].partial[g], token_of(partial, t));
+      }
+      cuda::add_round_bf16(d_partial[0], d_partial[1], n, d_out, nullptr);
+      const auto dense_out = as_float(download(d_out, n));
+      for (int t = 0; t < tokens; t++)
+        here += compare_bits<float>("dense out", mlp_want[static_cast<size_t>(t)].out, token_of(dense_out, t));
+    }
+    std::printf("layer %2d (%s, %s) Round of %d at %4lld: Selections %4zu .. %4zu, %zu differ\n", L,
+                full ? "Full" : "Shared", dense ? "Dense" : "Sparse", tokens, static_cast<long long>(first),
+                want.front().selection.size(), want.back().selection.size(), here);
     bad += here;
   }
   for (void* p : {static_cast<void*>(d_x), static_cast<void*>(d_partial[0]), static_cast<void*>(d_partial[1]),
@@ -690,19 +796,28 @@ bool check_head(const glm53::Dims& d, const io::BackboneParts& parts, std::mt199
   const glm53::Matrix m{head.value().values, d.vocab, d.hidden};
   auto dev = gpu::DeviceHead::upload(d, norm.value().values, m);
   if (!dev) die(dev.error());
-  auto* d_x = device_alloc<float>(static_cast<size_t>(d.hidden));
-  auto* d_logits = device_alloc<float>(static_cast<size_t>(d.vocab));
-  size_t bad = 0;
-  for (int t = 0; t < 2; t++) {
-    const auto x = random_residual(rng, d.hidden);
-    ck(cudaMemcpy(d_x, x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice), "x");
-    dev.value().logits(d_x, d_logits, nullptr);
-    ck(cudaDeviceSynchronize(), "logits");
-    const auto want = exact::logits(d, norm.value().values, m, x);
-    if (!want) die(want.error().what);
-    bad += compare_bits<float>("logit", want.value(), download(d_logits, static_cast<size_t>(d.vocab)));
+  constexpr int kTokens = 2;
+  auto* d_x = device_alloc<float>(static_cast<size_t>(kTokens) * d.hidden);
+  auto* d_logits = device_alloc<float>(static_cast<size_t>(kTokens) * d.vocab);
+  std::vector<std::vector<float>> xs;
+  std::vector<float> all;
+  for (int t = 0; t < kTokens; t++) {
+    xs.push_back(random_residual(rng, d.hidden));
+    all.insert(all.end(), xs.back().begin(), xs.back().end());
   }
-  std::printf("head: 2 tokens x %d logits: %zu differ\n", d.vocab, bad);
+  ck(cudaMemcpy(d_x, all.data(), all.size() * sizeof(float), cudaMemcpyHostToDevice), "x");
+  dev.value().logits(d_x, kTokens, d_logits, nullptr);
+  ck(cudaDeviceSynchronize(), "logits");
+  const auto got = download(d_logits, static_cast<size_t>(kTokens) * d.vocab);
+  size_t bad = 0;
+  for (int t = 0; t < kTokens; t++) {
+    const auto want = exact::logits(d, norm.value().values, m, xs[static_cast<size_t>(t)]);
+    if (!want) die(want.error().what);
+    bad += compare_bits<float>("logit", want.value(),
+                               std::vector<float>(got.begin() + static_cast<ptrdiff_t>(t) * d.vocab,
+                                                  got.begin() + static_cast<ptrdiff_t>(t + 1) * d.vocab));
+  }
+  std::printf("head: a Round of 2 tokens x %d logits: %zu differ\n", d.vocab, bad);
   cudaFree(d_x);
   cudaFree(d_logits);
   return bad == 0;
@@ -762,6 +877,9 @@ int main(int argc, char** argv) {
   for (const auto& [rows, n] : std::vector<std::pair<int, int>>{{1, 1}, {1, 63}, {1, 64}, {1, 65}, {1, 2048}, {1, 5000},
                                                                {8, 3001}})
     ok = check_index(rng, d, rows, n) && ok;
+  ok = check_select_round(rng, 2040, gpu::kMaxSelection) && ok;  // rows 0-7 at 2041 .. 2048 positions
+  ok = check_select_round(rng, 2044, gpu::kMaxSelection) && ok;  // crossing k inside the Round
+  ok = check_select_round(rng, 50000, gpu::kMaxSelection) && ok;
   ok = check_select_built(rng) && ok;
   ok = check_refusals() && ok;
   if (!backbone_path.empty()) {

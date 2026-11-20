@@ -113,12 +113,14 @@ __device__ unsigned block_scan(unsigned v, unsigned& total) {
  * (the k-th largest) and how many of the keys equal to it to take; then the positions are emitted
  * in order, 1024 at a time: those above T, and those equal to T while the take lasts.
  */
-__global__ void __launch_bounds__(kSelectThreads) select_kernel(const float* __restrict__ scores, int n, int k,
-                                                               int32_t* __restrict__ out) {
+__global__ void __launch_bounds__(kSelectThreads) select_kernel(const float* __restrict__ scores, int stride,
+                                                               RowLengths lengths, int k, int32_t* __restrict__ out,
+                                                               int out_stride) {
   __shared__ unsigned hist[256];
   __shared__ unsigned prefix, above_prefix;
-  const float* v = scores + static_cast<size_t>(blockIdx.x) * n;
-  out += static_cast<size_t>(blockIdx.x) * k;
+  const int n = lengths.n[blockIdx.x];
+  const float* v = scores + static_cast<size_t>(blockIdx.x) * stride;
+  out += static_cast<size_t>(blockIdx.x) * out_stride;
   const unsigned want = static_cast<unsigned>(min(k, n));
   if (threadIdx.x == 0) prefix = above_prefix = 0;
   for (int pass = 0; pass < 4; pass++) {
@@ -167,10 +169,19 @@ void index_scores(const __nv_bfloat16* q, const float* w, const __nv_bfloat16* k
                                                                                                      scale, scores);
 }
 
-cudaError_t select_top(const float* scores, int n, int k, int rows, int32_t* out, cudaStream_t stream) {
-  if (n < 1 || k < 1 || rows < 1 || rows > kMaxIndexRows) return cudaErrorInvalidValue;
-  select_kernel<<<rows, kSelectThreads, 0, stream>>>(scores, n, k, out);
+cudaError_t select_top(const float* scores, int stride, RowLengths lengths, int k, int rows, int32_t* out,
+                       int out_stride, cudaStream_t stream) {
+  if (k < 1 || rows < 1 || rows > kMaxIndexRows) return cudaErrorInvalidValue;
+  for (int t = 0; t < rows; t++)
+    if (lengths.n[t] < 1 || lengths.n[t] > stride) return cudaErrorInvalidValue;
+  select_kernel<<<rows, kSelectThreads, 0, stream>>>(scores, stride, lengths, k, out, out_stride);
   return cudaGetLastError();
+}
+
+cudaError_t select_top(const float* scores, int n, int k, int rows, int32_t* out, cudaStream_t stream) {
+  RowLengths all{};
+  for (int& v : all.n) v = n;
+  return select_top(scores, n, all, k, rows, out, k, stream);
 }
 
 }  // namespace ds4n::cuda::glm53

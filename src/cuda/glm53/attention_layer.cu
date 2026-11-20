@@ -70,23 +70,25 @@ int planes_of(int k) {
   return *p;
 }
 
-/** bf16(rows of w times x) for one token: the planes, then their sum rounded (exact::gemv_row, A3). */
-void linear_bf16(const __nv_bfloat16* w, const float* x, int rows, int k, float* planes, __nv_bfloat16* out,
-                 cudaStream_t s) {
+/** bf16(rows of w times x[t]) for `tokens` tokens: the planes, then their sums rounded (exact::gemv_row, A3). */
+void linear_bf16(const __nv_bfloat16* w, const float* x, int rows, int k, int tokens, float* planes,
+                 __nv_bfloat16* out, cudaStream_t s) {
   const int splits = planes_of(k);
-  bf16_gemv(w, x, rows, k, 1, splits, planes, s);
-  sum_planes_bf16(planes, splits, rows, 1, out, s);
+  bf16_gemv(w, x, rows, k, tokens, splits, planes, s);
+  sum_planes_bf16(planes, splits, rows, tokens, out, s);
 }
 
-void linear_f32(const __nv_bfloat16* w, const float* x, int rows, int k, float* planes, float* out, cudaStream_t s) {
+void linear_f32(const __nv_bfloat16* w, const float* x, int rows, int k, int tokens, float* planes, float* out,
+                cudaStream_t s) {
   const int splits = planes_of(k);
-  bf16_gemv(w, x, rows, k, 1, splits, planes, s);
-  sum_planes_f32(planes, splits, rows, 1, out, s);
+  bf16_gemv(w, x, rows, k, tokens, splits, planes, s);
+  sum_planes_f32(planes, splits, rows, tokens, out, s);
 }
 
 constexpr int kVHead = 256;  // v_head_dim
 constexpr int kPerHead = kNope + kVHead;  // kv_b rows per head: W_k, then W_v
 constexpr size_t kMaxPlanes = 393216;     // o_proj's: 6144 rows x 8 planes x 8 columns, the largest
+constexpr size_t kRows = kMaxRound;  // scratch rows: a whole Round
 
 }  // namespace
 
@@ -132,30 +134,26 @@ Result<DeviceAttention, std::string> DeviceAttention::upload(const exact::Attent
       t.k_norm_w_ = f32_of(ix.k_norm_weight);
       t.k_norm_b_ = f32_of(ix.k_norm_bias);
       t.index_keys_ = DeviceArray<__nv_bfloat16>(static_cast<size_t>(capacity) * kIndexHeadDim);
-      t.scores_ = DeviceArray<float>(static_cast<size_t>(capacity));
-      t.selected_ = DeviceArray<int32_t>(kMaxSelection);
-      t.index_q_ = DeviceArray<__nv_bfloat16>(static_cast<size_t>(kIndexHeads) * kIndexHeadDim);
-      t.head_w_bf16_ = DeviceArray<__nv_bfloat16>(kIndexHeads);
-      t.head_w_ = DeviceArray<float>(kIndexHeads);
-      std::vector<int32_t> iota(kMaxSelection);
-      for (int i = 0; i < kMaxSelection; i++) iota[static_cast<size_t>(i)] = i;
-      t.iota_ = DeviceArray<int32_t>(iota.size());
-      ck(cudaMemcpy(t.iota_.get(), iota.data(), iota.size() * sizeof(int32_t), cudaMemcpyHostToDevice), "upload");
+      t.scores_ = DeviceArray<float>(kRows * static_cast<size_t>(capacity));
+      t.index_q_ = DeviceArray<__nv_bfloat16>(kRows * kIndexHeads * kIndexHeadDim);
+      t.head_w_bf16_ = DeviceArray<__nv_bfloat16>(kRows * kIndexHeads);
+      t.head_w_ = DeviceArray<float>(kRows * kIndexHeads);
+      t.selected_ = DeviceArray<int32_t>(kRows * kMaxSelection);
     }
-    t.pos_ = DeviceArray<int64_t>(1);
-    t.h_ = DeviceArray<__nv_bfloat16>(static_cast<size_t>(d.hidden));
-    t.h_f32_ = DeviceArray<float>(static_cast<size_t>(d.hidden));
-    t.q_a_out_ = DeviceArray<__nv_bfloat16>(static_cast<size_t>(d.q_lora));
-    t.q_resid_ = DeviceArray<__nv_bfloat16>(static_cast<size_t>(d.q_lora));
-    t.q_resid_f32_ = DeviceArray<float>(static_cast<size_t>(d.q_lora));
-    t.q_ = DeviceArray<__nv_bfloat16>(static_cast<size_t>(kHeadsPerGpu) * kQkHead);
-    t.ckv_ = DeviceArray<__nv_bfloat16>(kKeyWidth);
-    t.queries_ = DeviceArray<__nv_bfloat16>(static_cast<size_t>(kHeadsPerGpu) * kKeyWidth);
-    t.ctx_ = DeviceArray<__nv_bfloat16>(static_cast<size_t>(kHeadsPerGpu) * kLatent);
-    t.heads_ = DeviceArray<__nv_bfloat16>(o_half);
-    t.heads_f32_ = DeviceArray<float>(o_half);
+    t.pos_ = DeviceArray<int64_t>(kRows);
+    t.h_ = DeviceArray<__nv_bfloat16>(kRows * d.hidden);
+    t.h_f32_ = DeviceArray<float>(kRows * d.hidden);
+    t.q_a_out_ = DeviceArray<__nv_bfloat16>(kRows * d.q_lora);
+    t.q_resid_ = DeviceArray<__nv_bfloat16>(kRows * d.q_lora);
+    t.q_resid_f32_ = DeviceArray<float>(kRows * d.q_lora);
+    t.q_ = DeviceArray<__nv_bfloat16>(kRows * kHeadsPerGpu * kQkHead);
+    t.ckv_ = DeviceArray<__nv_bfloat16>(kRows * kKeyWidth);
+    t.queries_ = DeviceArray<__nv_bfloat16>(kRows * kHeadsPerGpu * kKeyWidth);
+    t.ctx_ = DeviceArray<__nv_bfloat16>(kRows * kHeadsPerGpu * kLatent);
+    t.heads_ = DeviceArray<__nv_bfloat16>(kRows * o_half);
+    t.heads_f32_ = DeviceArray<float>(kRows * o_half);
     t.planes_ = DeviceArray<float>(kMaxPlanes);
-    const size_t partials = static_cast<size_t>(kMaxLatentSplits) * kHeadsPerGpu;
+    const size_t partials = kRows * kMaxLatentSplits * kHeadsPerGpu;
     t.m_ = DeviceArray<float>(partials);
     t.l_ = DeviceArray<float>(partials);
     t.o_part_ = DeviceArray<float>(partials * kLatent);
@@ -199,71 +197,90 @@ const __nv_bfloat16* DeviceAttention::index_key(int64_t p) const {
   return index_keys_.get() ? index_keys_.get() + p * kIndexHeadDim : nullptr;
 }
 
-Result<int, std::string> DeviceAttention::attend(const float* x, int64_t pos, const int32_t* shared, int shared_n,
-                                                 float* partial, cudaStream_t s) {
-  using R = Result<int, std::string>;
+Result<Selections, std::string> DeviceAttention::attend(const float* x, int tokens, int64_t first,
+                                                        const Selections* shared, float* partial, cudaStream_t s) {
+  using R = Result<Selections, std::string>;
   const g53::Dims& d = d_;
-  if (pos < 0 || pos >= capacity_) return R::err("the position is outside the cache");
-  if (kind_ == g53::IndexerKind::Shared && (shared == nullptr || shared_n < 1 || shared_n > kMaxSelection))
-    return R::err("a Shared layer needs the Full layer's Selection (1 .. 2048 entries)");
+  if (tokens < 1 || tokens > kMaxRound) return R::err("a Round is 1 .. 8 tokens");
+  if (first < 0 || first + tokens > capacity_) return R::err("the Round's positions are outside the cache");
+  if (kind_ == g53::IndexerKind::Shared) {
+    if (shared == nullptr || shared->rows == nullptr || shared->lengths.size() != static_cast<size_t>(tokens))
+      return R::err("a Shared layer needs the Full layer's Selections for this Round");
+    for (int t = 0; t < tokens; t++)
+      if (shared->lengths[t] < 1 || shared->lengths[t] > std::min<int64_t>(shared->stride, first + t + 1))
+        return R::err("a Selection is empty or longer than the positions its token sees");
+  }
   try {
-    ck(cudaMemcpyAsync(pos_.get(), &pos, sizeof pos, cudaMemcpyHostToDevice, s), "position");
+    int64_t positions[kMaxRound];
+    for (int t = 0; t < tokens; t++) positions[t] = first + t;
+    ck(cudaMemcpyAsync(pos_.get(), positions, tokens * sizeof(int64_t), cudaMemcpyHostToDevice, s), "positions");
     // h, q_resid, q (A2-A4).
-    rmsnorm(x, input_norm_.get(), d.hidden, 1, d.rms_eps, h_.get(), s);
-    bf16_to_f32(h_.get(), static_cast<size_t>(d.hidden), h_f32_.get(), s);
-    linear_bf16(q_a_.get(), h_f32_.get(), d.q_lora, d.hidden, planes_.get(), q_a_out_.get(), s);
-    rmsnorm(q_a_out_.get(), q_a_norm_.get(), d.q_lora, 1, g53::kLatentNormEps, q_resid_.get(), s);
-    bf16_to_f32(q_resid_.get(), static_cast<size_t>(d.q_lora), q_resid_f32_.get(), s);
-    linear_bf16(q_b_.get(), q_resid_f32_.get(), kHeadsPerGpu * kQkHead, d.q_lora, planes_.get(), q_.get(), s);
-    rope(q_.get(), 1, kHeadsPerGpu, static_cast<size_t>(kHeadsPerGpu) * kQkHead, kQkHead, kNope, freqs_.get(),
+    rmsnorm(x, input_norm_.get(), d.hidden, tokens, d.rms_eps, h_.get(), s);
+    bf16_to_f32(h_.get(), static_cast<size_t>(tokens) * d.hidden, h_f32_.get(), s);
+    linear_bf16(q_a_.get(), h_f32_.get(), d.q_lora, d.hidden, tokens, planes_.get(), q_a_out_.get(), s);
+    rmsnorm(q_a_out_.get(), q_a_norm_.get(), d.q_lora, tokens, g53::kLatentNormEps, q_resid_.get(), s);
+    bf16_to_f32(q_resid_.get(), static_cast<size_t>(tokens) * d.q_lora, q_resid_f32_.get(), s);
+    linear_bf16(q_b_.get(), q_resid_f32_.get(), kHeadsPerGpu * kQkHead, d.q_lora, tokens, planes_.get(), q_.get(), s);
+    rope(q_.get(), tokens, kHeadsPerGpu, static_cast<size_t>(kHeadsPerGpu) * kQkHead, kQkHead, kNope, freqs_.get(),
          pos_.get(), s);
-    // The cache row: rmsnorm(latent) | RoPE(k_rope), straight into the cache.
-    linear_bf16(kv_a_.get(), h_f32_.get(), kKeyWidth, d.hidden, planes_.get(), ckv_.get(), s);
-    __nv_bfloat16* row = rows_.get() + pos * kKeyWidth;
-    rmsnorm(ckv_.get(), kv_a_norm_.get(), kLatent, 1, g53::kLatentNormEps, row, s);
-    ck(cudaMemcpyAsync(row + kLatent, ckv_.get() + kLatent, kKeyRope * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice,
-                       s),
+    // The Round's cache rows, rmsnorm(latent) | RoPE(k_rope), straight into the cache, before any token attends.
+    linear_bf16(kv_a_.get(), h_f32_.get(), kKeyWidth, d.hidden, tokens, planes_.get(), ckv_.get(), s);
+    __nv_bfloat16* rows = rows_.get() + first * kKeyWidth;
+    rmsnorm(ckv_.get(), kKeyWidth, kv_a_norm_.get(), kLatent, tokens, g53::kLatentNormEps, rows, kKeyWidth, s);
+    ck(cudaMemcpy2DAsync(rows + kLatent, kKeyWidth * sizeof(__nv_bfloat16), ckv_.get() + kLatent,
+                         kKeyWidth * sizeof(__nv_bfloat16), kKeyRope * sizeof(__nv_bfloat16), tokens,
+                         cudaMemcpyDeviceToDevice, s),
        "k_rope");
-    rope(row + kLatent, 1, 1, kKeyRope, kKeyRope, 0, freqs_.get(), pos_.get(), s);
-    // The Selection (A7).
-    const int32_t* selection = shared;
-    int n = shared_n;
-    if (kind_ == g53::IndexerKind::Full) {
-      __nv_bfloat16* key = index_keys_.get() + pos * kIndexHeadDim;
-      linear_bf16(wk_.get(), h_f32_.get(), kIndexHeadDim, d.hidden, planes_.get(), key, s);
-      index_key_norm(key, k_norm_w_.get(), k_norm_b_.get(), g53::kIndexKeyNormEps, 1, s);
-      rope(key, 1, 1, kIndexHeadDim, kIndexHeadDim, 0, freqs_.get(), pos_.get(), s);
-      const int positions = static_cast<int>(pos) + 1;
-      if (positions <= d.index_topk) {
-        selection = iota_.get();
-        n = positions;
+    rope(rows + kLatent, tokens, 1, kKeyWidth, kKeyRope, 0, freqs_.get(), pos_.get(), s);
+    // The Selections (A7).
+    Selections sel;
+    if (kind_ == g53::IndexerKind::Shared) {
+      sel = *shared;
+    } else {
+      __nv_bfloat16* keys = index_keys_.get() + first * kIndexHeadDim;
+      linear_bf16(wk_.get(), h_f32_.get(), kIndexHeadDim, d.hidden, tokens, planes_.get(), keys, s);
+      index_key_norm(keys, k_norm_w_.get(), k_norm_b_.get(), g53::kIndexKeyNormEps, tokens, s);
+      rope(keys, tokens, 1, kIndexHeadDim, kIndexHeadDim, 0, freqs_.get(), pos_.get(), s);
+      sel.rows = selected_.get();
+      sel.stride = kMaxSelection;
+      const int seen_last = static_cast<int>(first) + tokens;  // positions the Round's last token sees
+      if (seen_last <= d.index_topk) {
+        all_positions(pos_.get(), tokens, kMaxSelection, selected_.get(), s);
+        for (int t = 0; t < tokens; t++) sel.lengths.push_back(static_cast<int>(first) + t + 1);
       } else {
-        linear_bf16(wq_b_.get(), q_resid_f32_.get(), kIndexHeads * kIndexHeadDim, d.q_lora, planes_.get(),
+        linear_bf16(wq_b_.get(), q_resid_f32_.get(), kIndexHeads * kIndexHeadDim, d.q_lora, tokens, planes_.get(),
                     index_q_.get(), s);
-        rope(index_q_.get(), 1, kIndexHeads, static_cast<size_t>(kIndexHeads) * kIndexHeadDim, kIndexHeadDim, 0,
+        rope(index_q_.get(), tokens, kIndexHeads, static_cast<size_t>(kIndexHeads) * kIndexHeadDim, kIndexHeadDim, 0,
              freqs_.get(), pos_.get(), s);
-        linear_bf16(weights_proj_.get(), h_f32_.get(), kIndexHeads, d.hidden, planes_.get(), head_w_bf16_.get(), s);
-        index_head_weights(head_w_bf16_.get(), kIndexHeads,
+        linear_bf16(weights_proj_.get(), h_f32_.get(), kIndexHeads, d.hidden, tokens, planes_.get(),
+                    head_w_bf16_.get(), s);
+        index_head_weights(head_w_bf16_.get(), tokens * kIndexHeads,
                            static_cast<float>(1.0 / std::sqrt(static_cast<double>(kIndexHeads))), head_w_.get(), s);
-        index_scores(index_q_.get(), head_w_.get(), index_keys_.get(), positions, 1, scores_.get(), s);
-        ck(select_top(scores_.get(), positions, d.index_topk, 1, selected_.get(), s), "select_top");
-        selection = selected_.get();
-        n = d.index_topk;
+        index_scores(index_q_.get(), head_w_.get(), index_keys_.get(), seen_last, tokens, scores_.get(), s);
+        ck(cudaMemsetAsync(selected_.get(), 0xFF, static_cast<size_t>(tokens) * kMaxSelection * sizeof(int32_t), s),
+           "Selections");
+        RowLengths lengths{};
+        for (int t = 0; t < tokens; t++) {
+          lengths.n[t] = static_cast<int>(first) + t + 1;
+          sel.lengths.push_back(std::min(lengths.n[t], d.index_topk));
+        }
+        ck(select_top(scores_.get(), seen_last, lengths, d.index_topk, tokens, selected_.get(), kMaxSelection, s),
+           "select_top");
       }
     }
-    selection_ = selection;
-    // MLA over the Selection, W_v, this GPU's o_proj partial (A5, A6).
-    absorbed_queries(q_.get(), wk_t_.get(), 1, queries_.get(), s);
+    // MLA over the Selections, W_v, this GPU's o_proj partials (A5, A6).
+    absorbed_queries(q_.get(), wk_t_.get(), tokens, queries_.get(), s);
     const float scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(kQkHead)));
-    ck(latent_attention(queries_.get(), rows_.get(), selection, n, n, 1, scale,
+    const int n = *std::max_element(sel.lengths.begin(), sel.lengths.end());
+    ck(latent_attention(queries_.get(), rows_.get(), sel.rows, n, sel.stride, tokens, scale,
                         LatentScratch{m_.get(), l_.get(), o_part_.get()}, ctx_.get(), s),
        "latent_attention");
     head_gemv(kv_b_.get() + static_cast<size_t>(kNope) * kLatent, static_cast<size_t>(kPerHead) * kLatent, kVHead,
-              kLatent, ctx_.get(), kLatent, 1, heads_.get(), kVHead, s);
-    bf16_to_f32(heads_.get(), heads_.size(), heads_f32_.get(), s);
-    linear_f32(o_.get(), heads_f32_.get(), d.hidden, kHeadsPerGpu * kVHead, planes_.get(), partial, s);
+              kLatent, ctx_.get(), kLatent, tokens, heads_.get(), kVHead, s);
+    bf16_to_f32(heads_.get(), static_cast<size_t>(tokens) * kHeadsPerGpu * kVHead, heads_f32_.get(), s);
+    linear_f32(o_.get(), heads_f32_.get(), d.hidden, kHeadsPerGpu * kVHead, tokens, planes_.get(), partial, s);
     ck(cudaGetLastError(), "attend");
-    return R::ok(n);
+    return R::ok(std::move(sel));
   } catch (const std::runtime_error& e) {
     return R::err(e.what());
   }
@@ -284,25 +301,33 @@ Result<DeviceDenseMlp, std::string> DeviceDenseMlp::upload(const g53::Mlp& mlp, 
     t.up_ = bf16_of(mlp.up.w, "up_proj");
     t.down_ = bf16_of(columns(mlp.down, static_cast<size_t>(gpu) * (t.inter_ / 2), static_cast<size_t>(t.inter_ / 2)),
                       "down_proj");
-    t.ones_ = f32_of(std::vector<float>(static_cast<size_t>(t.inter_), 1.0f));
-    t.x_f32_ = DeviceArray<float>(static_cast<size_t>(t.hidden_));
+    t.ones_ = f32_of(std::vector<float>(kRows * t.inter_, 1.0f));
+    t.x_f32_ = DeviceArray<float>(kRows * t.hidden_);
     t.planes_ = DeviceArray<float>(static_cast<size_t>(std::max(t.inter_, t.hidden_)) * 8 * 8);
-    t.gate_sum_ = DeviceArray<float>(static_cast<size_t>(t.inter_));
-    t.up_sum_ = DeviceArray<float>(static_cast<size_t>(t.inter_));
-    t.hid_ = DeviceArray<float>(static_cast<size_t>(t.inter_));
+    t.gate_sum_ = DeviceArray<float>(kRows * t.inter_);
+    t.up_sum_ = DeviceArray<float>(kRows * t.inter_);
+    t.hid_ = DeviceArray<float>(kRows * t.inter_);
+    t.hid_half_ = DeviceArray<float>(kRows * (t.inter_ / 2));
     return R::ok(std::move(t));
   } catch (const std::runtime_error& e) {
     return R::err(e.what());
   }
 }
 
-void DeviceDenseMlp::run(const __nv_bfloat16* ffn_in, float* partial, cudaStream_t s) {
-  bf16_to_f32(ffn_in, static_cast<size_t>(hidden_), x_f32_.get(), s);
-  linear_f32(gate_.get(), x_f32_.get(), inter_, hidden_, planes_.get(), gate_sum_.get(), s);
-  linear_f32(up_.get(), x_f32_.get(), inter_, hidden_, planes_.get(), up_sum_.get(), s);
-  hidden_values(gate_sum_.get(), up_sum_.get(), ones_.get(), inter_, hid_.get(), s);  // mx::swiglu at weight 1
+cudaError_t DeviceDenseMlp::run(const __nv_bfloat16* ffn_in, int tokens, float* partial, cudaStream_t s) {
+  if (tokens < 1 || tokens > kMaxRound) return cudaErrorInvalidValue;
+  bf16_to_f32(ffn_in, static_cast<size_t>(tokens) * hidden_, x_f32_.get(), s);
+  linear_f32(gate_.get(), x_f32_.get(), inter_, hidden_, tokens, planes_.get(), gate_sum_.get(), s);
+  linear_f32(up_.get(), x_f32_.get(), inter_, hidden_, tokens, planes_.get(), up_sum_.get(), s);
+  hidden_values(gate_sum_.get(), up_sum_.get(), ones_.get(), tokens * inter_, hid_.get(), s);  // mx::swiglu at weight 1
+  // This GPU's K half of every token's hidden row, as the down GEMV's [tokens][half] input.
   const int half = inter_ / 2;
-  linear_f32(down_.get(), hid_.get() + static_cast<size_t>(gpu_) * half, hidden_, half, planes_.get(), partial, s);
+  if (const auto e = cudaMemcpy2DAsync(hid_half_.get(), half * sizeof(float), hid_.get() + static_cast<size_t>(gpu_) * half,
+                                       inter_ * sizeof(float), half * sizeof(float), tokens, cudaMemcpyDeviceToDevice, s);
+      e != cudaSuccess)
+    return e;
+  linear_f32(down_.get(), hid_half_.get(), hidden_, half, tokens, planes_.get(), partial, s);
+  return cudaGetLastError();
 }
 
 Result<DeviceHead, std::string> DeviceHead::upload(const g53::Dims& d, std::span<const float> final_norm,
@@ -317,8 +342,8 @@ Result<DeviceHead, std::string> DeviceHead::upload(const g53::Dims& d, std::span
     planes_of(d.hidden);
     t.head_ = bf16_of(head.w, "lm_head");
     t.norm_ = f32_of(final_norm);
-    t.h_ = DeviceArray<__nv_bfloat16>(static_cast<size_t>(d.hidden));
-    t.h_f32_ = DeviceArray<float>(static_cast<size_t>(d.hidden));
+    t.h_ = DeviceArray<__nv_bfloat16>(kRows * d.hidden);
+    t.h_f32_ = DeviceArray<float>(kRows * d.hidden);
     t.planes_ = DeviceArray<float>(static_cast<size_t>(t.vocab_) * static_cast<size_t>(planes_of(d.hidden)) * 8);
     return R::ok(std::move(t));
   } catch (const std::runtime_error& e) {
@@ -326,16 +351,16 @@ Result<DeviceHead, std::string> DeviceHead::upload(const g53::Dims& d, std::span
   }
 }
 
-void DeviceHead::logits(const float* x, float* logits, cudaStream_t s) {
-  rmsnorm(x, norm_.get(), hidden_, 1, eps_, h_.get(), s);
-  bf16_to_f32(h_.get(), static_cast<size_t>(hidden_), h_f32_.get(), s);
-  linear_f32(head_.get(), h_f32_.get(), vocab_, hidden_, planes_.get(), logits, s);
+void DeviceHead::logits(const float* x, int tokens, float* logits, cudaStream_t s) {
+  rmsnorm(x, norm_.get(), hidden_, tokens, eps_, h_.get(), s);
+  bf16_to_f32(h_.get(), static_cast<size_t>(tokens) * hidden_, h_f32_.get(), s);
+  linear_f32(head_.get(), h_f32_.get(), vocab_, hidden_, tokens, planes_.get(), logits, s);
 }
 
-void DeviceAttention::finish(const float* x, const __nv_bfloat16* out, float* mid, __nv_bfloat16* ffn_in,
+void DeviceAttention::finish(const float* x, const __nv_bfloat16* out, int tokens, float* mid, __nv_bfloat16* ffn_in,
                              cudaStream_t s) const {
-  residual(x, out, d_.hidden, mid, s);
-  rmsnorm(mid, post_norm_.get(), d_.hidden, 1, d_.rms_eps, ffn_in, s);
+  residual(x, out, tokens * d_.hidden, mid, s);
+  rmsnorm(mid, post_norm_.get(), d_.hidden, tokens, d_.rms_eps, ffn_in, s);
 }
 
 }  // namespace ds4n::cuda::glm53

@@ -181,16 +181,20 @@ An independent audit (python, read-only, against the index) found:
      `DeviceHead`), one GPU's share of a layer outside the MoE.
    - **Gate:** `ds4n-glm53-attn-check --config ref/glm-5.3/config.json [--backbone DIR]`.
      - Without `--backbone`: the kernels on random inputs, 4 s.
-     - With it: whole real layers 0, 6, 3 and 77 at positions 0 to 3000, plus the head, all
-       bit-identical, 44 s.
-     - `tools/glm53-golden/gpu-attention-mutation-probe.sh` kills 38/38.
+     - With it: whole real layers 0, 6, 3 and 77 in Rounds of 1 and 8 tokens (positions 0 to
+       3000, one Round crossing index_topk), plus the head, all bit-identical to the oracle
+       decoding the same tokens one at a time.
+     - `tools/glm53-golden/gpu-attention-mutation-probe.sh [BACKBONE]` kills every mutant: 40
+       in the kernels, 6 in the executor (with a Backbone).
    - **One GPU, one token:** attention takes 14–20 µs per layer at a 2048-entry Selection. The
      indexer takes 22 µs at 4K context and 218 µs at 128K.
    - **Whole-model KL with the attention side exact:** `ds4n-glm53-oracle-run --activations
      ...,exact-attn`, run `docs/bench/glm53-attn/`.
+   - **Rounds (done 2026-11-20):** `DeviceAttention::attend` takes 1–8 tokens at consecutive
+     positions. Every token's cache row goes in before any attends, and each row's Selection
+     covers only its own prefix (`select_top`'s per-row `RowLengths`). A decode token is a
+     Round of 1.
    - **Next:**
-     - Rounds of 8 tokens in `DeviceAttention`: cache rows in before any token attends, and
-       per-row Selection lengths.
      - The two-GPU exchange_add.
      - The decode loop with the Expert cache (Phase 4).
 7. Phases 4–5 per the plan (fifth switch-primary entry `glm-native`, slots ladder, CyberGym).

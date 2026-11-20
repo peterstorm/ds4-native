@@ -12,9 +12,10 @@
 // norms) both GPUs compute alike, each into its own cache. The partials meet in
 // the Exchange (cuda::add_round_bf16, or exchange_add across two GPUs).
 //
-// Decode: one token a call. A Round of up to 8 tokens is the next extension:
-// every kernel below already takes rows, but a Round's later tokens attend its
-// earlier ones, so the cache rows go in before any token attends.
+// A call runs a Round: 1 .. 8 tokens at consecutive positions (decode is a
+// Round of 1; MTP verify a longer one). Every token's cache row goes in before
+// any token attends, so a later token sees the earlier ones, as decoding them
+// one by one would; each token's Selection covers only positions up to its own.
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -26,6 +27,8 @@
 
 #include "core/glm53/exact_attention.hpp"
 #include "core/result.hpp"
+#include "cuda/glm53/attention.cuh"
+#include "cuda/glm53/indexer.cuh"
 
 namespace ds4n::cuda::glm53 {
 
@@ -48,6 +51,17 @@ class DeviceArray {
   size_t n_ = 0;
 };
 
+/** A Round's most tokens: what both the attention and the indexer kernels take in one call. */
+constexpr int kMaxRound = kMaxAttentionRows;
+static_assert(kMaxRound == kMaxIndexRows, "the indexer must take a whole Round");
+
+/** A Round's Selections on the device: row t's entries at rows + t * stride, lengths[t] of them, then -1. */
+struct Selections {
+  const int32_t* rows = nullptr;
+  int stride = 0;
+  std::vector<int> lengths;
+};
+
 /**
  * GPU `gpu`'s share of one layer's attention, its caches for `capacity` positions,
  * and its scratch. Built only by upload, from the oracle's checked AttentionLayer.
@@ -64,22 +78,22 @@ class DeviceAttention {
   Result<int, std::string> load_cache(const ds4n::glm53::LayerCache& past);
 
   /**
-   * The token at `pos` whose residual stream is `x` (device, FP32 [hidden]): writes its cache row
-   * (and on a Full layer its index key) at `pos`, makes or takes its Selection (a Shared layer
-   * attends `shared`, `shared_n` device entries), and writes this GPU's o_proj partial (device,
-   * FP32 [hidden]). Returns the Selection's length; the Selection itself is at selection().
+   * A Round of `tokens` tokens at positions first .. first + tokens - 1 whose residual streams are
+   * `x` (device, FP32 [tokens][hidden]): writes their cache rows (and on a Full layer their index
+   * keys), makes their Selections (a Shared layer attends `shared`, the Full layer's for these
+   * tokens), and writes this GPU's o_proj partials (device, FP32 [tokens][hidden]). Returns the
+   * Selections attended (on a Full layer in this GPU's scratch, valid until the next Round).
    */
-  Result<int, std::string> attend(const float* x, int64_t pos, const int32_t* shared, int shared_n, float* partial,
-                                  cudaStream_t stream);
+  Result<Selections, std::string> attend(const float* x, int tokens, int64_t first, const Selections* shared,
+                                         float* partial, cudaStream_t stream);
 
   /**
-   * After the Exchange (out = bf16(GPU 0 + GPU 1), device BF16 [hidden]): mid = x + out (FP32)
-   * and ffn_in = rmsnorm(mid, post_attention_norm) (BF16), as exact::begin_layer.
+   * After the Exchange (out = bf16(GPU 0 + GPU 1), device BF16 [tokens][hidden]): mid = x + out
+   * (FP32) and ffn_in = rmsnorm(mid, post_attention_norm) (BF16), as exact::begin_layer.
    */
-  void finish(const float* x, const __nv_bfloat16* out, float* mid, __nv_bfloat16* ffn_in, cudaStream_t stream) const;
+  void finish(const float* x, const __nv_bfloat16* out, int tokens, float* mid, __nv_bfloat16* ffn_in,
+              cudaStream_t stream) const;
 
-  /** The Selection the last attend used (device, ascending). */
-  const int32_t* selection() const { return selection_; }
   /** Row p of the Latent rows ([latent | k_rope], device BF16) and of the index keys (Full layers). */
   const __nv_bfloat16* cache_row(int64_t p) const;
   const __nv_bfloat16* index_key(int64_t p) const;
@@ -94,25 +108,24 @@ class DeviceAttention {
   DeviceArray<float> input_norm_, post_norm_, q_a_norm_, kv_a_norm_, k_norm_w_, k_norm_b_, freqs_;
   // Caches and scratch.
   DeviceArray<__nv_bfloat16> rows_, index_keys_;
-  DeviceArray<int32_t> iota_, selected_;
+  DeviceArray<int32_t> selected_;
   DeviceArray<int64_t> pos_;
   DeviceArray<float> h_f32_, q_resid_f32_, heads_f32_, planes_, head_w_, scores_, m_, l_, o_part_;
   DeviceArray<__nv_bfloat16> h_, q_a_out_, q_resid_, q_, ckv_, queries_, ctx_, heads_, index_q_, head_w_bf16_;
-  const int32_t* selection_ = nullptr;
 };
 
 /** GPU `gpu`'s share of a Dense layer's MLP (A8): gate and up whole, down's K half. */
 class DeviceDenseMlp {
  public:
   static Result<DeviceDenseMlp, std::string> upload(const ds4n::glm53::Mlp& mlp, int gpu);
-  /** This GPU's down partial (device FP32 [hidden]) of BF16 `ffn_in` (device). */
-  void run(const __nv_bfloat16* ffn_in, float* partial, cudaStream_t stream);
+  /** This GPU's down partials (device FP32 [tokens][hidden]) of BF16 `ffn_in` (device, [tokens][hidden]). */
+  cudaError_t run(const __nv_bfloat16* ffn_in, int tokens, float* partial, cudaStream_t stream);
 
  private:
   DeviceDenseMlp() = default;
   int hidden_ = 0, inter_ = 0, gpu_ = 0;
   DeviceArray<__nv_bfloat16> gate_, up_, down_;
-  DeviceArray<float> ones_, x_f32_, planes_, gate_sum_, up_sum_, hid_;
+  DeviceArray<float> ones_, x_f32_, planes_, gate_sum_, up_sum_, hid_, hid_half_;
 };
 
 /** The head (A9): final norm and FP32 logits. */
@@ -120,8 +133,8 @@ class DeviceHead {
  public:
   static Result<DeviceHead, std::string> upload(const ds4n::glm53::Dims& d, std::span<const float> final_norm,
                                                 const ds4n::glm53::Matrix& head);
-  /** logits (device FP32 [vocab]) of the residual stream x (device FP32 [hidden]). */
-  void logits(const float* x, float* logits, cudaStream_t stream);
+  /** logits (device FP32 [tokens][vocab]) of the residual streams x (device FP32 [tokens][hidden]). */
+  void logits(const float* x, int tokens, float* logits, cudaStream_t stream);
 
  private:
   DeviceHead() = default;

@@ -30,11 +30,22 @@ constexpr int kMaxIndexRows = 8;  // a Round's tokens
 void index_scores(const __nv_bfloat16* q, const float* w, const __nv_bfloat16* keys, int n, int rows, float* scores,
                   cudaStream_t stream);
 
+/** Each row's score count, by value: a Round's rows see different prefixes of the positions. */
+struct RowLengths {
+  int n[kMaxIndexRows];
+};
+
 /**
- * out[t][0 .. min(k, n)) = glm53::top_k(scores[t][0 .. n), k): the positions of the k largest
- * scores, ties to the lower position, ascending; out is [rows][k]. One CTA per row. n >= 1,
- * k >= 1, rows 1 .. kMaxIndexRows; otherwise nothing runs and cudaErrorInvalidValue is returned.
+ * out[t][0 .. min(k, n_t)) = glm53::top_k(scores[t][0 .. n_t), k): the positions of the k largest
+ * scores, ties to the lower position, ascending; row t's scores at scores + t * stride, its
+ * output at out + t * out_stride (nothing written past min(k, n_t)). One CTA per row. Each n_t
+ * in 1 .. stride, k >= 1, rows 1 .. kMaxIndexRows; otherwise nothing runs and
+ * cudaErrorInvalidValue is returned.
  */
+cudaError_t select_top(const float* scores, int stride, RowLengths lengths, int k, int rows, int32_t* out,
+                       int out_stride, cudaStream_t stream);
+
+/** Every row n scores (stride n), outputs [rows][k]. */
 cudaError_t select_top(const float* scores, int n, int k, int rows, int32_t* out, cudaStream_t stream);
 
 }  // namespace ds4n::cuda::glm53
