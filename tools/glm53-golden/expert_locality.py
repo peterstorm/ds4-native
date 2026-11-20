@@ -3,7 +3,7 @@
 
     expert_locality.py ROUTES.tsv [--arithmetic NAME] [--phase all|prefill|decode]
                        [--slots 0.2,0.33,0.4,0.5,0.6] [--ram 0.18] [--warm 0.25]
-                       [--t-base 7.6] [--c-ram 0.35] [--c-ssd 1.6]
+                       [--t-base 7.6] [--c-ram 0.35] [--c-ssd 1.6] [--policies lru,decay,...]
     expert_locality.py --self-test
 
 ROUTES.tsv comes from `ds4n-glm53-oracle-run --routes`. A token's Route depends only on the
@@ -26,7 +26,8 @@ Policies:
 - belady: optimal eviction (knows the future). It is the lower bound for any policy.
 - lru-layer: LRU within each Sparse layer, each owning an equal share of the Slots. Every layer
   is called once per token, so this models the global cache well, and it is what the oracle can
-  simulate in its layer-major order (cache-conditional routing streams).
+  simulate in its layer-major order: the cache a cache-conditional (-ccλ) stream's router saw,
+  so the only policy that replays such a stream's Routes consistently.
 - static: the best fixed set (the most-picked Experts over the whole trace). It is the most any
   profile-placed, never-moving cache can reach.
 
@@ -265,7 +266,7 @@ def main(argv):
     if len(argv) < 2:
         sys.exit(__doc__)
     opts = {"--arithmetic": "", "--phase": "all", "--slots": "0.2,0.33,0.4,0.5,0.6", "--ram": "0.18",
-            "--warm": "0.25", "--t-base": "7.6", "--c-ram": "0.35", "--c-ssd": "1.6"}
+            "--warm": "0.25", "--t-base": "7.6", "--c-ram": "0.35", "--c-ssd": "1.6", "--policies": ",".join(POLICIES)}
     args = argv[2:]
     for i in range(0, len(args), 2):
         if args[i] not in opts or i + 1 >= len(args):
@@ -283,9 +284,12 @@ def main(argv):
           f"{counted_tokens} counted after warm-up; {len(picks)} of {keys} Experts picked at least once; "
           f"RAM tier {ram_slots} Experts")
     print(f"{'policy':8}{'slots':>8}{'share':>7}{'m':>8}{'miss/tok':>10}{'ram':>7}{'store':>7}{'tok/s':>7}")
+    policies = opts["--policies"].split(",")
+    if not set(policies) <= set(POLICIES):
+        sys.exit(f"--policies: choose from {', '.join(POLICIES)}")
     for share in (float(s) for s in opts["--slots"].split(",")):
         slots = int(keys * share)
-        for policy in POLICIES:
+        for policy in policies:
             r = run(calls, slots, ram_slots, count_from, policy, layers)
             per_tok = r.misses / counted_tokens
             ram, store = r.ram_hits / counted_tokens, (r.misses - r.ram_hits) / counted_tokens
