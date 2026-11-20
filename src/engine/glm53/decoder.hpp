@@ -21,6 +21,11 @@
 // Experts are placed together, so none evicts another. Under λ a Round is one
 // token: the router of token t + 1 must see the residency token t left.
 //
+// Below the Slots, optionally, the RAM tier (core/glm53/victim_tier): every
+// Expert a Load evicts is copied down into pinned host memory, and a Miss found
+// there moves up over PCIe instead of being read from the store. Slots and tier
+// then act as one LRU cache of both sizes. Routing never sees the tier.
+//
 // Every output is exact: ds4n-glm53-decode --check replays each layer on the
 // CPU oracle from the residual streams this decoder captures, bit for bit.
 #include <array>
@@ -43,14 +48,16 @@ struct DecoderConfig {
   float route_bonus = 0.0f;          // cache-conditional routing (λ); 0: exact routing
   unsigned threads = 16;             // Backbone load threads
   uint64_t reserve_bytes = 3ull << 30;  // VRAM per GPU left free when sizing the Slots
+  int ram_per_layer = 0;             // RAM tier: Experts per Sparse layer in pinned host memory; 0: none
 };
 
 struct DecoderStats {
   uint64_t rounds = 0, tokens = 0;
   uint64_t picks = 0;   // Expert placements asked for (a Round's distinct Experts, per Sparse layer)
-  uint64_t misses = 0;  // of them, read from the store
-  double load_s = 0.0;  // open(): the Backbone into VRAM
-  double round_s = 0.0, store_s = 0.0;  // in round(): all, and waiting on store reads and their copies
+  uint64_t misses = 0;    // of them, not in a Slot
+  uint64_t ram_hits = 0;  // of the Misses, moved up from the RAM tier (the rest read from the store)
+  double load_s = 0.0;    // open(): the Backbone into VRAM, the RAM tier pinned
+  double round_s = 0.0, store_s = 0.0;  // in round(): all, and serving Misses (reads, copies up and down)
 };
 
 class Decoder {

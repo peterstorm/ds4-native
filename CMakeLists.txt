@@ -31,6 +31,7 @@ add_library(ds4n_core STATIC
   src/core/glm53/moe_plan.cpp
   src/core/glm53/expert_tiles.cpp
   src/core/glm53/layer_expert_cache.cpp
+  src/core/glm53/victim_tier.cpp
   src/core/glm53/pruning.cpp
   src/core/indexer.cpp
   src/core/compressor.cpp
@@ -74,6 +75,8 @@ target_link_libraries(ds4n-store-build PRIVATE ds4n_io)
 add_library(ds4n_glm53_io STATIC src/io/glm53_backbone.cpp src/io/glm53_store.cpp src/io/glm53_weights.cpp)
 target_link_libraries(ds4n_glm53_io PUBLIC ds4n_io)
 target_compile_options(ds4n_glm53_io PRIVATE -Wall -Wextra -Wpedantic -Werror)
+add_executable(ds4n-glm53-readbench src/tools/glm53_read_bench.cpp)
+target_link_libraries(ds4n-glm53-readbench PRIVATE ds4n_glm53_io)
 add_executable(ds4n-glm53-store-build src/tools/glm53_store_build.cpp)
 target_link_libraries(ds4n-glm53-store-build PRIVATE ds4n_glm53_io)
 add_executable(ds4n-glm53-backbone-extract src/tools/glm53_backbone_extract.cpp)
@@ -193,6 +196,7 @@ add_executable(ds4n_tests
   tests/core/glm53/test_moe_plan.cpp
   tests/core/glm53/test_expert_tiles.cpp
   tests/core/glm53/test_layer_expert_cache.cpp
+  tests/core/glm53/test_victim_tier.cpp
   tests/core/glm53/test_pruning.cpp
   tests/core/test_indexer.cpp
   tests/core/test_compressor.cpp

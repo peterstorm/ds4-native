@@ -129,7 +129,18 @@ TEST_CASE("LayerExpertCache Slots: one to one onto [0, slots), and a resident Ex
       for (const SlotLoad& l : loads) {
         CHECK(before[static_cast<size_t>(l.expert)] == -1);  // a Load is a Miss
         CHECK(after[static_cast<size_t>(l.expert)] == l.slot);
+        if (l.evicted >= 0) {  // the Expert that held the Slot before, gone now
+          CHECK(before[static_cast<size_t>(l.evicted)] == l.slot);
+          CHECK(after[static_cast<size_t>(l.evicted)] == -1);
+        }
       }
+      // Every Slot that changed Expert is a Load's, and its old Expert is the one it names.
+      for (size_t e = 0; e < before.size(); e++)
+        if (before[e] >= 0 && after[e] == -1)
+          CHECK(std::ranges::count_if(loads, [&](const SlotLoad& l) { return l.evicted == static_cast<int32_t>(e); }) == 1);
+      // Free Slots are filled first: the first `free` Loads evict nothing, every later one evicts.
+      const auto free = static_cast<size_t>(kSlots - std::ranges::count_if(before, [](int32_t s) { return s >= 0; }));
+      for (size_t i = 0; i < loads.size(); i++) CHECK((loads[i].evicted == -1) == (i < free));
     }
   }
 }
@@ -150,9 +161,9 @@ TEST_CASE("LayerExpertCache Slots: place and use agree, and a failed Route chang
 
 TEST_CASE("LayerExpertCache Slots: filling takes Slots in order, an eviction hands its Slot on") {
   auto cache = LayerExpertCache::create(16, 4).value();
-  CHECK(cache.place(std::vector<int32_t>{5, 9}).value() == std::vector<SlotLoad>{{5, 0}, {9, 1}});
-  CHECK(cache.place(std::vector<int32_t>{2, 3}).value() == std::vector<SlotLoad>{{2, 2}, {3, 3}});
+  CHECK(cache.place(std::vector<int32_t>{5, 9}).value() == std::vector<SlotLoad>{{5, 0, -1}, {9, 1, -1}});
+  CHECK(cache.place(std::vector<int32_t>{2, 3}).value() == std::vector<SlotLoad>{{2, 2, -1}, {3, 3, -1}});
   // Full: 7 evicts the least recently used unneeded Expert, 5 (Slot 0), and takes its Slot.
-  CHECK(cache.place(std::vector<int32_t>{9, 7}).value() == std::vector<SlotLoad>{{7, 0}});
+  CHECK(cache.place(std::vector<int32_t>{9, 7}).value() == std::vector<SlotLoad>{{7, 0, 5}});
   CHECK(cache.slot_of()[5] == -1);
 }

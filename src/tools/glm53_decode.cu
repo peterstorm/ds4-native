@@ -4,7 +4,7 @@
 //
 //   ds4n-glm53-decode --config CONFIG --backbone DIR --store FILE --prompt "ID ID ..."
 //                     [--generate N] [--round R] [--lambda λ] [--slots-per-layer S]
-//                     [--capacity C] [--devices A,B] [--threads T] [--check]
+//                     [--ram-per-layer R] [--capacity C] [--devices A,B] [--threads T] [--check]
 //
 // --check captures the residual stream entering every layer for every token,
 // then replays each layer on the CPU in the Reference configuration from the
@@ -64,7 +64,7 @@ struct Args {
 Args parse(int argc, char** argv) {
   const std::string usage =
       "usage: --config CONFIG --backbone DIR --store FILE --prompt \"ID ID ...\" [--generate N] [--round R] "
-      "[--lambda λ] [--slots-per-layer S] [--capacity C] [--devices A,B] [--threads T] [--check]";
+      "[--lambda λ] [--slots-per-layer S] [--ram-per-layer R] [--capacity C] [--devices A,B] [--threads T] [--check]";
   Args a;
   for (int i = 1; i < argc; i++) {
     const std::string k = argv[i];
@@ -81,6 +81,7 @@ Args parse(int argc, char** argv) {
     else if (k == "--round") a.round = std::stoi(v);
     else if (k == "--lambda") a.decoder.route_bonus = std::stof(v);
     else if (k == "--slots-per-layer") a.decoder.slots_per_layer = std::stoi(v);
+    else if (k == "--ram-per-layer") a.decoder.ram_per_layer = std::stoi(v);
     else if (k == "--capacity") a.decoder.capacity = std::stoi(v);
     else if (k == "--threads") a.decoder.threads = static_cast<unsigned>(std::stoul(v));
     else if (k == "--devices") {
@@ -232,9 +233,9 @@ int main(int argc, char** argv) {
     if (!decoder) die(decoder.error());
     eng::Decoder& dec = *decoder.value();
     slots_per_layer = dec.slots_per_layer();
-    std::printf("open: %.1f s, %d Slots per Sparse layer (%.0f%% of the Experts), capacity %d, λ %g\n",
-                dec.stats().load_s, slots_per_layer, 100.0 * slots_per_layer / d.experts, args.decoder.capacity,
-                static_cast<double>(args.decoder.route_bonus));
+    std::printf("open: %.1f s, %d Slots per Sparse layer (%.0f%% of the Experts), RAM tier %d per layer, capacity %d, λ %g\n",
+                dec.stats().load_s, slots_per_layer, 100.0 * slots_per_layer / d.experts, args.decoder.ram_per_layer,
+                args.decoder.capacity, static_cast<double>(args.decoder.route_bonus));
     auto run = [&](std::span<const int32_t> tokens) {
       std::vector<std::vector<float>> layers;
       auto logits = dec.round(tokens, args.check ? &layers : nullptr);
@@ -267,16 +268,20 @@ int main(int argc, char** argv) {
     }
     generate_s = seconds_since(t0);
     const auto st = dec.stats();
-    std::printf("prompt: %zu tokens in %.2f s (%.1f tok/s); misses %.1f%% of %llu picks, store wait %.2f s\n",
+    std::printf("prompt: %zu tokens in %.2f s (%.1f tok/s); misses %.1f%% of %llu picks (%llu from RAM), miss wait %.2f s\n",
                 args.prompt.size(), prompt_s, static_cast<double>(args.prompt.size()) / prompt_s,
                 after_prompt.picks ? 100.0 * static_cast<double>(after_prompt.misses) / static_cast<double>(after_prompt.picks) : 0.0,
-                static_cast<unsigned long long>(after_prompt.picks), after_prompt.store_s);
+                static_cast<unsigned long long>(after_prompt.picks), static_cast<unsigned long long>(after_prompt.ram_hits),
+                after_prompt.store_s);
     if (args.generate > 0) {
       const auto picks = st.picks - after_prompt.picks, misses = st.misses - after_prompt.misses;
-      std::printf("generate: %d tokens in %.2f s (%.2f tok/s); misses %.1f%% (%.1f per token), store wait %.2f s\n",
+      const auto ram = st.ram_hits - after_prompt.ram_hits;
+      std::printf("generate: %d tokens in %.2f s (%.2f tok/s); misses %.1f%% (%.1f per token: %.1f from RAM, %.1f store reads), "
+                  "miss wait %.2f s\n",
                   args.generate, generate_s, args.generate / generate_s,
                   picks ? 100.0 * static_cast<double>(misses) / static_cast<double>(picks) : 0.0,
-                  static_cast<double>(misses) / args.generate, st.store_s - after_prompt.store_s);
+                  static_cast<double>(misses) / args.generate, static_cast<double>(ram) / args.generate,
+                  static_cast<double>(misses - ram) / args.generate, st.store_s - after_prompt.store_s);
       std::printf("generated:");
       for (int32_t t : generated) std::printf(" %d", t);
       std::printf("\n");

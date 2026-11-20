@@ -40,6 +40,7 @@ Result<std::vector<SlotLoad>, CacheModelError> LayerExpertCache::place(std::span
     const auto i = static_cast<size_t>(e);
     if (!resident_[i]) {
       int32_t slot = held_;  // while the cache fills, Slots are taken in order
+      int32_t evicted = -1;
       // A full cache evicts the least recently used Expert this Route does not
       // need: every needed resident Expert carries clock_ by now.
       if (held_ == slots_) {
@@ -48,6 +49,7 @@ Result<std::vector<SlotLoad>, CacheModelError> LayerExpertCache::place(std::span
           if (resident_[v] && last_use_[v] != clock_ && (victim == resident_.size() || last_use_[v] < last_use_[victim]))
             victim = v;
         resident_[victim] = 0;  // exists: the Route fits in the Slots, so some resident Expert is unneeded
+        evicted = static_cast<int32_t>(victim);
         slot = slot_of_[victim];
         slot_of_[victim] = -1;
         held_ -= 1;
@@ -55,7 +57,7 @@ Result<std::vector<SlotLoad>, CacheModelError> LayerExpertCache::place(std::span
       resident_[i] = 1;
       slot_of_[i] = slot;
       held_ += 1;
-      loads.push_back({e, slot});
+      loads.push_back({e, slot, evicted});
     }
     last_use_[i] = clock_;
   }

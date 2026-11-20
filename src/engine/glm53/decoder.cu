@@ -17,6 +17,7 @@
 #include "core/glm53/moe_plan.hpp"
 #include "core/glm53/reference.hpp"
 #include "core/glm53/store.hpp"
+#include "core/glm53/victim_tier.hpp"
 #include "core/mx_reference.hpp"
 #include "cuda/exchange.cuh"
 #include "cuda/glm53/attention.cuh"
@@ -152,17 +153,32 @@ struct Decoder::State {
   io::Fd store;
   std::optional<io::UringReader> reader;
   std::byte* staging = nullptr;  // pinned: kMaxJobs records' Halves, [job][half][kHalfBytes]
+  // The RAM tier: entries of two Halves, [half][kHalfBytes], pinned in blocks of kTierBlock.
+  static constexpr int kTierBlock = 32;
+  std::optional<g53::VictimTier> tier;
+  std::vector<int> tier_layer;  // [layer]: the tier's index of a Sparse layer
+  std::vector<std::byte*> tier_blocks;
   DecoderStats stats;
 
   ~State() {
     if (staging) cudaFreeHost(staging);
+    for (std::byte* b : tier_blocks) cudaFreeHost(b);
+  }
+
+  /** Half h of RAM tier entry `entry`. */
+  std::byte* entry_ptr(int32_t entry, size_t h) const {
+    return tier_blocks[static_cast<size_t>(entry / kTierBlock)] +
+           (static_cast<uint64_t>(entry % kTierBlock) * 2 + h) * kHalfBytes;
   }
 
   /** GPU h's Slot `slot` of layer L. */
   uint8_t* slot_ptr(int L, size_t h, int32_t slot) const {
     return gpus[h]->sparse[static_cast<size_t>(L)]->slots + static_cast<uint64_t>(slot) * kHalfBytes;
   }
-  /** Read `loads` (layer L's Misses) from the store; copy Half h of each to GPU h's Slot. */
+  /**
+   * Serve `loads` (layer L's Misses): copy each evicted Expert down into the RAM tier, then each
+   * Miss up from the tier or from the store, Half h to GPU h's Slot. Returns when every copy is done.
+   */
   void serve(int L, std::span<const g53::SlotLoad> loads);
   /** Layer L's MoE for the Round's `n` tokens: route, place, Experts, combine, Exchange, residual. */
   void moe(int L, int n);
@@ -363,6 +379,22 @@ Result<std::unique_ptr<Decoder>, std::string> Decoder::open(const g53::Config& c
       if (!cache) return R::err(cache.error().what);
       s.caches[L].emplace(std::move(cache).value());
     }
+    // The RAM tier: per_layer Experts a layer, and a Round's Loads spare (core/glm53/victim_tier).
+    if (c.ram_per_layer < 0) return R::err("the RAM tier size must be >= 0");
+    if (c.ram_per_layer > 0) {
+      auto tier = g53::VictimTier::create(static_cast<int>(sparse_layers.size()), d.experts, c.ram_per_layer,
+                                          moe_plan::kMaxJobs);
+      if (!tier) return R::err(tier.error().what);
+      s.tier.emplace(std::move(tier).value());
+      s.tier_layer.assign(static_cast<size_t>(d.layers), -1);
+      for (size_t i = 0; i < sparse_layers.size(); i++) s.tier_layer[static_cast<size_t>(sparse_layers[i])] = static_cast<int>(i);
+      for (int e = 0; e < s.tier->entries(); e += State::kTierBlock) {
+        std::byte* block = nullptr;
+        ck(cudaHostAlloc(reinterpret_cast<void**>(&block), State::kTierBlock * 2 * kHalfBytes, cudaHostAllocPortable),
+           "RAM tier");
+        s.tier_blocks.push_back(block);
+      }
+    }
     for (int g = 0; g < 2; g++) {
       ck(cudaSetDevice(s.gpus[g]->device), "cudaSetDevice");
       ck(cudaDeviceSynchronize(), "open");
@@ -377,14 +409,39 @@ Result<std::unique_ptr<Decoder>, std::string> Decoder::open(const g53::Config& c
 void Decoder::State::serve(int L, std::span<const g53::SlotLoad> loads) {
   if (loads.empty()) return;
   const auto t0 = std::chrono::steady_clock::now();
+  std::vector<g53::TierMove> moves(loads.size(), g53::TierMove{-1, -1});
+  if (tier) {
+    auto m = tier->serve(tier_layer[static_cast<size_t>(L)], loads);
+    if (!m) throw Failure("RAM tier: " + m.error().what);
+    moves = std::move(m).value();
+  }
+  // The store reads first: they take longest. Then, on each GPU's copy stream, every copy down
+  // leaves its Slot before a copy up (from the tier, or from staging as a read lands) fills it.
   std::vector<io::ReadRequest> reqs;
   for (size_t i = 0; i < loads.size(); i++)
-    for (uint32_t h = 0; h < 2; h++)
-      reqs.push_back({store.get(),
-                      g53::half_offset({static_cast<uint32_t>(L), static_cast<uint32_t>(loads[i].expert)}, h),
-                      {staging + (2 * i + h) * kHalfBytes, kHalfBytes},
-                      2 * i + h});
-  if (auto r = reader->submit(reqs); !r) throw Failure("Expert store: " + r.error().what);
+    if (moves[i].up < 0)
+      for (uint32_t h = 0; h < 2; h++)
+        reqs.push_back({store.get(),
+                        g53::half_offset({static_cast<uint32_t>(L), static_cast<uint32_t>(loads[i].expert)}, h),
+                        {staging + (2 * i + h) * kHalfBytes, kHalfBytes},
+                        2 * i + h});
+  if (!reqs.empty())
+    if (auto r = reader->submit(reqs); !r) throw Failure("Expert store: " + r.error().what);
+  for (size_t h = 0; h < 2; h++) {
+    Gpu& G = *gpus[h];
+    ck(cudaSetDevice(G.device), "cudaSetDevice");
+    for (size_t i = 0; i < loads.size(); i++)
+      if (moves[i].down >= 0)
+        ck(cudaMemcpyAsync(entry_ptr(moves[i].down, h), slot_ptr(L, h, loads[i].slot), kHalfBytes,
+                           cudaMemcpyDeviceToHost, G.copy),
+           "copy down");
+    for (size_t i = 0; i < loads.size(); i++)
+      if (moves[i].up >= 0)
+        ck(cudaMemcpyAsync(slot_ptr(L, h, loads[i].slot), entry_ptr(moves[i].up, h), kHalfBytes,
+                           cudaMemcpyHostToDevice, G.copy),
+           "copy up");
+  }
+  stats.ram_hits += loads.size() - reqs.size() / 2;
   for (size_t landed = 0; landed < reqs.size();) {
     auto done = reader->wait(1);
     if (!done) throw Failure("Expert store: " + done.error().what);
@@ -400,7 +457,7 @@ void Decoder::State::serve(int L, std::span<const g53::SlotLoad> loads) {
       landed++;
     }
   }
-  // The staging buffer is reused by the next layer's reads: the copies finish first.
+  // The staging buffer and the tier's entries are reused by the next layer: the copies finish first.
   for (auto& G : gpus) {
     ck(cudaSetDevice(G->device), "cudaSetDevice");
     ck(cudaStreamSynchronize(G->copy), "Slot copies");

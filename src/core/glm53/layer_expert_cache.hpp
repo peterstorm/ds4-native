@@ -34,10 +34,11 @@ struct CacheModelError {
   std::string what;
 };
 
-/** A Miss to serve: copy `expert` into Slot `slot` (whose previous Expert, if any, was evicted). */
+/** A Miss to serve: copy `expert` into Slot `slot`, evicting `evicted` from it (-1: the Slot was free). */
 struct SlotLoad {
   int32_t expert;
   int32_t slot;
+  int32_t evicted;
   friend bool operator==(SlotLoad, SlotLoad) = default;
 };
 
@@ -56,7 +57,7 @@ class LayerExpertCache {
 
   /**
    * Record one token's Route, as use(), and return its Misses in Route order,
-   * each with the Slot it now occupies.
+   * each with the Slot it now occupies and the Expert it evicted from it.
    */
   Result<std::vector<SlotLoad>, CacheModelError> place(std::span<const int32_t> route);
 
