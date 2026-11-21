@@ -25,6 +25,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -94,6 +95,21 @@ class LayerScratch {
   DeviceArray<float> mlp_x_, gate_sum_, up_sum_, hid_, hid_half_, ones_;
 };
 
+/**
+ * One layer's cache positions [0, positions()) in host memory, as DeviceAttention::save_positions
+ * copied them: the Latent rows (BF16 [positions][kKeyWidth]) and, on a Full layer, the index keys
+ * (BF16 [positions][kIndexHeadDim]). Only save_positions makes one.
+ */
+class HostPositions {
+ public:
+  int64_t positions() const { return positions_; }
+
+ private:
+  friend class DeviceAttention;
+  int64_t positions_ = 0;
+  std::unique_ptr<std::byte[]> rows_, keys_;
+};
+
 /** A call's Selections on the device: token t's entries at rows + t * stride, lengths[t] of them, then -1. */
 struct Selections {
   const int32_t* rows = nullptr;
@@ -115,6 +131,16 @@ class DeviceAttention {
 
   /** Copies the oracle's cache rows [0, past.length) into this GPU's caches. */
   Result<int, std::string> load_cache(const ds4n::glm53::LayerCache& past);
+
+  /** One position's cache bytes: its Latent row and, on a Full layer, its index key. */
+  uint64_t position_bytes() const;
+  /** Positions [0, n) of the caches (n in 0 .. capacity), copied to host memory once `stream`'s work before is done. */
+  Result<HostPositions, std::string> save_positions(int64_t n, cudaStream_t stream) const;
+  /**
+   * Positions [0, n) of `from` (n <= from.positions(), saved from a layer of this one's kind) into the
+   * caches, the copy done when this returns. Fails, copying nothing, on another n or kind.
+   */
+  Result<int64_t, std::string> restore_positions(const HostPositions& from, int64_t n, cudaStream_t stream);
 
   /**
    * A wave of `tokens` (1 .. scratch.wave()) tokens at positions first .. first + tokens - 1 whose

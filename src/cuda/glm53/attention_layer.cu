@@ -232,6 +232,53 @@ Result<int, std::string> DeviceAttention::load_cache(const g53::LayerCache& past
   }
 }
 
+uint64_t DeviceAttention::position_bytes() const {
+  return (static_cast<uint64_t>(kKeyWidth) + (index_keys_.get() ? kIndexHeadDim : 0)) * sizeof(__nv_bfloat16);
+}
+
+Result<HostPositions, std::string> DeviceAttention::save_positions(int64_t n, cudaStream_t s) const {
+  using R = Result<HostPositions, std::string>;
+  if (n < 0 || n > capacity_) return R::err("positions outside the cache");
+  try {
+    HostPositions h;
+    h.positions_ = n;
+    const auto N = static_cast<size_t>(n);
+    // Pageable host memory: copied synchronously, and it does not take from the pinned RAM tier.
+    h.rows_ = std::make_unique_for_overwrite<std::byte[]>(std::max<size_t>(N * kKeyWidth * sizeof(__nv_bfloat16), 1));
+    ck(cudaMemcpyAsync(h.rows_.get(), rows_.get(), N * kKeyWidth * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost, s),
+       "save rows");
+    if (index_keys_.get()) {
+      h.keys_ = std::make_unique_for_overwrite<std::byte[]>(std::max<size_t>(N * kIndexHeadDim * sizeof(__nv_bfloat16), 1));
+      ck(cudaMemcpyAsync(h.keys_.get(), index_keys_.get(), N * kIndexHeadDim * sizeof(__nv_bfloat16),
+                         cudaMemcpyDeviceToHost, s),
+         "save index keys");
+    }
+    ck(cudaStreamSynchronize(s), "save positions");
+    return R::ok(std::move(h));
+  } catch (const std::runtime_error& e) {
+    return R::err(e.what());
+  }
+}
+
+Result<int64_t, std::string> DeviceAttention::restore_positions(const HostPositions& from, int64_t n, cudaStream_t s) {
+  using R = Result<int64_t, std::string>;
+  if (n < 0 || n > from.positions_ || n > capacity_) return R::err("positions outside the saved ones or the cache");
+  if ((from.keys_ != nullptr) != (index_keys_.get() != nullptr)) return R::err("saved from a layer of another kind");
+  try {
+    const auto N = static_cast<size_t>(n);
+    ck(cudaMemcpyAsync(rows_.get(), from.rows_.get(), N * kKeyWidth * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice, s),
+       "restore rows");
+    if (index_keys_.get())
+      ck(cudaMemcpyAsync(index_keys_.get(), from.keys_.get(), N * kIndexHeadDim * sizeof(__nv_bfloat16),
+                         cudaMemcpyHostToDevice, s),
+         "restore index keys");
+    ck(cudaStreamSynchronize(s), "restore positions");
+    return R::ok(n);
+  } catch (const std::runtime_error& e) {
+    return R::err(e.what());
+  }
+}
+
 const __nv_bfloat16* DeviceAttention::cache_row(int64_t p) const { return rows_.get() + p * kKeyWidth; }
 
 const __nv_bfloat16* DeviceAttention::index_key(int64_t p) const {

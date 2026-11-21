@@ -32,6 +32,7 @@ add_library(ds4n_core STATIC
   src/core/glm53/expert_tiles.cpp
   src/core/glm53/layer_expert_cache.cpp
   src/core/glm53/victim_tier.cpp
+  src/core/glm53/sessions.cpp
   src/core/meminfo.cpp
   src/core/glm53/pruning.cpp
   src/core/indexer.cpp
@@ -157,12 +158,18 @@ if(DS4N_CUDA)
   target_compile_options(ds4n-glm53-moe-check PRIVATE ${DS4N_CUDA_FLAGS})
   target_link_libraries(ds4n-glm53-moe-check PRIVATE ds4n_cuda ds4n_glm53_io)
   # GLM-5.3's engine: the decoder on two GPUs, and its gate.
-  add_library(ds4n_glm53_engine STATIC src/engine/glm53/decoder.cu)
+  add_library(ds4n_glm53_engine STATIC src/engine/glm53/decoder.cu src/engine/glm53/conversation.cu)
   target_compile_options(ds4n_glm53_engine PRIVATE ${DS4N_CUDA_FLAGS})
   target_link_libraries(ds4n_glm53_engine PUBLIC ds4n_cuda ds4n_glm53_io ds4n_io)
   add_executable(ds4n-glm53-decode src/tools/glm53_decode.cu)
   target_compile_options(ds4n-glm53-decode PRIVATE ${DS4N_CUDA_FLAGS})
   target_link_libraries(ds4n-glm53-decode PRIVATE ds4n_glm53_engine)
+  add_executable(ds4n-glm53-serve src/tools/glm53_serve.cu)
+  target_compile_options(ds4n-glm53-serve PRIVATE ${DS4N_CUDA_FLAGS})
+  target_link_libraries(ds4n-glm53-serve PRIVATE ds4n_glm53_engine)
+  add_executable(ds4n-glm53-serve-check src/tools/glm53_serve_check.cu)
+  target_compile_options(ds4n-glm53-serve-check PRIVATE ${DS4N_CUDA_FLAGS})
+  target_link_libraries(ds4n-glm53-serve-check PRIVATE ds4n_glm53_engine)
   # The oracle tool gains its GPU path (--gpu) in a CUDA build.
   target_link_libraries(ds4n-glm53-oracle-run PRIVATE ds4n_cuda CUDA::cudart)
   target_compile_definitions(ds4n-glm53-oracle-run PRIVATE DS4N_GLM53_GPU)
@@ -198,6 +205,7 @@ add_executable(ds4n_tests
   tests/core/glm53/test_expert_tiles.cpp
   tests/core/glm53/test_layer_expert_cache.cpp
   tests/core/glm53/test_victim_tier.cpp
+  tests/core/glm53/test_sessions.cpp
   tests/core/test_meminfo.cpp
   tests/core/glm53/test_pruning.cpp
   tests/core/test_indexer.cpp

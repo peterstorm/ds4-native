@@ -42,6 +42,13 @@
 // The store may have replicas, one per drive: each Half is read from the one
 // with fewest reads in flight, so the drives' bandwidth adds up.
 //
+// Every cache is indexed by position, so a server keeps conversations with three
+// moves (core/glm53/sessions plans them): rewind() shortens the caches to a
+// prompt's shared prefix, save() copies positions [0, n) of every layer to host
+// memory (both GPUs hold the same rows: GPU 0's), restore() copies them back into
+// both GPUs. The bytes are the caches' own, so a resumed conversation's logits are
+// the bits of one that never left.
+//
 // Every output is exact: ds4n-glm53-decode --check replays each layer on the
 // CPU oracle from the residual streams this decoder captures, bit for bit.
 #include <array>
@@ -97,6 +104,22 @@ struct DecoderStats {
   double round_s = 0.0, store_s = 0.0;  // in round(): all, and serving Misses (reads, copies up and down)
 };
 
+/** Positions [0, positions()) of every layer's caches in host memory (pageable): only Decoder::save makes one. */
+class KvRows {
+ public:
+  KvRows(KvRows&&) noexcept;
+  KvRows& operator=(KvRows&&) noexcept;
+  ~KvRows();
+  int64_t positions() const { return positions_; }
+
+ private:
+  friend class Decoder;
+  struct Layers;
+  KvRows(int64_t positions, std::unique_ptr<Layers> layers);
+  int64_t positions_ = 0;
+  std::unique_ptr<Layers> layers_;
+};
+
 class Decoder {
  public:
   /**
@@ -131,7 +154,17 @@ class Decoder {
                                                   std::vector<std::vector<float>>* capture = nullptr,
                                                   std::vector<float>* all_logits = nullptr);
 
+  /** The caches shortened to `n` positions (0 .. length()); later tokens overwrite the rows past it. */
+  Result<int64_t, std::string> rewind(int64_t n);
+  /** Positions [0, n) (n in 0 .. length()) of every layer's caches, copied to host memory. */
+  Result<KvRows, std::string> save(int64_t n) const;
+  /** Positions [0, n) of `rows` (n <= rows.positions()) copied into both GPUs' caches; the length is then n. */
+  Result<int64_t, std::string> restore(const KvRows& rows, int64_t n);
+  /** One position's cache bytes over every layer: what save() takes in host memory per position. */
+  uint64_t position_bytes() const;
+
   int64_t length() const;
+  int capacity() const;
   int slots_per_layer() const;
   int ram_per_layer() const;  // the RAM tier's Experts per Sparse layer, as sized; 0: none
   DecoderStats stats() const;

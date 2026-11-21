@@ -1,0 +1,19 @@
+open: 75 s, 99 Slots per layer, capacity 4096, 95.2 KB a position
+S1: save, rewind, restore on the Decoder
+  A swept alone: its last logits                                           exact (0 of 154880 values differ)
+  A restored, B swept: B's logits                                          exact (0 of 15488000 values differ)
+  A restored, B fed a token at a time: B's logits                          exact (0 of 15488000 values differ)
+  A's first third restored, the rest of A and B swept: B's logits          exact (0 of 15488000 values differ)
+S2: a server's conversations, greedy, 6 tokens a reply
+    note: set aside a conversation of 205 tokens
+    note: set aside a conversation of 105 tokens
+    note: resumed a conversation set aside, at 205 tokens
+  reuse: X 0, Y 0, X next 205 (of 306), X after 311 (of 412)
+  X's next turn resumes from its checkpoint: its whole last turn but one token exact (0 of 1 values differ)
+  X's turn after resumes from the live caches                              exact (0 of 1 values differ)
+  a STOP ends the reply after the token it came with                       exact (0 of 1 values differ)
+  X's next turn: logits rows as on empty caches                            exact (0 of 929280 values differ)
+  X's next turn: tokens as on empty caches                                 exact (0 of 1 values differ)
+  X's turn after: logits rows as on empty caches                           exact (0 of 929280 values differ)
+  X's turn after: tokens as on empty caches                                exact (0 of 1 values differ)
+PASS: every resumed conversation is bit-identical to a fresh run

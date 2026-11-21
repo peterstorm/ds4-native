@@ -1,0 +1,31 @@
+INFO engine=ds4-native engine_kind=ds4-native model=glm-5.3 context=4096 vram_slots=7425 ram_records=0 lambda=0 checkpoint_gb=4.0 load_s=73 logit_bias=1 lanes=1
+READY 4096 stop
+ERR token id '999999999' is not in the vocabulary
+PP 0 64 0.0 0.0 0
+PP 64 64 20938.0 3.1 0
+T 486
+T 73712
+T 8232
+T 5194
+T 486
+STAT tok_s=3.77 ms_tok=265.18 vram_hit=0.7817
+DONE 5 64 20938.0 1325.9 length 0 0 0 0 0
+NOTE sessions: set aside a conversation of 68 tokens
+PP 67 80 0.0 0.0 67
+PP 80 80 3545.9 3.7 67
+T 701
+T 15699
+T 8360
+T 49449
+T 8
+STAT tok_s=4.09 ms_tok=244.36 vram_hit=0.8013
+DONE 5 80 3545.9 1221.8 length 0 0 67 0 0
+NOTE sessions: set aside a conversation of 84 tokens
+PP 63 64 0.0 0.0 63
+PP 64 64 76.4 13.1 63
+T 486
+T 73712
+T 8232
+T 6856
+STAT tok_s=22.62 ms_tok=44.21 vram_hit=0.9739
+DONE 4 64 76.4 176.8 length 0 0 63 0 0

@@ -359,9 +359,70 @@ struct Decoder::State {
   }
 };
 
+/** Every layer's saved positions, GPU 0's, [layer]. */
+struct KvRows::Layers {
+  std::vector<gpu::HostPositions> layer;
+};
+KvRows::KvRows(int64_t positions, std::unique_ptr<Layers> layers) : positions_(positions), layers_(std::move(layers)) {}
+KvRows::KvRows(KvRows&&) noexcept = default;
+KvRows& KvRows::operator=(KvRows&&) noexcept = default;
+KvRows::~KvRows() = default;
+
 Decoder::Decoder(std::unique_ptr<State> s) : s_(std::move(s)) {}
 Decoder::~Decoder() = default;
+
+Result<int64_t, std::string> Decoder::rewind(int64_t n) {
+  using R = Result<int64_t, std::string>;
+  if (s_->broken) return R::err("an earlier Round failed part way: open a new Decoder");
+  if (n < 0 || n > s_->length) return R::err("a rewind goes back to 0 .. length() positions");
+  s_->length = n;
+  return R::ok(n);
+}
+
+Result<KvRows, std::string> Decoder::save(int64_t n) const {
+  using R = Result<KvRows, std::string>;
+  State& s = *s_;
+  if (s.broken) return R::err("an earlier Round failed part way: open a new Decoder");
+  if (n < 0 || n > s.length) return R::err("a save takes 0 .. length() positions");
+  Gpu& G0 = *s.gpus[0];
+  if (cudaSetDevice(G0.device) != cudaSuccess) return R::err("cudaSetDevice");
+  auto layers = std::make_unique<KvRows::Layers>();
+  for (int L = 0; L < s.d.layers; L++) {
+    auto p = G0.attention[static_cast<size_t>(L)]->save_positions(n, G0.stream);
+    if (!p) return R::err("layer " + std::to_string(L) + ": " + p.error());
+    layers->layer.push_back(std::move(p).value());
+  }
+  return R::ok(KvRows(n, std::move(layers)));
+}
+
+Result<int64_t, std::string> Decoder::restore(const KvRows& rows, int64_t n) {
+  using R = Result<int64_t, std::string>;
+  State& s = *s_;
+  if (s.broken) return R::err("an earlier Round failed part way: open a new Decoder");
+  if (n < 0 || n > rows.positions() || n > s.config.capacity || rows.layers_->layer.size() != static_cast<size_t>(s.d.layers))
+    return R::err("a restore takes 0 .. the saved positions, within the capacity");
+  s.broken = true;  // until both GPUs hold the rows
+  for (auto& G : s.gpus) {
+    if (cudaSetDevice(G->device) != cudaSuccess) return R::err("cudaSetDevice");
+    for (int L = 0; L < s.d.layers; L++) {
+      auto r = G->attention[static_cast<size_t>(L)]->restore_positions(rows.layers_->layer[static_cast<size_t>(L)], n,
+                                                                         G->stream);
+      if (!r) return R::err("layer " + std::to_string(L) + ": " + r.error());
+    }
+  }
+  s.length = n;
+  s.broken = false;
+  return R::ok(n);
+}
+
+uint64_t Decoder::position_bytes() const {
+  uint64_t b = 0;
+  for (const auto& a : s_->gpus[0]->attention) b += a->position_bytes();
+  return b;
+}
+
 int64_t Decoder::length() const { return s_->length; }
+int Decoder::capacity() const { return s_->config.capacity; }
 int Decoder::slots_per_layer() const { return s_->slots_per_layer; }
 int Decoder::ram_per_layer() const { return s_->ram_per_layer; }
 DecoderStats Decoder::stats() const { return s_->stats; }
