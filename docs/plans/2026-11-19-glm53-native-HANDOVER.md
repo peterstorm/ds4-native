@@ -202,7 +202,12 @@ An independent audit (python, read-only, against the index) found:
    - **Docker flags:** `--security-opt seccomp=unconfined` (io_uring) and `--ulimit memlock=-1`.
    - **Gate:** `--check` replays every layer of every token on the CPU oracle, bit for bit.
      Results in `docs/bench/glm53-decode/`.
-   - **Next:** speed. The engine computes a token in ~25 ms; the rest is waiting on the store.
+   - **Speed, 2026-11-21 (plan step 8):** the RAM victim tier (`--ram-per-layer 24`) and prompt
+     sweeps (`Decoder::prefill`, the tool's default; `--prefill rounds` for the old path). Each is
+     gated bit-identical, exact and λ. Exact: prompt 18–54 tok/s (700–2,800 tokens), decode 3.4
+     tok/s. λ 0.03: decode 6.3–7.6 tok/s.
+   - **Next:** more RAM for the tier (`zfs_arc_max` is the operator's call), read-ahead for long
+     prompts, a server around the Decoder.
 7. Phases 4–5 per the plan (fifth switch-primary entry `glm-native`, slots ladder, CyberGym).
 
 ## Environment facts (the things that cost time to rediscover)

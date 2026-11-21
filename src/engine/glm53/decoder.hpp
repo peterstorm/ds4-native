@@ -26,6 +26,15 @@
 // there moves up over PCIe instead of being read from the store. Slots and tier
 // then act as one LRU cache of both sizes. Routing never sees the tier.
 //
+// A prompt runs faster as a sweep (prefill): layer by layer, every token of it
+// through layer L before any goes on, so a layer's Experts are read once for the
+// whole prompt instead of once per Round. Each layer attends the prompt in
+// Rounds of 8 in order, routes every Round, gathers the union of their Experts
+// into a VRAM scratch (from a Slot, the RAM tier or the store), and runs each
+// Round's Experts from it. The Expert cache still records the Rounds one by one,
+// as round() would; only its final state is written to the Slots and the tier,
+// at the end of the layer. Same arithmetic per token, so the same bits.
+//
 // Every output is exact: ds4n-glm53-decode --check replays each layer on the
 // CPU oracle from the residual streams this decoder captures, bit for bit.
 #include <array>
@@ -55,7 +64,8 @@ struct DecoderStats {
   uint64_t rounds = 0, tokens = 0;
   uint64_t picks = 0;   // Expert placements asked for (a Round's distinct Experts, per Sparse layer)
   uint64_t misses = 0;    // of them, not in a Slot
-  uint64_t ram_hits = 0;  // of the Misses, moved up from the RAM tier (the rest read from the store)
+  uint64_t ram_hits = 0;  // Experts copied up from the RAM tier (round(): Misses; prefill(): scratch fills)
+  uint64_t store_reads = 0;  // Experts read from the store
   double load_s = 0.0;    // open(): the Backbone into VRAM, the RAM tier pinned
   double round_s = 0.0, store_s = 0.0;  // in round(): all, and serving Misses (reads, copies up and down)
 };
@@ -79,6 +89,16 @@ class Decoder {
    */
   Result<std::vector<float>, std::string> round(std::span<const int32_t> tokens,
                                                 std::vector<std::vector<float>>* capture = nullptr);
+
+  /**
+   * Run a prompt of any length (up to the free capacity) as a sweep and append it to the cache. A sweep
+   * routes exactly, also under route_bonus: λ then applies from the next round() on, against the residency
+   * the sweep left (the Rounds of 8 it recorded, as round() would). Returns the last token's logits
+   * [vocab]; with `all_logits`, every token's too, [n][vocab]. `capture` is as round()'s, for all n.
+   */
+  Result<std::vector<float>, std::string> prefill(std::span<const int32_t> tokens,
+                                                  std::vector<std::vector<float>>* capture = nullptr,
+                                                  std::vector<float>* all_logits = nullptr);
 
   int64_t length() const;
   int slots_per_layer() const;

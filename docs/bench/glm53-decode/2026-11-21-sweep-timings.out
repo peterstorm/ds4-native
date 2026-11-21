@@ -1,0 +1,29 @@
+# ds4n-glm53-decode, desktop (2x 96 GB GPUs, one Samsung 9100 PRO), RAM tier 24 per layer, exact routing.
+# Prompt: locality corpus prompt 3 (700 tokens), and all four corpus prompts joined (2,800 tokens).
+# Three CPU replays (--check gates) ran beside these, so the non-store time is if anything high.
+
+## Sweep v1: Rounds of 8 per layer from a scratch gathered whole (b96f438 + sweep), 700 tokens
+open: 77.2 s, 97 Slots per Sparse layer (38% of the Experts), RAM tier 24 per layer, capacity 4096, λ 0
+prompt (sweep): 700 tokens in 41.79 s (16.8 tok/s); 18237 store reads, 0 from RAM, miss wait 35.91 s
+generate: 32 tokens in 9.72 s (3.29 tok/s); misses 25.2% (151.2 per token: 38.7 from RAM, 112.5 store reads), miss wait 8.90 s
+generated: 101175 320 477 2572 20651 75403 220 15 8 760 576 18672 10792 220 17 29348 33 817 3950 320 477 35159 2411 220 100461 9624 2687 429 374 220 100067 29348
+
+## Sweep v1 + one routing pass per layer, 700 tokens
+open: 76.9 s, 96 Slots per Sparse layer (38% of the Experts), RAM tier 24 per layer, capacity 4096, λ 0
+prompt (sweep): 700 tokens in 41.49 s (16.9 tok/s); 18237 store reads, 0 from RAM, miss wait 36.02 s
+generate: 32 tokens in 9.78 s (3.27 tok/s); misses 25.5% (152.8 per token: 39.1 from RAM, 113.8 store reads), miss wait 8.95 s
+generated: 101175 320 477 2572 20651 75403 220 15 8 760 576 18672 10792 220 17 29348 33 817 3950 320 477 35159 2411 220 100461 9624 2687 429 374 220 100067 29348
+
+## Same, 2,800 tokens
+open: 76.7 s, 96 Slots per Sparse layer (38% of the Experts), RAM tier 24 per layer, capacity 4096, λ 0
+prompt (sweep): 2800 tokens in 60.26 s (46.5 tok/s); 19168 store reads, 0 from RAM, miss wait 38.11 s
+generate: 16 tokens in 5.92 s (2.70 tok/s); misses 30.5% (183.1 per token: 41.7 from RAM, 141.4 store reads), miss wait 5.48 s
+generated: 12160 4532 760 5162 9245 91 4421 91 4421 7360 91 350 26444 760 220 17
+
+## Grouped MoE overlapped with the reads (final), 700 and 2,800 tokens
+prompt (sweep): 700 tokens in 38.88 s (18.0 tok/s); 18237 store reads, 0 from RAM, miss wait 35.17 s
+generate: 16 tokens in 5.18 s (3.09 tok/s); misses 27.5% (165.2 per token: 45.1 from RAM, 120.2 store reads), miss wait 4.76 s
+generated: 101175 320 477 2572 20651 75403 220 15 8 760 576 18672 10792 220 17 29348
+prompt (sweep): 2800 tokens in 51.66 s (54.2 tok/s); 19168 store reads, 0 from RAM, miss wait 37.08 s
+generate: 16 tokens in 5.94 s (2.69 tok/s); misses 30.5% (183.1 per token: 41.7 from RAM, 141.4 store reads), miss wait 5.51 s
+generated: 12160 4532 760 5162 9245 91 4421 91 4421 7360 91 350 26444 760 220 17

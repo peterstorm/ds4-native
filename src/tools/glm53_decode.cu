@@ -4,7 +4,10 @@
 //
 //   ds4n-glm53-decode --config CONFIG --backbone DIR --store FILE --prompt "ID ID ..."
 //                     [--generate N] [--round R] [--lambda λ] [--slots-per-layer S]
-//                     [--ram-per-layer R] [--capacity C] [--devices A,B] [--threads T] [--check]
+//                     [--ram-per-layer R] [--prefill sweep|rounds] [--capacity C] [--devices A,B]
+//                     [--threads T] [--check]
+// The prompt runs as a sweep (Decoder::prefill: routed exactly, also under λ, which then applies to the
+// generated tokens), or in Rounds of --round (--prefill rounds; under λ Rounds of 1, every token λ-routed).
 //
 // --check captures the residual stream entering every layer for every token,
 // then replays each layer on the CPU in the Reference configuration from the
@@ -24,6 +27,7 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <set>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -57,6 +61,7 @@ struct Args {
   std::string config, backbone, store;
   std::vector<int32_t> prompt;
   int generate = 0, round = 8;
+  std::string prefill = "sweep";  // or "rounds"; a sweep routes the prompt exactly, also under λ
   eng::DecoderConfig decoder;
   bool check = false;
 };
@@ -64,7 +69,8 @@ struct Args {
 Args parse(int argc, char** argv) {
   const std::string usage =
       "usage: --config CONFIG --backbone DIR --store FILE --prompt \"ID ID ...\" [--generate N] [--round R] "
-      "[--lambda λ] [--slots-per-layer S] [--ram-per-layer R] [--capacity C] [--devices A,B] [--threads T] [--check]";
+      "[--prefill sweep|rounds] [--lambda λ] [--slots-per-layer S] [--ram-per-layer R] [--capacity C] [--devices A,B] "
+      "[--threads T] [--check]";
   Args a;
   for (int i = 1; i < argc; i++) {
     const std::string k = argv[i];
@@ -78,6 +84,7 @@ Args parse(int argc, char** argv) {
     else if (k == "--backbone") a.backbone = v;
     else if (k == "--store") a.store = v;
     else if (k == "--generate") a.generate = std::stoi(v);
+    else if (k == "--prefill") a.prefill = v;
     else if (k == "--round") a.round = std::stoi(v);
     else if (k == "--lambda") a.decoder.route_bonus = std::stof(v);
     else if (k == "--slots-per-layer") a.decoder.slots_per_layer = std::stoi(v);
@@ -92,6 +99,7 @@ Args parse(int argc, char** argv) {
     } else die("unknown argument " + k + "\n" + usage);
   }
   if (a.config.empty() || a.backbone.empty() || a.store.empty() || a.prompt.empty()) die(usage);
+  if (a.prefill != "sweep" && a.prefill != "rounds") die(usage);
   if (a.round < 1 || a.round > 8) die("--round is 1 .. 8");
   if (a.decoder.route_bonus != 0.0f) a.round = 1;  // the decoder's rule under λ
   return a;
@@ -115,7 +123,7 @@ size_t differing(std::span<const float> want, std::span<const float> got) {
 
 /** The CPU replay (see top). Returns whether every layer and logit was bit-identical. */
 bool replay(const glm53::Config& config, const io::BackboneParts& parts, const std::string& store_path,
-            const Captured& cap, float lambda, int slots_per_layer, unsigned threads) {
+            const Captured& cap, float lambda, int slots_per_layer, unsigned threads, size_t exact_prefix) {
   const glm53::Dims& d = config.dims();
   auto store = io::StoreReader::open(store_path);
   if (!store) die(store.error().what);
@@ -146,6 +154,7 @@ bool replay(const glm53::Config& config, const io::BackboneParts& parts, const s
       if (lambda != 0.0f) cache.emplace(glm53::LayerExpertCache::create(d.experts, slots_per_layer).value());
     }
     std::map<int32_t, exact::Fp4Expert> experts;
+    std::set<int32_t> round_union;
     glm53::LayerCache past;
     size_t bad = 0;
     for (size_t t = 0; t < T; t++) {
@@ -164,11 +173,23 @@ bool replay(const glm53::Config& config, const io::BackboneParts& parts, const s
         if (!y) die(where + y.error().what);
         ffn.out = std::move(y).value().out;
       } else {
+        // A swept prompt's tokens route exactly; the cache records each Round of 8 of them as one
+        // Route, its Experts' union ascending (the sweep's Plans). Later tokens route with λ, one by one.
+        const bool swept = t < exact_prefix;
         exact::RouteChoice choice;
-        if (cache) choice.bonus = exact::ResidentBonus{lambda, cache->resident()};
+        if (cache && !swept) choice.bonus = exact::ResidentBonus{lambda, cache->resident()};
         auto ms = exact::begin_moe(d, *layer, start.value().ffn_in, choice);
         if (!ms) die(where + ms.error().what);
-        if (cache && !cache->place(ms.value().route.expert)) die(where + "the cache model refused a Route");
+        if (cache && swept) {
+          round_union.insert(ms.value().route.expert.begin(), ms.value().route.expert.end());
+          if ((t + 1) % 8 == 0 || t + 1 == exact_prefix) {
+            if (!cache->place(std::vector<int32_t>(round_union.begin(), round_union.end())))
+              die(where + "the cache model refused a Round");
+            round_union.clear();
+          }
+        } else if (cache && !cache->place(ms.value().route.expert)) {
+          die(where + "the cache model refused a Route");
+        }
         std::vector<exact::Halves> halves;
         for (size_t k = 0; k < ms.value().route.expert.size(); k++) {
           const int32_t e = ms.value().route.expert[k];
@@ -255,9 +276,27 @@ int main(int argc, char** argv) {
     };
     auto t0 = std::chrono::steady_clock::now();
     int32_t next = 0;
-    for (size_t i = 0; i < args.prompt.size(); i += static_cast<size_t>(args.round)) {
-      const size_t n = std::min(static_cast<size_t>(args.round), args.prompt.size() - i);
-      next = run(std::span<const int32_t>(args.prompt).subspan(i, n));
+    if (args.prefill == "sweep") {
+      std::vector<std::vector<float>> layers;
+      std::vector<float> all;
+      auto last = dec.prefill(args.prompt, args.check ? &layers : nullptr, args.check ? &all : nullptr);
+      if (!last) die(last.error());
+      if (args.check) {
+        const size_t V = static_cast<size_t>(d.vocab), H = static_cast<size_t>(d.hidden);
+        cap.x.resize(layers.size());
+        for (size_t L = 0; L < layers.size(); L++)
+          for (size_t t = 0; t < args.prompt.size(); t++)
+            cap.x[L].emplace_back(layers[L].begin() + static_cast<ptrdiff_t>(t * H),
+                                  layers[L].begin() + static_cast<ptrdiff_t>((t + 1) * H));
+        for (size_t t = 0; t < args.prompt.size(); t++)
+          cap.logits.emplace_back(all.begin() + static_cast<ptrdiff_t>(t * V), all.begin() + static_cast<ptrdiff_t>((t + 1) * V));
+      }
+      next = argmax(last.value());
+    } else {
+      for (size_t i = 0; i < args.prompt.size(); i += static_cast<size_t>(args.round)) {
+        const size_t n = std::min(static_cast<size_t>(args.round), args.prompt.size() - i);
+        next = run(std::span<const int32_t>(args.prompt).subspan(i, n));
+      }
     }
     prompt_s = seconds_since(t0);
     const auto after_prompt = dec.stats();
@@ -268,11 +307,10 @@ int main(int argc, char** argv) {
     }
     generate_s = seconds_since(t0);
     const auto st = dec.stats();
-    std::printf("prompt: %zu tokens in %.2f s (%.1f tok/s); misses %.1f%% of %llu picks (%llu from RAM), miss wait %.2f s\n",
-                args.prompt.size(), prompt_s, static_cast<double>(args.prompt.size()) / prompt_s,
-                after_prompt.picks ? 100.0 * static_cast<double>(after_prompt.misses) / static_cast<double>(after_prompt.picks) : 0.0,
-                static_cast<unsigned long long>(after_prompt.picks), static_cast<unsigned long long>(after_prompt.ram_hits),
-                after_prompt.store_s);
+    std::printf("prompt (%s): %zu tokens in %.2f s (%.1f tok/s); %llu store reads, %llu from RAM, miss wait %.2f s\n",
+                args.prefill.c_str(), args.prompt.size(), prompt_s, static_cast<double>(args.prompt.size()) / prompt_s,
+                static_cast<unsigned long long>(after_prompt.store_reads),
+                static_cast<unsigned long long>(after_prompt.ram_hits), after_prompt.store_s);
     if (args.generate > 0) {
       const auto picks = st.picks - after_prompt.picks, misses = st.misses - after_prompt.misses;
       const auto ram = st.ram_hits - after_prompt.ram_hits;
@@ -290,7 +328,7 @@ int main(int argc, char** argv) {
   if (!args.check) return 0;
   std::fflush(stdout);
   const bool ok = replay(config.value(), parts.value(), args.store, cap, args.decoder.route_bonus, slots_per_layer,
-                         args.decoder.threads);
+                         args.decoder.threads, args.prefill == "sweep" ? args.prompt.size() : 0);
   std::printf("%s\n", ok ? "PASS: every layer and logit bit-identical to the Reference configuration"
                          : "FAIL: the decoder differs from the Reference configuration");
   return ok ? 0 : 1;
