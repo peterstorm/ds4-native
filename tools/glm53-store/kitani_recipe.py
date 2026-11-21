@@ -2,29 +2,40 @@
 """kitaniai's conversion recipe, restated: FP8 recovery to BF16, then MXFP4 round-to-nearest (numpy).
 
     kitani_recipe.py --self-test
-    kitani_recipe.py verify BACKBONE_A_DIR TENSOR...    (range-fetches the cyber FP8 source)
-    kitani_recipe.py build SOURCE_DIR BACKBONE_A_DIR OUT_DIR
+    kitani_recipe.py verify cyber|stock BACKBONE_A_DIR TENSOR...   (range-fetches that FP8 source)
+    kitani_recipe.py build SOURCE_DIR BACKBONE_A_DIR OUT_DIR       (Backbone B, cyber)
                          (SOURCE_DIR: fetch-cyber-delta.py's, with delta/, delta-plan.json, CRACK_SURGERY.json)
+    kitani_recipe.py build-stock SURGERY_JSON BACKBONE_A_DIR OUT_DIR   (Backbone C, stock)
+                         (SURGERY_JSON: the uncensored release's CRACK_SURGERY.json, naming the targets)
 
-Backbone A (`kitaniai/GLM-5.3-UNCENSORED-MXFP4`) was made by one AMD Quark 0.13 call
-(`quantize.py`: `direct_quantize_checkpoint`, scheme mxfp4, `keep_excluded_layers_as_original_model_state
-=False`) from `dealignai/GLM-5.3-UNCENSORED-FP8`. Two of its operations matter to Backbone B, whose
-edited tensors arrive as FP8 with 128 x 128 block scales:
+The lineage: zai-org/GLM-5.3-BF16 -> JANGQ-AI/GLM-5.3-FP8 (`jangq_fp8`) -> dealignai's CRACK
+surgery (UNCENSORED or CYBERSECURITY, FP8) -> kitaniai/GLM-5.3-UNCENSORED-MXFP4 (Backbone A).
+Backbone A was made by one AMD Quark 0.13 call (`quantize.py`: `direct_quantize_checkpoint`,
+scheme mxfp4, `keep_excluded_layers_as_original_model_state=False`) from
+`dealignai/GLM-5.3-UNCENSORED-FP8`. Two of its operations matter to the variants, whose
+replacement tensors arrive as FP8 with 128 x 128 block scales:
 
 - **FP8 recovery** (excluded layers, e.g. every self_attn.o_proj): BF16 = E4M3 x scale_inv.
 - **MXFP4 round-to-nearest** (quantized layers, e.g. every mlp.shared_experts.down_proj): blocks of
   32 along the input dimension, an E8M0 scale per block, E2M1 codes packed two per byte.
 
-Backbone B in Backbone A's formats runs on the same kernels. `verify` proves this restatement
-bit-exact on tensors both variants leave unedited (o_proj layers 0-11, shared down_proj 3-19):
-the recipe applied to the cyber FP8 source must give exactly Backbone A's bytes.
+A variant in Backbone A's formats runs on the same kernels. `verify` proves the restatement
+bit-exact on tensors every variant leaves unedited (o_proj layers 0-11, shared down_proj 3-19):
+the recipe applied to that FP8 source must give exactly Backbone A's bytes. Two sources:
 
-`build` makes Backbone B: every part of Backbone A cloned copy-on-write (ZFS block cloning: only
-rewritten blocks cost space, about 12.7 GiB), each of the surgery's targets converted and written
-over its own bytes (same dtype and shape, so headers and offsets do not move), then every byte
-re-read: headers and untouched tensors must be Backbone A's, targets what was written. The
-loader (io::BackboneParts) reads it like any Backbone. VARIANT.json records the source, recipe,
-and per target its hashes and ||B - A|| / ||A||.
+- **cyber**: `dealignai/GLM-5.3-CYBERSECURITY-FP8`, the surgery's targets fetched as a delta.
+- **stock**: the pre-surgery FP8. JANGQ-AI/GLM-5.3-FP8 is no longer published; it is zai's BF16
+  quantized per 128 x 128 block with an FP32 scale amax / 448 and x / scale rounded to E4M3
+  (`jangq_fp8`, proven bit-exact through this recipe on the 29 unedited weights, 2026-11-21).
+  zai-org/GLM-5.3's own FP8 is a different quantization (99.6% of recovered bytes agree), so it
+  serves only as an independent cross-check of the fetched BF16.
+
+`build` / `build-stock` make the variant: every part of Backbone A cloned copy-on-write (ZFS block
+cloning: only rewritten blocks cost space, about 12.7 GiB), each of the surgery's targets converted
+and written over its own bytes (same dtype and shape, so headers and offsets do not move), then
+every byte re-read: headers and untouched tensors must be Backbone A's, targets what was written.
+The loader (io::BackboneParts) reads it like any Backbone. VARIANT.json records the source, recipe,
+and per target its hashes and ||variant - A|| / ||A||.
 """
 import hashlib
 import json
@@ -37,8 +48,10 @@ import urllib.request
 
 import numpy as np
 
-CYBER_REPO = "dealignai/GLM-5.3-CYBERSECURITY-FP8"
-CYBER_REV = "5915c1b88f998a9c1e1a0c83688e285a08ae3ca5"
+CYBER = ("dealignai/GLM-5.3-CYBERSECURITY-FP8", "5915c1b88f998a9c1e1a0c83688e285a08ae3ca5")
+STOCK_BF16 = ("zai-org/GLM-5.3-BF16", "abf42e6c0e53bc29a875511301e7b7fcd220315b")
+ZAI_FP8 = ("zai-org/GLM-5.3", "aca966e4e02791568aa6a4ced368624b3d897f42")  # kitaniai's LICENSE_PROVENANCE pin
+MIN_ZAI_AGREEMENT = 0.95  # E4M3 codes equal to zai's own FP8 (two quantizations of one BF16 agree ~99%)
 FP8_BLOCK = 128
 MX_BLOCK = 32
 MIN_FREE = 8 * 2**30  # left on the pool after the variant's own blocks
@@ -60,6 +73,52 @@ def e4m3_table():
 
 
 E4M3 = e4m3_table()
+E4M3_POSITIVE = E4M3[:0x7F].astype(np.float64)  # codes 0x00 .. 0x7e, ascending; 0x7f is NaN
+
+
+def e4m3_rne(v):
+    """float32 values -> E4M3 codes: round to nearest, ties to the even code, saturating at 448.
+
+    The sign is the value's sign bit, so a negative value that rounds to zero is 0x80 (as a float8
+    cast keeps -0). Distances are taken in float64, where every E4M3 value and midpoint is exact.
+    A magnitude past 448 finds no code above it: `hi` stays 0x7e, nearer than 0x7d (saturation).
+    """
+    v = np.asarray(v, dtype=np.float32)
+    mag = np.abs(v).astype(np.float64)
+    hi = np.clip(np.searchsorted(E4M3_POSITIVE, mag), 1, 0x7E)
+    lo = hi - 1
+    d_lo, d_hi = mag - E4M3_POSITIVE[lo], E4M3_POSITIVE[hi] - mag
+    code = np.where((d_hi < d_lo) | ((d_hi == d_lo) & (hi % 2 == 0)), hi, lo).astype(np.uint8)
+    return code | np.where(np.signbit(v), 0x80, 0).astype(np.uint8)
+
+
+def jangq_fp8(bf16):
+    """BF16 bits [R, C] -> JANGQ-AI/GLM-5.3-FP8's (E4M3 codes [R, C], float32 scale_inv [R/128, C/128]).
+
+    Per 128 x 128 block (ragged at the edges): scale = amax / 448 in FP32 (a zero block's amax is
+    taken as 1e-12), codes = e4m3_rne(x / scale). Computed one band of 128 rows at a time, so a
+    100M-weight tensor needs no more than a band's temporaries.
+    """
+    rows, cols = bf16.shape
+    nb_r, nb_c = -(-rows // FP8_BLOCK), -(-cols // FP8_BLOCK)
+    codes = np.empty((rows, cols), np.uint8)
+    scales = np.empty((nb_r, nb_c), np.float32)
+    pad_c = nb_c * FP8_BLOCK - cols
+    for br in range(nb_r):
+        band = bf16_values(bf16[br * FP8_BLOCK:(br + 1) * FP8_BLOCK])
+        padded = np.pad(band, ((0, 0), (0, pad_c)))
+        amax = np.abs(padded).reshape(band.shape[0], nb_c, FP8_BLOCK).max(axis=(0, 2))
+        s = np.maximum(amax, np.float32(1e-12)) / np.float32(448.0)
+        scales[br] = s
+        codes[br * FP8_BLOCK:(br + 1) * FP8_BLOCK] = e4m3_rne(band / np.repeat(s, FP8_BLOCK)[:cols])
+    return codes, scales
+
+
+def surgery_targets(surgery):
+    """A CRACK_SURGERY.json's targets: self_attn.o_proj on its attention layers, the shared expert's
+    down_proj on its FFN layers (its `n_targets` miscounts them; the layer lists are what it edited)."""
+    return sorted([f"model.layers.{L}.self_attn.o_proj.weight" for L in surgery["attn_layers"]] +
+                  [f"model.layers.{L}.mlp.shared_experts.down_proj.weight" for L in surgery["ffn_layers"]])
 
 
 def bf16_bits(x):
@@ -161,15 +220,24 @@ def _fetch(url, begin, end):
     return data
 
 
-class RemoteShards:
-    """Tensors of the pinned cyber revision, read by HTTP range from their shards."""
+def remote_weight_map(repo_rev):
+    """A pinned revision's model.safetensors.index.json weight map."""
+    repo, rev = repo_rev
+    with urllib.request.urlopen(f"https://huggingface.co/{repo}/resolve/{rev}/model.safetensors.index.json") as r:
+        return json.load(r)["weight_map"]
 
-    def __init__(self, weight_map):
-        self.weight_map, self.headers = weight_map, {}
+
+class RemoteShards:
+    """Tensors of a pinned (repo, revision), read by HTTP range from their shards."""
+
+    def __init__(self, repo_rev, weight_map=None):
+        self.repo, self.rev = repo_rev
+        self.weight_map = weight_map if weight_map is not None else remote_weight_map(repo_rev)
+        self.headers = {}
 
     def _header(self, shard):
         if shard not in self.headers:
-            url = f"https://huggingface.co/{CYBER_REPO}/resolve/{CYBER_REV}/{shard}"
+            url = f"https://huggingface.co/{self.repo}/resolve/{self.rev}/{shard}"
             n = int.from_bytes(_fetch(url, 0, 8), "little")
             self.headers[shard] = (url, json.loads(_fetch(url, 8, 8 + n)), 8 + n)
         return self.headers[shard]
@@ -213,12 +281,54 @@ def as_array(dtype, shape, raw):
     return np.frombuffer(raw, dtype=np_type).reshape(shape)
 
 
-def verify(backbone_a, names, weight_map):
-    """The recipe on cyber tensors both variants leave unedited must give Backbone A's bytes."""
-    remote, local = RemoteShards(weight_map), LocalShards(backbone_a)
+class Fp8Shards:
+    """An FP8 source whose tensors are stored as E4M3 with `_scale_inv` (the cyber delta, a release)."""
+
+    def __init__(self, shards):
+        self.shards = shards
+
+    def fp8(self, name):
+        """(codes, scale_inv, receipt fields) of weight `name`."""
+        return as_array(*self.shards.tensor(name)), as_array(*self.shards.tensor(name + "_scale_inv")), {}
+
+
+class StockFp8:
+    """The pre-surgery FP8: zai's BF16, fetched by range, quantized as JANGQ did (`jangq_fp8`).
+
+    Each weight's codes are compared with zai's own FP8 of it (`check`, a second publisher's bytes of
+    the same weights): two quantizations of one BF16 agree on ~99% of codes, damaged bytes on ~1/256.
+    """
+
+    def __init__(self, bf16, check=None, min_agreement=MIN_ZAI_AGREEMENT):
+        self.bf16, self.check, self.min_agreement = bf16, check, min_agreement
+
+    def fp8(self, name):
+        codes, scales = jangq_fp8(as_array(*self.bf16.tensor(name)))
+        if self.check is None:
+            return codes, scales, {}
+        agreement = float(np.count_nonzero(codes == as_array(*self.check.tensor(name))) / codes.size)
+        if agreement < self.min_agreement:
+            raise SystemExit(f"ABORT: {name}: {agreement:.4f} of codes agree with zai's FP8, "
+                             f"wanted >= {self.min_agreement}")
+        return codes, scales, {"zai_fp8_codes_identical": agreement}
+
+
+def delta_targets(delta, expected):
+    """The delta's targets, which must be exactly the surgery's."""
+    targets = sorted(n for n in delta.where if n.endswith(".weight"))
+    if set(targets) != set(expected):
+        raise SystemExit(f"the delta holds {len(targets)} targets, the surgery names {len(expected)}; "
+                         f"missing e.g. {sorted(set(expected) - set(targets))[:3]}")
+    return targets
+
+
+def verify(source, backbone_a, names):
+    """The recipe on tensors every variant leaves unedited must give Backbone A's bytes."""
+    local = LocalShards(backbone_a)
     failures = 0
     for name in names:
-        out = converted(name, as_array(*remote.tensor(name)), as_array(*remote.tensor(name + "_scale_inv")))
+        codes, scale_inv, _ = source.fp8(name)
+        out = converted(name, codes, scale_inv)
         for tname, (dtype, shape, raw) in out.items():
             want_dtype, want_shape, want = local.tensor(tname)
             same = np.count_nonzero(np.frombuffer(raw, np.uint8) == np.frombuffer(want, np.uint8))
@@ -274,8 +384,9 @@ def reflink(src, dst_dir):
     subprocess.run(["cp", "--reflink=always", src, dst_dir], check=True)
 
 
-def build(delta_dir, backbone_a, out_dir, expected, clone=reflink, min_free=MIN_FREE):
-    """Backbone B: every part of Backbone A reflinked, the targets rewritten in place, every byte re-read.
+def build(source, targets, backbone_a, out_dir, clone=reflink, min_free=MIN_FREE):
+    """A variant: every part of Backbone A reflinked, the targets (from `source`, an FP8 source)
+    rewritten in place, every byte re-read.
 
     Writes cover whole filesystem records (`record_spans`): each span is filled from Backbone A's
     pristine part, then overlaid with the targets in it. A partial-record write into a freshly
@@ -287,11 +398,7 @@ def build(delta_dir, backbone_a, out_dir, expected, clone=reflink, min_free=MIN_
     """
     if os.path.exists(out_dir):
         raise SystemExit(f"{out_dir} exists; a variant is built once, into a new directory")
-    delta, a = LocalShards(delta_dir), LocalShards(backbone_a)
-    targets = sorted(n for n in delta.where if n.endswith(".weight"))
-    if set(targets) != set(expected):
-        raise SystemExit(f"the delta holds {len(targets)} targets, the surgery names {len(expected)}; "
-                         f"missing e.g. {sorted(set(expected) - set(targets))[:3]}")
+    a = LocalShards(backbone_a)
     tmp = out_dir + ".tmp"
     if os.path.exists(tmp):  # an earlier run's staging: measure free space without it
         shutil.rmtree(tmp)
@@ -312,7 +419,8 @@ def build(delta_dir, backbone_a, out_dir, expected, clone=reflink, min_free=MIN_
     for path, names in sorted(by_part.items()):
         writes = []
         for name in names:
-            out = converted(name, as_array(*delta.tensor(name)), as_array(*delta.tensor(name + "_scale_inv")))
+            codes, scale_inv, checked = source.fp8(name)
+            out = converted(name, codes, scale_inv)
             before = {t: a.tensor(t) for t in out}
             for tname, (dtype, shape, raw) in out.items():
                 t_path, meta, base = a.where[tname]
@@ -327,9 +435,11 @@ def build(delta_dir, backbone_a, out_dir, expected, clone=reflink, min_free=MIN_
             if not (np.all(np.isfinite(new)) and np.isfinite(change)):
                 raise SystemExit(f"ABORT: {name}: non-finite values")
             receipts.append({"tensor": name, "part": os.path.basename(path),
-                             "sha256": {t: written[t] for t in out}, "relative_change_vs_backbone_a": change})
+                             "sha256": {t: written[t] for t in out}, "relative_change_vs_backbone_a": change,
+                             **checked})
             done += 1
-            print(f"[{done}/{len(targets)}] {name}: converted, ||B - A|| / ||A|| = {change:.4f}", flush=True)
+            print(f"[{done}/{len(targets)}] {name}: converted, ||variant - A|| / ||A|| = {change:.4f}"
+                  + "".join(f", {k} {v:.4f}" for k, v in checked.items()), flush=True)
         dst = os.path.join(tmp, os.path.basename(path))
         record = os.stat(dst).st_blksize
         spans = record_spans([(o, len(raw)) for o, raw in writes], record, os.path.getsize(path))
@@ -358,7 +468,7 @@ def build(delta_dir, backbone_a, out_dir, expected, clone=reflink, min_free=MIN_
                 raise SystemExit(f"ABORT: {os.path.basename(path)}: header differs from Backbone A's")
     b = LocalShards(tmp)
     if set(b.where) != set(a.where):
-        raise SystemExit("ABORT: Backbone B's tensor names differ from Backbone A's")
+        raise SystemExit("ABORT: the variant's tensor names differ from Backbone A's")
     for tname in sorted(b.where):
         raw = b.tensor(tname)[2]
         if tname in written:
@@ -430,12 +540,13 @@ def build_test(rng):
                            ((name, ("F8_E4M3", list(codes.shape), codes.tobytes())),
                             (name + "_scale_inv", ("F32", list(scale.shape), scale.tobytes())))})
         before = {f: open(os.path.join(a_dir, f), "rb").read() for f in os.listdir(a_dir)}
+        delta = LocalShards(delta_dir)
         try:
-            build(delta_dir, a_dir, out, [o], clone=shutil.copy, min_free=0)
+            delta_targets(delta, [o])
             raise AssertionError("a delta with more targets than the surgery names must be refused")
         except SystemExit:
             pass
-        tmp, receipts = build(delta_dir, a_dir, out, [o, s], clone=shutil.copy, min_free=0)
+        tmp, receipts = build(Fp8Shards(delta), delta_targets(delta, [o, s]), a_dir, out, clone=shutil.copy, min_free=0)
         b = LocalShards(tmp)
         for name, (codes, scale) in fp8.items():
             for t, (dt, shape, raw) in converted(name, codes, scale).items():
@@ -443,6 +554,68 @@ def build_test(rng):
         assert b.tensor("model.layers.12.self_attn.q_a_proj.weight") == a_tensors["model.layers.12.self_attn.q_a_proj.weight"]
         assert before == {f: open(os.path.join(a_dir, f), "rb").read() for f in os.listdir(a_dir)}, "A was written"
         assert [r["tensor"] for r in receipts] == [o, s] and all(r["relative_change_vs_backbone_a"] > 0 for r in receipts)
+
+
+def stock_build_test(rng):
+    """build() from the stock source: BF16 quantized as JANGQ did, then the recipe; a check source that
+    disagrees (damaged bytes) aborts before anything is written."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as root:
+        a_dir, bf16_dir, fp8_dir = (os.path.join(root, d) for d in ("a", "bf16", "fp8"))
+        for d in (a_dir, bf16_dir, fp8_dir):
+            os.makedirs(d)
+        o = "model.layers.12.self_attn.o_proj.weight"
+        bf16 = bf16_bits(rng.standard_normal((256, 384)).astype(np.float32) * 0.02)
+        codes, scale = jangq_fp8(bf16)
+        other = codes ^ 0x01
+        other[(other & 0x7F) == 0x7F] = 0x30  # 0x7f is E4M3's NaN
+        a_tensors = converted(o, other, scale)  # Backbone A: the same shape, other values
+        write_safetensors(os.path.join(a_dir, "backbone-00001-of-00001.safetensors"), a_tensors)
+        write_safetensors(os.path.join(bf16_dir, "model-00001.safetensors"), {o: ("BF16", [256, 384], bf16.tobytes())})
+        write_safetensors(os.path.join(fp8_dir, "model-00001.safetensors"), {o: ("F8_E4M3", [256, 384], codes.tobytes())})
+        source = StockFp8(LocalShards(bf16_dir), check=LocalShards(fp8_dir))
+        tmp, receipts = build(source, [o], a_dir, os.path.join(root, "c"), clone=shutil.copy, min_free=0)
+        assert LocalShards(tmp).tensor(o) == converted(o, codes, scale)[o]
+        assert receipts[0]["zai_fp8_codes_identical"] == 1.0
+        damaged = codes.copy()
+        damaged[::2] = rng.integers(0, 0x7E, damaged[::2].shape).astype(np.uint8)
+        write_safetensors(os.path.join(fp8_dir, "model-00001.safetensors"), {o: ("F8_E4M3", [256, 384], damaged.tobytes())})
+        try:
+            build(StockFp8(LocalShards(bf16_dir), check=LocalShards(fp8_dir)), [o], a_dir, os.path.join(root, "d"),
+                  clone=shutil.copy, min_free=0)
+            raise AssertionError("a source that disagrees with zai's FP8 must be refused")
+        except SystemExit:
+            pass
+
+
+def jangq_test(rng):
+    """e4m3_rne and jangq_fp8: every code is its own value's rounding, midpoints go to the even code,
+    the range saturates; each block's amax lands on 448; agreement with torch's float8 cast when present."""
+    finite = np.array([c for c in range(256) if (c & 0x7F) != 0x7F], np.uint8)
+    assert np.array_equal(e4m3_rne(E4M3[finite]), finite)
+    mid = ((E4M3_POSITIVE[1:] + E4M3_POSITIVE[:-1]) / 2).astype(np.float32)  # every midpoint is exact in float32
+    assert np.all(e4m3_rne(mid) % 2 == 0)
+    assert list(e4m3_rne(np.array([448.0, 464.0, 1e9, -1e9, -1e-30], np.float32))) == [0x7E, 0x7E, 0x7E, 0xFE, 0x80]
+    bf16 = bf16_bits(rng.standard_normal((200, 300)).astype(np.float32) * np.float32(0.03))
+    codes, scales = jangq_fp8(bf16)
+    assert scales.shape == (2, 3) and codes.shape == (200, 300)
+    amax = np.pad(np.abs(bf16_values(bf16)), ((0, 56), (0, 84))).reshape(2, 128, 3, 128).max(axis=(1, 3))
+    assert np.array_equal(scales, amax / np.float32(448.0))  # the scale is amax / 448 in FP32, exactly
+    for br in range(2):
+        for bc in range(3):
+            block = codes[br * 128:(br + 1) * 128, bc * 128:(bc + 1) * 128]
+            assert np.any((block & 0x7F) == 0x7E), (br, bc)  # the block's amax maps to 448
+    x = bf16_values(bf16)
+    rec = fp8_dequant(codes, scales)
+    assert np.all(np.abs(rec - x) <= np.abs(x) * 2.0 ** -4 + np.repeat(np.repeat(scales, 128, 0), 128, 1)[:200, :300] * 2.0 ** -9)
+    try:
+        import torch
+    except ImportError:
+        print("self-test: torch absent, the float8 cross-check skipped")
+        return
+    v = (rng.standard_normal(1 << 21) * np.exp2(rng.integers(-12, 9, 1 << 21))).astype(np.float32)
+    want = torch.from_numpy(v).clamp(-448, 448).to(torch.float8_e4m3fn).view(torch.uint8).numpy()
+    assert np.array_equal(e4m3_rne(v), want)
 
 
 def self_test():
@@ -499,19 +672,39 @@ def self_test():
     m = converted("model.layers.40.mlp.shared_experts.down_proj.weight", codes, sc)
     pk, scl = mxfp4_rtn(fp8_dequant(codes, sc))
     assert np.array_equal(weight_values(m, "model.layers.40.mlp.shared_experts.down_proj.weight"), mxfp4_values(pk, scl))
+    surgery = {"attn_layers": list(range(12, 78)), "ffn_layers": list(range(20, 78)), "n_targets": 119}
+    targets = surgery_targets(surgery)
+    assert len(targets) == 124 and targets == sorted(set(targets))
+    assert "model.layers.12.self_attn.o_proj.weight" in targets and "model.layers.11.self_attn.o_proj.weight" not in targets
+    assert "model.layers.20.mlp.shared_experts.down_proj.weight" in targets
     spans_test(rng)
     build_test(rng)
+    stock_build_test(rng)
+    jangq_test(rng)
     print("self-test: ok")
+
+
+UNEDITED = ([f"model.layers.{L}.self_attn.o_proj.weight" for L in range(12)] +
+            [f"model.layers.{L}.mlp.shared_experts.down_proj.weight" for L in range(3, 20)])
+
+
+def stock_source():
+    return StockFp8(RemoteShards(STOCK_BF16), check=RemoteShards(ZAI_FP8))
+
+
+def finish(tmp, out_dir, variant):
+    with open(os.path.join(tmp, "VARIANT.json"), "w") as f:
+        json.dump(variant, f, indent=1)
+    os.replace(tmp, out_dir)
+    print(f"DONE: {out_dir}, {len(variant['targets'])} targets", flush=True)
 
 
 def main(argv):
     if argv[1:] == ["--self-test"]:
         return self_test()
-    if len(argv) >= 4 and argv[1] == "verify":
-        index = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model.safetensors.index.json")
-        index = os.environ.get("CYBER_INDEX", index)
-        weight_map = json.load(open(index))["weight_map"]
-        sys.exit(1 if verify(argv[2], argv[3:], weight_map) else 0)
+    if len(argv) >= 4 and argv[1] == "verify" and argv[2] in ("cyber", "stock"):
+        source = Fp8Shards(RemoteShards(CYBER)) if argv[2] == "cyber" else stock_source()
+        sys.exit(1 if verify(source, argv[3], argv[4:] or UNEDITED) else 0)
     if len(argv) == 5 and argv[1] == "build":
         source, backbone_a, out_dir = argv[2:]
         plan = json.load(open(os.path.join(source, "delta-plan.json")))
@@ -520,18 +713,37 @@ def main(argv):
         expected = sorted(t for s in plan["shards"] for t in s["tensors"] if t.endswith(".weight"))
         if len(expected) != surgery["n_targets"]:
             raise SystemExit(f"the plan names {len(expected)} targets, CRACK_SURGERY.json {surgery['n_targets']}")
-        tmp, receipts = build(os.path.join(source, "delta"), backbone_a, out_dir, expected)
-        variant = {"variant": "glm-cyber", "base": os.path.abspath(backbone_a),
-                   "source": {"repo": plan["repo"], "revision": plan["revision"],
-                              "crack_surgery_sha256": hashlib.sha256(open(surgery_path, "rb").read()).hexdigest(),
-                              "delta_receipts": "delta-receipts.log (each shard sha256-checked against its LFS hash)"},
-                   "recipe": "tools/glm53-store/kitani_recipe.py: kitaniai's Quark 0.13 conversion, restated and "
-                             "verified bit-exact on the 29 weights both variants leave unedited",
-                   "targets": receipts}
-        with open(os.path.join(tmp, "VARIANT.json"), "w") as f:
-            json.dump(variant, f, indent=1)
-        os.replace(tmp, out_dir)
-        print(f"DONE: {out_dir}, {len(receipts)} targets", flush=True)
+        delta = LocalShards(os.path.join(source, "delta"))
+        tmp, receipts = build(Fp8Shards(delta), delta_targets(delta, expected), backbone_a, out_dir)
+        finish(tmp, out_dir, {
+            "variant": "glm-cyber", "base": os.path.abspath(backbone_a),
+            "source": {"repo": plan["repo"], "revision": plan["revision"],
+                       "crack_surgery_sha256": hashlib.sha256(open(surgery_path, "rb").read()).hexdigest(),
+                       "delta_receipts": "delta-receipts.log (each shard sha256-checked against its LFS hash)"},
+            "recipe": "tools/glm53-store/kitani_recipe.py: kitaniai's Quark 0.13 conversion, restated and "
+                      "verified bit-exact on the 29 weights both variants leave unedited",
+            "targets": receipts})
+        return
+    if len(argv) == 5 and argv[1] == "build-stock":
+        surgery_path, backbone_a, out_dir = argv[2:]
+        surgery_raw = open(surgery_path, "rb").read()
+        targets = surgery_targets(json.loads(surgery_raw))
+        source = stock_source()
+        if verify(source, backbone_a, UNEDITED):  # the chain is proven on this run's own fetches first
+            raise SystemExit("ABORT: the stock chain does not reproduce Backbone A's unedited weights")
+        tmp, receipts = build(source, targets, backbone_a, out_dir)
+        finish(tmp, out_dir, {
+            "variant": "glm-stock", "base": os.path.abspath(backbone_a),
+            "source": {"repo": STOCK_BF16[0], "revision": STOCK_BF16[1],
+                       "quantized_as": "JANGQ-AI/GLM-5.3-FP8 (unpublished): FP32 amax/448 per 128x128 block, "
+                                       "x/scale rounded to E4M3 (jangq_fp8)",
+                       "cross_check": {"repo": ZAI_FP8[0], "revision": ZAI_FP8[1],
+                                       "min_codes_identical": MIN_ZAI_AGREEMENT},
+                       "replaces_surgery": {"crack_surgery_sha256": hashlib.sha256(surgery_raw).hexdigest(),
+                                            "repo": "dealignai/GLM-5.3-UNCENSORED-FP8"}},
+            "recipe": "tools/glm53-store/kitani_recipe.py: zai BF16 -> jangq_fp8 -> kitaniai's Quark 0.13 "
+                      "conversion, verified bit-exact on the 29 weights no surgery edits (this run)",
+            "targets": receipts})
         return
     sys.exit(__doc__)
 

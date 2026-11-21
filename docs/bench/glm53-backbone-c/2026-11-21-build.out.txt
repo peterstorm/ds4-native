@@ -1,0 +1,243 @@
+model.layers.0.self_attn.o_proj.weight: BF16 [6144, 16384], 201326592/201326592 bytes identical
+model.layers.1.self_attn.o_proj.weight: BF16 [6144, 16384], 201326592/201326592 bytes identical
+model.layers.2.self_attn.o_proj.weight: BF16 [6144, 16384], 201326592/201326592 bytes identical
+model.layers.3.self_attn.o_proj.weight: BF16 [6144, 16384], 201326592/201326592 bytes identical
+model.layers.4.self_attn.o_proj.weight: BF16 [6144, 16384], 201326592/201326592 bytes identical
+model.layers.5.self_attn.o_proj.weight: BF16 [6144, 16384], 201326592/201326592 bytes identical
+model.layers.6.self_attn.o_proj.weight: BF16 [6144, 16384], 201326592/201326592 bytes identical
+model.layers.7.self_attn.o_proj.weight: BF16 [6144, 16384], 201326592/201326592 bytes identical
+model.layers.8.self_attn.o_proj.weight: BF16 [6144, 16384], 201326592/201326592 bytes identical
+model.layers.9.self_attn.o_proj.weight: BF16 [6144, 16384], 201326592/201326592 bytes identical
+model.layers.10.self_attn.o_proj.weight: BF16 [6144, 16384], 201326592/201326592 bytes identical
+model.layers.11.self_attn.o_proj.weight: BF16 [6144, 16384], 201326592/201326592 bytes identical
+model.layers.3.mlp.shared_experts.down_proj.weight: U8 [6144, 1024], 6291456/6291456 bytes identical
+model.layers.3.mlp.shared_experts.down_proj.weight_scale: U8 [6144, 64], 393216/393216 bytes identical
+model.layers.4.mlp.shared_experts.down_proj.weight: U8 [6144, 1024], 6291456/6291456 bytes identical
+model.layers.4.mlp.shared_experts.down_proj.weight_scale: U8 [6144, 64], 393216/393216 bytes identical
+model.layers.5.mlp.shared_experts.down_proj.weight: U8 [6144, 1024], 6291456/6291456 bytes identical
+model.layers.5.mlp.shared_experts.down_proj.weight_scale: U8 [6144, 64], 393216/393216 bytes identical
+model.layers.6.mlp.shared_experts.down_proj.weight: U8 [6144, 1024], 6291456/6291456 bytes identical
+model.layers.6.mlp.shared_experts.down_proj.weight_scale: U8 [6144, 64], 393216/393216 bytes identical
+model.layers.7.mlp.shared_experts.down_proj.weight: U8 [6144, 1024], 6291456/6291456 bytes identical
+model.layers.7.mlp.shared_experts.down_proj.weight_scale: U8 [6144, 64], 393216/393216 bytes identical
+model.layers.8.mlp.shared_experts.down_proj.weight: U8 [6144, 1024], 6291456/6291456 bytes identical
+model.layers.8.mlp.shared_experts.down_proj.weight_scale: U8 [6144, 64], 393216/393216 bytes identical
+model.layers.9.mlp.shared_experts.down_proj.weight: U8 [6144, 1024], 6291456/6291456 bytes identical
+model.layers.9.mlp.shared_experts.down_proj.weight_scale: U8 [6144, 64], 393216/393216 bytes identical
+model.layers.10.mlp.shared_experts.down_proj.weight: U8 [6144, 1024], 6291456/6291456 bytes identical
+model.layers.10.mlp.shared_experts.down_proj.weight_scale: U8 [6144, 64], 393216/393216 bytes identical
+model.layers.11.mlp.shared_experts.down_proj.weight: U8 [6144, 1024], 6291456/6291456 bytes identical
+model.layers.11.mlp.shared_experts.down_proj.weight_scale: U8 [6144, 64], 393216/393216 bytes identical
+model.layers.12.mlp.shared_experts.down_proj.weight: U8 [6144, 1024], 6291456/6291456 bytes identical
+model.layers.12.mlp.shared_experts.down_proj.weight_scale: U8 [6144, 64], 393216/393216 bytes identical
+model.layers.13.mlp.shared_experts.down_proj.weight: U8 [6144, 1024], 6291456/6291456 bytes identical
+model.layers.13.mlp.shared_experts.down_proj.weight_scale: U8 [6144, 64], 393216/393216 bytes identical
+model.layers.14.mlp.shared_experts.down_proj.weight: U8 [6144, 1024], 6291456/6291456 bytes identical
+model.layers.14.mlp.shared_experts.down_proj.weight_scale: U8 [6144, 64], 393216/393216 bytes identical
+model.layers.15.mlp.shared_experts.down_proj.weight: U8 [6144, 1024], 6291456/6291456 bytes identical
+model.layers.15.mlp.shared_experts.down_proj.weight_scale: U8 [6144, 64], 393216/393216 bytes identical
+model.layers.16.mlp.shared_experts.down_proj.weight: U8 [6144, 1024], 6291456/6291456 bytes identical
+model.layers.16.mlp.shared_experts.down_proj.weight_scale: U8 [6144, 64], 393216/393216 bytes identical
+model.layers.17.mlp.shared_experts.down_proj.weight: U8 [6144, 1024], 6291456/6291456 bytes identical
+model.layers.17.mlp.shared_experts.down_proj.weight_scale: U8 [6144, 64], 393216/393216 bytes identical
+model.layers.18.mlp.shared_experts.down_proj.weight: U8 [6144, 1024], 6291456/6291456 bytes identical
+model.layers.18.mlp.shared_experts.down_proj.weight_scale: U8 [6144, 64], 393216/393216 bytes identical
+model.layers.19.mlp.shared_experts.down_proj.weight: U8 [6144, 1024], 6291456/6291456 bytes identical
+model.layers.19.mlp.shared_experts.down_proj.weight_scale: U8 [6144, 64], 393216/393216 bytes identical
+VERIFIED: bit-exact
+[1/124] model.layers.12.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0000, zai_fp8_codes_identical 0.9995
+  backbone-00013-of-00282.safetensors: 1 record-aligned spans written
+[2/124] model.layers.13.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0000, zai_fp8_codes_identical 0.9994
+  backbone-00016-of-00282.safetensors: 1 record-aligned spans written
+[3/124] model.layers.14.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0000, zai_fp8_codes_identical 0.9994
+  backbone-00020-of-00282.safetensors: 1 record-aligned spans written
+[4/124] model.layers.15.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0000, zai_fp8_codes_identical 0.9994
+  backbone-00024-of-00282.safetensors: 1 record-aligned spans written
+[5/124] model.layers.16.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0000, zai_fp8_codes_identical 0.9995
+  backbone-00027-of-00282.safetensors: 1 record-aligned spans written
+[6/124] model.layers.17.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0563, zai_fp8_codes_identical 0.9995
+  backbone-00031-of-00282.safetensors: 1 record-aligned spans written
+[7/124] model.layers.18.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0491, zai_fp8_codes_identical 0.9992
+  backbone-00035-of-00282.safetensors: 1 record-aligned spans written
+[8/124] model.layers.19.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0625, zai_fp8_codes_identical 0.9994
+  backbone-00038-of-00282.safetensors: 1 record-aligned spans written
+[9/124] model.layers.20.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.0928, zai_fp8_codes_identical 0.9994
+[10/124] model.layers.20.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0596, zai_fp8_codes_identical 0.9996
+  backbone-00042-of-00282.safetensors: 2 record-aligned spans written
+[11/124] model.layers.21.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1070, zai_fp8_codes_identical 0.9993
+[12/124] model.layers.21.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0988, zai_fp8_codes_identical 0.9995
+  backbone-00046-of-00282.safetensors: 2 record-aligned spans written
+[13/124] model.layers.22.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.0914, zai_fp8_codes_identical 0.9996
+  backbone-00049-of-00282.safetensors: 1 record-aligned spans written
+[14/124] model.layers.22.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0691, zai_fp8_codes_identical 0.9994
+  backbone-00050-of-00282.safetensors: 1 record-aligned spans written
+[15/124] model.layers.23.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1122, zai_fp8_codes_identical 0.9994
+[16/124] model.layers.23.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0535, zai_fp8_codes_identical 0.9994
+  backbone-00053-of-00282.safetensors: 2 record-aligned spans written
+[17/124] model.layers.24.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1049, zai_fp8_codes_identical 0.9994
+[18/124] model.layers.24.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0505, zai_fp8_codes_identical 0.9993
+  backbone-00057-of-00282.safetensors: 2 record-aligned spans written
+[19/124] model.layers.25.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1375, zai_fp8_codes_identical 0.9993
+[20/124] model.layers.25.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0592, zai_fp8_codes_identical 0.9994
+  backbone-00061-of-00282.safetensors: 2 record-aligned spans written
+[21/124] model.layers.26.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1378, zai_fp8_codes_identical 0.9995
+[22/124] model.layers.26.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0583, zai_fp8_codes_identical 0.9993
+  backbone-00064-of-00282.safetensors: 2 record-aligned spans written
+[23/124] model.layers.27.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1163, zai_fp8_codes_identical 0.9996
+[24/124] model.layers.27.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0513, zai_fp8_codes_identical 0.9996
+  backbone-00068-of-00282.safetensors: 2 record-aligned spans written
+[25/124] model.layers.28.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1126, zai_fp8_codes_identical 0.9998
+[26/124] model.layers.28.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0519, zai_fp8_codes_identical 0.9993
+  backbone-00072-of-00282.safetensors: 2 record-aligned spans written
+[27/124] model.layers.29.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1234, zai_fp8_codes_identical 0.9995
+[28/124] model.layers.29.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0669, zai_fp8_codes_identical 0.9993
+  backbone-00075-of-00282.safetensors: 2 record-aligned spans written
+[29/124] model.layers.30.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1054, zai_fp8_codes_identical 0.9997
+[30/124] model.layers.30.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0522, zai_fp8_codes_identical 0.9993
+  backbone-00083-of-00282.safetensors: 2 record-aligned spans written
+[31/124] model.layers.31.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1000, zai_fp8_codes_identical 0.9998
+[32/124] model.layers.31.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0559, zai_fp8_codes_identical 0.9993
+  backbone-00086-of-00282.safetensors: 2 record-aligned spans written
+[33/124] model.layers.32.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1020, zai_fp8_codes_identical 0.9998
+[34/124] model.layers.32.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0513, zai_fp8_codes_identical 0.9992
+  backbone-00090-of-00282.safetensors: 2 record-aligned spans written
+[35/124] model.layers.33.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.0903, zai_fp8_codes_identical 0.9998
+[36/124] model.layers.33.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0527, zai_fp8_codes_identical 0.9993
+  backbone-00094-of-00282.safetensors: 2 record-aligned spans written
+[37/124] model.layers.34.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1061, zai_fp8_codes_identical 0.9998
+[38/124] model.layers.34.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0582, zai_fp8_codes_identical 0.9992
+  backbone-00097-of-00282.safetensors: 2 record-aligned spans written
+[39/124] model.layers.35.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1022, zai_fp8_codes_identical 0.9997
+[40/124] model.layers.35.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0645, zai_fp8_codes_identical 0.9990
+  backbone-00101-of-00282.safetensors: 2 record-aligned spans written
+[41/124] model.layers.36.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1066, zai_fp8_codes_identical 0.9997
+[42/124] model.layers.36.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0615, zai_fp8_codes_identical 0.9989
+  backbone-00105-of-00282.safetensors: 2 record-aligned spans written
+[43/124] model.layers.37.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1178, zai_fp8_codes_identical 0.9996
+[44/124] model.layers.37.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0651, zai_fp8_codes_identical 0.9991
+  backbone-00108-of-00282.safetensors: 2 record-aligned spans written
+[45/124] model.layers.38.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1033, zai_fp8_codes_identical 0.9998
+[46/124] model.layers.38.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0665, zai_fp8_codes_identical 0.9990
+  backbone-00112-of-00282.safetensors: 2 record-aligned spans written
+[47/124] model.layers.39.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1043, zai_fp8_codes_identical 0.9997
+[48/124] model.layers.39.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0697, zai_fp8_codes_identical 0.9992
+  backbone-00116-of-00282.safetensors: 2 record-aligned spans written
+[49/124] model.layers.40.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1199, zai_fp8_codes_identical 0.9997
+[50/124] model.layers.40.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0965, zai_fp8_codes_identical 0.9990
+  backbone-00123-of-00282.safetensors: 2 record-aligned spans written
+[51/124] model.layers.41.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1124, zai_fp8_codes_identical 0.9997
+[52/124] model.layers.41.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0776, zai_fp8_codes_identical 0.9991
+  backbone-00127-of-00282.safetensors: 2 record-aligned spans written
+[53/124] model.layers.42.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1246, zai_fp8_codes_identical 0.9997
+  backbone-00130-of-00282.safetensors: 1 record-aligned spans written
+[54/124] model.layers.42.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.1136, zai_fp8_codes_identical 0.9991
+  backbone-00131-of-00282.safetensors: 1 record-aligned spans written
+[55/124] model.layers.43.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1260, zai_fp8_codes_identical 0.9995
+[56/124] model.layers.43.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.1212, zai_fp8_codes_identical 0.9990
+  backbone-00134-of-00282.safetensors: 2 record-aligned spans written
+[57/124] model.layers.44.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1185, zai_fp8_codes_identical 0.9997
+[58/124] model.layers.44.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0478, zai_fp8_codes_identical 0.9992
+  backbone-00138-of-00282.safetensors: 2 record-aligned spans written
+[59/124] model.layers.45.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1463, zai_fp8_codes_identical 0.9995
+[60/124] model.layers.45.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0597, zai_fp8_codes_identical 0.9991
+  backbone-00142-of-00282.safetensors: 2 record-aligned spans written
+[61/124] model.layers.46.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1525, zai_fp8_codes_identical 0.9998
+[62/124] model.layers.46.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.1025, zai_fp8_codes_identical 0.9991
+  backbone-00145-of-00282.safetensors: 2 record-aligned spans written
+[63/124] model.layers.47.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1456, zai_fp8_codes_identical 0.9997
+[64/124] model.layers.47.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0750, zai_fp8_codes_identical 0.9992
+  backbone-00149-of-00282.safetensors: 2 record-aligned spans written
+[65/124] model.layers.48.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1680, zai_fp8_codes_identical 0.9997
+[66/124] model.layers.48.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.1111, zai_fp8_codes_identical 0.9990
+  backbone-00153-of-00282.safetensors: 2 record-aligned spans written
+[67/124] model.layers.49.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1609, zai_fp8_codes_identical 0.9996
+[68/124] model.layers.49.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.1265, zai_fp8_codes_identical 0.9989
+  backbone-00156-of-00282.safetensors: 2 record-aligned spans written
+[69/124] model.layers.50.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1535, zai_fp8_codes_identical 0.9995
+[70/124] model.layers.50.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.1003, zai_fp8_codes_identical 0.9992
+  backbone-00164-of-00282.safetensors: 2 record-aligned spans written
+[71/124] model.layers.51.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1476, zai_fp8_codes_identical 0.9998
+[72/124] model.layers.51.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0906, zai_fp8_codes_identical 0.9993
+  backbone-00167-of-00282.safetensors: 2 record-aligned spans written
+[73/124] model.layers.52.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1583, zai_fp8_codes_identical 0.9998
+[74/124] model.layers.52.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0860, zai_fp8_codes_identical 0.9994
+  backbone-00171-of-00282.safetensors: 2 record-aligned spans written
+[75/124] model.layers.53.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1563, zai_fp8_codes_identical 0.9998
+[76/124] model.layers.53.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.1168, zai_fp8_codes_identical 0.9992
+  backbone-00175-of-00282.safetensors: 2 record-aligned spans written
+[77/124] model.layers.54.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1524, zai_fp8_codes_identical 0.9998
+[78/124] model.layers.54.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.1056, zai_fp8_codes_identical 0.9991
+  backbone-00178-of-00282.safetensors: 2 record-aligned spans written
+[79/124] model.layers.55.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1741, zai_fp8_codes_identical 0.9995
+[80/124] model.layers.55.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.1047, zai_fp8_codes_identical 0.9991
+  backbone-00182-of-00282.safetensors: 2 record-aligned spans written
+[81/124] model.layers.56.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1805, zai_fp8_codes_identical 0.9994
+[82/124] model.layers.56.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0885, zai_fp8_codes_identical 0.9995
+  backbone-00186-of-00282.safetensors: 2 record-aligned spans written
+[83/124] model.layers.57.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1880, zai_fp8_codes_identical 0.9994
+[84/124] model.layers.57.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0820, zai_fp8_codes_identical 0.9992
+  backbone-00189-of-00282.safetensors: 2 record-aligned spans written
+[85/124] model.layers.58.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1850, zai_fp8_codes_identical 0.9992
+[86/124] model.layers.58.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.1263, zai_fp8_codes_identical 0.9990
+  backbone-00193-of-00282.safetensors: 2 record-aligned spans written
+[87/124] model.layers.59.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1845, zai_fp8_codes_identical 0.9995
+[88/124] model.layers.59.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.1297, zai_fp8_codes_identical 0.9989
+  backbone-00197-of-00282.safetensors: 2 record-aligned spans written
+[89/124] model.layers.60.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1595, zai_fp8_codes_identical 0.9995
+[90/124] model.layers.60.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0695, zai_fp8_codes_identical 0.9991
+  backbone-00204-of-00282.safetensors: 2 record-aligned spans written
+[91/124] model.layers.61.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1420, zai_fp8_codes_identical 0.9995
+[92/124] model.layers.61.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0628, zai_fp8_codes_identical 0.9991
+  backbone-00208-of-00282.safetensors: 2 record-aligned spans written
+[93/124] model.layers.62.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1216, zai_fp8_codes_identical 0.9993
+  backbone-00211-of-00282.safetensors: 1 record-aligned spans written
+[94/124] model.layers.62.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0543, zai_fp8_codes_identical 0.9993
+  backbone-00212-of-00282.safetensors: 1 record-aligned spans written
+[95/124] model.layers.63.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.0898, zai_fp8_codes_identical 0.9996
+[96/124] model.layers.63.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0482, zai_fp8_codes_identical 0.9992
+  backbone-00215-of-00282.safetensors: 2 record-aligned spans written
+[97/124] model.layers.64.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1323, zai_fp8_codes_identical 0.9997
+[98/124] model.layers.64.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0552, zai_fp8_codes_identical 0.9992
+  backbone-00219-of-00282.safetensors: 2 record-aligned spans written
+[99/124] model.layers.65.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1324, zai_fp8_codes_identical 0.9995
+[100/124] model.layers.65.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0486, zai_fp8_codes_identical 0.9990
+  backbone-00223-of-00282.safetensors: 2 record-aligned spans written
+[101/124] model.layers.66.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1311, zai_fp8_codes_identical 0.9995
+[102/124] model.layers.66.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0518, zai_fp8_codes_identical 0.9988
+  backbone-00226-of-00282.safetensors: 2 record-aligned spans written
+[103/124] model.layers.67.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1058, zai_fp8_codes_identical 0.9997
+[104/124] model.layers.67.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0735, zai_fp8_codes_identical 0.9989
+  backbone-00230-of-00282.safetensors: 2 record-aligned spans written
+[105/124] model.layers.68.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1245, zai_fp8_codes_identical 0.9996
+[106/124] model.layers.68.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0760, zai_fp8_codes_identical 0.9991
+  backbone-00234-of-00282.safetensors: 2 record-aligned spans written
+[107/124] model.layers.69.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1031, zai_fp8_codes_identical 0.9992
+[108/124] model.layers.69.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0573, zai_fp8_codes_identical 0.9987
+  backbone-00237-of-00282.safetensors: 2 record-aligned spans written
+[109/124] model.layers.70.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1116, zai_fp8_codes_identical 0.9993
+[110/124] model.layers.70.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0565, zai_fp8_codes_identical 0.9991
+  backbone-00245-of-00282.safetensors: 2 record-aligned spans written
+[111/124] model.layers.71.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1310, zai_fp8_codes_identical 0.9993
+[112/124] model.layers.71.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0816, zai_fp8_codes_identical 0.9991
+  backbone-00248-of-00282.safetensors: 2 record-aligned spans written
+[113/124] model.layers.72.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1140, zai_fp8_codes_identical 0.9987
+[114/124] model.layers.72.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0697, zai_fp8_codes_identical 0.9990
+  backbone-00252-of-00282.safetensors: 2 record-aligned spans written
+[115/124] model.layers.73.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1212, zai_fp8_codes_identical 0.9990
+[116/124] model.layers.73.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0619, zai_fp8_codes_identical 0.9991
+  backbone-00256-of-00282.safetensors: 2 record-aligned spans written
+[117/124] model.layers.74.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1139, zai_fp8_codes_identical 0.9989
+[118/124] model.layers.74.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0639, zai_fp8_codes_identical 0.9992
+  backbone-00259-of-00282.safetensors: 2 record-aligned spans written
+[119/124] model.layers.75.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1290, zai_fp8_codes_identical 0.9992
+[120/124] model.layers.75.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0605, zai_fp8_codes_identical 0.9992
+  backbone-00263-of-00282.safetensors: 2 record-aligned spans written
+[121/124] model.layers.76.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.1451, zai_fp8_codes_identical 0.9994
+[122/124] model.layers.76.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0610, zai_fp8_codes_identical 0.9993
+  backbone-00267-of-00282.safetensors: 2 record-aligned spans written
+[123/124] model.layers.77.mlp.shared_experts.down_proj.weight: converted, ||variant - A|| / ||A|| = 0.2101, zai_fp8_codes_identical 0.9993
+[124/124] model.layers.77.self_attn.o_proj.weight: converted, ||variant - A|| / ||A|| = 0.0780, zai_fp8_codes_identical 0.9993
+  backbone-00270-of-00282.safetensors: 2 record-aligned spans written
+re-read: 88 headers, 182 written and 2799 untouched tensors as expected
+DONE: /models/glm53-store/backbone-stock, 124 targets
+exit=0
