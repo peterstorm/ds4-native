@@ -5,7 +5,7 @@
 //   - the live Session: the tokens whose KV rows the decoder's caches hold,
 //     positions [0, live().size());
 //   - Checkpoints: Sessions set aside in host memory (a copy of their rows), the
-//     least recently set aside first, within a byte budget.
+//     least recently used (set aside or resumed from) first, within a byte budget.
 //
 // plan(prompt) says where the prompt resumes: the held Session sharing the
 // longest prefix with it (the live one unless a Checkpoint shares strictly more),
@@ -16,8 +16,10 @@
 // server re-renders and re-tokenizes it), which is no conversation worth a copy;
 // another conversation taking the caches drops all of this one's own. A Checkpoint
 // whose tokens another one starts with holds nothing more, and is dropped; past
-// the budget the least recently set aside go. A Checkpoint resumed from moves
-// into the caches: its host copy goes.
+// the budget the least recently used go. A Checkpoint the prompt continues moves
+// into the caches (its host copy goes); one the prompt branches from, dropping
+// `min_lost` or more of its tokens, is another conversation that shares a prefix
+// (a system prompt, a chat template's start) and stays.
 //
 // The shell performs a Resume in order: set the live rows aside (save), copy a
 // Checkpoint's rows in (restore), rewind the caches to `keep`, free the host rows
@@ -37,7 +39,7 @@ struct SessionLimits {
   int64_t capacity = 0;         // positions the decoder's caches hold
   uint64_t budget_bytes = 0;    // host memory the Checkpoints may take together (0: none are kept)
   uint64_t position_bytes = 0;  // one position's rows in every layer (Decoder::position_bytes)
-  size_t min_lost = 1;          // the fewest live tokens a prompt must drop for the live Session to be set aside
+  size_t min_lost = 1;          // the fewest tokens a prompt must drop of a Session for it to be kept apart
 };
 
 /** A Session set aside: its tokens, whose rows the shell holds in host memory under `id`. */
@@ -76,7 +78,7 @@ class Sessions {
   const SessionLimits& limits() const { return limits_; }
   /** The tokens whose rows the caches hold, in position order. */
   std::span<const int32_t> live() const { return live_; }
-  /** The Checkpoints, the least recently set aside first. */
+  /** The Checkpoints, the least recently used first. */
   std::span<const Checkpoint> checkpoints() const { return checkpoints_; }
   /** The Checkpoints' host memory. */
   uint64_t held_bytes() const;

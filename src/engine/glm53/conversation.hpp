@@ -35,9 +35,9 @@ namespace ds4n::engine::glm53 {
 struct ConversationConfig {
   std::vector<int32_t> stops;     // the tokens that end a reply (GLM's turn ends)
   uint64_t checkpoint_bytes = 0;  // host memory for the conversations set aside (0: none are kept)
-  // The fewest cached tokens a prompt must drop for their conversation to be set aside: a chat's next
-  // turn re-renders the last reply and may differ from the cached tokens in a few of them; another
-  // conversation drops all of this one's own.
+  // The fewest tokens a prompt must drop of a conversation (the live one, or a Checkpoint it resumes
+  // a prefix of) for that conversation to be kept apart: a chat's next turn re-renders the last reply
+  // and may differ from the cached tokens in a few of them; another conversation drops all of them.
   size_t min_lost = 64;
 };
 
@@ -77,8 +77,6 @@ class Conversation {
    * token; a wrap it reports stays for the rest of the request. Throws on a Decoder failure.
    */
   Outcome reply(const wire::Generate& g, const ReplyEvents& ev, const std::function<Interrupts()>& poll);
-
-  const ds4n::glm53::Sessions& sessions() const { return sessions_; }
 
  private:
   Conversation(Decoder& decoder, ConversationConfig config, ds4n::glm53::Sessions sessions)

@@ -21,7 +21,7 @@ bool starts(std::span<const int32_t> a, std::span<const int32_t> b) {
 
 const char* what(SessionError e) {
   switch (e) {
-    case SessionError::BadLimits: return "the context and a position's size must be positive";
+    case SessionError::BadLimits: return "the context, a position's size and min_lost must be positive";
     case SessionError::EmptyPrompt: return "the prompt is empty";
     case SessionError::PromptTooLong: return "the prompt leaves no room for a reply in the context";
     case SessionError::CacheFull: return "the context is full";
@@ -46,8 +46,8 @@ Result<Planned, SessionError> Sessions::plan(std::span<const int32_t> prompt) co
   if (prompt.empty()) return R::err(SessionError::EmptyPrompt);
   if (static_cast<int64_t>(prompt.size()) >= limits_.capacity) return R::err(SessionError::PromptTooLong);
 
-  // The Checkpoint sharing the most, the most recently set aside on a tie; it is resumed from only
-  // when it shares strictly more than the live Session.
+  // The Checkpoint sharing the most, the most recently used on a tie; it is resumed from only when it
+  // shares strictly more than the live Session.
   const size_t live_shared = shared_prefix(live_, prompt);
   size_t best = live_shared;
   std::optional<size_t> from;
@@ -62,6 +62,16 @@ Result<Planned, SessionError> Sessions::plan(std::span<const int32_t> prompt) co
   Sessions after = *this;
   Resume r;
   r.keep = std::min(best, prompt.size() - 1);
+  if (from) {
+    // A Checkpoint the prompt continues moves into the caches: its host copy goes once copied. One the
+    // prompt branches from (dropping min_lost or more of its tokens) is another conversation sharing a
+    // prefix: it stays, as the most recently used but for the live Session, should that be set aside.
+    const Checkpoint used = checkpoints_[*from];
+    r.restore = used.id;
+    std::erase_if(after.checkpoints_, [&](const Checkpoint& c) { return c.id == used.id; });
+    if (used.tokens.size() - best >= limits_.min_lost) after.checkpoints_.push_back(used);
+    else r.freed.push_back(used.id);
+  }
   // Once the prompt is read the caches hold it: the live tokens past its share are dropped. Set the live
   // Session aside when that is min_lost or more, unless a Checkpoint already holds it all.
   const bool lost = live_.size() - live_shared >= limits_.min_lost;
@@ -69,7 +79,8 @@ Result<Planned, SessionError> Sessions::plan(std::span<const int32_t> prompt) co
   const uint64_t live_bytes = live_.size() * limits_.position_bytes;
   if (lost && !held && live_bytes <= limits_.budget_bytes) {
     r.save = after.next_id_++;
-    // A Checkpoint the live Session starts with holds nothing more.
+    // A Checkpoint the live Session starts with holds nothing more (never the one resumed from: the
+    // live Session would share at least as much with the prompt).
     std::erase_if(after.checkpoints_, [&](const Checkpoint& c) {
       if (!starts(c.tokens, live_)) return false;
       r.freed.push_back(c.id);
@@ -77,12 +88,7 @@ Result<Planned, SessionError> Sessions::plan(std::span<const int32_t> prompt) co
     });
     after.checkpoints_.push_back({*r.save, live_});
   }
-  if (from) {  // moves into the caches: its host copy goes once copied
-    r.restore = checkpoints_[*from].id;
-    r.freed.push_back(*r.restore);
-    std::erase_if(after.checkpoints_, [&](const Checkpoint& c) { return c.id == *r.restore; });
-  }
-  while (after.held_bytes() > limits_.budget_bytes) {  // the least recently set aside first; never the one just saved
+  while (after.held_bytes() > limits_.budget_bytes) {  // the least recently used first; never the one just saved
     r.freed.push_back(after.checkpoints_.front().id);
     after.checkpoints_.erase(after.checkpoints_.begin());
   }

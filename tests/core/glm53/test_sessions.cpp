@@ -6,7 +6,8 @@
 // prompt; the host holds exactly the Checkpoints, within the budget, none the
 // start of another; a live Session the prompt drops `min_lost` or more tokens of
 // stays recoverable when it fits the budget, and one it drops fewer of is never
-// copied.
+// copied; a Checkpoint resumed from is freed when the prompt continues it, and
+// one the prompt branches from stays unless the budget evicts it.
 #include <doctest/doctest.h>
 
 #include <algorithm>
@@ -94,6 +95,15 @@ Planned resume(const Sessions& s, FakeKv& kv, const Tokens& prompt) {
   if (dropped >= s.limits().min_lost && s.live().size() * s.limits().position_bytes <= s.limits().budget_bytes)
     CHECK(std::ranges::any_of(p.after.checkpoints(), [&](const Checkpoint& c) { return starts(s.live(), c.tokens); }));
   if (dropped < s.limits().min_lost) CHECK_FALSE(p.resume.save);
+  // A Checkpoint resumed from is freed when the prompt drops fewer than min_lost of its tokens; one it
+  // drops more of is another conversation, and goes only when the budget evicts it.
+  if (p.resume.restore) {
+    const auto used = std::ranges::find(s.checkpoints(), *p.resume.restore, &Checkpoint::id);
+    REQUIRE(used != s.checkpoints().end());
+    const bool kept = std::ranges::any_of(p.after.checkpoints(), [&](const Checkpoint& c) { return c.id == used->id; });
+    if (used->tokens.size() - shared(used->tokens, prompt) < s.limits().min_lost) CHECK_FALSE(kept);
+    else if (!kept) CHECK(p.after.held_bytes() + used->tokens.size() * s.limits().position_bytes > s.limits().budget_bytes);
+  }
   return p;
 }
 
@@ -151,6 +161,45 @@ TEST_CASE("Sessions: a next turn that re-renders the reply's last tokens differe
   FakeKv other = kv;  // the same caches for the second prompt
   CHECK(resume(s, kv, {1, 2, 3, 4, 5, 7, 6, 6, 1}).resume == want(6));  // drops [8, 9]: fewer than 4
   CHECK(resume(s, other, {1, 2, 9}).resume == want(2, 0));              // drops 6 tokens: another conversation
+}
+
+TEST_CASE("Sessions: a prompt that branches early from a Checkpoint resumes its prefix and keeps it") {
+  FakeKv kv;
+  Sessions s = make(64, 100, 1, 4);
+  const Tokens d{1, 2, 3, 4, 5, 6, 7, 8}, x{9, 9, 9, 9, 9};
+  s = resume(s, kv, d).after.fed(d).value();
+  kv.feed(d);
+  Planned p = resume(s, kv, x);  // D set aside as 0
+  s = p.after.fed(x).value();
+  kv.feed(x);
+  p = resume(s, kv, {1, 2, 7, 7});  // shares [1, 2] with D, drops 6 of it: D stays; X set aside as 1
+  CHECK(p.resume == want(2, 1, 0));
+  REQUIRE(p.after.checkpoints().size() == 2);
+  CHECK(p.after.checkpoints()[0] == Checkpoint{0, d});
+  s = p.after.fed(Tokens{7, 7}).value();
+  kv.feed(Tokens{7, 7});
+  Tokens d2 = d;
+  d2.push_back(5);
+  p = resume(s, kv, d2);  // continues D: D moves into the caches; the live branch loses only [7, 7], kept by no copy
+  CHECK(p.resume == want(8, std::nullopt, 0, {0}));
+  REQUIRE(p.after.checkpoints().size() == 1);
+  CHECK(p.after.checkpoints()[0] == Checkpoint{1, x});
+}
+
+TEST_CASE("Sessions: a Checkpoint resumed from counts as recently used") {
+  FakeKv kv;
+  Sessions s = make(64, 6);  // two conversations of 3 tokens fit
+  for (int32_t c = 1; c <= 3; c++) {
+    const Tokens t{c, c, c};
+    s = resume(s, kv, t).after.fed(t).value();
+    kv.feed(t);
+  }
+  // [1 1 1] and [2 2 2] held, [3 3 3] live. A branch from [1 1 1] uses it: [2 2 2] is the least recently used.
+  const Planned p = resume(s, kv, {1, 1, 5});
+  CHECK(p.resume == want(2, 2, 0, {1}));
+  REQUIRE(p.after.checkpoints().size() == 2);
+  CHECK(p.after.checkpoints()[0].tokens == Tokens{1, 1, 1});
+  CHECK(p.after.checkpoints()[1].tokens == Tokens{3, 3, 3});
 }
 
 TEST_CASE("Sessions: a budget of 0 keeps no Checkpoints; one too small for the live Session skips it") {
