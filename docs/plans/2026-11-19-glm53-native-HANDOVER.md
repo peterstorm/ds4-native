@@ -1,4 +1,4 @@
-# HANDOVER: GLM-5.3 full uncensored on ds4-native — session state 2026-11-21 (prefill analysis)
+# HANDOVER: GLM-5.3 full uncensored on ds4-native — session state 2026-11-21 (attention in waves)
 
 Resume point for any fresh session. Companion to
 [`2026-11-19-glm53-native.md`](2026-11-19-glm53-native.md) (the plan — read it first; its
@@ -218,11 +218,20 @@ An independent audit (python, read-only, against the index) found:
        through the existing tiled `bf16_gemv`.
      - Why DS4.1 is faster: 2.7× fewer Expert bytes per token, 79% vs 54% of the model held, and
        waves.
+   - **Attention in waves: done 2026-11-21** (`docs/bench/glm53-decode/2026-11-21-waves-report.md`):
+     - A sweep attends (and runs the Dense MLPs) in waves of 512 (`--wave`, default 512): the
+       linears once a wave through the tiled `bf16_gemv`, the core a Round at a time. One
+       `LayerScratch` per GPU (+2 Slots per layer).
+     - Gates PASS: attn-check with waves on real layers, `--check --wave 16`, a 2,800-token
+       `--logits-hash` equal across Rounds and waves of 8/64/512.
+     - 11,200 tokens cold 64.3 → 39.0 s (the read floor); warm 20.2 s; short turns unchanged.
    - **Next:**
      1. The second NVMe, in **`M.2_3` or `M.2_4`, never `M.2_2`**: that slot shares lanes with
-        GPU 2 and drops it to x4. Bring-up in the speed report, section 8.
-     2. Attention in waves for the sweep.
-     3. A server around the Decoder.
+        GPU 2 and drops it to x4. Bring-up in the speed report, section 8. Cold prompts of every
+        length now wait on the drive, so this is the prefill lever.
+     2. A server around the Decoder.
+     3. For warm long prompts: `head_gemv` (absorbed queries, W_v) as a tiled GEMV if the
+        arithmetic order allows; then GLM's own larger Exchange.
      - More host RAM is the biggest hardware lever (192–256 GB); it's the owner's call.
 7. Phases 4–5 per the plan (fifth switch-primary entry `glm-native`, slots ladder, CyberGym).
 

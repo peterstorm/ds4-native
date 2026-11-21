@@ -120,6 +120,10 @@ Estimates are model-based from the measurements above, marked ≈. Measured valu
 
 ### A. Attention in waves (software; the one big code lever, ready to build)
 
+> **Built and measured the same day: `2026-11-21-waves-report.md`.** Bit-identical (three gates).
+> 11,200 tokens cold 64.3 → 39.0 s (the read floor), warm 20.2 s; GPU per prompt token
+> 5.7 → ≈ 1.4 ms. Short turns unchanged, as predicted below.
+
 **What changes:**
 - In a sweep, run each layer's attention projections, plane sums, norms, rope, per-head GEMVs and
   Exchanges over many Rounds at once (waves of 64 Rounds, or the whole prompt). The projections

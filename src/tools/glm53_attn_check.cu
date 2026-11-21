@@ -39,17 +39,25 @@
 //                      row's length 0 or past the stride.
 // With --backbone, whole layers on real weights too (cuda/glm53/attention_layer):
 // a Dense layer, a Sparse Full layer, a Shared layer and the last layer, each
-// over a random past cache in Rounds: decode tokens at 0, 2047 and 2048 (the
-// first the indexer selects for), and Rounds of 8 at 1, 100, 2044 (crossing
-// index_topk inside the Round) and the cache's end. Both GPUs' shares run on
-// this GPU and are exchanged. The oracle decodes each Round's tokens one by one,
-// each attending the earlier ones' rows: per token, each GPU's o_proj partial
-// (FP32), the cache row, the index key and the Selection against exact::attend;
-// mid and ffn_in against exact::begin_layer; the Dense MLP's partials and output
-// against exact::dense_mlp; and the head's logits (a Round of 2) against
-// exact::logits.
+// over a random past cache, both GPUs' shares on this GPU sharing one
+// LayerScratch (as a GPU's layers do), exchanged: decode tokens at 0, 2047 and
+// 2048 (the first the indexer selects for); Rounds of 8 at 1, 100, 2044
+// (crossing index_topk inside the Round) and the cache's end; and waves (the
+// linears over the whole wave, the core a Round at a time) of 77 from 0, 200
+// from 1950 (Rounds off the multiples of 8, crossing index_topk) and 512 ending
+// at the cache's end. The oracle decodes the tokens one by one: per token, each
+// GPU's o_proj partial (FP32), the cache row, the index key and the Selection
+// against exact::attend; mid and ffn_in against exact::begin_layer; the Dense
+// MLP's partials and output against exact::dense_mlp; and the head's logits (a
+// Round of 2) against exact::logits. Token t's past is the cache plus the GPU's
+// rows of the tokens before it, each of which is checked against the oracle's
+// own row, so it is the oracle's past; with every past fixed in advance the
+// tokens run on all the host's threads. Refusals too: a scratch for waves of 0,
+// 7 or 520 tokens or no positions, more tokens than a scratch's wave, a scratch
+// for a smaller cache than the layer's.
 // Any difference exits 1. --iters times one decode token (rows 1, n 2048) and a
-// Round of 8 (default 50).
+// Round of 8 (default 50), and with --backbone each layer's attention of 512
+// tokens in Rounds of 8 and in one wave (one GPU's share).
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -62,9 +70,11 @@
 #include <cstring>
 #include <fstream>
 #include <numeric>
+#include <optional>
 #include <random>
 #include <span>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "core/glm53/config.hpp"
@@ -638,11 +648,128 @@ std::vector<float> random_residual(std::mt19937& rng, int n) {
   return x;
 }
 
+/** The oracle's view of a wave's tokens: per token, exact::attend's result and exact::begin_layer's. */
+struct WaveOracle {
+  std::vector<exact::Attention> attend;
+  std::vector<glm53::LayerStart> start;
+};
+
 /**
- * One layer's Rounds: both GPUs' shares against exact::attend / begin_layer / dense_mlp run token by
- * token, each token attending the Round's earlier rows, as decoding them one at a time would.
+ * The oracle for the tokens `xs` ([T][hidden]) at positions past.length .. past.length + T - 1:
+ * token t attends `past` plus the first t of `rows` (the GPU's rows of these tokens, each checked
+ * against the oracle's own row by the caller: when they all agree this is the oracle's own past,
+ * by induction over the tokens) with `selections[t]` on a Shared layer. Each token's past is known
+ * in advance, so the tokens split over the host's threads.
  */
-bool check_layer(const glm53::Config& config, const io::BackboneParts& parts, int L, std::mt19937& rng) {
+WaveOracle oracle_wave(const exact::AttentionLayer& a, std::span<const float> input_norm, float eps,
+                       const glm53::LayerCache& past, const std::vector<float>& xs, const glm53::LayerCache& rows,
+                       const std::vector<std::vector<int32_t>>& selections) {
+  const auto hidden = static_cast<size_t>(a.dims().hidden);
+  const size_t T = xs.size() / hidden;
+  WaveOracle o;
+  o.attend.resize(T);
+  o.start.resize(T);
+  const size_t threads = std::min<size_t>(T, std::max(1u, std::thread::hardware_concurrency()));
+  std::vector<std::string> failed(threads);
+  auto append = [&rows](glm53::LayerCache& c, size_t t) {
+    auto copy = [t](std::vector<float>& to, const std::vector<float>& from, size_t width) {
+      to.insert(to.end(), from.begin() + static_cast<ptrdiff_t>(t * width),
+                from.begin() + static_cast<ptrdiff_t>((t + 1) * width));
+    };
+    copy(c.latent, rows.latent, gpu::kLatent);
+    copy(c.k_rope, rows.k_rope, gpu::kKeyRope);
+    if (!rows.index_keys.empty()) copy(c.index_keys, rows.index_keys, gpu::kIndexHeadDim);
+    c.length++;
+  };
+  std::vector<std::thread> pool;
+  for (size_t i = 0; i < threads; i++)
+    pool.emplace_back([&, i] {
+      const size_t lo = T * i / threads, hi = T * (i + 1) / threads;
+      glm53::LayerCache mine = past;
+      for (size_t t = 0; t < lo; t++) append(mine, t);
+      for (size_t t = lo; t < hi; t++) {
+        const std::span<const float> x(xs.data() + t * hidden, hidden);
+        auto w = exact::attend(a, mine, hc::rmsnorm(x, input_norm, eps), selections[t]);
+        auto st = exact::begin_layer(a, mine, x, selections[t]);
+        if (!w || !st) {
+          failed[i] = !w ? w.error().what : st.error().what;
+          return;
+        }
+        o.attend[t] = std::move(w).value();
+        o.start[t] = std::move(st).value();
+        append(mine, t);
+      }
+    });
+  for (auto& th : pool) th.join();
+  for (const auto& f : failed)
+    if (!f.empty()) die(f);
+  return o;
+}
+
+/**
+ * Mean milliseconds of `att` attending `tokens` tokens ([tokens][hidden] at `d_x`) at `first` in
+ * calls of `step` tokens (`shared`: a Shared layer's Selections for all of them), on this GPU.
+ */
+double time_attend(gpu::DeviceAttention& att, gpu::LayerScratch& w, int hidden, const float* d_x, int tokens,
+                   int64_t first, const gpu::Selections* shared, float* d_partial, int step, int iters) {
+  const auto H = static_cast<size_t>(hidden);
+  auto pass = [&] {
+    for (int t0 = 0; t0 < tokens; t0 += step) {
+      const int n = std::min(step, tokens - t0);
+      std::optional<gpu::Selections> part;
+      if (shared)
+        part = gpu::Selections{shared->rows + static_cast<size_t>(t0) * shared->stride, shared->stride,
+                               std::vector<int>(shared->lengths.begin() + t0, shared->lengths.begin() + t0 + n)};
+      const auto sel = att.attend(d_x + t0 * H, n, first + t0, part ? &*part : nullptr, w, d_partial + t0 * H, nullptr);
+      if (!sel) die(sel.error());
+    }
+  };
+  pass();  // warm-up
+  cudaEvent_t start, stop;
+  ck(cudaEventCreate(&start), "event");
+  ck(cudaEventCreate(&stop), "event");
+  ck(cudaEventRecord(start), "event");
+  for (int i = 0; i < iters; i++) pass();
+  ck(cudaEventRecord(stop), "event");
+  ck(cudaEventSynchronize(stop), "event");
+  float ms = 0.0f;
+  ck(cudaEventElapsedTime(&ms, start, stop), "event");
+  cudaEventDestroy(start);
+  cudaEventDestroy(stop);
+  return ms / iters;
+}
+
+/** A refused call: what attend says to a count past the scratch's wave or a scratch for a smaller cache. */
+size_t check_attend_refusals(const glm53::Dims& d, gpu::DeviceAttention& att, int capacity, const float* d_x,
+                             float* d_partial) {
+  size_t bad = 0;
+  for (const auto& [wave, cap] : std::vector<std::pair<int, int>>{{0, capacity}, {7, capacity}, {gpu::kMaxWave + 8, capacity},
+                                                                  {gpu::kMaxRound, 0}})
+    if (gpu::LayerScratch::create(d, wave, cap)) {
+      std::fprintf(stderr, "  a scratch for waves of %d over %d positions: not refused\n", wave, cap);
+      bad++;
+    }
+  auto round = gpu::LayerScratch::create(d, gpu::kMaxRound, capacity);
+  auto small = gpu::LayerScratch::create(d, gpu::kMaxRound, capacity - 1);
+  if (!round || !small) die("a Round's scratch: " + (round ? small.error() : round.error()));
+  if (att.attend(d_x, gpu::kMaxRound + 1, 0, nullptr, round.value(), d_partial, nullptr)) {
+    std::fprintf(stderr, "  %d tokens on a scratch for 8: not refused\n", gpu::kMaxRound + 1);
+    bad++;
+  }
+  if (att.attend(d_x, 1, 0, nullptr, small.value(), d_partial, nullptr)) {
+    std::fprintf(stderr, "  a scratch for a smaller cache: not refused\n");
+    bad++;
+  }
+  std::printf("scratch and wave refusals (waves of 0, 7, %d, no positions; %d tokens on a Round's scratch; a "
+              "smaller cache's scratch): %s\n", gpu::kMaxWave + 8, gpu::kMaxRound + 1, bad ? "FAILED" : "all refused");
+  return bad;
+}
+
+/**
+ * One layer's calls: both GPUs' shares, on one LayerScratch as a GPU's layers share one, against the
+ * oracle token by token (oracle_wave): decode tokens, Rounds and waves.
+ */
+bool check_layer(const glm53::Config& config, const io::BackboneParts& parts, int L, std::mt19937& rng, int iters) {
   const glm53::Dims& d = config.dims();
   const auto weights = parts.load_layer(L, 16);
   if (!weights) die(weights.error().what);
@@ -653,6 +780,9 @@ bool check_layer(const glm53::Config& config, const io::BackboneParts& parts, in
   const bool full = config.indexer(L) == glm53::IndexerKind::Full;
   const auto* dense = std::get_if<glm53::Mlp>(&bound.value().mlp);
   constexpr int kCapacity = 3001;
+  auto scratch = gpu::LayerScratch::create(d, gpu::kMaxWave, kCapacity);
+  if (!scratch) die(scratch.error());
+  gpu::LayerScratch& w = scratch.value();
   std::vector<gpu::DeviceAttention> share;
   std::vector<gpu::DeviceDenseMlp> mlp;
   for (int g = 0; g < 2; g++) {
@@ -666,120 +796,135 @@ bool check_layer(const glm53::Config& config, const io::BackboneParts& parts, in
     }
   }
   const size_t H = static_cast<size_t>(d.hidden);
-  constexpr size_t R = gpu::kMaxRound;
+  constexpr size_t R = gpu::kMaxWave;
   auto* d_x = device_alloc<float>(R * H);
   std::array<float*, 2> d_partial{device_alloc<float>(R * H), device_alloc<float>(R * H)};
   auto* d_out = device_alloc<__nv_bfloat16>(R * H);
   auto* d_mid = device_alloc<float>(R * H);
   auto* d_ffn = device_alloc<__nv_bfloat16>(R * H);
   auto* d_shared = device_alloc<int32_t>(R * gpu::kMaxSelection);
-  size_t bad = 0;
-  // Rounds (first position, tokens): decode at the edges, and Rounds of 8 that start in the cache,
-  // cross index_topk (rows 0-3 keep every position, rows 4-7 select) and end at the capacity.
-  const std::array<std::pair<int64_t, int>, 7> rounds{
-      {{0, 1}, {1, 8}, {100, 8}, {2047, 1}, {2044, 8}, {2048, 1}, {kCapacity - 8, 8}}};
-  for (const auto& [first, tokens] : rounds) {
-    // The oracle decodes the Round's tokens one by one, each attending the rows of those before it.
-    auto past = random_past(rng, first, full);
-    const auto loaded = past;
+  size_t bad = check_attend_refusals(d, share[0], kCapacity, d_x, d_partial[0]);
+  // Calls (first position, tokens): decode tokens at the edges; Rounds of 8 that start in the cache,
+  // cross index_topk (rows 0-3 keep every position, rows 4-7 select) and end at the capacity; waves of
+  // 77 from 0 (every token keeps every position; the last Round a part one), of 200 from 1950 (Rounds
+  // off the multiples of 8, index_topk crossed at the 99th token) and a whole wave ending at the capacity.
+  const std::array<std::pair<int64_t, int>, 10> calls{{{0, 1},
+                                                       {1, 8},
+                                                       {100, 8},
+                                                       {2047, 1},
+                                                       {2044, 8},
+                                                       {2048, 1},
+                                                       {kCapacity - 8, 8},
+                                                       {0, 77},
+                                                       {1950, 200},
+                                                       {kCapacity - gpu::kMaxWave, gpu::kMaxWave}}};
+  for (const auto& [first, tokens] : calls) {
+    const auto T = static_cast<size_t>(tokens);
+    const auto past = random_past(rng, first, full);
     std::vector<float> xs;
-    std::vector<exact::Attention> want;
-    std::vector<glm53::LayerStart> starts;
+    std::vector<std::vector<int32_t>> selections(T);
     gpu::Selections shared{d_shared, gpu::kMaxSelection, {}};
-    std::vector<int32_t> shared_rows(R * gpu::kMaxSelection, -1);
-    for (int t = 0; t < tokens; t++) {
-      const int64_t pos = first + t;
+    std::vector<int32_t> shared_rows(T * gpu::kMaxSelection, -1);
+    for (size_t t = 0; t < T; t++) {
       const auto x = random_residual(rng, d.hidden);
       xs.insert(xs.end(), x.begin(), x.end());
-      std::vector<int32_t> sel;
-      if (!full) {
-        sel.resize(static_cast<size_t>(pos) + 1);
-        std::iota(sel.begin(), sel.end(), 0);
-        std::shuffle(sel.begin(), sel.end(), rng);
-        sel.resize(std::min<size_t>(sel.size(), gpu::kMaxSelection));
-        std::sort(sel.begin(), sel.end());
-        std::copy(sel.begin(), sel.end(), shared_rows.begin() + static_cast<ptrdiff_t>(t) * gpu::kMaxSelection);
-        shared.lengths.push_back(static_cast<int>(sel.size()));
-      }
-      const auto h = hc::rmsnorm(x, bound.value().input_norm, d.rms_eps);
-      auto w = exact::attend(a.value(), past, h, sel);
-      if (!w) die(w.error().what);
-      auto st = exact::begin_layer(a.value(), past, x, sel);
-      if (!st) die(st.error().what);
-      const auto& row = w.value().row;
-      past.latent.insert(past.latent.end(), row.latent.begin(), row.latent.end());
-      past.k_rope.insert(past.k_rope.end(), row.k_rope.begin(), row.k_rope.end());
-      past.index_keys.insert(past.index_keys.end(), row.index_key.begin(), row.index_key.end());
-      past.length++;
-      want.push_back(std::move(w).value());
-      starts.push_back(std::move(st).value());
+      if (full) continue;
+      auto& sel = selections[t];
+      sel.resize(static_cast<size_t>(first) + t + 1);
+      std::iota(sel.begin(), sel.end(), 0);
+      std::shuffle(sel.begin(), sel.end(), rng);
+      sel.resize(std::min<size_t>(sel.size(), gpu::kMaxSelection));
+      std::sort(sel.begin(), sel.end());
+      std::copy(sel.begin(), sel.end(), shared_rows.begin() + static_cast<ptrdiff_t>(t * gpu::kMaxSelection));
+      shared.lengths.push_back(static_cast<int>(sel.size()));
     }
     ck(cudaMemcpy(d_x, xs.data(), xs.size() * sizeof(float), cudaMemcpyHostToDevice), "x");
     if (!full)
       ck(cudaMemcpy(d_shared, shared_rows.data(), shared_rows.size() * sizeof(int32_t), cudaMemcpyHostToDevice),
          "shared");
-    size_t here = 0;
-    const auto token_of = [&](const std::vector<float>& all, int t) {
-      return std::vector<float>(all.begin() + static_cast<ptrdiff_t>(t) * d.hidden,
-                                all.begin() + static_cast<ptrdiff_t>(t + 1) * d.hidden);
-    };
+    // Both GPUs' shares: their partials, cache rows, index keys and Selections.
+    std::array<std::vector<float>, 2> partial;
+    std::array<glm53::LayerCache, 2> rows;
+    std::array<std::vector<std::vector<int32_t>>, 2> made;
     for (int g = 0; g < 2; g++) {
-      if (auto r = share[g].load_cache(loaded); !r) die(r.error());
-      const auto sel = share[g].attend(d_x, tokens, first, full ? nullptr : &shared, d_partial[g], nullptr);
+      if (auto r = share[g].load_cache(past); !r) die(r.error());
+      const auto sel = share[g].attend(d_x, tokens, first, full ? nullptr : &shared, w, d_partial[g], nullptr);
       if (!sel) die(sel.error());
       ck(cudaDeviceSynchronize(), "attend");
-      const auto partial = download(d_partial[g], static_cast<size_t>(tokens) * H);
-      for (int t = 0; t < tokens; t++) {
-        const auto& w = want[static_cast<size_t>(t)];
-        here += compare_bits<float>("partial", w.o.partial[g], token_of(partial, t));
-        const auto row = as_float(download(share[g].cache_row(first + t), gpu::kKeyWidth));
-        here += compare_bits<float>("latent", w.row.latent, {row.begin(), row.begin() + gpu::kLatent});
-        here += compare_bits<float>("k_rope", w.row.k_rope, {row.begin() + gpu::kLatent, row.end()});
+      partial[g] = download(d_partial[g], T * H);
+      const auto r = as_float(download(share[g].cache_row(first), T * gpu::kKeyWidth));
+      for (size_t t = 0; t < T; t++) {
+        const auto row = r.begin() + static_cast<ptrdiff_t>(t * gpu::kKeyWidth);
+        rows[g].latent.insert(rows[g].latent.end(), row, row + gpu::kLatent);
+        rows[g].k_rope.insert(rows[g].k_rope.end(), row + gpu::kLatent, row + gpu::kKeyWidth);
+        made[g].push_back(download(sel.value().rows + t * sel.value().stride, static_cast<size_t>(sel.value().lengths[t])));
+      }
+      if (full) rows[g].index_keys = as_float(download(share[g].index_key(first), T * gpu::kIndexHeadDim));
+      rows[g].length = tokens;
+    }
+    const WaveOracle want = oracle_wave(a.value(), bound.value().input_norm, d.rms_eps, past, xs, rows[0], selections);
+    size_t here = 0;
+    const auto token_of = [&](const std::vector<float>& all, size_t t, size_t width) {
+      return std::vector<float>(all.begin() + static_cast<ptrdiff_t>(t * width),
+                                all.begin() + static_cast<ptrdiff_t>((t + 1) * width));
+    };
+    for (int g = 0; g < 2; g++)
+      for (size_t t = 0; t < T; t++) {
+        const auto& o = want.attend[t];
+        here += compare_bits<float>("partial", o.o.partial[g], token_of(partial[g], t, H));
+        here += compare_bits<float>("latent", o.row.latent, token_of(rows[g].latent, t, gpu::kLatent));
+        here += compare_bits<float>("k_rope", o.row.k_rope, token_of(rows[g].k_rope, t, gpu::kKeyRope));
         if (full)
-          here += compare_bits<float>("index key", w.row.index_key,
-                                      as_float(download(share[g].index_key(first + t), gpu::kIndexHeadDim)));
-        const auto got = download(sel.value().rows + static_cast<size_t>(t) * sel.value().stride,
-                                  static_cast<size_t>(sel.value().lengths[static_cast<size_t>(t)]));
-        if (got != w.selection) {
+          here += compare_bits<float>("index key", o.row.index_key, token_of(rows[g].index_keys, t, gpu::kIndexHeadDim));
+        if (made[g][t] != o.selection) {
           here++;
           std::fprintf(stderr, "  layer %d position %lld: the Selection differs (%zu vs %zu entries)\n", L,
-                       static_cast<long long>(first + t), got.size(), w.selection.size());
+                       static_cast<long long>(first) + static_cast<long long>(t), made[g][t].size(), o.selection.size());
         }
       }
-    }
-    const size_t n = static_cast<size_t>(tokens) * H;
+    const size_t n = T * H;
     cuda::add_round_bf16(d_partial[0], d_partial[1], n, d_out, nullptr);
     share[0].finish(d_x, d_out, tokens, d_mid, d_ffn, nullptr);
     ck(cudaDeviceSynchronize(), "finish");
     const auto out = as_float(download(d_out, n)), mid = download(d_mid, n), ffn = as_float(download(d_ffn, n));
-    for (int t = 0; t < tokens; t++) {
-      here += compare_bits<float>("out", want[static_cast<size_t>(t)].o.out, token_of(out, t));
-      here += compare_bits<float>("mid", starts[static_cast<size_t>(t)].mid, token_of(mid, t));
-      here += compare_bits<float>("ffn_in", starts[static_cast<size_t>(t)].ffn_in, token_of(ffn, t));
+    for (size_t t = 0; t < T; t++) {
+      here += compare_bits<float>("out", want.attend[t].o.out, token_of(out, t, H));
+      here += compare_bits<float>("mid", want.start[t].mid, token_of(mid, t, H));
+      here += compare_bits<float>("ffn_in", want.start[t].ffn_in, token_of(ffn, t, H));
     }
     if (dense) {
-      std::vector<exact::Exchanged> mlp_want;
-      for (int t = 0; t < tokens; t++) {
-        auto e = exact::dense_mlp(*dense, starts[static_cast<size_t>(t)].ffn_in);
+      std::vector<exact::Exchanged> mlp_want(T);
+      for (size_t t = 0; t < T; t++) {
+        auto e = exact::dense_mlp(*dense, want.start[t].ffn_in);
         if (!e) die(e.error().what);
-        mlp_want.push_back(std::move(e).value());
+        mlp_want[t] = std::move(e).value();
       }
       for (int g = 0; g < 2; g++) {
-        ck(mlp[g].run(d_ffn, tokens, d_partial[g], nullptr), "dense");
+        ck(mlp[g].run(d_ffn, tokens, w, d_partial[g], nullptr), "dense");
         ck(cudaDeviceSynchronize(), "dense");
-        const auto partial = download(d_partial[g], n);
-        for (int t = 0; t < tokens; t++)
-          here += compare_bits<float>("dense partial", mlp_want[static_cast<size_t>(t)].partial[g], token_of(partial, t));
+        const auto got = download(d_partial[g], n);
+        for (size_t t = 0; t < T; t++)
+          here += compare_bits<float>("dense partial", mlp_want[t].partial[g], token_of(got, t, H));
       }
       cuda::add_round_bf16(d_partial[0], d_partial[1], n, d_out, nullptr);
       const auto dense_out = as_float(download(d_out, n));
-      for (int t = 0; t < tokens; t++)
-        here += compare_bits<float>("dense out", mlp_want[static_cast<size_t>(t)].out, token_of(dense_out, t));
+      for (size_t t = 0; t < T; t++)
+        here += compare_bits<float>("dense out", mlp_want[t].out, token_of(dense_out, t, H));
     }
-    std::printf("layer %2d (%s, %s) Round of %d at %4lld: Selections %4zu .. %4zu, %zu differ\n", L,
-                full ? "Full" : "Shared", dense ? "Dense" : "Sparse", tokens, static_cast<long long>(first),
-                want.front().selection.size(), want.back().selection.size(), here);
+    std::printf("layer %2d (%s, %s) %s of %3d at %4lld: Selections %4zu .. %4zu, %zu differ\n", L,
+                full ? "Full" : "Shared", dense ? "Dense" : "Sparse", tokens <= gpu::kMaxRound ? "Round" : "wave ",
+                tokens, static_cast<long long>(first), want.attend.front().selection.size(),
+                want.attend.back().selection.size(), here);
+    std::fflush(stdout);
     bad += here;
+    if (iters > 0 && tokens == gpu::kMaxWave) {
+      const gpu::Selections* sh = full ? nullptr : &shared;
+      const double rounds = time_attend(share[0], w, d.hidden, d_x, tokens, first, sh, d_partial[0], gpu::kMaxRound, iters);
+      const double wave = time_attend(share[0], w, d.hidden, d_x, tokens, first, sh, d_partial[0], gpu::kMaxWave, iters);
+      std::printf("layer %2d: %d tokens' attention, one GPU's share: in Rounds of 8 %.2f ms (%.1f us/token), "
+                  "in a wave %.2f ms (%.1f us/token), %.2fx\n",
+                  L, tokens, rounds, 1000.0 * rounds / tokens, wave, 1000.0 * wave / tokens, rounds / wave);
+    }
   }
   for (void* p : {static_cast<void*>(d_x), static_cast<void*>(d_partial[0]), static_cast<void*>(d_partial[1]),
                   static_cast<void*>(d_out), static_cast<void*>(d_mid), static_cast<void*>(d_ffn),
@@ -898,7 +1043,7 @@ int main(int argc, char** argv) {
     }));
     layers.push_back(first([&](int L) { return cfg.indexer(L) == glm53::IndexerKind::Shared; }));
     layers.push_back(d.layers - 1);
-    for (const int L : layers) ok = check_layer(cfg, parts.value(), L, rng) && ok;
+    for (const int L : layers) ok = check_layer(cfg, parts.value(), L, rng, iters) && ok;
     ok = check_head(d, parts.value(), rng) && ok;
   }
   if (iters > 0) {

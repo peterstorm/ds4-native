@@ -143,7 +143,8 @@ struct Gpu {
   std::vector<std::optional<gpu::DeviceDenseMlp>> dense;       // [layer], Dense layers
   std::vector<std::optional<SparseLayer>> sparse;              // [layer], Sparse layers
   std::optional<gpu::DeviceHead> head;                         // GPU 0
-  // A Round's scratch, [kMaxRound][...].
+  std::optional<gpu::LayerScratch> layer_scratch;              // every layer's attention and Dense MLP scratch
+  // A Round's scratch, [kMaxRound][...]; `partial` and `out` hold a wave, [wave][hidden].
   float *x = nullptr, *partial = nullptr, *mid = nullptr, *ffn_f32 = nullptr, *y = nullptr;
   __nv_bfloat16 *out = nullptr, *ffn = nullptr;
   float *router_planes = nullptr, *weights = nullptr, *logits = nullptr;
@@ -203,6 +204,19 @@ struct Gpu {
     return {sx + at, smid + at, sffn + at};
   }
 };
+
+/**
+ * out = bf16(GPU 0's + GPU 1's) of `tokens` rows ([tokens][hidden]) of partials, in as many Exchanges
+ * as the inbox needs (each takes kExchangeRows rows); both GPUs call it alike.
+ */
+constexpr int kExchangeRows = cuda::kExchangeMaxBlocks * cuda::kExchangeChunk / kDim;
+void exchange_rows(const Gpu& G, const float* mine, int tokens, __nv_bfloat16* out) {
+  for (int t = 0; t < tokens; t += kExchangeRows) {
+    const size_t at = static_cast<size_t>(t) * kDim;
+    cuda::exchange_add(G.link, mine + at, static_cast<size_t>(std::min(kExchangeRows, tokens - t)) * kDim, out + at,
+                       G.stream);
+  }
+}
 
 }  // namespace
 
@@ -327,10 +341,13 @@ struct Decoder::State {
   void moe(int L, int n, const std::array<Rows, 2>& rows);
   /** Layer L's MoE for a sweep's Rounds: route all, gather their Experts, run them, settle the cache. */
   void sweep_moe(int L, int tokens);
-  /** Each GPU attends layer L for a Round (`full`: each GPU's last Full layer Selections), Exchange, finish. */
+  /**
+   * Each GPU attends layer L for `n` tokens, a Round or a sweep's wave (`shared`: each GPU's last
+   * Full layer's Selections for them), Exchange, finish.
+   */
   Result<std::array<gpu::Selections, 2>, std::string> attend(int L, int n, int64_t first, const std::array<Rows, 2>& rows,
                                                              const std::array<const gpu::Selections*, 2>& shared);
-  /** Dense layer L's MLP for a Round, Exchange, residual. */
+  /** Dense layer L's MLP for `n` tokens (a Round or a wave), Exchange, residual. */
   void dense(int L, int n, const std::array<Rows, 2>& rows);
   /** Why `tokens` cannot be appended now (an earlier failure, the capacity, an id), or nothing. */
   std::optional<std::string> refuse(std::span<const int32_t> tokens) const {
@@ -396,6 +413,9 @@ Result<std::unique_ptr<Decoder>, std::string> Decoder::open(const g53::Config& c
       G.attention.resize(static_cast<size_t>(d.layers));
       G.dense.resize(static_cast<size_t>(d.layers));
       G.sparse.resize(static_cast<size_t>(d.layers));
+      auto scratch = gpu::LayerScratch::create(d, c.wave, c.capacity);
+      if (!scratch) return R::err("the layer scratch: " + scratch.error());
+      G.layer_scratch.emplace(std::move(scratch).value());
     }
     for (int g = 0; g < 2; g++) {
       s.gpus[g]->link.peer_inbox = s.gpus[1 - g]->link.inbox;
@@ -479,13 +499,13 @@ Result<std::unique_ptr<Decoder>, std::string> Decoder::open(const g53::Config& c
     for (int g = 0; g < 2; g++) {
       Gpu& G = *s.gpus[g];
       ck(cudaSetDevice(G.device), "cudaSetDevice");
-      const size_t H = static_cast<size_t>(kMaxRound) * kDim;
+      const size_t H = static_cast<size_t>(kMaxRound) * kDim, W = static_cast<size_t>(c.wave) * kDim;
       G.x = G.mem.alloc<float>(H);
-      G.partial = G.mem.alloc<float>(H);
+      G.partial = G.mem.alloc<float>(W);
       G.mid = G.mem.alloc<float>(H);
       G.ffn_f32 = G.mem.alloc<float>(H);
       G.y = G.mem.alloc<float>(H);
-      G.out = G.mem.alloc<__nv_bfloat16>(H);
+      G.out = G.mem.alloc<__nv_bfloat16>(W);
       G.ffn = G.mem.alloc<__nv_bfloat16>(H);
       G.router_planes = G.mem.alloc<float>(static_cast<size_t>(s.router_planes) * d.experts * cuda::kMaxTokens);
       G.experts = G.mem.alloc<int32_t>(static_cast<size_t>(kMaxRound) * moe_plan::kTopK);
@@ -762,8 +782,6 @@ void Decoder::State::moe(int L, int n, const std::array<Rows, 2>& rows) {
 
 void Decoder::State::sweep_moe(int L, int tokens) {
   const int rounds = (tokens + kMaxRound - 1) / kMaxRound;
-  auto round_rows = [&](int r) { return std::array<Rows, 2>{gpus[0]->sweep_rows(r * kMaxRound), gpus[1]->sweep_rows(r * kMaxRound)}; };
-  auto round_n = [&](int r) { return std::min(kMaxRound, tokens - r * kMaxRound); };
   g53::LayerExpertCache& cache = *caches[static_cast<size_t>(L)];
   const int t = tier ? tier_layer[static_cast<size_t>(L)] : -1;
   const size_t N = static_cast<size_t>(tokens) * kDim;
@@ -976,15 +994,15 @@ void Decoder::State::sweep_moe(int L, int tokens) {
   fetch.layer = -1;
   stats.store_s += seconds_since(t0);
 
-  // Each Round's Exchange and residual, as a Round's.
-  for (int r = 0; r < rounds; r++) {
-    const auto rows = round_rows(r);
-    const size_t n = static_cast<size_t>(round_n(r)) * kDim;
+  // Each wave's Exchange and residual.
+  for (int t0 = 0; t0 < tokens; t0 += config.wave) {
+    const int m = std::min(config.wave, tokens - t0);
     for (size_t h = 0; h < 2; h++) {
       Gpu& G = *gpus[h];
       ck(cudaSetDevice(G.device), "cudaSetDevice");
-      cuda::exchange_add(G.link, G.sffn_f32 + static_cast<size_t>(r) * kMaxRound * kDim, n, G.out, G.stream);
-      gpu::residual(rows[h].mid, G.out, static_cast<int>(n), rows[h].x, G.stream);
+      const Rows rows = G.sweep_rows(t0);
+      exchange_rows(G, G.sffn_f32 + static_cast<size_t>(t0) * kDim, m, G.out);
+      gpu::residual(rows.mid, G.out, m * kDim, rows.x, G.stream);
     }
   }
 
@@ -1122,30 +1140,28 @@ bool Decoder::State::fetch_pump(bool block) {
 Result<std::array<gpu::Selections, 2>, std::string> Decoder::State::attend(
     int L, int n, int64_t first, const std::array<Rows, 2>& rows, const std::array<const gpu::Selections*, 2>& shared) {
   using R = Result<std::array<gpu::Selections, 2>, std::string>;
-  const size_t N = static_cast<size_t>(n) * kDim;
   std::array<gpu::Selections, 2> made;
   for (size_t g = 0; g < 2; g++) {
     Gpu& G = *gpus[g];
     ck(cudaSetDevice(G.device), "cudaSetDevice");
     auto& att = *G.attention[static_cast<size_t>(L)];
     auto sel = att.attend(rows[g].x, n, first, att.indexer() == g53::IndexerKind::Shared ? shared[g] : nullptr,
-                          G.partial, G.stream);
+                          *G.layer_scratch, G.partial, G.stream);
     if (!sel) return R::err(sel.error());
     made[g] = std::move(sel).value();
-    cuda::exchange_add(G.link, G.partial, N, G.out, G.stream);
+    exchange_rows(G, G.partial, n, G.out);
     att.finish(rows[g].x, G.out, n, rows[g].mid, rows[g].ffn, G.stream);
   }
   return R::ok(std::move(made));
 }
 
 void Decoder::State::dense(int L, int n, const std::array<Rows, 2>& rows) {
-  const size_t N = static_cast<size_t>(n) * kDim;
   for (size_t g = 0; g < 2; g++) {
     Gpu& G = *gpus[g];
     ck(cudaSetDevice(G.device), "cudaSetDevice");
-    ck(G.dense[static_cast<size_t>(L)]->run(rows[g].ffn, n, G.partial, G.stream), "Dense MLP");
-    cuda::exchange_add(G.link, G.partial, N, G.out, G.stream);
-    gpu::residual(rows[g].mid, G.out, static_cast<int>(N), rows[g].x, G.stream);
+    ck(G.dense[static_cast<size_t>(L)]->run(rows[g].ffn, n, *G.layer_scratch, G.partial, G.stream), "Dense MLP");
+    exchange_rows(G, G.partial, n, G.out);
+    gpu::residual(rows[g].mid, G.out, n * kDim, rows[g].x, G.stream);
   }
 }
 
@@ -1241,7 +1257,8 @@ Result<std::vector<float>, std::string> Decoder::prefill(std::span<const int32_t
   const auto t0 = std::chrono::steady_clock::now();
   const size_t N = static_cast<size_t>(n) * kDim;
   const int rounds = (n + kMaxRound - 1) / kMaxRound;
-  auto round_rows = [&](int r) { return std::array<Rows, 2>{s.gpus[0]->sweep_rows(r * kMaxRound), s.gpus[1]->sweep_rows(r * kMaxRound)}; };
+  const int wave = s.config.wave;
+  auto rows_at = [&](int t) { return std::array<Rows, 2>{s.gpus[0]->sweep_rows(t), s.gpus[1]->sweep_rows(t)}; };
   auto round_n = [&](int r) { return std::min(kMaxRound, n - r * kMaxRound); };
   s.broken = true;  // until the sweep completes
   try {
@@ -1251,8 +1268,9 @@ Result<std::vector<float>, std::string> Decoder::prefill(std::span<const int32_t
       ck(cudaSetDevice(G->device), "cudaSetDevice");
       ck(cudaMemcpyAsync(G->sx, x.data(), N * sizeof(float), cudaMemcpyHostToDevice, G->stream), "x");
     }
-    // Each Round's Selections from the last Full layer, saved (a Full layer's scratch holds one Round's).
-    std::array<std::vector<std::vector<int>>, 2> lengths;
+    // Every token's Selection from the last Full layer, saved in ssel (the layer scratch holds one wave's):
+    // each GPU's lengths, token by token.
+    std::array<std::vector<int>, 2> lengths;
     for (int L = 0; L < d.layers; L++) {
       const auto where = "layer " + std::to_string(L) + ": ";
       if (capture) {
@@ -1265,18 +1283,20 @@ Result<std::vector<float>, std::string> Decoder::prefill(std::span<const int32_t
       }
       const bool full = s.gpus[0]->attention[static_cast<size_t>(L)]->indexer() == g53::IndexerKind::Full;
       if (full)
-        for (auto& l : lengths) l.assign(static_cast<size_t>(rounds), {});
-      else if (lengths[0].size() != static_cast<size_t>(rounds))
+        for (auto& l : lengths) l.clear();
+      else if (lengths[0].size() != static_cast<size_t>(n))
         return R::err(where + "a Shared layer before any Full layer");
-      for (int r = 0; r < rounds; r++) {
+      for (int t0 = 0; t0 < n; t0 += wave) {
+        const int m = std::min(wave, n - t0);
         std::array<gpu::Selections, 2> saved;
         std::array<const gpu::Selections*, 2> shared{nullptr, nullptr};
         for (size_t g = 0; g < 2 && !full; g++) {
-          saved[g] = {s.gpus[g]->ssel + static_cast<size_t>(r) * kMaxRound * gpu::kMaxSelection, gpu::kMaxSelection,
-                      lengths[g][static_cast<size_t>(r)]};
+          const auto from = lengths[g].begin() + t0;
+          saved[g] = {s.gpus[g]->ssel + static_cast<size_t>(t0) * gpu::kMaxSelection, gpu::kMaxSelection,
+                      std::vector<int>(from, from + m)};
           shared[g] = &saved[g];
         }
-        auto sel = s.attend(L, round_n(r), s.length + r * kMaxRound, round_rows(r), shared);
+        auto sel = s.attend(L, m, s.length + t0, rows_at(t0), shared);
         if (!sel) return R::err(where + sel.error());
         s.fetch_pump(false);  // a read-ahead keeps the drive busy through the attention
         if (full)
@@ -1285,15 +1305,15 @@ Result<std::vector<float>, std::string> Decoder::prefill(std::span<const int32_t
             if (made.stride != gpu::kMaxSelection) return R::err(where + "unexpected Selection stride");
             Gpu& G = *s.gpus[g];
             ck(cudaSetDevice(G.device), "cudaSetDevice");
-            ck(cudaMemcpyAsync(G.ssel + static_cast<size_t>(r) * kMaxRound * gpu::kMaxSelection, made.rows,
-                               static_cast<size_t>(round_n(r)) * gpu::kMaxSelection * sizeof(int32_t),
-                               cudaMemcpyDeviceToDevice, G.stream),
+            ck(cudaMemcpyAsync(G.ssel + static_cast<size_t>(t0) * gpu::kMaxSelection, made.rows,
+                               static_cast<size_t>(m) * gpu::kMaxSelection * sizeof(int32_t), cudaMemcpyDeviceToDevice,
+                               G.stream),
                "save Selections");
-            lengths[g][static_cast<size_t>(r)] = made.lengths;
+            lengths[g].insert(lengths[g].end(), made.lengths.begin(), made.lengths.end());
           }
       }
       if (s.gpus[0]->dense[static_cast<size_t>(L)])
-        for (int r = 0; r < rounds; r++) s.dense(L, round_n(r), round_rows(r));
+        for (int t0 = 0; t0 < n; t0 += wave) s.dense(L, std::min(wave, n - t0), rows_at(t0));
       else
         s.sweep_moe(L, n);
     }

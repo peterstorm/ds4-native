@@ -1,0 +1,64 @@
+open: 79.5 s, 97 Slots per Sparse layer (38% of the Experts), RAM tier 39 per layer, 1 store replica(s), capacity 12288, λ 0
+prompt (sweep, wave 512): 11200 tokens in 39.20 s (285.7 tok/s); 19200 store reads (4 read ahead, not routed), 0 from RAM, miss wait 23.95 s
+Generating '/tmp/nsys-root/nsys-report-254c.qdstrm'
+Generated:
+window 32.53 s, 731192 kernels
+
+GPU 0: busy (union) 13.00 s of 32.53 s; kernel time 13.00 s
+      3.62 s  27.8%      6624 x    546.3 us  bf16_gemv_tile_kernel
+      2.49 s  19.1%      2972 x    837.2 us  head_gemv_kernel
+      1.82 s  14.0%     44956 x     40.6 us  exchange_kernel
+      1.75 s  13.5%     89678 x     19.5 us  split_kernel
+      0.94 s   7.2%     25472 x     36.8 us  gemv_groups_kernel
+      0.92 s   7.1%     89753 x     10.3 us  combine_kernel
+      0.49 s   3.8%     18325 x     27.0 us  select_kernel
+      0.30 s   2.3%     12736 x     23.6 us  accumulate_tokens_kernel
+      0.19 s   1.5%     12736 x     15.0 us  gather_quantize_kernel
+      0.12 s   0.9%     18325 x      6.4 us  scores_kernel
+      0.10 s   0.8%      6560 x     15.4 us  sum_planes_groups_kernel
+      0.07 s   0.5%     12736 x      5.3 us  swiglu_groups_kernel
+      0.05 s   0.4%      3654 x     13.5 us  rope_kernel
+      0.04 s   0.3%      4602 x      9.0 us  bf16_to_f32_kernel
+      0.03 s   0.2%      5946 x      5.4 us  rmsnorm_kernel
+      0.03 s   0.2%      2972 x      9.4 us  residual_kernel
+
+GPU 1: busy (union) 12.94 s of 32.53 s; kernel time 12.94 s
+      3.57 s  27.6%      6624 x    538.2 us  bf16_gemv_tile_kernel
+      2.45 s  18.9%      2972 x    824.7 us  head_gemv_kernel
+      1.84 s  14.3%     44956 x     41.0 us  exchange_kernel
+      1.75 s  13.6%     89678 x     19.6 us  split_kernel
+      0.93 s   7.2%     25472 x     36.7 us  gemv_groups_kernel
+      0.92 s   7.1%     89753 x     10.3 us  combine_kernel
+      0.50 s   3.9%     18325 x     27.4 us  select_kernel
+      0.30 s   2.3%     12736 x     23.5 us  accumulate_tokens_kernel
+      0.19 s   1.5%     12736 x     15.2 us  gather_quantize_kernel
+      0.12 s   0.9%     18325 x      6.5 us  scores_kernel
+      0.10 s   0.8%      6560 x     15.3 us  sum_planes_groups_kernel
+      0.07 s   0.5%     12736 x      5.4 us  swiglu_groups_kernel
+      0.05 s   0.4%      3654 x     13.4 us  rope_kernel
+      0.04 s   0.3%      4600 x      9.0 us  bf16_to_f32_kernel
+      0.03 s   0.2%      5944 x      5.4 us  rmsnorm_kernel
+      0.03 s   0.2%      2972 x      9.5 us  residual_kernel
+
+memcpy:
+  GPU 0 H2D: 7.26 s, 166.5 GB, 18672 copies
+  GPU 1 H2D: 7.26 s, 166.5 GB, 18672 copies
+  GPU 0 D2H: 1.66 s, 27.7 GB, 3010 copies
+  GPU 1 D2H: 1.64 s, 27.5 GB, 2741 copies
+  GPU 0 D2D: 0.06 s, 64.8 GB, 8146 copies
+  GPU 1 D2D: 0.07 s, 64.8 GB, 8146 copies
+
+GEMVs on GPU 0, by kernel and launch shape (grid x,y,z; block):
+  bf16_gemv_tile_kernel  grid (192, 8, 8) block 256:    1344 calls, total    2.00 s, mean    1489.2 us
+  head_gemv_kernel       grid (1048576, 1, 1) block 256:    1344 calls, total    1.39 s, mean    1031.7 us
+  head_gemv_kernel       grid (524288, 1, 1) block 256:    1344 calls, total    0.98 s, mean     728.3 us
+  bf16_gemv_tile_kernel  grid (256, 2, 8) block 256:    1344 calls, total    0.65 s, mean     481.4 us
+  bf16_gemv_tile_kernel  grid (64, 6, 8) block 256:    1344 calls, total    0.49 s, mean     363.1 us
+  bf16_gemv_tile_kernel  grid (18, 6, 8) block 256:    1344 calls, total    0.15 s, mean     109.5 us
+  bf16_gemv_tile_kernel  grid (192, 8, 7) block 256:      64 calls, total    0.10 s, mean    1613.4 us
+  bf16_gemv_tile_kernel  grid (8, 6, 175) block 256:      64 calls, total    0.08 s, mean    1246.8 us
+  head_gemv_kernel       grid (917504, 1, 1) block 256:      64 calls, total    0.07 s, mean    1114.7 us
+  bf16_gemv_tile_kernel  grid (128, 2, 8) block 256:     272 calls, total    0.07 s, mean     240.4 us
+  head_gemv_kernel       grid (458752, 1, 1) block 256:      64 calls, total    0.05 s, mean     786.7 us
+  bf16_gemv_tile_kernel  grid (256, 2, 7) block 256:      64 calls, total    0.03 s, mean     513.2 us
+  bf16_gemv_tile_kernel  grid (64, 6, 7) block 256:      64 calls, total    0.02 s, mean     356.6 us

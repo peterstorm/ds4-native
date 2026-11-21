@@ -29,9 +29,10 @@
 // A prompt runs faster as a sweep (prefill): layer by layer, every token of it
 // through layer L before any goes on, so a layer's Experts are read once for the
 // whole prompt instead of once per Round. Each layer attends the prompt in
-// Rounds of 8 in order, routes every Round, gathers the union of their Experts
-// into a VRAM scratch (from a Slot, the RAM tier or the store), and runs each
-// Round's Experts from it. The Expert cache still records the Rounds one by one,
+// waves of up to 64 Rounds in order (the linears over the whole wave, reading
+// their weights once a wave; the attention core a Round at a time), routes
+// every Round, gathers the union of their Experts into a VRAM scratch (from a
+// Slot, the RAM tier or the store), and runs each Round's Experts from it. The Expert cache still records the Rounds one by one,
 // as round() would; only its final state is written to the Slots and the tier,
 // at the end of the layer. Same arithmetic per token, so the same bits. While a
 // layer's attention runs the drive would idle, so for a long prompt the next
@@ -79,6 +80,10 @@ struct DecoderConfig {
   // layer's was routed (a long prompt routes nearly all; a short one's guesses would only take the drive
   // from reads it needs). 0: always; above 1: never.
   float read_ahead_share = 0.8f;
+  // Tokens a sweep's attention and Dense MLPs take at once (a wave): a multiple of 8, 8 .. 512
+  // (cuda::glm53::kMaxWave). Each GPU's layer scratch is sized for it (512: ~0.4 GB); 8 runs a sweep
+  // Round by Round.
+  int wave = 512;
 };
 
 struct DecoderStats {

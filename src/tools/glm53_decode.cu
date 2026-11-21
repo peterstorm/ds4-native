@@ -5,14 +5,17 @@
 //   ds4n-glm53-decode --config CONFIG --backbone DIR --store FILE[,FILE...] --prompt "ID ID ..."
 //                     [--generate N] [--round R] [--lambda λ] [--slots-per-layer S]
 //                     [--ram-per-layer R|auto] [--ram-reserve-gib G] [--read-ahead SHARE]
-//                     [--prefill sweep|rounds] [--capacity C] [--devices A,B] [--threads T] [--then "ID ID ..."]
-//                     [--check]
+//                     [--prefill sweep|rounds] [--wave W] [--capacity C] [--devices A,B] [--threads T]
+//                     [--then "ID ID ..."] [--logits-hash] [--check]
 // --store takes replicas of one store, one per drive (the decoder spreads its reads over them).
 // --ram-per-layer auto sizes the RAM tier to the host's available memory less --ram-reserve-gib (10).
 // --then "ID ID ..." sweeps a second prompt after the generated tokens, as a next turn would arrive:
 // prefill against a warm cache (not with --check).
 // The prompt runs as a sweep (Decoder::prefill: routed exactly, also under λ, which then applies to the
 // generated tokens), or in Rounds of --round (--prefill rounds; under λ Rounds of 1, every token λ-routed).
+// A sweep's attention and Dense MLPs take --wave tokens at once (8 .. 512, a multiple of 8; default 512).
+// --logits-hash prints an FNV-1a hash of every prompt token's logits: equal hashes across --prefill and
+// --wave settings show a prompt too long for --check ran to the same bits every way.
 //
 // --check captures the residual stream entering every layer for every token,
 // then replays each layer on the CPU in the Reference configuration from the
@@ -27,6 +30,7 @@
 // replays saw the residency the decoder's did. Any difference exits 1.
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -34,6 +38,7 @@
 #include <map>
 #include <set>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -80,20 +85,21 @@ struct Args {
   int generate = 0, round = 8;
   std::string prefill = "sweep";  // or "rounds"; a sweep routes the prompt exactly, also under λ
   eng::DecoderConfig decoder;
-  bool check = false;
+  bool check = false, logits_hash = false;
 };
 
 Args parse(int argc, char** argv) {
   const std::string usage =
       "usage: --config CONFIG --backbone DIR --store FILE[,FILE...] --prompt \"ID ID ...\" [--generate N] [--round R] "
       "[--prefill sweep|rounds] [--lambda λ] [--slots-per-layer S] [--ram-per-layer R|auto] [--ram-reserve-gib G] "
-      "[--read-ahead SHARE] [--capacity C] [--devices A,B] [--threads T] [--then \"ID ID ...\"] [--check]";
+      "[--read-ahead SHARE] [--wave W] [--capacity C] [--devices A,B] [--threads T] [--then \"ID ID ...\"] "
+      "[--logits-hash] [--check]";
   std::optional<uint64_t> reserve_gib;
   Args a;
   for (int i = 1; i < argc; i++) {
     const std::string k = argv[i];
-    if (k == "--check") {
-      a.check = true;
+    if (k == "--check" || k == "--logits-hash") {
+      (k == "--check" ? a.check : a.logits_hash) = true;
       continue;
     }
     if (i + 1 >= argc) die(usage);
@@ -117,6 +123,7 @@ Args parse(int argc, char** argv) {
         a.decoder.ram_tier = eng::RamTierFixed{std::stoi(v)};
     } else if (k == "--ram-reserve-gib") reserve_gib = std::stoull(v);
     else if (k == "--read-ahead") a.decoder.read_ahead_share = std::stof(v);
+    else if (k == "--wave") a.decoder.wave = std::stoi(v);
     else if (k == "--capacity") a.decoder.capacity = std::stoi(v);
     else if (k == "--threads") a.decoder.threads = static_cast<unsigned>(std::stoul(v));
     else if (k == "--devices") {
@@ -137,6 +144,14 @@ Args parse(int argc, char** argv) {
   if (a.round < 1 || a.round > 8) die("--round is 1 .. 8");
   if (a.decoder.route_bonus != 0.0f) a.round = 1;  // the decoder's rule under λ
   return a;
+}
+
+/** FNV-1a (64-bit) over the bytes of `v`, continuing from `h`: a run's logits as one number. */
+constexpr uint64_t kFnvBasis = 0xcbf29ce484222325ULL;
+uint64_t fnv1a(uint64_t h, std::span<const float> v) {
+  const auto* b = reinterpret_cast<const unsigned char*>(v.data());
+  for (size_t i = 0; i < v.size_bytes(); i++) h = (h ^ b[i]) * 0x100000001b3ULL;
+  return h;
 }
 
 int32_t argmax(std::span<const float> v) {
@@ -292,10 +307,13 @@ int main(int argc, char** argv) {
                 "replica(s), capacity %d, λ %g\n",
                 dec.stats().load_s, slots_per_layer, 100.0 * slots_per_layer / d.experts, dec.ram_per_layer(),
                 args.stores.size(), args.decoder.capacity, static_cast<double>(args.decoder.route_bonus));
-    auto run = [&](std::span<const int32_t> tokens) {
+    std::optional<uint64_t> digest;  // --logits-hash: every prompt token's logits
+    if (args.logits_hash) digest = kFnvBasis;
+    auto run = [&](std::span<const int32_t> tokens, bool prompt) {
       std::vector<std::vector<float>> layers;
       auto logits = dec.round(tokens, args.check ? &layers : nullptr);
       if (!logits) die(logits.error());
+      if (prompt && digest) digest = fnv1a(*digest, logits.value());
       const size_t n = tokens.size(), V = static_cast<size_t>(d.vocab), H = static_cast<size_t>(d.hidden);
       if (args.check) {
         if (cap.x.empty()) cap.x.resize(layers.size());
@@ -314,8 +332,9 @@ int main(int argc, char** argv) {
     if (args.prefill == "sweep") {
       std::vector<std::vector<float>> layers;
       std::vector<float> all;
-      auto last = dec.prefill(args.prompt, args.check ? &layers : nullptr, args.check ? &all : nullptr);
+      auto last = dec.prefill(args.prompt, args.check ? &layers : nullptr, args.check || digest ? &all : nullptr);
       if (!last) die(last.error());
+      if (digest) digest = fnv1a(*digest, all);
       if (args.check) {
         const size_t V = static_cast<size_t>(d.vocab), H = static_cast<size_t>(d.hidden);
         cap.x.resize(layers.size());
@@ -330,7 +349,7 @@ int main(int argc, char** argv) {
     } else {
       for (size_t i = 0; i < args.prompt.size(); i += static_cast<size_t>(args.round)) {
         const size_t n = std::min(static_cast<size_t>(args.round), args.prompt.size() - i);
-        next = run(std::span<const int32_t>(args.prompt).subspan(i, n));
+        next = run(std::span<const int32_t>(args.prompt).subspan(i, n), true);
       }
     }
     prompt_s = seconds_since(t0);
@@ -338,11 +357,15 @@ int main(int argc, char** argv) {
     t0 = std::chrono::steady_clock::now();
     for (int g = 0; g < args.generate; g++) {
       generated.push_back(next);
-      next = run(std::span<const int32_t>(&generated.back(), 1));
+      next = run(std::span<const int32_t>(&generated.back(), 1), false);
     }
     generate_s = seconds_since(t0);
     const auto st = dec.stats();
-    print_prefill("prompt (" + args.prefill + ")", args.prompt.size(), prompt_s, {}, after_prompt);
+    const std::string how = args.prefill == "sweep" ? "sweep, wave " + std::to_string(args.decoder.wave) : "rounds";
+    print_prefill("prompt (" + how + ")", args.prompt.size(), prompt_s, {}, after_prompt);
+    if (digest)
+      std::printf("logits hash: %016llx over %zu prompt tokens\n", static_cast<unsigned long long>(*digest),
+                  args.prompt.size());
     if (args.generate > 0) {
       const auto picks = st.picks - after_prompt.picks, misses = st.misses - after_prompt.misses;
       const auto ram = st.ram_hits - after_prompt.ram_hits;
