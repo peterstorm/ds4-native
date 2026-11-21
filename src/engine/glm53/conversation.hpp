@@ -37,8 +37,10 @@ struct ConversationConfig {
   uint64_t checkpoint_bytes = 0;  // host memory for the conversations set aside (0: none are kept)
   // The fewest tokens a prompt must drop of a conversation (the live one, or a Checkpoint it resumes
   // a prefix of) for that conversation to be kept apart: a chat's next turn re-renders the last reply
-  // and may differ from the cached tokens in a few of them; another conversation drops all of them.
-  size_t min_lost = 64;
+  // and may differ from the cached tokens in a few of them (0 measured through Maya's GLM-5 template),
+  // which must not copy the whole conversation again; another conversation drops all of them. A
+  // conversation kept by none is read again on return: 16 tokens are ~1-2 s on this engine.
+  size_t min_lost = 16;
 };
 
 /** What a request writes as it goes. `logits` (may be empty) sees every row a token is picked from. */
