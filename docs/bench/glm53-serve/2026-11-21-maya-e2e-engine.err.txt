@@ -1,0 +1,58 @@
+ds4n-glm53-serve: ready in 83 s: context 65536, 83 Slots per Sparse layer, RAM tier 38 per layer, λ 0.03, checkpoints 4.0 GB (95.2 KB a token)
+ds4n-glm53-serve: prompt 30 tokens = 0 reused + 30 read in 14268 ms (2.1 tok/s)
+ds4n-glm53-serve: 67 written in 9837 ms (6.81 tok/s), stop; misses 3934 of 39600 (841 RAM tier, 3093 store, 8207 ms waited)
+ds4n-glm53-serve: set aside a conversation of 96 tokens
+ds4n-glm53-serve: prompt 36 tokens = 9 reused + 27 read in 5984 ms (4.5 tok/s)
+ds4n-glm53-serve: 62 written in 9924 ms (6.25 tok/s), stop; misses 4605 of 36600 (1514 RAM tier, 3091 store, 8414 ms waited)
+ds4n-glm53-serve: prompt 109 tokens = 97 reused + 12 read in 3011 ms (4.0 tok/s)
+ds4n-glm53-serve: 28 written in 4711 ms (5.94 tok/s), stop; misses 2673 of 16200 (1262 RAM tier, 1411 store, 4039 ms waited)
+ds4n-glm53-serve: set aside a conversation of 136 tokens
+ds4n-glm53-serve: prompt 27 tokens = 17 reused + 10 read in 2895 ms (3.5 tok/s)
+ds4n-glm53-serve: 37 written in 5686 ms (6.51 tok/s), stop; misses 2458 of 21600 (696 RAM tier, 1762 store, 4794 ms waited)
+ds4n-glm53-serve: resumed a conversation set aside, at 136 tokens
+ds4n-glm53-serve: prompt 144 tokens = 136 reused + 8 read in 2133 ms (3.8 tok/s)
+ds4n-glm53-serve: 71 written in 11798 ms (6.02 tok/s), stop; misses 5802 of 42000 (2130 RAM tier, 3672 store, 10059 ms waited)
+ds4n-glm53-serve: set aside a conversation of 214 tokens
+ds4n-glm53-serve: resumed a conversation set aside, at 10 tokens
+ds4n-glm53-serve: prompt 27 tokens = 10 reused + 17 read in 3927 ms (4.3 tok/s)
+ds4n-glm53-serve: 39 written in 4830 ms (8.07 tok/s), cancel; misses 2045 of 22800 (627 RAM tier, 1418 store, 3893 ms waited)
+ds4n-glm53-serve: ready in 79 s: context 65536, 83 Slots per Sparse layer, RAM tier 37 per layer, λ 0.03, checkpoints 4.0 GB (95.2 KB a token)
+ds4n-glm53-serve: prompt 22 tokens = 0 reused + 22 read in 11620 ms (1.9 tok/s)
+ds4n-glm53-serve: 3 written in 534 ms (5.62 tok/s), stop; misses 205 of 1200 (2 RAM tier, 203 store, 482 ms waited)
+ds4n-glm53-serve: prompt 21 tokens = 12 reused + 9 read in 1476 ms (6.1 tok/s)
+ds4n-glm53-serve: 3 written in 287 ms (10.44 tok/s), stop; misses 100 of 1200 (8 RAM tier, 92 store, 238 ms waited)
+ds4n-glm53-serve: prompt 32 tokens = 12 reused + 20 read in 1923 ms (10.4 tok/s)
+ds4n-glm53-serve: 3 written in 249 ms (12.06 tok/s), stop; misses 90 of 1200 (16 RAM tier, 74 store, 199 ms waited)
+ds4n-glm53-serve: prompt 4519 tokens = 10 reused + 4509 read in 22892 ms (197.0 tok/s)
+ds4n-glm53-serve: 399 written in 64036 ms (6.23 tok/s), stop; misses 30923 of 238800 (11568 RAM tier, 19355 store, 53649 ms waited)
+ds4n-glm53-serve: set aside a conversation of 4917 tokens
+ds4n-glm53-serve: prompt 63 tokens = 8 reused + 55 read in 10098 ms (5.4 tok/s)
+ds4n-glm53-serve: 366 written in 51905 ms (7.05 tok/s), stop; misses 25799 of 219000 (10903 RAM tier, 14896 store, 42870 ms waited)
+ds4n-glm53-serve: set aside a conversation of 428 tokens
+ds4n-glm53-serve: prompt 32 tokens = 10 reused + 22 read in 6249 ms (3.5 tok/s)
+ds4n-glm53-serve: 83 written in 12427 ms (6.68 tok/s), stop; misses 6118 of 49200 (2466 RAM tier, 3652 store, 10398 ms waited)
+ds4n-glm53-serve: ready in 81 s: context 65536, 83 Slots per Sparse layer, RAM tier 37 per layer, λ 0.03, checkpoints 4.0 GB (95.2 KB a token)
+ds4n-glm53-serve: prompt 42 tokens = 0 reused + 42 read in 17693 ms (2.4 tok/s)
+ds4n-glm53-serve: 3 written in 425 ms (7.07 tok/s), stop; misses 188 of 1200 (43 RAM tier, 145 store, 374 ms waited)
+ds4n-glm53-serve: set aside a conversation of 44 tokens
+ds4n-glm53-serve: prompt 21 tokens = 10 reused + 11 read in 1939 ms (5.7 tok/s)
+ds4n-glm53-serve: 3 written in 295 ms (10.18 tok/s), stop; misses 121 of 1200 (30 RAM tier, 91 store, 245 ms waited)
+ds4n-glm53-serve: resumed a conversation set aside, at 44 tokens
+ds4n-glm53-serve: prompt 52 tokens = 44 reused + 8 read in 1474 ms (5.4 tok/s)
+ds4n-glm53-serve: 3 written in 258 ms (11.61 tok/s), stop; misses 108 of 1200 (35 RAM tier, 73 store, 209 ms waited)
+ds4n-glm53-serve: set aside a conversation of 54 tokens
+ds4n-glm53-serve: prompt 36 tokens = 9 reused + 27 read in 5539 ms (4.9 tok/s)
+ds4n-glm53-serve: 67 written in 10930 ms (6.13 tok/s), stop; misses 5159 of 39600 (1725 RAM tier, 3434 store, 9294 ms waited)
+ds4n-glm53-serve: prompt 114 tokens = 102 reused + 12 read in 3137 ms (3.8 tok/s)
+ds4n-glm53-serve: 28 written in 4741 ms (5.91 tok/s), stop; misses 2639 of 16200 (1200 RAM tier, 1439 store, 4071 ms waited)
+ds4n-glm53-serve: set aside a conversation of 141 tokens
+ds4n-glm53-serve: prompt 27 tokens = 17 reused + 10 read in 2856 ms (3.5 tok/s)
+ds4n-glm53-serve: 49 written in 6788 ms (7.22 tok/s), stop; misses 2785 of 28800 (736 RAM tier, 2049 store, 5604 ms waited)
+ds4n-glm53-serve: set aside a conversation of 75 tokens
+ds4n-glm53-serve: resumed a conversation set aside, at 141 tokens
+ds4n-glm53-serve: prompt 149 tokens = 141 reused + 8 read in 2234 ms (3.6 tok/s)
+ds4n-glm53-serve: 69 written in 11019 ms (6.26 tok/s), stop; misses 5284 of 40800 (1881 RAM tier, 3403 store, 9333 ms waited)
+ds4n-glm53-serve: set aside a conversation of 217 tokens
+ds4n-glm53-serve: resumed a conversation set aside, at 10 tokens
+ds4n-glm53-serve: prompt 15 tokens = 10 reused + 5 read in 1676 ms (3.0 tok/s)
+ds4n-glm53-serve: 8 written in 1140 ms (7.02 tok/s), length; misses 541 of 4200 (193 RAM tier, 348 store, 966 ms waited)
