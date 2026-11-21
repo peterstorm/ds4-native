@@ -1,4 +1,4 @@
-# HANDOVER: GLM-5.3 full uncensored on ds4-native — session state 2026-11-21 (attention in waves)
+# HANDOVER: GLM-5.3 full uncensored on ds4-native — session state 2026-11-21 (served: primary `glm-native`)
 
 Resume point for any fresh session. Companion to
 [`2026-11-19-glm53-native.md`](2026-11-19-glm53-native.md) (the plan — read it first; its
@@ -46,6 +46,7 @@ CyberGym verdict decides keep/archive.
 | Fetch tool | `ds4-native` main: `tools/glm53-store/fetch-kitaniai.sh`; deployed desktop-side at `/models/glm53-native/fetch-kitaniai.sh` | download complete 15:26 (`hf exit=0`) |
 | Desktop reclaim (353.3 GB freed) | only export-source `model-*.safetensors` deleted; receipts `/models/glm53-hyperflare/archive-receipt-{fp4-local,uncensored}-shards.json` | done, flare untouched and still serving |
 | Inference reorg (dotfiles) | `.dotfiles` main `a157e3b6` (pushed) | done |
+| **Served (Phase 4, 2026-11-21)** | engine `1849006`/`26ea3db`/`6866989`: `core/glm53/sessions`, `Decoder::save/restore/rewind`, `engine/glm53/conversation`, `ds4n-glm53-serve`, `ds4n-glm53-serve-check`, `tools/glm53-serve/write_tokenizer.py`; `.dotfiles` `1ef77094`/`55d87bf2`: `glm53/glm53-native/run-glm53-native.sh`, primary `glm-native`, Pi catalog, contract, runbook; report `docs/bench/glm53-serve/2026-11-21-serve.md` | **live on desktop `:8000`** (container `glm53-native`, `restart=unless-stopped`). 6.2–7.1 tok/s decode at λ 0.03, 64K; 4.5K-token prompt at 197 tok/s; next turns read 8–12 tokens; displaced conversations resume from Checkpoints. Bit-exact save/restore (0 of ~46.5M logits). Sessions bug found end to end and fixed. Round trip via `switch-primary.sh` 67 s / 91 s. **Open: a GLM Ledger** (Slots sized from free VRAM) |
 
 ### State of the pool
 
@@ -229,12 +230,25 @@ An independent audit (python, read-only, against the index) found:
      1. The second NVMe, in **`M.2_3` or `M.2_4`, never `M.2_2`**: that slot shares lanes with
         GPU 2 and drops it to x4. Bring-up in the speed report, section 8. Cold prompts of every
         length now wait on the drive, so this is the prefill lever.
-     2. A server around the Decoder.
+     2. ~~A server around the Decoder~~: done 2026-11-21, item 7.
      3. After the second NVMe (long prompts are at the read floor cold and warm until then):
         `head_gemv` (absorbed queries, W_v) as a tiled GEMV if the arithmetic order allows; then
         GLM's own larger Exchange.
      - More host RAM is the biggest hardware lever (192–256 GB); it's the owner's call.
-7. Phases 4–5 per the plan (fifth switch-primary entry `glm-native`, slots ladder, CyberGym).
+7. **Phase 4: served 2026-11-21** (Done table; report `docs/bench/glm53-serve/2026-11-21-serve.md`;
+   runbook `.dotfiles/scripts/inference/runbooks/glm53-native-runbook-2026-11-21.md`).
+   - **Operate:** `switch-primary.sh glm-native` (or `/switch glm-native` in Pi); `toggle` refuses
+     it (no stock counterpart). New engine commit: bump `DS4N_COMMIT` in the launcher, then
+     `run-glm53-native.sh --install` (builds, runs the core tests, writes and checks the tokenizer).
+   - **Gates:** `ds4n-glm53-serve-check` (save/restore bit-exact, the server's conversations);
+     dotfiles `tests/glm53-native-contract.sh` and `tests/switch-primary-unit.sh`.
+   - **Next, in order:**
+     1. A GLM Ledger (plan Phase 4: Slots are sized from free VRAM today).
+     2. Phase 5: CyberGym subset + harm rubric against the Flash primaries; λ above 0.03 only
+        after those task benchmarks.
+     3. The second NVMe (`M.2_3`/`M.2_4`), then MTP.
+     4. Merge `glm53/engine-core` into main once Phase 5 decides keep (DS4.1's sources are
+        untouched on the branch).
 
 ## Environment facts (the things that cost time to rediscover)
 
@@ -288,6 +302,8 @@ An independent audit (python, read-only, against the index) found:
 | Serving design / engine internals | `ds4-native/docs/design/{serving,forward-pass,dspark}.md` |
 | Inference map (primaries, runbooks) | `.dotfiles/scripts/inference/INDEX.md` |
 | Native-engine ops runbook | `.dotfiles/scripts/inference/runbooks/ds41-1017-native-runbook-2026-11-19.md` |
+| GLM-5.3 served: report (design, gates, measurements, the Sessions bug) | `ds4-native/docs/bench/glm53-serve/2026-11-21-serve.md` |
+| GLM-5.3 ops runbook (primary `glm-native`) | `.dotfiles/scripts/inference/runbooks/glm53-native-runbook-2026-11-21.md` |
 | Hyperflare/GLM-Flash-uncensored story | `.dotfiles/scripts/inference/runbooks/glm53-flash-hyperflare-tp2-v16-runbook-2026-11-13.md` |
 
 ## Open questions carried forward

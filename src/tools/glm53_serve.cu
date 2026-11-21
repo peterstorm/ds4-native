@@ -12,7 +12,8 @@
 // caches and a prompt sweep's rows): ~0.26 Expert Slots per layer.
 // --lambda λ (default 0): cache-conditional routing for the reply's tokens; prompts route exactly.
 // --checkpoint-gb G (default 4): host memory for conversations set aside (engine/glm53/conversation),
-// ~94 KB a token; with --ram-per-layer auto the RAM tier leaves it free beside --ram-reserve-gib (10).
+// 95.2 KB a token (Decoder::position_bytes; 4 GB hold ~42K tokens); with --ram-per-layer auto the RAM
+// tier leaves it free beside --ram-reserve-gib (10).
 // --stops (default GLM's turn ends: <|endoftext|>, <|user|>, <|observation|>).
 //
 // One request at a time (READY <context> stop, no multi=): the server queues the rest. A chat's next
