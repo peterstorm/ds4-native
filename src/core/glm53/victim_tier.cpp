@@ -21,6 +21,23 @@ Result<VictimTier, CacheModelError> VictimTier::create(int layers, int experts, 
   return R::ok(VictimTier(layers, experts, per_layer, spare));
 }
 
+int tier_fit(uint64_t budget, int layers, int experts, int spare, int block, uint64_t entry_bytes) {
+  auto bytes = [&](int per_layer) {
+    const uint64_t entries = static_cast<uint64_t>(layers) * static_cast<uint64_t>(per_layer) + static_cast<uint64_t>(spare);
+    const uint64_t blocks = (entries + static_cast<uint64_t>(block) - 1) / static_cast<uint64_t>(block);
+    return blocks * static_cast<uint64_t>(block) * entry_bytes;
+  };
+  int lo = 0, hi = experts;  // the largest that fits is in [lo, hi]; 0 counts as fitting
+  while (lo < hi) {
+    const int mid = lo + (hi - lo + 1) / 2;
+    if (bytes(mid) <= budget)
+      lo = mid;
+    else
+      hi = mid - 1;
+  }
+  return lo;
+}
+
 int32_t VictimTier::entry_of(int layer, int32_t expert) const {
   if (layer < 0 || static_cast<size_t>(layer) >= stored_.size() || expert < 0 || expert >= experts_) return -1;
   return entry_[static_cast<size_t>(layer) * static_cast<size_t>(experts_) + static_cast<size_t>(expert)];

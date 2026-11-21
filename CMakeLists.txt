@@ -32,6 +32,7 @@ add_library(ds4n_core STATIC
   src/core/glm53/expert_tiles.cpp
   src/core/glm53/layer_expert_cache.cpp
   src/core/glm53/victim_tier.cpp
+  src/core/meminfo.cpp
   src/core/glm53/pruning.cpp
   src/core/indexer.cpp
   src/core/compressor.cpp
@@ -197,6 +198,7 @@ add_executable(ds4n_tests
   tests/core/glm53/test_expert_tiles.cpp
   tests/core/glm53/test_layer_expert_cache.cpp
   tests/core/glm53/test_victim_tier.cpp
+  tests/core/test_meminfo.cpp
   tests/core/glm53/test_pruning.cpp
   tests/core/test_indexer.cpp
   tests/core/test_compressor.cpp

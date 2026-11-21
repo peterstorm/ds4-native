@@ -137,6 +137,29 @@ TEST_CASE("VictimTier refuses bad shapes and bad Loads, changing nothing") {
   CHECK(tier.entry_of(0, 2) == -1);
 }
 
+TEST_CASE("tier_fit: the largest tier that fits the budget, block rounding included") {
+  std::mt19937_64 rng(7);
+  for (int i = 0; i < 2000; i++) {
+    const int layers = 1 + static_cast<int>(rng() % 80), experts = 1 + static_cast<int>(rng() % 256);
+    const int spare = 1 + static_cast<int>(rng() % 64), block = 1 + static_cast<int>(rng() % 32);
+    const uint64_t entry = 1 + rng() % 1000, budget = rng() % (static_cast<uint64_t>(layers) * 300 * entry);
+    auto bytes = [&](int p) {
+      const uint64_t entries = static_cast<uint64_t>(layers) * static_cast<uint64_t>(p) + static_cast<uint64_t>(spare);
+      return (entries + static_cast<uint64_t>(block) - 1) / static_cast<uint64_t>(block) * static_cast<uint64_t>(block) * entry;
+    };
+    const int p = tier_fit(budget, layers, experts, spare, block, entry);
+    REQUIRE(p >= 0);
+    REQUIRE(p <= experts);
+    if (p > 0) CHECK(bytes(p) <= budget);           // it fits
+    if (p < experts) CHECK(bytes(p + 1) > budget);  // one more would not
+  }
+  // 75 layers of 20 MiB entries, 64 spare, blocks of 32: 2 GiB more is ~1.4 more per layer.
+  CHECK(tier_fit(0, 75, 256, 64, 32, 20ull << 20) == 0);
+  CHECK(tier_fit(UINT64_MAX / 2, 75, 256, 64, 32, 20ull << 20) == 256);
+  const int at56 = tier_fit(56ull << 30, 75, 256, 64, 32, 20ull << 20);
+  CHECK(at56 == (56 * 1024 / 20 - 64) / 75);  // 37: block rounding costs nothing here
+}
+
 TEST_CASE("VictimTier: a worked example") {
   // One layer, 2 Experts per layer, 2 spares: entries 0 .. 3; a freed entry is handed out next.
   auto tier = VictimTier::create(1, 16, 2, 2).value();

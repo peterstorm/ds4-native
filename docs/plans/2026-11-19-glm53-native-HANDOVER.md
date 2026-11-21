@@ -206,8 +206,13 @@ An independent audit (python, read-only, against the index) found:
      sweeps (`Decoder::prefill`, the tool's default; `--prefill rounds` for the old path). Each is
      gated bit-identical, exact and λ. Exact: prompt 18–54 tok/s (700–2,800 tokens), decode 3.4
      tok/s. λ 0.03: decode 6.3–7.6 tok/s.
-   - **Next:** more RAM for the tier (`zfs_arc_max` is the operator's call), read-ahead for long
-     prompts, a server around the Decoder.
+   - **Speed, round 2:**
+     - `--ram-per-layer auto`: 38 per layer since the ARC went to 4 GiB.
+     - Read-ahead: prompts run at the drive's limit, 73 tok/s at 2,800 tokens.
+     - `--store A,B` replicas.
+     - Exact decode 3.56 tok/s; λ 0.03 6.85 tok/s.
+   - **Next:** the second NVMe (bring-up in `docs/bench/glm53-decode/2026-11-21-speed-report.md`
+     section 8), then a server around the Decoder.
 7. Phases 4–5 per the plan (fifth switch-primary entry `glm-native`, slots ladder, CyberGym).
 
 ## Environment facts (the things that cost time to rediscover)

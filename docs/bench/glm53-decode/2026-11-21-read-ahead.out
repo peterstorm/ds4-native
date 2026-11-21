@@ -1,0 +1,15 @@
+# ds4n-glm53-decode, desktop, RAM tier 24 per layer, exact routing, 16 generated tokens.
+# --read-ahead 2: never read ahead (the previous behaviour); 0.8: the default.
+# A CPU replay (--check gate) ran beside these.
+[ra 2] prompt (sweep): 700 tokens in 38.87 s (18.0 tok/s); 18237 store reads (0 read ahead, not routed), 0 from RAM, miss wait 35.16 s
+[ra 2] generate: 16 tokens in 5.02 s (3.19 tok/s); misses 26.9% (161.7 per token: 45.1 from RAM, 116.6 store reads), miss wait 4.60 s
+[ra 2] generated: 101175 320 477 2572 20651 75403 220 15 8 760 576 18672 10792 220 17 29348
+[ra 2] prompt (sweep): 2800 tokens in 51.84 s (54.0 tok/s); 19168 store reads (0 read ahead, not routed), 0 from RAM, miss wait 37.23 s
+[ra 2] generate: 16 tokens in 5.72 s (2.80 tok/s); misses 30.0% (179.8 per token: 41.6 from RAM, 138.2 store reads), miss wait 5.29 s
+[ra 2] generated: 12160 4532 760 5162 9245 91 4421 91 4421 7360 91 350 26444 760 220 17
+[ra 0.8] prompt (sweep): 700 tokens in 36.22 s (19.3 tok/s); 18504 store reads (231 read ahead, not routed), 0 from RAM, miss wait 32.35 s
+[ra 0.8] generate: 16 tokens in 4.96 s (3.23 tok/s); misses 26.9% (161.7 per token: 45.1 from RAM, 116.6 store reads), miss wait 4.54 s
+[ra 0.8] generated: 101175 320 477 2572 20651 75403 220 15 8 760 576 18672 10792 220 17 29348
+[ra 0.8] prompt (sweep): 2800 tokens in 38.30 s (73.1 tok/s); 19189 store reads (11 read ahead, not routed), 0 from RAM, miss wait 23.37 s
+[ra 0.8] generate: 16 tokens in 5.67 s (2.82 tok/s); misses 30.0% (179.8 per token: 41.6 from RAM, 138.2 store reads), miss wait 5.24 s
+[ra 0.8] generated: 12160 4532 760 5162 9245 91 4421 91 4421 7360 91 350 26444 760 220 17

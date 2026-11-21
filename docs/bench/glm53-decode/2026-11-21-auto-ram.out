@@ -1,0 +1,10 @@
+open: 79.7 s, 97 Slots per Sparse layer (38% of the Experts), RAM tier 38 per layer, 1 store replica(s), capacity 4096, λ 0
+prompt (sweep): 700 tokens in 36.32 s (19.3 tok/s); 18536 store reads (244 read ahead, not routed), 0 from RAM, miss wait 31.82 s
+generate: 128 tokens in 36.00 s (3.56 tok/s); misses 28.0% (167.9 per token: 72.2 from RAM, 95.6 store reads), miss wait 32.70 s
+generated: 101175 320 477 2572 20651 75403 220 15 8 760 576 18672 10792 220 17 29348 33 817 3950 320 477 35159 2411 220 100461 9624 2687 429 374 220 100067 29348 33 2687 13 12058 13 760 13646 50174 99317 9245 91 3070 785 51223 334
+lowest MemAvailable during the run: 10 GiB
+open: 78.9 s, 97 Slots per Sparse layer (38% of the Experts), RAM tier 38 per layer, 1 store replica(s), capacity 4096, λ 0.03
+prompt (sweep): 700 tokens in 35.94 s (19.5 tok/s); 18534 store reads (243 read ahead, not routed), 0 from RAM, miss wait 31.44 s
+generate: 128 tokens in 18.68 s (6.85 tok/s); misses 12.3% (73.8 per token: 32.2 from RAM, 41.6 store reads), miss wait 15.46 s
+generated: 101175 320 477 2572 20651 75403 8 760 33389 101175 18672 25 220 17 17543 5820 7726 817 3950 320 477 13 220 15 13 20 4142 16 15380 33 2687 11392 220 16 4142 17 15380 33 2687 568 2411 220 104029 4 315 33234 320 2660 39100
+lowest MemAvailable during the run: 10 GiB

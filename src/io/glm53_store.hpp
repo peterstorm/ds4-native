@@ -44,6 +44,16 @@ Result<StoreCheck, IoError> check_store_tensors(const std::string& store_path,
                                                 const std::map<std::string, glm53::ShardedTensor>& index,
                                                 uint32_t first, uint32_t last, unsigned threads);
 
+/**
+ * Open `paths` as replicas of one Expert store, each with `access` (the decoder: O_DIRECT, one
+ * replica per drive, its reads spread over them). Each must carry this build's header, all must be
+ * the same size, and they must agree byte for byte on `samples` 4 KiB pages spread over the file
+ * (the first, the last and evenly between): a cheap check that they are copies of one store, not a
+ * proof. No paths, or `samples` < 2, is an error.
+ */
+Result<std::vector<Fd>, IoError> open_store_replicas(const std::vector<std::string>& paths, Access access,
+                                                     unsigned samples = 64);
+
 /** An Expert store open for reading routed Experts back. */
 class StoreReader {
  public:

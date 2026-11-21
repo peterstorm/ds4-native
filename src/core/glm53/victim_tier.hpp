@@ -33,6 +33,13 @@ struct TierMove {
   friend bool operator==(TierMove, TierMove) = default;
 };
 
+/**
+ * The most Experts per layer whose tier fits in `budget` bytes: `layers` layers' entries and
+ * `spare` more, allocated `block` entries at a time, each `entry_bytes`; at most `experts`, and 0
+ * when not even one per layer fits. All sizes positive.
+ */
+int tier_fit(uint64_t budget, int layers, int experts, int spare, int block, uint64_t entry_bytes);
+
 class VictimTier {
  public:
   /** `layers` Sparse layers of `experts`, `per_layer` Experts each, `spare` extra entries. */

@@ -2,10 +2,12 @@
 // Rounds, then greedy generation, with timings; --check gates every layer of
 // every token against the CPU oracle, bit for bit.
 //
-//   ds4n-glm53-decode --config CONFIG --backbone DIR --store FILE --prompt "ID ID ..."
+//   ds4n-glm53-decode --config CONFIG --backbone DIR --store FILE[,FILE...] --prompt "ID ID ..."
 //                     [--generate N] [--round R] [--lambda λ] [--slots-per-layer S]
-//                     [--ram-per-layer R] [--prefill sweep|rounds] [--capacity C] [--devices A,B]
-//                     [--threads T] [--check]
+//                     [--ram-per-layer R|auto] [--ram-reserve-gib G] [--read-ahead SHARE]
+//                     [--prefill sweep|rounds] [--capacity C] [--devices A,B] [--threads T] [--check]
+// --store takes replicas of one store, one per drive (the decoder spreads its reads over them).
+// --ram-per-layer auto sizes the RAM tier to the host's available memory less --ram-reserve-gib (10).
 // The prompt runs as a sweep (Decoder::prefill: routed exactly, also under λ, which then applies to the
 // generated tokens), or in Rounds of --round (--prefill rounds; under λ Rounds of 1, every token λ-routed).
 //
@@ -58,7 +60,8 @@ double seconds_since(std::chrono::steady_clock::time_point t0) {
 }
 
 struct Args {
-  std::string config, backbone, store;
+  std::string config, backbone;
+  std::vector<std::string> stores;  // replicas of one Expert store
   std::vector<int32_t> prompt;
   int generate = 0, round = 8;
   std::string prefill = "sweep";  // or "rounds"; a sweep routes the prompt exactly, also under λ
@@ -68,9 +71,10 @@ struct Args {
 
 Args parse(int argc, char** argv) {
   const std::string usage =
-      "usage: --config CONFIG --backbone DIR --store FILE --prompt \"ID ID ...\" [--generate N] [--round R] "
-      "[--prefill sweep|rounds] [--lambda λ] [--slots-per-layer S] [--ram-per-layer R] [--capacity C] [--devices A,B] "
-      "[--threads T] [--check]";
+      "usage: --config CONFIG --backbone DIR --store FILE[,FILE...] --prompt \"ID ID ...\" [--generate N] [--round R] "
+      "[--prefill sweep|rounds] [--lambda λ] [--slots-per-layer S] [--ram-per-layer R|auto] [--ram-reserve-gib G] "
+      "[--read-ahead SHARE] [--capacity C] [--devices A,B] [--threads T] [--check]";
+  std::optional<uint64_t> reserve_gib;
   Args a;
   for (int i = 1; i < argc; i++) {
     const std::string k = argv[i];
@@ -82,13 +86,23 @@ Args parse(int argc, char** argv) {
     const std::string v = argv[++i];
     if (k == "--config") a.config = v;
     else if (k == "--backbone") a.backbone = v;
-    else if (k == "--store") a.store = v;
+    else if (k == "--store") {
+      std::istringstream in(v);
+      for (std::string path; std::getline(in, path, ',');)
+        if (!path.empty()) a.stores.push_back(path);
+    }
     else if (k == "--generate") a.generate = std::stoi(v);
     else if (k == "--prefill") a.prefill = v;
     else if (k == "--round") a.round = std::stoi(v);
     else if (k == "--lambda") a.decoder.route_bonus = std::stof(v);
     else if (k == "--slots-per-layer") a.decoder.slots_per_layer = std::stoi(v);
-    else if (k == "--ram-per-layer") a.decoder.ram_per_layer = std::stoi(v);
+    else if (k == "--ram-per-layer") {
+      if (v == "auto")
+        a.decoder.ram_tier = eng::RamTierFit{};
+      else
+        a.decoder.ram_tier = eng::RamTierFixed{std::stoi(v)};
+    } else if (k == "--ram-reserve-gib") reserve_gib = std::stoull(v);
+    else if (k == "--read-ahead") a.decoder.read_ahead_share = std::stof(v);
     else if (k == "--capacity") a.decoder.capacity = std::stoi(v);
     else if (k == "--threads") a.decoder.threads = static_cast<unsigned>(std::stoul(v));
     else if (k == "--devices") {
@@ -98,7 +112,12 @@ Args parse(int argc, char** argv) {
       for (int32_t t; in >> t;) a.prompt.push_back(t);
     } else die("unknown argument " + k + "\n" + usage);
   }
-  if (a.config.empty() || a.backbone.empty() || a.store.empty() || a.prompt.empty()) die(usage);
+  if (a.config.empty() || a.backbone.empty() || a.stores.empty() || a.prompt.empty()) die(usage);
+  if (reserve_gib) {
+    auto* fit = std::get_if<eng::RamTierFit>(&a.decoder.ram_tier);
+    if (!fit) die("--ram-reserve-gib goes with --ram-per-layer auto");
+    fit->reserve_bytes = *reserve_gib << 30;
+  }
   if (a.prefill != "sweep" && a.prefill != "rounds") die(usage);
   if (a.round < 1 || a.round > 8) die("--round is 1 .. 8");
   if (a.decoder.route_bonus != 0.0f) a.round = 1;  // the decoder's rule under λ
@@ -250,13 +269,14 @@ int main(int argc, char** argv) {
   double prompt_s = 0.0, generate_s = 0.0;
   int slots_per_layer = 0;
   {
-    auto decoder = eng::Decoder::open(config.value(), parts.value(), args.store, args.decoder);
+    auto decoder = eng::Decoder::open(config.value(), parts.value(), args.stores, args.decoder);
     if (!decoder) die(decoder.error());
     eng::Decoder& dec = *decoder.value();
     slots_per_layer = dec.slots_per_layer();
-    std::printf("open: %.1f s, %d Slots per Sparse layer (%.0f%% of the Experts), RAM tier %d per layer, capacity %d, λ %g\n",
-                dec.stats().load_s, slots_per_layer, 100.0 * slots_per_layer / d.experts, args.decoder.ram_per_layer,
-                args.decoder.capacity, static_cast<double>(args.decoder.route_bonus));
+    std::printf("open: %.1f s, %d Slots per Sparse layer (%.0f%% of the Experts), RAM tier %d per layer, %zu store "
+                "replica(s), capacity %d, λ %g\n",
+                dec.stats().load_s, slots_per_layer, 100.0 * slots_per_layer / d.experts, dec.ram_per_layer(),
+                args.stores.size(), args.decoder.capacity, static_cast<double>(args.decoder.route_bonus));
     auto run = [&](std::span<const int32_t> tokens) {
       std::vector<std::vector<float>> layers;
       auto logits = dec.round(tokens, args.check ? &layers : nullptr);
@@ -307,9 +327,11 @@ int main(int argc, char** argv) {
     }
     generate_s = seconds_since(t0);
     const auto st = dec.stats();
-    std::printf("prompt (%s): %zu tokens in %.2f s (%.1f tok/s); %llu store reads, %llu from RAM, miss wait %.2f s\n",
+    std::printf("prompt (%s): %zu tokens in %.2f s (%.1f tok/s); %llu store reads (%llu read ahead, not routed), "
+                "%llu from RAM, miss wait %.2f s\n",
                 args.prefill.c_str(), args.prompt.size(), prompt_s, static_cast<double>(args.prompt.size()) / prompt_s,
                 static_cast<unsigned long long>(after_prompt.store_reads),
+                static_cast<unsigned long long>(after_prompt.unrouted_reads),
                 static_cast<unsigned long long>(after_prompt.ram_hits), after_prompt.store_s);
     if (args.generate > 0) {
       const auto picks = st.picks - after_prompt.picks, misses = st.misses - after_prompt.misses;
@@ -327,7 +349,7 @@ int main(int argc, char** argv) {
   }
   if (!args.check) return 0;
   std::fflush(stdout);
-  const bool ok = replay(config.value(), parts.value(), args.store, cap, args.decoder.route_bonus, slots_per_layer,
+  const bool ok = replay(config.value(), parts.value(), args.stores.front(), cap, args.decoder.route_bonus, slots_per_layer,
                          args.decoder.threads, args.prefill == "sweep" ? args.prompt.size() : 0);
   std::printf("%s\n", ok ? "PASS: every layer and logit bit-identical to the Reference configuration"
                          : "FAIL: the decoder differs from the Reference configuration");

@@ -7,9 +7,11 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <numeric>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 
 #include "core/glm53/exact_attention.hpp"
@@ -20,6 +22,7 @@
 #include "core/glm53/reference.hpp"
 #include "core/glm53/store.hpp"
 #include "core/glm53/victim_tier.hpp"
+#include "core/meminfo.hpp"
 #include "core/mx_reference.hpp"
 #include "cuda/exchange.cuh"
 #include "cuda/glm53/attention.cuh"
@@ -30,6 +33,7 @@
 #include "cuda/mx_gemv.cuh"
 #include "cuda/planes.cuh"
 #include "io/file.hpp"
+#include "io/glm53_store.hpp"
 #include "io/uring_reader.hpp"
 
 namespace ds4n::engine::glm53 {
@@ -117,9 +121,10 @@ struct JobUpload {
   int down_first[gpu::kJobSlots];
   int32_t slot_of[g53::kExperts];
 };
-constexpr int kRing = 4;
+constexpr int kRing = 4;  // pinned uploads in flight per GPU: a host copy waits only for the one kRing back
 constexpr int kGroupBatch = 64;  // a sweep batch's groups: within MoeBuffers' kJobSlots slots
-constexpr float kNoLimit = std::numeric_limits<float>::infinity();  // GLM's SwiGLU: DS4.1's grouped one, unclamped  // pinned uploads in flight per GPU: a host copy waits only for the one kRing back
+constexpr float kNoLimit = std::numeric_limits<float>::infinity();  // GLM's SwiGLU: DS4.1's grouped one, unclamped
+constexpr int kRecords = moe_plan::kMaxJobs;  // staging records: one Expert's two Halves each
 
 /** A Round's rows on one GPU: the residual stream, the post-attention residual, the FFN input. */
 struct Rows {
@@ -169,6 +174,7 @@ struct Gpu {
   cuda::GemvJob* g_jobs = nullptr;
   int* g_first = nullptr;
   std::vector<cudaEvent_t> batch_ready, staged;  // per batch (and one spare, last); per staging record
+  cudaEvent_t routed = nullptr;                   // a sweep layer's Routes copied to the host
 
   Gpu() = default;
   Gpu(const Gpu&) = delete;
@@ -179,6 +185,7 @@ struct Gpu {
       if (e) cudaEventDestroy(e);
     for (cudaEvent_t e : batch_ready) cudaEventDestroy(e);
     for (cudaEvent_t e : staged) cudaEventDestroy(e);
+    if (routed) cudaEventDestroy(routed);
     if (ring) cudaFreeHost(ring);
     if (copy) cudaStreamDestroy(copy);
     if (stream) cudaStreamDestroy(stream);
@@ -210,17 +217,39 @@ struct Decoder::State {
   size_t max_group_columns = 0;  // a sweep's group columns (8 per group), at most
   int64_t length = 0;
   bool broken = false;  // a Round failed part way: the caches and Slots no longer agree with `length`
-  io::Fd store;
+  // The Expert store's replicas (one per drive) and the reads each has in flight; a read's replica by tag.
+  std::vector<io::Fd> replicas;
+  std::vector<unsigned> replica_reads;
+  std::array<size_t, 2 * kRecords> replica_of_tag{};
   std::optional<io::UringReader> reader;
-  std::byte* staging = nullptr;  // pinned: kMaxJobs records' Halves, [job][half][kHalfBytes]
+  std::byte* staging = nullptr;  // pinned: kRecords records' Halves, [record][half][kHalfBytes]
+  // A sweep layer's store reads into the scratch (Expert e to scratch e), through the staging records:
+  // begun at its gather, or ahead of it (read-ahead) after the previous Sparse layer's; narrowed to the
+  // Experts routed once routing is known. Ascending, so the first batches can start first.
+  struct Fetch {
+    int layer = -1;                  // -1: none under way
+    std::vector<int32_t> queue;      // Experts to submit, ascending; queue[next ..] not yet
+    size_t next = 0;
+    std::vector<uint8_t> wanted;     // [expert]: copied into the scratch as it lands
+    std::vector<uint8_t> submitted;  // [expert]
+    std::vector<uint8_t> landed;     // [expert]: wanted, and its copies up queued
+    size_t pending = 0;              // wanted, not landed
+    std::vector<int> free_records;
+    std::array<int32_t, kRecords> record_expert{};
+    std::array<int, kRecords> halves{};  // Halves of the record's Expert landed
+  } fetch;
   // The RAM tier: entries of two Halves, [half][kHalfBytes], pinned in blocks of kTierBlock.
   static constexpr int kTierBlock = 32;
   std::optional<g53::VictimTier> tier;
   std::vector<int> tier_layer;  // [layer]: the tier's index of a Sparse layer
   std::vector<std::byte*> tier_blocks;
+  int ram_per_layer = 0;
   DecoderStats stats;
 
   ~State() {
+    // A failed sweep may leave reads in flight into staging: they land before it is freed.
+    while (reader && reader->in_flight() > 0)
+      if (!reader->wait(1)) break;
     if (staging) cudaFreeHost(staging);
     for (std::byte* b : tier_blocks) cudaFreeHost(b);
   }
@@ -240,8 +269,47 @@ struct Decoder::State {
    * Miss up from the tier or from the store, Half h to GPU h's Slot. Returns when every copy is done.
    */
   void serve(int L, std::span<const g53::SlotLoad> loads);
-  /** GPU h's scratch Expert `i` (a sweep's). */
-  uint8_t* scratch_ptr(size_t h, int i) const { return gpus[h]->scratch + static_cast<uint64_t>(i) * kHalfBytes; }
+  /** GPU h's scratch Half of Expert `e` (a sweep's). */
+  uint8_t* scratch_ptr(size_t h, int32_t e) const { return gpus[h]->scratch + static_cast<uint64_t>(e) * kHalfBytes; }
+  /** The read of Half h of layer L's Expert e into staging record `record`, from the replica with fewest in flight. */
+  io::ReadRequest half_read(int L, int32_t e, uint32_t h, size_t record) {
+    const uint64_t tag = 2 * record + h;
+    const auto r = static_cast<size_t>(std::ranges::min_element(replica_reads) - replica_reads.begin());
+    replica_reads[r]++;
+    replica_of_tag[tag] = r;
+    return {replicas[r].get(), g53::half_offset({static_cast<uint32_t>(L), static_cast<uint32_t>(e)}, h),
+            {staging + tag * kHalfBytes, kHalfBytes}, tag};
+  }
+  /** A read's completion, checked; its replica has one read fewer in flight. */
+  void read_landed(const io::Completion& c) {
+    replica_reads[replica_of_tag[c.tag]]--;
+    if (c.result != static_cast<int32_t>(kHalfBytes))
+      throw Failure("Expert store: a Half read returned " + std::to_string(c.result));
+  }
+  /** Begin layer L's fetch of `experts` (ascending); the copy streams first wait for every kernel queued so far. */
+  void fetch_begin(int L, std::vector<int32_t> experts);
+  /** Routing is known: of the fetch, only `experts` (ascending) are wanted; any not yet submitted are queued. */
+  void fetch_want(std::span<const int32_t> experts);
+  /**
+   * Submit what the free records take, then take the reads landed (with `block`, at least one), copying
+   * each wanted Half into the scratch. Returns whether reads are still in flight.
+   */
+  bool fetch_pump(bool block);
+  /** The Sparse layer after L, or -1. */
+  int next_sparse(int L) const {
+    for (int K = L + 1; K < d.layers; K++)
+      if (caches[static_cast<size_t>(K)]) return K;
+    return -1;
+  }
+  /** Layer L's Experts in neither a Slot nor the RAM tier, ascending. */
+  std::vector<int32_t> nonresident(int L) const {
+    const auto& slot_of = caches[static_cast<size_t>(L)]->slot_of();
+    std::vector<int32_t> out;
+    for (int32_t e = 0; e < d.experts; e++)
+      if (slot_of[static_cast<size_t>(e)] < 0 && (!tier || tier->entry_of(tier_layer[static_cast<size_t>(L)], e) < 0))
+        out.push_back(e);
+    return out;
+  }
 
   /** Both GPUs route the Round's `n` tokens of layer L (the same bits); stream-ordered, no wait. */
   void launch_route(int L, int n, const std::array<Rows, 2>& rows);
@@ -278,10 +346,12 @@ Decoder::Decoder(std::unique_ptr<State> s) : s_(std::move(s)) {}
 Decoder::~Decoder() = default;
 int64_t Decoder::length() const { return s_->length; }
 int Decoder::slots_per_layer() const { return s_->slots_per_layer; }
+int Decoder::ram_per_layer() const { return s_->ram_per_layer; }
 DecoderStats Decoder::stats() const { return s_->stats; }
 
 Result<std::unique_ptr<Decoder>, std::string> Decoder::open(const g53::Config& config, const io::BackboneParts& parts,
-                                                            const std::string& store_path, const DecoderConfig& c) {
+                                                            const std::vector<std::string>& store_replicas,
+                                                            const DecoderConfig& c) {
   using R = Result<std::unique_ptr<Decoder>, std::string>;
   const auto t0 = std::chrono::steady_clock::now();
   const g53::Dims& d = config.dims();
@@ -294,15 +364,17 @@ Result<std::unique_ptr<Decoder>, std::string> Decoder::open(const g53::Config& c
   s.d = d;
   s.config = c;
   try {
-    // The Expert store, read with O_DIRECT through io_uring.
-    auto fd = io::open_file(store_path, io::Access::ReadDirect);
-    if (!fd) return R::err(fd.error().what);
-    s.store = std::move(fd).value();
-    auto reader = io::UringReader::create(2 * moe_plan::kMaxJobs, true);
+    // The Expert store's replicas, read with O_DIRECT through io_uring.
+    auto replicas = io::open_store_replicas(store_replicas, io::Access::ReadDirect);
+    if (!replicas) return R::err(replicas.error().what);
+    s.replicas = std::move(replicas).value();
+    s.replica_reads.assign(s.replicas.size(), 0);
+    auto reader = io::UringReader::create(2 * kRecords, true);
     if (!reader) return R::err(reader.error().what);
     s.reader.emplace(std::move(reader).value());
-    ck(cudaHostAlloc(reinterpret_cast<void**>(&s.staging), moe_plan::kMaxJobs * 2 * kHalfBytes, cudaHostAllocPortable),
-       "staging");
+    ck(cudaHostAlloc(reinterpret_cast<void**>(&s.staging), kRecords * 2 * kHalfBytes, cudaHostAllocPortable), "staging");
+    s.fetch.free_records.resize(kRecords);
+    std::iota(s.fetch.free_records.rbegin(), s.fetch.free_records.rend(), 0);
 
     // Both GPUs, peer access, the Exchange.
     for (int g = 0; g < 2; g++) {
@@ -458,9 +530,10 @@ Result<std::unique_ptr<Decoder>, std::string> Decoder::open(const g53::Config& c
       G.g_jobs = G.mem.alloc<cuda::GemvJob>(3 * s.max_group_columns / kMaxRound);
       G.g_first = G.mem.alloc<int>(3 * s.max_group_columns / kMaxRound);
       G.batch_ready.resize(s.max_group_columns / kMaxRound / kGroupBatch + 2);
-      G.staged.resize(moe_plan::kMaxJobs);
+      G.staged.resize(kRecords);
       for (auto* v : {&G.batch_ready, &G.staged})
         for (auto& e : *v) ck(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "sweep events");
+      ck(cudaEventCreateWithFlags(&G.routed, cudaEventDisableTiming), "sweep events");
     }
 
     // The Slots: an equal share per Sparse layer, as many as fit beside the reserve on both GPUs.
@@ -495,11 +568,29 @@ Result<std::unique_ptr<Decoder>, std::string> Decoder::open(const g53::Config& c
       if (!cache) return R::err(cache.error().what);
       s.caches[L].emplace(std::move(cache).value());
     }
-    // The RAM tier: per_layer Experts a layer, and a Round's Loads spare (core/glm53/victim_tier).
-    if (c.ram_per_layer < 0) return R::err("the RAM tier size must be >= 0");
-    if (c.ram_per_layer > 0) {
-      auto tier = g53::VictimTier::create(static_cast<int>(sparse_layers.size()), d.experts, c.ram_per_layer,
-                                          moe_plan::kMaxJobs);
+    // The RAM tier: per_layer Experts a layer, and a Round's Loads spare (core/glm53/victim_tier); sized
+    // now, after every other allocation, when it is sized to the memory available.
+    const int layers = static_cast<int>(sparse_layers.size());
+    struct Sizing {
+      const g53::Dims& d;
+      int layers;
+      int operator()(RamTierFixed f) const {
+        if (f.per_layer < 0) throw Failure("the RAM tier size must be >= 0");
+        return f.per_layer;
+      }
+      int operator()(RamTierFit f) const {
+        std::ifstream in("/proc/meminfo");
+        std::stringstream text;
+        text << in.rdbuf();
+        const auto available = mem_available_bytes(text.str());
+        if (!available) throw Failure("RAM tier: /proc/meminfo: " + available.error().what);
+        const uint64_t budget = available.value() > f.reserve_bytes ? available.value() - f.reserve_bytes : 0;
+        return g53::tier_fit(budget, layers, d.experts, kRecords, State::kTierBlock, 2 * kHalfBytes);
+      }
+    };
+    s.ram_per_layer = std::visit(Sizing{d, layers}, c.ram_tier);
+    if (s.ram_per_layer > 0) {
+      auto tier = g53::VictimTier::create(layers, d.experts, s.ram_per_layer, kRecords);
       if (!tier) return R::err(tier.error().what);
       s.tier.emplace(std::move(tier).value());
       s.tier_layer.assign(static_cast<size_t>(d.layers), -1);
@@ -536,11 +627,7 @@ void Decoder::State::serve(int L, std::span<const g53::SlotLoad> loads) {
   std::vector<io::ReadRequest> reqs;
   for (size_t i = 0; i < loads.size(); i++)
     if (moves[i].up < 0)
-      for (uint32_t h = 0; h < 2; h++)
-        reqs.push_back({store.get(),
-                        g53::half_offset({static_cast<uint32_t>(L), static_cast<uint32_t>(loads[i].expert)}, h),
-                        {staging + (2 * i + h) * kHalfBytes, kHalfBytes},
-                        2 * i + h});
+      for (uint32_t h = 0; h < 2; h++) reqs.push_back(half_read(L, loads[i].expert, h, i));
   if (!reqs.empty())
     if (auto r = reader->submit(reqs); !r) throw Failure("Expert store: " + r.error().what);
   for (size_t h = 0; h < 2; h++) {
@@ -563,8 +650,7 @@ void Decoder::State::serve(int L, std::span<const g53::SlotLoad> loads) {
     auto done = reader->wait(1);
     if (!done) throw Failure("Expert store: " + done.error().what);
     for (const io::Completion& c : done.value()) {
-      if (c.result != static_cast<int32_t>(kHalfBytes))
-        throw Failure("Expert store: a Half read returned " + std::to_string(c.result));
+      read_landed(c);
       const size_t i = c.tag / 2, h = c.tag % 2;
       Gpu& G = *gpus[h];
       ck(cudaSetDevice(G.device), "cudaSetDevice");
@@ -705,7 +791,11 @@ void Decoder::State::sweep_moe(int L, int tokens) {
        "Plans");
     ck(cudaMemcpyAsync(experts.data(), G0.sexperts, picks * sizeof(int32_t), cudaMemcpyDeviceToHost, G0.stream), "Routes");
     ck(cudaMemcpyAsync(weights.data(), G0.sweights, picks * sizeof(float), cudaMemcpyDeviceToHost, G0.stream), "Routes");
-    ck(cudaStreamSynchronize(G0.stream), "route");
+    ck(cudaEventRecord(G0.routed, G0.stream), "route");
+    // A read-ahead keeps the drive busy meanwhile.
+    while (cudaEventQuery(G0.routed) == cudaErrorNotReady && fetch_pump(true)) {
+    }
+    ck(cudaEventSynchronize(G0.routed), "route");
   }
   std::vector<uint8_t> needed(static_cast<size_t>(d.experts), 0);
   for (const moe_plan::Plan& plan : plans) {
@@ -726,9 +816,6 @@ void Decoder::State::sweep_moe(int L, int tokens) {
   auto grouped = moe_plan::group_tokens(routes);
   if (!grouped) throw Failure("layer " + std::to_string(L) + ": " + grouped.error().what);
   const std::vector<moe::Group>& groups = grouped.value().groups;
-  std::vector<int> scratch_of(static_cast<size_t>(d.experts), -1);
-  for (int e = 0, used = 0; e < d.experts; e++)
-    if (needed[static_cast<size_t>(e)]) scratch_of[static_cast<size_t>(e)] = used++;
   struct Batch {
     size_t first, count;        // groups
     size_t job_at;              // its gate/up jobs, then its down jobs
@@ -762,7 +849,7 @@ void Decoder::State::sweep_moe(int L, int tokens) {
       std::vector<cuda::GemvJob> down;
       for (const moe::ExpertRun& run : runs) {
         const int32_t e = stretch[run.first].expert;
-        const uint8_t* w = e == moe::kSharedExpert ? sp.shared : scratch_ptr(h, scratch_of[static_cast<size_t>(e)]);
+        const uint8_t* w = e == moe::kSharedExpert ? sp.shared : scratch_ptr(h, e);
         const int slot = static_cast<int>(run.first), n = static_cast<int>(run.count);
         uint8_t* codes = gpus[h]->gx_codes + run.first * kGateBlocks * 256;
         uint8_t* scales = gpus[h]->gx_scales + run.first * kGateBlocks * 8;
@@ -812,43 +899,37 @@ void Decoder::State::sweep_moe(int L, int tokens) {
     put(G.g_first, first[h]);
   }
 
-  // 3. Gather the Experts into the scratch, ascending: from a Slot or the RAM tier at once, from the store
-  //    as reads land. A batch runs as soon as its Experts' copies are queued: the compute stream waits on an
-  //    event of the copy stream, so the Experts' kernels run beside the reads still coming. The last
-  //    layer's kernels and settling copies must be done with the scratch first.
-  for (auto& G : gpus) {
-    ck(cudaSetDevice(G->device), "cudaSetDevice");
-    ck(cudaStreamSynchronize(G->copy), "sweep");
-  }
+  // 3. Gather the Experts into the scratch: from a Slot or the RAM tier at once, from the store as reads
+  //    land (the fetch, perhaps begun ahead). A batch runs as soon as its Experts' copies are queued: the
+  //    compute stream waits on an event of the copy stream, so the Experts' kernels run beside the reads
+  //    still coming. Everything on the copy streams is ordered after the last layer's settling copies, and
+  //    (fetch_begin) after the kernels that read the scratch before.
   const auto t0 = std::chrono::steady_clock::now();
   const std::vector<int32_t> slot_start = cache.slot_of();
   std::vector<int32_t> entry_start(static_cast<size_t>(d.experts), -1);
   if (tier)
     for (int32_t e = 0; e < d.experts; e++) entry_start[static_cast<size_t>(e)] = tier->entry_of(t, e);
-  // The scratch is still read by the last layer's kernels on the compute streams: the copy streams wait.
-  for (auto& G : gpus) {
-    ck(cudaSetDevice(G->device), "cudaSetDevice");
-    ck(cudaEventRecord(G->batch_ready.back(), G->stream), "sweep");
-    ck(cudaStreamWaitEvent(G->copy, G->batch_ready.back(), 0), "sweep");
-  }
-  std::vector<uint8_t> ready(static_cast<size_t>(d.experts), 0);
+  const std::vector<int32_t> unheld = nonresident(L);
   std::vector<int32_t> from_store;
+  for (int32_t e : unheld)
+    if (needed[static_cast<size_t>(e)]) from_store.push_back(e);
+  if (fetch.layer == L)
+    fetch_want(from_store);
+  else
+    fetch_begin(L, from_store);
+  std::vector<uint8_t> ready(static_cast<size_t>(d.experts), 0);  // from a Slot or the tier
   for (int32_t e = 0; e < d.experts; e++) {
     const auto i = static_cast<size_t>(e);
-    if (!needed[i]) continue;
-    if (slot_start[i] < 0 && entry_start[i] < 0) {
-      from_store.push_back(e);
-      continue;
-    }
+    if (!needed[i] || (slot_start[i] < 0 && entry_start[i] < 0)) continue;
     for (size_t h = 0; h < 2; h++) {
       Gpu& G = *gpus[h];
       ck(cudaSetDevice(G.device), "cudaSetDevice");
       if (slot_start[i] >= 0)
-        ck(cudaMemcpyAsync(scratch_ptr(h, scratch_of[i]), slot_ptr(L, h, slot_start[i]), kHalfBytes,
-                           cudaMemcpyDeviceToDevice, G.copy),
+        ck(cudaMemcpyAsync(scratch_ptr(h, e), slot_ptr(L, h, slot_start[i]), kHalfBytes, cudaMemcpyDeviceToDevice,
+                           G.copy),
            "scratch from a Slot");
       else
-        ck(cudaMemcpyAsync(scratch_ptr(h, scratch_of[i]), entry_ptr(entry_start[i], h), kHalfBytes,
+        ck(cudaMemcpyAsync(scratch_ptr(h, e), entry_ptr(entry_start[i], h), kHalfBytes,
                            cudaMemcpyHostToDevice, G.copy),
            "scratch from the RAM tier");
     }
@@ -859,7 +940,11 @@ void Decoder::State::sweep_moe(int L, int tokens) {
   auto launch_ready = [&] {
     for (; launched < batches.size(); launched++) {
       const Batch& b = batches[launched];
-      if (!std::ranges::all_of(b.experts, [&](int32_t e) { return ready[static_cast<size_t>(e)] != 0; })) return;
+      if (!std::ranges::all_of(b.experts, [&](int32_t e) {
+            const auto i = static_cast<size_t>(e);
+            return ready[i] != 0 || fetch.landed[i] != 0;
+          }))
+        return;
       for (size_t h = 0; h < 2; h++) {
         Gpu& G = *gpus[h];
         ck(cudaSetDevice(G.device), "cudaSetDevice");
@@ -881,55 +966,14 @@ void Decoder::State::sweep_moe(int L, int tokens) {
     }
   };
   launch_ready();
-  // The store's share through the staging buffer's kMaxJobs records, ascending, refilled as they land.
-  std::vector<int> free_records(moe_plan::kMaxJobs);
-  std::iota(free_records.rbegin(), free_records.rend(), 0);
-  std::vector<int32_t> record_expert(moe_plan::kMaxJobs, -1);
-  std::vector<int> halves_landed(moe_plan::kMaxJobs, 0);
-  size_t submitted = 0, landed = 0;
-  while (landed < from_store.size()) {
-    std::vector<io::ReadRequest> reqs;
-    while (!free_records.empty() && submitted < from_store.size()) {
-      const int k = free_records.back();
-      free_records.pop_back();
-      for (size_t h = 0; h < 2; h++) {  // its last copies up have left it
-        ck(cudaSetDevice(gpus[h]->device), "cudaSetDevice");
-        ck(cudaEventSynchronize(gpus[h]->staged[static_cast<size_t>(k)]), "staging");
-      }
-      record_expert[static_cast<size_t>(k)] = from_store[submitted++];
-      halves_landed[static_cast<size_t>(k)] = 0;
-      for (uint32_t h = 0; h < 2; h++)
-        reqs.push_back({store.get(),
-                        g53::half_offset({static_cast<uint32_t>(L), static_cast<uint32_t>(record_expert[static_cast<size_t>(k)])}, h),
-                        {staging + (2 * static_cast<size_t>(k) + h) * kHalfBytes, kHalfBytes},
-                        2 * static_cast<uint64_t>(k) + h});
-    }
-    if (!reqs.empty())
-      if (auto r = reader->submit(reqs); !r) throw Failure("Expert store: " + r.error().what);
-    auto done = reader->wait(1);
-    if (!done) throw Failure("Expert store: " + done.error().what);
-    for (const io::Completion& c : done.value()) {
-      if (c.result != static_cast<int32_t>(kHalfBytes))
-        throw Failure("Expert store: a Half read returned " + std::to_string(c.result));
-      const size_t k = c.tag / 2, h = c.tag % 2;
-      const auto e = static_cast<size_t>(record_expert[k]);
-      Gpu& G = *gpus[h];
-      ck(cudaSetDevice(G.device), "cudaSetDevice");
-      ck(cudaMemcpyAsync(scratch_ptr(h, scratch_of[e]), staging + c.tag * kHalfBytes, kHalfBytes, cudaMemcpyHostToDevice,
-                         G.copy),
-         "scratch from the store");
-      ck(cudaEventRecord(G.staged[k], G.copy), "staging");
-      if (++halves_landed[k] == 2) {
-        ready[e] = 1;
-        free_records.push_back(static_cast<int>(k));
-        landed++;
-      }
-    }
+  while (fetch.pending > 0) {
+    fetch_pump(true);
     launch_ready();
   }
-  launch_ready();
   if (launched != batches.size()) throw Failure("a sweep batch never became ready");
-  stats.store_reads += from_store.size();
+  while (fetch_pump(true)) {  // reads ahead that were not routed: their records are the next fetch's
+  }
+  fetch.layer = -1;
   stats.store_s += seconds_since(t0);
 
   // Each Round's Exchange and residual, as a Round's.
@@ -967,7 +1011,7 @@ void Decoder::State::sweep_moe(int L, int tokens) {
         const auto i = static_cast<size_t>(e);
         const int32_t entry = tier->entry_of(t, e);
         if (entry < 0 || entry == entry_start[i]) continue;
-        const uint8_t* src = needed[i] ? scratch_ptr(h, scratch_of[i]) : nullptr;
+        const uint8_t* src = needed[i] ? scratch_ptr(h, e) : nullptr;
         if (!src) {
           if (slot_start[i] < 0) throw Failure("RAM tier: an Expert entered it from nowhere");
           src = slot_ptr(L, h, slot_start[i]);
@@ -978,7 +1022,7 @@ void Decoder::State::sweep_moe(int L, int tokens) {
       const auto i = static_cast<size_t>(e);
       if (slot_end[i] < 0 || slot_end[i] == slot_start[i]) continue;
       if (!needed[i]) throw Failure("Expert cache: an Expert entered a Slot without being routed");
-      ck(cudaMemcpyAsync(slot_ptr(L, h, slot_end[i]), scratch_ptr(h, scratch_of[i]), kHalfBytes,
+      ck(cudaMemcpyAsync(slot_ptr(L, h, slot_end[i]), scratch_ptr(h, e), kHalfBytes,
                          cudaMemcpyDeviceToDevice, G.copy),
          "settle the Slots");
     }
@@ -986,6 +1030,93 @@ void Decoder::State::sweep_moe(int L, int tokens) {
                        cudaMemcpyHostToDevice, G.copy),
        "Slot table");
   }
+
+  // 5. Read the next Sparse layer's non-resident Experts ahead, if this layer routed most of its own: the
+  //    drive would idle through the next layer's attention. Queued after the settling copies, which read
+  //    the scratch this overwrites.
+  const int next = next_sparse(L);
+  if (next >= 0 && !unheld.empty() &&
+      static_cast<double>(from_store.size()) >= static_cast<double>(config.read_ahead_share) * static_cast<double>(unheld.size())) {
+    fetch_begin(next, nonresident(next));
+    fetch_pump(false);
+  }
+}
+
+void Decoder::State::fetch_begin(int L, std::vector<int32_t> experts) {
+  if (fetch.layer >= 0 || reader->in_flight() > 0) throw Failure("a fetch began while another was under way");
+  for (auto& G : gpus) {
+    ck(cudaSetDevice(G->device), "cudaSetDevice");
+    ck(cudaEventRecord(G->batch_ready.back(), G->stream), "fetch");
+    ck(cudaStreamWaitEvent(G->copy, G->batch_ready.back(), 0), "fetch");
+  }
+  const auto E = static_cast<size_t>(d.experts);
+  fetch.layer = L;
+  fetch.wanted.assign(E, 0);
+  for (int32_t e : experts) fetch.wanted[static_cast<size_t>(e)] = 1;
+  fetch.submitted.assign(E, 0);
+  fetch.landed.assign(E, 0);
+  fetch.pending = experts.size();
+  fetch.queue = std::move(experts);
+  fetch.next = 0;
+}
+
+void Decoder::State::fetch_want(std::span<const int32_t> experts) {
+  std::fill(fetch.wanted.begin(), fetch.wanted.end(), uint8_t{0});
+  fetch.queue.clear();
+  fetch.next = 0;
+  fetch.pending = 0;
+  for (int32_t e : experts) {
+    const auto i = static_cast<size_t>(e);
+    fetch.wanted[i] = 1;
+    if (!fetch.landed[i]) fetch.pending++;
+    if (!fetch.submitted[i]) fetch.queue.push_back(e);
+  }
+}
+
+bool Decoder::State::fetch_pump(bool block) {
+  if (fetch.layer < 0) return false;
+  std::vector<io::ReadRequest> reqs;
+  while (!fetch.free_records.empty() && fetch.next < fetch.queue.size()) {
+    const int k = fetch.free_records.back();
+    fetch.free_records.pop_back();
+    for (size_t h = 0; h < 2; h++) {  // its last copies up have left it
+      ck(cudaSetDevice(gpus[h]->device), "cudaSetDevice");
+      ck(cudaEventSynchronize(gpus[h]->staged[static_cast<size_t>(k)]), "staging");
+    }
+    const int32_t e = fetch.queue[fetch.next++];
+    fetch.submitted[static_cast<size_t>(e)] = 1;
+    fetch.record_expert[static_cast<size_t>(k)] = e;
+    fetch.halves[static_cast<size_t>(k)] = 0;
+    for (uint32_t h = 0; h < 2; h++) reqs.push_back(half_read(fetch.layer, e, h, static_cast<size_t>(k)));
+    stats.store_reads++;
+  }
+  if (!reqs.empty())
+    if (auto r = reader->submit(reqs); !r) throw Failure("Expert store: " + r.error().what);
+  if (reader->in_flight() == 0) return false;
+  auto done = reader->wait(block ? 1 : 0);
+  if (!done) throw Failure("Expert store: " + done.error().what);
+  for (const io::Completion& c : done.value()) {
+    read_landed(c);
+    const size_t k = c.tag / 2, h = c.tag % 2;
+    const auto e = static_cast<size_t>(fetch.record_expert[k]);
+    if (fetch.wanted[e]) {
+      Gpu& G = *gpus[h];
+      ck(cudaSetDevice(G.device), "cudaSetDevice");
+      ck(cudaMemcpyAsync(scratch_ptr(h, static_cast<int32_t>(e)), staging + c.tag * kHalfBytes, kHalfBytes,
+                         cudaMemcpyHostToDevice, G.copy),
+         "scratch from the store");
+      ck(cudaEventRecord(G.staged[k], G.copy), "staging");
+    }
+    if (++fetch.halves[k] < 2) continue;
+    fetch.free_records.push_back(static_cast<int>(k));
+    if (fetch.wanted[e]) {  // wanted from submission on (fetch_want only narrows): both Halves copied
+      fetch.landed[e] = 1;
+      fetch.pending--;
+    } else {
+      stats.unrouted_reads++;
+    }
+  }
+  return reader->in_flight() > 0 || fetch.next < fetch.queue.size();
 }
 
 Result<std::array<gpu::Selections, 2>, std::string> Decoder::State::attend(
@@ -1147,6 +1278,7 @@ Result<std::vector<float>, std::string> Decoder::prefill(std::span<const int32_t
         }
         auto sel = s.attend(L, round_n(r), s.length + r * kMaxRound, round_rows(r), shared);
         if (!sel) return R::err(where + sel.error());
+        s.fetch_pump(false);  // a read-ahead keeps the drive busy through the attention
         if (full)
           for (size_t g = 0; g < 2; g++) {
             const gpu::Selections& made = sel.value()[g];

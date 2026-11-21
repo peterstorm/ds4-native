@@ -7,13 +7,16 @@ which replays every layer of every token on the CPU oracle (see "Gates").
 
 ## Results at a glance
 
-| Workload | Before | After | Change |
+| Workload | Before | After (final) | Change |
 |---|---|---|---|
-| 700-token chat prompt, exact | 204.5 s (3.4 tok/s) | **38.9 s (18.0 tok/s)** | prompt sweep + RAM tier |
-| 2,800-token prompt, exact | ~800 s (est. at 3.4 tok/s) | **51.7 s (54.2 tok/s)** | prompt sweep |
-| Decode, exact, chat | 2.65 tok/s | **3.36 tok/s** | RAM tier, 24 Experts per layer |
-| Decode, λ 0.03, chat | 7.56 tok/s (prompt λ-routed) | 6.26 tok/s after an exact sweep | see "λ after a sweep" |
-| 700 + 128 tokens, λ 0.03, end to end | 146 s | **59.8 s** | sweep, then λ decode |
+| 700-token chat prompt, exact | 204.5 s (3.4 tok/s) | **36.3 s (19.3 tok/s)** | prompt sweep, read-ahead |
+| 2,800-token prompt, exact | ~800 s (est. at 3.4 tok/s) | **38.3 s (73.1 tok/s)** | prompt sweep, read-ahead: at the drive's limit |
+| Decode, exact, chat | 2.65 tok/s | **3.56 tok/s** | RAM tier, 38 Experts per layer (auto) |
+| Decode, λ 0.03, chat | 7.56 tok/s (prompt λ-routed) | 6.85 tok/s after an exact sweep | see "λ after a sweep" |
+| 700 + 128 tokens, λ 0.03, end to end | 146 s | **54.6 s** | sweep, then λ decode |
+
+Sections 1–5 are the steps in order (commit `62af83d`); sections 6–8 are the second round (RAM to the
+limit, read-ahead, store replicas for the second NVMe).
 
 ## 1. The store is bandwidth-bound (`ds4n-glm53-readbench`)
 
@@ -140,6 +143,82 @@ Over a longer reply the first effect fades as λ re-shapes the cache. Receipts:
 - **Store reads counted separately** (`DecoderStats::store_reads`). In a sweep, cache Misses and
   reads differ.
 
+## 6. As much RAM as makes sense: ARC 16 → 4 GiB, the tier sized to what is available
+
+- **ZFS ARC.** `zfs_arc_max` 16 → 4 GiB, live via `/sys/module/zfs/parameters/zfs_arc_max` and in
+  the desktop's kernel parameters (dotfiles `b296982a`). The store is read with O_DIRECT, which
+  bypasses the ARC, so the ARC held only /nix and metadata. MemAvailable went 61 → 73 GiB.
+- **`--ram-per-layer auto`** (`RamTierFit`). The tier is sized at the end of `open()`, after every
+  other allocation, to MemAvailable less a reserve (`--ram-reserve-gib`, default 10). The sizing is
+  `core/glm53/victim_tier`'s `tier_fit`, with a property test, and the meminfo text is parsed by
+  `core/meminfo`. On a busier host the tier comes out smaller instead of wedging the box: pinned
+  memory cannot be swapped, and a DS4.1 run once wedged this host that way.
+- **Measured:** 38 per layer (56 GiB pinned). The lowest MemAvailable during the runs was 10 GiB, so
+  the reserve held. Everything else the decoder holds on the host is ~4 GiB (measured at RAM 24:
+  40 GiB in use, of which 36 GiB pinned).
+
+| 700-token prompt + 128 tokens | RAM 24 | RAM auto (38) |
+|---|---|---|
+| Exact decode | 3.36 tok/s, 110 store reads/token | **3.56 tok/s**, 95.6 store + 72.2 RAM |
+| λ 0.03 decode | 6.26 tok/s, 49.2 store reads/token | **6.85 tok/s**, 41.6 store + 32.2 RAM |
+
+Receipt: `2026-11-21-auto-ram.out`. The λ run generates different text from the RAM-24 run's
+because λ routing reads the VRAM Slots, and the Slot count changed (95 → 97).
+
+## 7. Read-ahead: the drive works through the next layer's attention
+
+After the grouped, overlapped sweep, a 2,800-token prompt still spent ~15 s beyond its reads. The
+drive idled during each layer's attention and routing, because a layer's reads could only start
+once its routing was known.
+
+- **The read-ahead.** At the end of a Sparse layer's sweep, the decoder starts reading the *next*
+  Sparse layer's non-resident Experts (neither in a Slot nor in the tier), in ascending id. It
+  reads straight into the scratch, which the next layer's Experts use anyway, so it costs **no VRAM
+  and no host memory**.
+- **When routing is known,** the fetch is narrowed to the Experts routed. Unsubmitted guesses are
+  dropped, and in-flight ones land and are discarded. The host keeps the reads flowing between
+  attention Rounds and while it waits for the routing download.
+- **Not a forecast.** DS4.1's forecasts tried to guess *which* Experts the next token needs, and
+  were dropped. This only bets that a long prompt needs nearly all of them, and checks that bet each
+  layer: it reads ahead only when the layer just finished routed at least `--read-ahead` (0.8) of its
+  non-resident Experts.
+- **`core` structure.** One `Fetch` owns a layer's store reads (begin, narrow, pump), replacing the
+  gather loop's own staging bookkeeping. The scratch is now indexed by Expert id, so the compact
+  index map is gone and a read can land before routing names the Experts.
+
+| Prompt | No read-ahead | Read-ahead (default) | Unrouted reads | Read rate |
+|---|---|---|---|---|
+| 700 tokens | 38.87 s | **36.22 s (19.3 tok/s)** | 231 (1.3%) | 10.2 GB/s |
+| 2,800 tokens | 51.84 s | **38.30 s (73.1 tok/s)** | 11 | 10.0 GB/s |
+
+Receipt: `2026-11-21-read-ahead.out`. **Both sweeps now run at the drive's saturation rate (~10.5
+GB/s)**, so on one drive the prompt is as fast as the store allows. Generated tokens are identical.
+
+## 8. Store replicas: ready for the second NVMe
+
+`--store A,B` (`Decoder::open` takes replicas). `io::open_store_replicas` checks each replica's
+header and size, and compares 64 4 KiB pages spread over the files: the first, the last, and evenly
+between. A wrong file is refused at open. Each Half read goes to the replica with the fewest reads
+in flight, so two drives' bandwidth adds up, and a faster drive takes a larger share. The gate runs
+with the same file given twice, which exercises the split.
+
+**Bringing up the second drive** (once installed; the pool and dataset should then be declared in
+`machines/desktop/disks.nix` like `rpool/models/glm53-store`):
+
+```sh
+ls -l /dev/disk/by-id/ | grep nvme                       # the new drive's id
+sudo zpool create -o ashift=12 -O mountpoint=none -O atime=off -O xattr=sa xpool /dev/disk/by-id/nvme-NEW
+sudo zfs create -o mountpoint=legacy -o compression=zle -o recordsize=1M -o primarycache=metadata xpool/glm53-store
+sudo mkdir -p /models/glm53-store-b && sudo mount -t zfs xpool/glm53-store /models/glm53-store-b
+sudo cp --sparse=always /models/glm53-store/experts.ds4n /models/glm53-store-b/   # ~386 GB, the dataset's 1M zle records
+# then: docker run ... -v /models/glm53-store-b:/store-b:ro ... --store /store/experts.ds4n,/store-b/experts.ds4n
+```
+
+Only `experts.ds4n` (386 GB) needs a replica; the Backbone is read once at open. Expected: the
+prompt sweep's read floor halves (~36 s → ~18 s for a cold whole-model read). Decode's store reads
+would take about half as long, which is ~1.5–1.7× exact decode at today's miss counts. That holds if
+both drives get their own PCIe lanes; check with `ds4n-glm53-readbench` on each before trusting it.
+
 ## Gates
 
 All gates run `ds4n-glm53-decode --check`: every layer of every token, and every logit, compared
@@ -155,15 +234,14 @@ refactor of the argument checks: ctest is green and the 700-token run generates 
 | RAM tier, Rounds of 8 | copies down/up, the tier's entry reuse | **PASS**, 79 layers + logits (`2026-11-21-ramcheck.out`) |
 | Grouped overlapped sweep, exact | partial groups, batches, settling Slots and tier, decode after | **PASS** (`2026-11-21-sweepcheck.out`) |
 | Sweep then λ 0.03 decode | the replay's swept-prefix model, λ residency after a sweep | **PASS** (`2026-11-21-lambdacheck.out`) |
+| Read-ahead forced (`--read-ahead 0`), two replicas | guesses landed, dropped, narrowed (3,489 unrouted); the replica split | **PASS** (`2026-11-21-racheck.out`) |
 
 ## Where decode speed stands, and what would move it
 
-Exact decode is store-bound: ~110 store reads per token × ~2 ms ≈ 220 ms of ~300 ms. The
+Exact decode is store-bound: ~96 store reads per token × ~2 ms ≈ 190 ms of ~280 ms. The
 remaining levers, in order of size:
 1. **λ.** Halves the reads (measured). Already the served choice at 0.03.
-2. **More host RAM for the tier.** Each +1.5 GiB is +1 Expert per layer. Lowering ZFS's ARC
-   ceiling (`zfs_arc_max`, 16 GiB today, useless to O_DIRECT reads) would free ~12 GiB, i.e. +8
-   per layer. This is a host setting, so the operator decides.
-3. **A second NVMe:** roughly doubles the read bandwidth, so ~2× decode.
+2. **The second NVMe** (section 8, code ready): about half the read time.
+3. **More host RAM.** The tier takes all but 10 GiB of what is available; more needs more DIMMs.
 4. **Speculative decoding (MTP):** pays only once reads are cheap. A verify Round of k tokens
    reads ~k× the Experts (`tools/glm53-golden/verify_round_reads.py`).
