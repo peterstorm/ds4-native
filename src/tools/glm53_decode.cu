@@ -5,9 +5,12 @@
 //   ds4n-glm53-decode --config CONFIG --backbone DIR --store FILE[,FILE...] --prompt "ID ID ..."
 //                     [--generate N] [--round R] [--lambda λ] [--slots-per-layer S]
 //                     [--ram-per-layer R|auto] [--ram-reserve-gib G] [--read-ahead SHARE]
-//                     [--prefill sweep|rounds] [--capacity C] [--devices A,B] [--threads T] [--check]
+//                     [--prefill sweep|rounds] [--capacity C] [--devices A,B] [--threads T] [--then "ID ID ..."]
+//                     [--check]
 // --store takes replicas of one store, one per drive (the decoder spreads its reads over them).
 // --ram-per-layer auto sizes the RAM tier to the host's available memory less --ram-reserve-gib (10).
+// --then "ID ID ..." sweeps a second prompt after the generated tokens, as a next turn would arrive:
+// prefill against a warm cache (not with --check).
 // The prompt runs as a sweep (Decoder::prefill: routed exactly, also under λ, which then applies to the
 // generated tokens), or in Rounds of --round (--prefill rounds; under λ Rounds of 1, every token λ-routed).
 //
@@ -59,10 +62,21 @@ double seconds_since(std::chrono::steady_clock::time_point t0) {
   return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
 
+/** One prompt's line: its tokens, its time, and the Expert traffic between the stats before and after it. */
+void print_prefill(const std::string& label, size_t tokens, double s, const eng::DecoderStats& before,
+                   const eng::DecoderStats& after) {
+  std::printf("%s: %zu tokens in %.2f s (%.1f tok/s); %llu store reads (%llu read ahead, not routed), "
+              "%llu from RAM, miss wait %.2f s\n",
+              label.c_str(), tokens, s, static_cast<double>(tokens) / s,
+              static_cast<unsigned long long>(after.store_reads - before.store_reads),
+              static_cast<unsigned long long>(after.unrouted_reads - before.unrouted_reads),
+              static_cast<unsigned long long>(after.ram_hits - before.ram_hits), after.store_s - before.store_s);
+}
+
 struct Args {
   std::string config, backbone;
   std::vector<std::string> stores;  // replicas of one Expert store
-  std::vector<int32_t> prompt;
+  std::vector<int32_t> prompt, then;
   int generate = 0, round = 8;
   std::string prefill = "sweep";  // or "rounds"; a sweep routes the prompt exactly, also under λ
   eng::DecoderConfig decoder;
@@ -73,7 +87,7 @@ Args parse(int argc, char** argv) {
   const std::string usage =
       "usage: --config CONFIG --backbone DIR --store FILE[,FILE...] --prompt \"ID ID ...\" [--generate N] [--round R] "
       "[--prefill sweep|rounds] [--lambda λ] [--slots-per-layer S] [--ram-per-layer R|auto] [--ram-reserve-gib G] "
-      "[--read-ahead SHARE] [--capacity C] [--devices A,B] [--threads T] [--check]";
+      "[--read-ahead SHARE] [--capacity C] [--devices A,B] [--threads T] [--then \"ID ID ...\"] [--check]";
   std::optional<uint64_t> reserve_gib;
   Args a;
   for (int i = 1; i < argc; i++) {
@@ -107,9 +121,9 @@ Args parse(int argc, char** argv) {
     else if (k == "--threads") a.decoder.threads = static_cast<unsigned>(std::stoul(v));
     else if (k == "--devices") {
       if (std::sscanf(v.c_str(), "%d,%d", &a.decoder.devices[0], &a.decoder.devices[1]) != 2) die(usage);
-    } else if (k == "--prompt") {
+    } else if (k == "--prompt" || k == "--then") {
       std::istringstream in(v);
-      for (int32_t t; in >> t;) a.prompt.push_back(t);
+      for (int32_t t; in >> t;) (k == "--prompt" ? a.prompt : a.then).push_back(t);
     } else die("unknown argument " + k + "\n" + usage);
   }
   if (a.config.empty() || a.backbone.empty() || a.stores.empty() || a.prompt.empty()) die(usage);
@@ -119,6 +133,7 @@ Args parse(int argc, char** argv) {
     fit->reserve_bytes = *reserve_gib << 30;
   }
   if (a.prefill != "sweep" && a.prefill != "rounds") die(usage);
+  if (!a.then.empty() && a.check) die("--then is a timing run: not with --check");
   if (a.round < 1 || a.round > 8) die("--round is 1 .. 8");
   if (a.decoder.route_bonus != 0.0f) a.round = 1;  // the decoder's rule under λ
   return a;
@@ -327,12 +342,7 @@ int main(int argc, char** argv) {
     }
     generate_s = seconds_since(t0);
     const auto st = dec.stats();
-    std::printf("prompt (%s): %zu tokens in %.2f s (%.1f tok/s); %llu store reads (%llu read ahead, not routed), "
-                "%llu from RAM, miss wait %.2f s\n",
-                args.prefill.c_str(), args.prompt.size(), prompt_s, static_cast<double>(args.prompt.size()) / prompt_s,
-                static_cast<unsigned long long>(after_prompt.store_reads),
-                static_cast<unsigned long long>(after_prompt.unrouted_reads),
-                static_cast<unsigned long long>(after_prompt.ram_hits), after_prompt.store_s);
+    print_prefill("prompt (" + args.prefill + ")", args.prompt.size(), prompt_s, {}, after_prompt);
     if (args.generate > 0) {
       const auto picks = st.picks - after_prompt.picks, misses = st.misses - after_prompt.misses;
       const auto ram = st.ram_hits - after_prompt.ram_hits;
@@ -345,6 +355,13 @@ int main(int argc, char** argv) {
       std::printf("generated:");
       for (int32_t t : generated) std::printf(" %d", t);
       std::printf("\n");
+    }
+    if (!args.then.empty()) {
+      const auto before = dec.stats();
+      const auto t1 = std::chrono::steady_clock::now();
+      auto last = dec.prefill(args.then);
+      if (!last) die(last.error());
+      print_prefill("then (sweep, warm)", args.then.size(), seconds_since(t1), before, dec.stats());
     }
   }
   if (!args.check) return 0;

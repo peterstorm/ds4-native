@@ -1,0 +1,9 @@
+# verify_round_reads.py 2026-11-20-locality.routes.tsv.gz exact S: decode store reads per token, one LRU of S = Slots + tier per layer
+Slots+tier 136 per layer:   Round of 1:  101.4 reads/Round (1.00x one token's), 101.4 per token if all accepted
+Slots+tier 138 per layer:   Round of 1:   98.6 reads/Round (1.00x one token's),  98.6 per token if all accepted
+Slots+tier 170 per layer:   Round of 1:   58.3 reads/Round (1.00x one token's),  58.3 per token if all accepted
+Slots+tier 199 per layer:   Round of 1:   30.3 reads/Round (1.00x one token's),  30.3 per token if all accepted
+Slots+tier 200 per layer:   Round of 1:   29.5 reads/Round (1.00x one token's),  29.5 per token if all accepted
+Slots+tier 230 per layer:   Round of 1:    9.8 reads/Round (1.00x one token's),   9.8 per token if all accepted
+Slots+tier 240 per layer:   Round of 1:    5.6 reads/Round (1.00x one token's),   5.6 per token if all accepted
+Slots+tier 250 per layer:   Round of 1:    2.4 reads/Round (1.00x one token's),   2.4 per token if all accepted

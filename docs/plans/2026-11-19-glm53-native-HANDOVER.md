@@ -1,4 +1,4 @@
-# HANDOVER: GLM-5.3 full uncensored on ds4-native — session state 2026-11-20 (updated 13:00)
+# HANDOVER: GLM-5.3 full uncensored on ds4-native — session state 2026-11-21 (prefill analysis)
 
 Resume point for any fresh session. Companion to
 [`2026-11-19-glm53-native.md`](2026-11-19-glm53-native.md) (the plan — read it first; its
@@ -211,8 +211,19 @@ An independent audit (python, read-only, against the index) found:
      - Read-ahead: prompts run at the drive's limit, 73 tok/s at 2,800 tokens.
      - `--store A,B` replicas.
      - Exact decode 3.56 tok/s; λ 0.03 6.85 tok/s.
-   - **Next:** the second NVMe (bring-up in `docs/bench/glm53-decode/2026-11-21-speed-report.md`
-     section 8), then a server around the Decoder.
+   - **Prefill analysis (2026-11-21, `docs/bench/glm53-decode/2026-11-21-prefill-analysis.md`):**
+     - Short turns are read-bound. Warm (`--then`), 64 / 128 / 700 tokens take 8.5 / 13.4 / 17.4 s.
+     - Long prompts are compute-bound: 11.2K tokens in 64 s.
+     - 75% of that GPU time is per-Round attention projections. The fix is attention in waves
+       through the existing tiled `bf16_gemv`.
+     - Why DS4.1 is faster: 2.7× fewer Expert bytes per token, 79% vs 54% of the model held, and
+       waves.
+   - **Next:**
+     1. The second NVMe, in **`M.2_3` or `M.2_4`, never `M.2_2`**: that slot shares lanes with
+        GPU 2 and drops it to x4. Bring-up in the speed report, section 8.
+     2. Attention in waves for the sweep.
+     3. A server around the Decoder.
+     - More host RAM is the biggest hardware lever (192–256 GB); it's the owner's call.
 7. Phases 4–5 per the plan (fifth switch-primary entry `glm-native`, slots ladder, CyberGym).
 
 ## Environment facts (the things that cost time to rediscover)

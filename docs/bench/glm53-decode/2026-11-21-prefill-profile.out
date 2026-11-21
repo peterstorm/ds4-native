@@ -1,0 +1,57 @@
+# nsys, 11,200-token sweep (long-prompt x4), capacity 12288, RAM auto; window from 85 s for 75 s
+window 62.74 s, 6151621 kernels
+
+GPU 0: busy (union) 59.35 s of 62.74 s; kernel time 59.35 s
+     44.33 s  74.7%    486495 x     91.1 us  bf16_gemv_kernel
+      3.45 s   5.8%    210069 x     16.4 us  exchange_kernel
+      2.83 s   4.8%    209982 x     13.5 us  head_gemv_kernel
+      2.08 s   3.5%    104991 x     19.8 us  split_kernel
+      1.31 s   2.2%     29850 x     44.0 us  gemv_groups_kernel
+      1.14 s   1.9%    105066 x     10.8 us  combine_kernel
+      0.90 s   1.5%    419964 x      2.2 us  rmsnorm_kernel
+      0.83 s   1.4%    486421 x      1.7 us  sum_planes_kernel
+      0.57 s   1.0%     20613 x     27.6 us  select_kernel
+      0.42 s   0.7%    255816 x      1.6 us  rope_kernel
+      0.37 s   0.6%     14925 x     24.7 us  accumulate_tokens_kernel
+      0.25 s   0.4%     14925 x     16.7 us  gather_quantize_kernel
+      0.23 s   0.4%    315126 x      0.7 us  bf16_to_f32_kernel
+      0.19 s   0.3%    210069 x      0.9 us  residual_kernel
+      0.14 s   0.2%     20613 x      6.7 us  scores_kernel
+
+GPU 1: busy (union) 59.32 s of 62.74 s; kernel time 59.32 s
+     43.98 s  74.1%    486495 x     90.4 us  bf16_gemv_kernel
+      3.80 s   6.4%    210069 x     18.1 us  exchange_kernel
+      2.82 s   4.8%    209982 x     13.4 us  head_gemv_kernel
+      2.09 s   3.5%    104991 x     19.9 us  split_kernel
+      1.29 s   2.2%     29850 x     43.4 us  gemv_groups_kernel
+      1.15 s   1.9%    105066 x     10.9 us  combine_kernel
+      0.89 s   1.5%    419964 x      2.1 us  rmsnorm_kernel
+      0.82 s   1.4%    486420 x      1.7 us  sum_planes_kernel
+      0.57 s   1.0%     20613 x     27.5 us  select_kernel
+      0.42 s   0.7%    255816 x      1.6 us  rope_kernel
+      0.37 s   0.6%     14925 x     24.7 us  accumulate_tokens_kernel
+      0.25 s   0.4%     14925 x     16.8 us  gather_quantize_kernel
+      0.23 s   0.4%    315126 x      0.7 us  bf16_to_f32_kernel
+      0.19 s   0.3%    210069 x      0.9 us  residual_kernel
+      0.14 s   0.2%     20613 x      6.6 us  scores_kernel
+
+memcpy:
+  GPU 0 H2D: 8.29 s, 194.8 GB, 125085 copies
+  GPU 1 H2D: 8.27 s, 194.8 GB, 125086 copies
+  GPU 0 D2H: 1.50 s, 32.5 GB, 3511 copies
+  GPU 1 D2H: 1.49 s, 32.2 GB, 3209 copies
+  GPU 0 D2D: 0.17 s, 73.2 GB, 137319 copies
+  GPU 1 D2D: 0.17 s, 73.2 GB, 137319 copies
+
+bf16_gemv on GPU 0, by launch shape (grid x,y,z; block):
+  grid (6144, 1, 1) block 256:  104991 calls, total   25.67 s, mean     244.5 us, max     277.3 us
+  grid (2048, 1, 1) block 256:  104990 calls, total    7.79 s, mean      74.2 us, max      87.8 us
+  grid (1536, 1, 1) block 256:  104990 calls, total    6.93 s, mean      66.0 us, max      97.3 us
+  grid (432, 1, 1) block 256:  104991 calls, total    2.60 s, mean      24.8 us, max      57.7 us
+  grid (1024, 1, 1) block 256:   20613 calls, total    0.92 s, mean      44.8 us, max      46.9 us
+  grid (96, 1, 1) block 256:   25221 calls, total    0.24 s, mean       9.6 us, max      63.1 us
+  grid (24, 1, 1) block 256:   20613 calls, total    0.17 s, mean       8.3 us, max       9.0 us
+  grid (116160, 1, 1) block 256:       2 calls, total    0.01 s, mean    2929.0 us, max    4671.4 us
+  grid (9216, 1, 1) block 256:       6 calls, total    0.00 s, mean      94.8 us, max      95.6 us
+  grid (192, 1, 1) block 256:      75 calls, total    0.00 s, mean       4.2 us, max       4.5 us
+  grid (4608, 1, 1) block 256:       3 calls, total    0.00 s, mean      48.0 us, max      48.1 us

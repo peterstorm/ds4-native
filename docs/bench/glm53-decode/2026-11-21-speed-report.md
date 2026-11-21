@@ -214,10 +214,17 @@ sudo cp --sparse=always /models/glm53-store/experts.ds4n /models/glm53-store-b/ 
 # then: docker run ... -v /models/glm53-store-b:/store-b:ro ... --store /store/experts.ds4n,/store-b/experts.ds4n
 ```
 
-Only `experts.ds4n` (386 GB) needs a replica; the Backbone is read once at open. Expected: the
-prompt sweep's read floor halves (~36 s → ~18 s for a cold whole-model read). Decode's store reads
-would take about half as long, which is ~1.5–1.7× exact decode at today's miss counts. That holds if
-both drives get their own PCIe lanes; check with `ds4n-glm53-readbench` on each before trusting it.
+Only `experts.ds4n` (386 GB) needs a replica; the Backbone is read once at open.
+
+**Which M.2 slot (checked after this section was first written; see `2026-11-21-prefill-analysis.md`
+§4C):** `M.2_3` or `M.2_4`, never `M.2_2`. On this board `M.2_2` shares lanes with the second GPU
+slot. Populating it drops GPU 2 to x4, which halves its RAM-tier copies, its share of the store
+reads and the cross-GPU Exchanges. The chipset slots are PCIe 4.0 x4 behind the chipset's own x4
+uplink, so expect ~6.5–7 GB/s from the new drive and ~17 GB/s for the pair (≈ 1.6×, not 2×).
+
+Expected: the read floor × ≈ 0.6 (cold whole-model read ≈ 36 → ≈ 22 s), and exact decode ≈ 4.2–4.7
+tok/s. After installing, check that both GPUs still show x8 (`lspci -PP -d 10de:`), then run
+`ds4n-glm53-readbench` on each drive alone and on both at once.
 
 ## Gates
 
