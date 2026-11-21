@@ -66,7 +66,7 @@ that file; after = `2026-11-21-waves-timings.out` and `…-warm.out`.
 | Prompt | Before | After (wave 512) | |
 |---|---|---|---|
 | 11,200 tokens, cold (capacity 12,288) | 64.33 s (174 tok/s), miss wait 0.7 s | **39.03 s (287 tok/s)**, miss wait 24.5 s | 1.65×, now at the read floor |
-| 11,200 tokens, warm (after a 2,800-token turn; capacity 16,384) | 65.77 s (170 tok/s), miss wait 0.45 s (the `--wave 8` control) | **20.15 s (556 tok/s)**, miss wait 4.2 s | **3.26×**, compute-bound again |
+| 11,200 tokens, warm (after a 2,800-token turn; capacity 16,384) | 65.77 s (170 tok/s), miss wait 0.45 s (the `--wave 8` control) | **20.15 s (556 tok/s)**, miss wait 4.2 s | **3.26×**, near its read floor (below) |
 | 2,800 tokens, cold | 39.23 s | 36.83 s | read floor |
 | 700 tokens, cold / warm | 35.64 / 17.40 s | 35.20 / 16.82 s | read-bound |
 | 64 tokens, cold / warm | 21.88 / 8.51 s | 21.89 / 8.38 s | read-bound |
@@ -117,8 +117,14 @@ All linears together: 44.3 → 3.6 s (12×).
   non-resident Experts once, ~384 GB: at ~10 GB/s that is the ~37 s floor, and 2,800 and 11,200
   tokens both sit on it. Only bandwidth moves it: the second NVMe (`M.2_3`/`M.2_4`, ≈ 1.6×) or
   more RAM (more of the model held, fewer reads).
-- **Warm long prompts are compute-bound again**, at ≈ 1.4 ms per token. The next software items,
-  by size:
+- **Warm long prompts are near their read floor too.** The warm 11,200-token turn read 9,000
+  Experts (~180 GB, ~18 s at 10.1 GB/s) and took 20.2 s; its ~15.5 s of GPU work overlapped the
+  reads (waves of 64 instead of 512 cost 1.2 s, so the overlap is not perfect). A long prompt
+  needs nearly every Expert, so a warm one reads the ~46% the Slots and the tier do not hold,
+  whatever its text. (Corrected 2026-11-21: this report first called the warm turn compute-bound.)
+- **The GPU items matter once reads get cheaper:** with the second NVMe (~16–17 GB/s) the warm
+  floor drops to ~11 s, under the ~15.5 s of GPU work, and for prompts past ~15K tokens warm.
+  Then, by size:
   1. `head_gemv` (2.5 s per 11.2K): absorbed queries (W_k^T, k = 192) and W_v (k = 512) read
      their weights per token, without reuse across tokens. W_v's width (512 = 2 × 256) qualifies
      for a tiled GEMV; whether the arithmetic order matches `exact::gemv_row` there is the

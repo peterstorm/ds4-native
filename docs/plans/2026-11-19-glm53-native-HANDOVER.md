@@ -230,8 +230,9 @@ An independent audit (python, read-only, against the index) found:
         GPU 2 and drops it to x4. Bring-up in the speed report, section 8. Cold prompts of every
         length now wait on the drive, so this is the prefill lever.
      2. A server around the Decoder.
-     3. For warm long prompts: `head_gemv` (absorbed queries, W_v) as a tiled GEMV if the
-        arithmetic order allows; then GLM's own larger Exchange.
+     3. After the second NVMe (long prompts are at the read floor cold and warm until then):
+        `head_gemv` (absorbed queries, W_v) as a tiled GEMV if the arithmetic order allows; then
+        GLM's own larger Exchange.
      - More host RAM is the biggest hardware lever (192–256 GB); it's the owner's call.
 7. Phases 4–5 per the plan (fifth switch-primary entry `glm-native`, slots ladder, CyberGym).
 
