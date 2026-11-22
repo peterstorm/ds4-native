@@ -5,8 +5,8 @@
 //
 // Where a prompt resumes is core/glm53/sessions' plan; this performs it on the
 // Decoder (set the live caches aside, copy a Checkpoint in, rewind, free host
-// rows), reads the prompt's rest as one sweep (Decoder::prefill: routed exactly,
-// also under λ), then writes the reply: core/sampler picks each token from its
+// rows), reads the prompt's rest as a sweep per Cohort (Decoder::prefill: routed
+// exactly, also under λ), then writes the reply: core/sampler picks each token from its
 // logits (draw k for the k-th written), core/reply says when the reply ends (a
 // stop token, max_new, the context, a STOP) and when a reasoning block over its
 // budget is closed. Each written token but the last is fed back (Decoder::round).

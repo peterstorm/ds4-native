@@ -14,6 +14,7 @@
 #include <sstream>
 #include <stdexcept>
 
+#include "core/glm53/cohort.hpp"
 #include "core/glm53/exact_attention.hpp"
 #include "core/glm53/exact_moe.hpp"
 #include "core/glm53/expert_tiles.hpp"
@@ -157,8 +158,9 @@ struct Gpu {
   JobUpload* ring = nullptr;
   std::array<cudaEvent_t, kRing> ring_done{};
   int ring_next = 0;
-  // A sweep: its rows [capacity][hidden], each Round's saved Selections [Round][kMaxRound][kMaxSelection],
-  // and the scratch its layer's Experts run from, [expert][kHalfBytes].
+  // A sweep: its rows [Cohort][hidden], each Round's saved Selections [Round][kMaxRound][kMaxSelection],
+  // and the scratch its layer's Experts run from, [expert][kHalfBytes]. Sized for min(Cohort, capacity)
+  // tokens: a longer prompt is read as several sweeps.
   float *sx = nullptr, *smid = nullptr;
   __nv_bfloat16* sffn = nullptr;
   int32_t* ssel = nullptr;
@@ -221,8 +223,10 @@ void exchange_rows(const Gpu& G, const float* mine, int tokens, __nv_bfloat16* o
 }  // namespace
 
 struct Decoder::State {
+  explicit State(g53::CohortSize c) : cohort(c) {}
   g53::Dims d;
   DecoderConfig config;
+  g53::CohortSize cohort;  // config.cohort, parsed: a prompt's sweeps take this many tokens each
   std::array<std::unique_ptr<Gpu>, 2> gpus;
   std::vector<uint16_t> embed;                    // [vocab][hidden] BF16 bits
   std::vector<std::optional<g53::LayerExpertCache>> caches;  // [layer], Sparse layers
@@ -342,6 +346,13 @@ struct Decoder::State {
   /** Layer L's MoE for a sweep's Rounds: route all, gather their Experts, run them, settle the cache. */
   void sweep_moe(int L, int tokens);
   /**
+   * One Cohort's prompt sweep: `tokens` (1 .. the sweep buffers' tokens) at positions first ..
+   * first + n - 1 through every layer, their cache rows written, their last residual streams left in
+   * the sweep rows. With `capture`, (*capture)[L] gets the Cohort's streams entering layer L at rows
+   * `at` .. at + n - 1 (sized for the whole prompt). The length is the caller's to advance.
+   */
+  void sweep(std::span<const int32_t> tokens, int64_t first, size_t at, std::vector<std::vector<float>>* capture);
+  /**
    * Each GPU attends layer L for `n` tokens, a Round or a sweep's wave (`shared`: each GPU's last
    * Full layer's Selections for them), Exchange, finish.
    */
@@ -437,7 +448,9 @@ Result<std::unique_ptr<Decoder>, std::string> Decoder::open(const g53::Config& c
   if (!(c.route_bonus >= 0.0f) || !std::isfinite(c.route_bonus)) return R::err("the route bonus must be finite, >= 0");
   if (d.hidden != kDim || d.experts != static_cast<int>(g53::kExperts) || d.moe_intermediate != static_cast<int>(g53::kIntermediate))
     return R::err("the config's widths are not the Expert store's");
-  auto st = std::make_unique<State>();
+  const auto cohort = g53::CohortSize::fit(c.cohort, c.wave);
+  if (!cohort) return R::err(cohort.error().what);
+  auto st = std::make_unique<State>(cohort.value());
   State& s = *st;
   s.d = d;
   s.config = c;
@@ -587,8 +600,10 @@ Result<std::unique_ptr<Decoder>, std::string> Decoder::open(const g53::Config& c
       ck(cudaHostAlloc(reinterpret_cast<void**>(&G.ring), kRing * sizeof(JobUpload), cudaHostAllocPortable), "upload ring");
       for (auto& e : G.ring_done) ck(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "upload ring");
       if (g == 0) G.logits = G.mem.alloc<float>(static_cast<size_t>(kMaxRound) * d.vocab);
-      const size_t C = static_cast<size_t>(c.capacity) * kDim;
-      const size_t rounds = static_cast<size_t>(c.capacity + kMaxRound - 1) / kMaxRound;
+      // The sweep buffers, for one Cohort: no prompt sweep takes more tokens than a Cohort or the capacity.
+      const auto sweep_tokens = static_cast<size_t>(std::min(s.cohort.tokens(), c.capacity));
+      const size_t C = sweep_tokens * kDim;
+      const size_t rounds = (sweep_tokens + kMaxRound - 1) / kMaxRound;
       G.sx = G.mem.alloc<float>(C);
       G.smid = G.mem.alloc<float>(C);
       G.sffn = G.mem.alloc<__nv_bfloat16>(C);
@@ -603,7 +618,7 @@ Result<std::unique_ptr<Decoder>, std::string> Decoder::open(const g53::Config& c
       G.gx_scales = G.mem.alloc<uint8_t>(static_cast<size_t>(kGroupBatch) * kGateBlocks * 8);
       // Groups a sweep makes, at most: each Expert's tokens in eights (tokens + one part group per Expert),
       // and the shared Expert's one per Round.
-      s.max_group_columns = (static_cast<size_t>(c.capacity) + d.experts + rounds) * kMaxRound;
+      s.max_group_columns = (sweep_tokens + d.experts + rounds) * kMaxRound;
       G.g_token_of = G.mem.alloc<int32_t>(s.max_group_columns);
       G.g_weight = G.mem.alloc<float>(s.max_group_columns);
       G.g_slots = G.mem.alloc<int32_t>(s.max_group_columns);
@@ -1306,6 +1321,70 @@ Result<std::vector<float>, std::string> Decoder::round(std::span<const int32_t> 
   }
 }
 
+void Decoder::State::sweep(std::span<const int32_t> tokens, int64_t first, size_t at,
+                           std::vector<std::vector<float>>* capture) {
+  const int n = static_cast<int>(tokens.size());
+  const size_t N = static_cast<size_t>(n) * kDim;
+  const int wave = config.wave;
+  auto rows_at = [&](int t) { return std::array<Rows, 2>{gpus[0]->sweep_rows(t), gpus[1]->sweep_rows(t)}; };
+  auto capture_layer = [&](int L) {  // the Cohort's streams entering layer L (L = layers: after the last)
+    if (!capture) return;
+    ck(cudaSetDevice(gpus[0]->device), "cudaSetDevice");
+    ck(cudaMemcpyAsync((*capture)[static_cast<size_t>(L)].data() + at * kDim, gpus[0]->sx, N * sizeof(float),
+                       cudaMemcpyDeviceToHost, gpus[0]->stream),
+       "capture");
+    ck(cudaStreamSynchronize(gpus[0]->stream), "layer");
+  };
+  const std::vector<float> x = embed_rows(embed, tokens);
+  for (auto& G : gpus) {
+    ck(cudaSetDevice(G->device), "cudaSetDevice");
+    ck(cudaMemcpyAsync(G->sx, x.data(), N * sizeof(float), cudaMemcpyHostToDevice, G->stream), "x");
+  }
+  // Every token's Selection from the last Full layer, saved in ssel (the layer scratch holds one wave's):
+  // each GPU's lengths, token by token.
+  std::array<std::vector<int>, 2> lengths;
+  for (int L = 0; L < d.layers; L++) {
+    const auto where = "layer " + std::to_string(L) + ": ";
+    capture_layer(L);
+    const bool full = gpus[0]->attention[static_cast<size_t>(L)]->indexer() == g53::IndexerKind::Full;
+    if (full)
+      for (auto& l : lengths) l.clear();
+    else if (lengths[0].size() != static_cast<size_t>(n))
+      throw Failure(where + "a Shared layer before any Full layer");
+    for (int t0 = 0; t0 < n; t0 += wave) {
+      const int m = std::min(wave, n - t0);
+      std::array<gpu::Selections, 2> saved;
+      std::array<const gpu::Selections*, 2> shared{nullptr, nullptr};
+      for (size_t g = 0; g < 2 && !full; g++) {
+        const auto from = lengths[g].begin() + t0;
+        saved[g] = {gpus[g]->ssel + static_cast<size_t>(t0) * gpu::kMaxSelection, gpu::kMaxSelection,
+                    std::vector<int>(from, from + m)};
+        shared[g] = &saved[g];
+      }
+      auto sel = attend(L, m, first + t0, rows_at(t0), shared);
+      if (!sel) throw Failure(where + sel.error());
+      fetch_pump(false);  // a read-ahead keeps the drive busy through the attention
+      if (full)
+        for (size_t g = 0; g < 2; g++) {
+          const gpu::Selections& made = sel.value()[g];
+          if (made.stride != gpu::kMaxSelection) throw Failure(where + "unexpected Selection stride");
+          Gpu& G = *gpus[g];
+          ck(cudaSetDevice(G.device), "cudaSetDevice");
+          ck(cudaMemcpyAsync(G.ssel + static_cast<size_t>(t0) * gpu::kMaxSelection, made.rows,
+                             static_cast<size_t>(m) * gpu::kMaxSelection * sizeof(int32_t), cudaMemcpyDeviceToDevice,
+                             G.stream),
+             "save Selections");
+          lengths[g].insert(lengths[g].end(), made.lengths.begin(), made.lengths.end());
+        }
+    }
+    if (gpus[0]->dense[static_cast<size_t>(L)])
+      for (int t0 = 0; t0 < n; t0 += wave) dense(L, std::min(wave, n - t0), rows_at(t0));
+    else
+      sweep_moe(L, n);
+  }
+  capture_layer(d.layers);
+}
+
 Result<std::vector<float>, std::string> Decoder::prefill(std::span<const int32_t> tokens,
                                                          std::vector<std::vector<float>>* capture,
                                                          std::vector<float>* all_logits) {
@@ -1317,90 +1396,40 @@ Result<std::vector<float>, std::string> Decoder::prefill(std::span<const int32_t
   if (auto why = s.refuse(tokens)) return R::err(*why);
   const auto t0 = std::chrono::steady_clock::now();
   const size_t N = static_cast<size_t>(n) * kDim;
+  const size_t V = static_cast<size_t>(d.vocab);
   const int rounds = (n + kMaxRound - 1) / kMaxRound;
-  const int wave = s.config.wave;
-  auto rows_at = [&](int t) { return std::array<Rows, 2>{s.gpus[0]->sweep_rows(t), s.gpus[1]->sweep_rows(t)}; };
-  auto round_n = [&](int r) { return std::min(kMaxRound, n - r * kMaxRound); };
-  s.broken = true;  // until the sweep completes
+  s.broken = true;  // until every sweep completes
   try {
-    const std::vector<float> x = embed_rows(s.embed, tokens);
-    if (capture) capture->assign(static_cast<size_t>(d.layers) + 1, {});
-    for (auto& G : s.gpus) {
-      ck(cudaSetDevice(G->device), "cudaSetDevice");
-      ck(cudaMemcpyAsync(G->sx, x.data(), N * sizeof(float), cudaMemcpyHostToDevice, G->stream), "x");
-    }
-    // Every token's Selection from the last Full layer, saved in ssel (the layer scratch holds one wave's):
-    // each GPU's lengths, token by token.
-    std::array<std::vector<int>, 2> lengths;
-    for (int L = 0; L < d.layers; L++) {
-      const auto where = "layer " + std::to_string(L) + ": ";
-      if (capture) {
-        auto& row = (*capture)[static_cast<size_t>(L)];
-        row.resize(N);
-        ck(cudaSetDevice(s.gpus[0]->device), "cudaSetDevice");
-        ck(cudaMemcpyAsync(row.data(), s.gpus[0]->sx, N * sizeof(float), cudaMemcpyDeviceToHost, s.gpus[0]->stream),
-           "capture");
-        ck(cudaStreamSynchronize(s.gpus[0]->stream), "layer");
-      }
-      const bool full = s.gpus[0]->attention[static_cast<size_t>(L)]->indexer() == g53::IndexerKind::Full;
-      if (full)
-        for (auto& l : lengths) l.clear();
-      else if (lengths[0].size() != static_cast<size_t>(n))
-        return R::err(where + "a Shared layer before any Full layer");
-      for (int t0 = 0; t0 < n; t0 += wave) {
-        const int m = std::min(wave, n - t0);
-        std::array<gpu::Selections, 2> saved;
-        std::array<const gpu::Selections*, 2> shared{nullptr, nullptr};
-        for (size_t g = 0; g < 2 && !full; g++) {
-          const auto from = lengths[g].begin() + t0;
-          saved[g] = {s.gpus[g]->ssel + static_cast<size_t>(t0) * gpu::kMaxSelection, gpu::kMaxSelection,
-                      std::vector<int>(from, from + m)};
-          shared[g] = &saved[g];
-        }
-        auto sel = s.attend(L, m, s.length + t0, rows_at(t0), shared);
-        if (!sel) return R::err(where + sel.error());
-        s.fetch_pump(false);  // a read-ahead keeps the drive busy through the attention
-        if (full)
-          for (size_t g = 0; g < 2; g++) {
-            const gpu::Selections& made = sel.value()[g];
-            if (made.stride != gpu::kMaxSelection) return R::err(where + "unexpected Selection stride");
-            Gpu& G = *s.gpus[g];
-            ck(cudaSetDevice(G.device), "cudaSetDevice");
-            ck(cudaMemcpyAsync(G.ssel + static_cast<size_t>(t0) * gpu::kMaxSelection, made.rows,
-                               static_cast<size_t>(m) * gpu::kMaxSelection * sizeof(int32_t), cudaMemcpyDeviceToDevice,
-                               G.stream),
-               "save Selections");
-            lengths[g].insert(lengths[g].end(), made.lengths.begin(), made.lengths.end());
-          }
-      }
-      if (s.gpus[0]->dense[static_cast<size_t>(L)])
-        for (int t0 = 0; t0 < n; t0 += wave) s.dense(L, std::min(wave, n - t0), rows_at(t0));
-      else
-        s.sweep_moe(L, n);
-    }
-    if (capture) {
-      auto& row = (*capture)[static_cast<size_t>(d.layers)];
-      row.resize(N);
-      ck(cudaSetDevice(s.gpus[0]->device), "cudaSetDevice");
-      ck(cudaMemcpyAsync(row.data(), s.gpus[0]->sx, N * sizeof(float), cudaMemcpyDeviceToHost, s.gpus[0]->stream),
-         "capture");
-    }
-    // The head: the last Round's (its last token's logits), or every Round's.
-    Gpu& G0 = *s.gpus[0];
-    ck(cudaSetDevice(G0.device), "cudaSetDevice");
-    const size_t V = static_cast<size_t>(d.vocab);
+    if (capture) capture->assign(static_cast<size_t>(d.layers) + 1, std::vector<float>(N));
     if (all_logits) all_logits->assign(static_cast<size_t>(n) * V, 0.0f);
     std::vector<float> last(V);
-    for (int r = all_logits ? 0 : rounds - 1; r < rounds; r++) {
-      G0.head->logits(G0.sx + static_cast<size_t>(r) * kMaxRound * kDim, round_n(r), G0.logits, G0.stream);
+    Gpu& G0 = *s.gpus[0];
+    for (const g53::Cohort& c : g53::cohorts(n, s.cohort)) {
+      s.sweep(tokens.subspan(static_cast<size_t>(c.first), static_cast<size_t>(c.count)), s.length + c.first,
+              static_cast<size_t>(c.first), capture);
+      // The head, before the next Cohort's sweep overwrites the rows: every Round's logits, or (the
+      // prompt's last Cohort) the last Round's, for its last token's.
+      const bool final = c.first + c.count == n;
+      const int cohort_rounds = (c.count + kMaxRound - 1) / kMaxRound;
+      auto round_n = [&](int r) { return std::min(kMaxRound, c.count - r * kMaxRound); };
+      int from = cohort_rounds;  // a Cohort before the last: no logits wanted
       if (all_logits)
-        ck(cudaMemcpyAsync(all_logits->data() + static_cast<size_t>(r) * kMaxRound * V, G0.logits,
-                           static_cast<size_t>(round_n(r)) * V * sizeof(float), cudaMemcpyDeviceToHost, G0.stream),
-           "logits");
-      if (r == rounds - 1)
-        ck(cudaMemcpyAsync(last.data(), G0.logits + static_cast<size_t>(round_n(r) - 1) * V, V * sizeof(float),
-                           cudaMemcpyDeviceToHost, G0.stream),
-           "logits");
+        from = 0;
+      else if (final)
+        from = cohort_rounds - 1;
+      ck(cudaSetDevice(G0.device), "cudaSetDevice");
+      for (int r = from; r < cohort_rounds; r++) {
+        G0.head->logits(G0.sx + static_cast<size_t>(r) * kMaxRound * kDim, round_n(r), G0.logits, G0.stream);
+        if (all_logits)
+          ck(cudaMemcpyAsync(all_logits->data() + (static_cast<size_t>(c.first) + static_cast<size_t>(r) * kMaxRound) * V,
+                             G0.logits, static_cast<size_t>(round_n(r)) * V * sizeof(float), cudaMemcpyDeviceToHost,
+                             G0.stream),
+             "logits");
+        if (final && r == cohort_rounds - 1)
+          ck(cudaMemcpyAsync(last.data(), G0.logits + static_cast<size_t>(round_n(r) - 1) * V, V * sizeof(float),
+                             cudaMemcpyDeviceToHost, G0.stream),
+             "logits");
+      }
     }
     for (auto& G : s.gpus) {
       ck(cudaSetDevice(G->device), "cudaSetDevice");

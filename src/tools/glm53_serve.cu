@@ -5,11 +5,14 @@
 //
 //   ds4n-glm53-serve --serve --config CONFIG --backbone DIR --store FILE[,FILE...] [--max-context N]
 //                    [--lambda λ] [--slots-per-layer S] [--ram-per-layer R|auto] [--ram-reserve-gib G]
-//                    [--checkpoint-gb G] [--stops ID,ID,...] [--wave W] [--devices A,B] [--threads T]
+//                    [--checkpoint-gb G] [--stops ID,ID,...] [--wave W] [--cohort K] [--devices A,B]
+//                    [--threads T]
 //
 // --max-context N (default 16384): positions every layer's cache holds, the context Maya reports (its
-// dashboard restarts the engine with another). Each 1K positions take ~0.2 GB of VRAM per GPU (the
-// caches and a prompt sweep's rows): ~0.26 Expert Slots per layer.
+// dashboard restarts the engine with another). Each 1K positions take ~0.1 GB of VRAM per GPU (the
+// caches, 95.2 KB a position): ~0.13 Expert Slots per layer.
+// --cohort K (default 16384, rounded down to whole waves): a longer prompt is read as a sweep per K tokens; the
+// sweep's buffers take ~101 KB a token of min(K, N) on each GPU (16K: ~1.7 GB, ~2.2 Slots per layer).
 // --lambda λ (default 0): cache-conditional routing for the reply's tokens; prompts route exactly.
 // --checkpoint-gb G (default 4): host memory for conversations set aside (engine/glm53/conversation),
 // 95.2 KB a token (Decoder::position_bytes; 4 GB hold ~42K tokens); with --ram-per-layer auto the RAM
@@ -154,6 +157,7 @@ int main(int argc, char** argv) {
     else if (a == "--checkpoint-gb") checkpoint_gb = std::stod(v);
     else if (a == "--stops") stops = v;
     else if (a == "--wave") dc.wave = std::stoi(v);
+    else if (a == "--cohort") dc.cohort = std::stoi(v);
     else if (a == "--threads") dc.threads = static_cast<unsigned>(std::stoul(v));
     else if (a == "--devices") {
       if (std::sscanf(v.c_str(), "%d,%d", &dc.devices[0], &dc.devices[1]) != 2) die("--devices A,B");
@@ -166,7 +170,8 @@ int main(int argc, char** argv) {
   }
   if (!serve || config_path.empty() || backbone.empty() || stores.empty())
     die("usage: ds4n-glm53-serve --serve --config CONFIG --backbone DIR --store FILE[,FILE...] [--max-context N] [--lambda λ] "
-        "[--slots-per-layer S] [--ram-per-layer R|auto] [--ram-reserve-gib G] [--checkpoint-gb G] [--stops ID,...]");
+        "[--slots-per-layer S] [--ram-per-layer R|auto] [--ram-reserve-gib G] [--checkpoint-gb G] [--stops ID,...] "
+        "[--wave W] [--cohort K] [--devices A,B] [--threads T]");
   if (!(checkpoint_gb >= 0.0)) die("--checkpoint-gb must be >= 0");
   const auto checkpoint_bytes = static_cast<uint64_t>(checkpoint_gb * 1e9);
   // The RAM tier is pinned at open, sized to the memory available then: the checkpoints' budget stays free beside the reserve.

@@ -243,6 +243,14 @@ An independent audit (python, read-only, against the index) found:
      `run-glm53-native.sh --install` (builds, runs the core tests, writes and checks the tokenizer).
    - **Gates:** `ds4n-glm53-serve-check` (save/restore bit-exact, the server's conversations);
      dotfiles `tests/glm53-native-contract.sh` and `tests/switch-primary-unit.sh`.
+   - **Cohorts, 2026-11-22** (branch `glm53/chunked-sweeps`, worktree `~/dev/ds4-native-glm53-chunked`;
+     not merged, not served): a position of capacity cost 196.4 KB per GPU, of which 101 KB was the
+     prompt sweep's buffers. A prompt is now read as one sweep per Cohort (`core/glm53/cohort`,
+     `DecoderConfig::cohort`, `--cohort`, default 16K rounded down to whole waves), with the buffers
+     sized for one Cohort. Predicted: ~89 Slots at 64K instead of 83, and ~268K context at the 64-Slot
+     floor. The unit tests and a mutation probe (6/6) pass. **The GPU gates are still owed** (report
+     `docs/bench/glm53-capacity/2026-11-22-capacity.md`, "Gates still owed"), and `DS4N_COMMIT` moves
+     only after them.
    - **Next, in order:**
      1. A GLM Ledger (plan Phase 4: Slots are sized from free VRAM today).
      2. Phase 5: CyberGym subset + harm rubric against the Flash primaries; λ above 0.03 only

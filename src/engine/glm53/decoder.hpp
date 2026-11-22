@@ -39,6 +39,13 @@
 // Sparse layer's non-resident Experts are read ahead into the scratch (a long
 // prompt needs nearly all of them; a guess that is not routed is dropped).
 //
+// A prompt longer than a Cohort (DecoderConfig::cohort) is read as one sweep per
+// Cohort, in order (core/glm53/cohort): a sweep's buffers are sized for a Cohort,
+// not for the capacity, so context costs only its caches. Each Cohort starts at a
+// multiple of the wave, so its waves and Rounds are the whole-prompt sweep's and
+// so are the bits; it attends the earlier Cohorts' cache rows as a wave attends
+// the earlier waves'.
+//
 // The store may have replicas, one per drive: each Half is read from the one
 // with fewest reads in flight, so the drives' bandwidth adds up.
 //
@@ -91,6 +98,11 @@ struct DecoderConfig {
   // (cuda::glm53::kMaxWave). Each GPU's layer scratch is sized for it (512: ~0.4 GB); 8 runs a sweep
   // Round by Round.
   int wave = 512;
+  // Tokens one prompt sweep takes at most (a Cohort, core/glm53/cohort; rounded down to whole waves); a
+  // longer prompt is read as several sweeps, to the same bits. Each GPU's sweep buffers are sized for
+  // min(cohort, capacity) tokens, ~101 KB a token (16K: ~1.7 GB), instead of for the capacity; a Cohort
+  // past the first gathers each layer's Experts again.
+  int cohort = 16384;
 };
 
 struct DecoderStats {
@@ -145,7 +157,7 @@ class Decoder {
                                                 std::vector<std::vector<float>>* capture = nullptr);
 
   /**
-   * Run a prompt of any length (up to the free capacity) as a sweep and append it to the cache. A sweep
+   * Run a prompt of any length (up to the free capacity) as a sweep per Cohort and append it to the cache. A sweep
    * routes exactly, also under route_bonus: λ then applies from the next round() on, against the residency
    * the sweep left (the Rounds of 8 it recorded, as round() would). Returns the last token's logits
    * [vocab]; with `all_logits`, every token's too, [n][vocab]. `capture` is as round()'s, for all n.

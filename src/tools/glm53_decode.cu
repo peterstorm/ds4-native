@@ -5,8 +5,8 @@
 //   ds4n-glm53-decode --config CONFIG --backbone DIR --store FILE[,FILE...] --prompt "ID ID ..."
 //                     [--generate N] [--round R] [--lambda λ] [--slots-per-layer S]
 //                     [--ram-per-layer R|auto] [--ram-reserve-gib G] [--read-ahead SHARE]
-//                     [--prefill sweep|rounds] [--wave W] [--capacity C] [--devices A,B] [--threads T]
-//                     [--then "ID ID ..."] [--logits-hash] [--check]
+//                     [--prefill sweep|rounds] [--wave W] [--cohort K] [--capacity C] [--devices A,B]
+//                     [--threads T] [--then "ID ID ..."] [--logits-hash] [--check]
 // --store takes replicas of one store, one per drive (the decoder spreads its reads over them).
 // --ram-per-layer auto sizes the RAM tier to the host's available memory less --ram-reserve-gib (10).
 // --then "ID ID ..." sweeps a second prompt after the generated tokens, as a next turn would arrive:
@@ -14,8 +14,10 @@
 // The prompt runs as a sweep (Decoder::prefill: routed exactly, also under λ, which then applies to the
 // generated tokens), or in Rounds of --round (--prefill rounds; under λ Rounds of 1, every token λ-routed).
 // A sweep's attention and Dense MLPs take --wave tokens at once (8 .. 512, a multiple of 8; default 512).
-// --logits-hash prints an FNV-1a hash of every prompt token's logits: equal hashes across --prefill and
-// --wave settings show a prompt too long for --check ran to the same bits every way.
+// A prompt longer than --cohort tokens (default 16384, rounded down to whole waves) is read as a sweep per
+// Cohort: --check with a small --cohort (one wave, say) puts a short prompt across several Cohorts.
+// --logits-hash prints an FNV-1a hash of every prompt token's logits: equal hashes across --prefill,
+// --wave and --cohort settings show a prompt too long for --check ran to the same bits every way.
 //
 // --check captures the residual stream entering every layer for every token,
 // then replays each layer on the CPU in the Reference configuration from the
@@ -92,7 +94,7 @@ Args parse(int argc, char** argv) {
   const std::string usage =
       "usage: --config CONFIG --backbone DIR --store FILE[,FILE...] --prompt \"ID ID ...\" [--generate N] [--round R] "
       "[--prefill sweep|rounds] [--lambda λ] [--slots-per-layer S] [--ram-per-layer R|auto] [--ram-reserve-gib G] "
-      "[--read-ahead SHARE] [--wave W] [--capacity C] [--devices A,B] [--threads T] [--then \"ID ID ...\"] "
+      "[--read-ahead SHARE] [--wave W] [--cohort K] [--capacity C] [--devices A,B] [--threads T] [--then \"ID ID ...\"] "
       "[--logits-hash] [--check]";
   std::optional<uint64_t> reserve_gib;
   Args a;
@@ -124,6 +126,7 @@ Args parse(int argc, char** argv) {
     } else if (k == "--ram-reserve-gib") reserve_gib = std::stoull(v);
     else if (k == "--read-ahead") a.decoder.read_ahead_share = std::stof(v);
     else if (k == "--wave") a.decoder.wave = std::stoi(v);
+    else if (k == "--cohort") a.decoder.cohort = std::stoi(v);
     else if (k == "--capacity") a.decoder.capacity = std::stoi(v);
     else if (k == "--threads") a.decoder.threads = static_cast<unsigned>(std::stoul(v));
     else if (k == "--devices") {
@@ -361,7 +364,9 @@ int main(int argc, char** argv) {
     }
     generate_s = seconds_since(t0);
     const auto st = dec.stats();
-    const std::string how = args.prefill == "sweep" ? "sweep, wave " + std::to_string(args.decoder.wave) : "rounds";
+    const std::string how = args.prefill == "sweep" ? "sweep, wave " + std::to_string(args.decoder.wave) + ", cohort " +
+                                                          std::to_string(args.decoder.cohort)
+                                                    : "rounds";
     print_prefill("prompt (" + how + ")", args.prompt.size(), prompt_s, {}, after_prompt);
     if (digest)
       std::printf("logits hash: %016llx over %zu prompt tokens\n", static_cast<unsigned long long>(*digest),

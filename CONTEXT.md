@@ -94,7 +94,7 @@ The rows a verify Round takes: the Anchor and that many minus one drafted tokens
 The time of a Step with zero Misses.
 
 **Cohort**:
-A group of prefill rows whose routed Experts are loaded once per layer and shared: a prompt sweep's chunk (up to 64K tokens; a longer prompt is read as several).
+A group of prefill rows whose routed Experts are loaded once per layer and shared: a prompt sweep's chunk (up to 64K tokens; a longer prompt is read as several). GLM-5.3's is `DecoderConfig::cohort` (default 16K, a multiple of the Wave, `core/glm53/cohort`): every Cohort starts at a multiple of the Wave, so its Waves and Rounds are the whole prompt's and so are the bits, and a sweep's buffers are sized for one Cohort, not for the capacity.
 
 **Prompt sweep**:
 A Cohort's pass through the model layer by layer: every row through layer L before any goes on, so each layer's Experts are read once per Cohort (`Decoder::prefill`).

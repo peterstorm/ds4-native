@@ -33,6 +33,7 @@ add_library(ds4n_core STATIC
   src/core/glm53/layer_expert_cache.cpp
   src/core/glm53/victim_tier.cpp
   src/core/glm53/sessions.cpp
+  src/core/glm53/cohort.cpp
   src/core/meminfo.cpp
   src/core/glm53/pruning.cpp
   src/core/indexer.cpp
@@ -206,6 +207,7 @@ add_executable(ds4n_tests
   tests/core/glm53/test_layer_expert_cache.cpp
   tests/core/glm53/test_victim_tier.cpp
   tests/core/glm53/test_sessions.cpp
+  tests/core/glm53/test_cohort.cpp
   tests/core/test_meminfo.cpp
   tests/core/glm53/test_pruning.cpp
   tests/core/test_indexer.cpp
