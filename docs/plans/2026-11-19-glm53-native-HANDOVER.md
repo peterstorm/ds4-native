@@ -280,15 +280,61 @@ An independent audit (python, read-only, against the index) found:
        - warm start: helps the first ~100 tokens only.
      - Under λ the policy decides what is routed: counter55 needs its KL re-measured before it
        serves. The per-layer weights need the Ledger (now built) to give layers unequal Slots.
+   - **counter55 ported, and the owed GPU gates, 2026-11-22** (branch `glm53/counter-eviction` on
+     `02f37f6`, worktree `~/dev/ds4-native-glm53-counter`; report
+     `docs/bench/glm53-counter/2026-11-22-counter-report.md`, with every receipt beside it):
+     - **The port.**
+       - `core/glm53/layer_expert_cache` takes an Eviction policy (`Lru` | `CounterDecay`), set by
+         `DecoderConfig::eviction` and `--eviction lru|counter:N` on decode, serve and oracle-run.
+       - A Round advances the counter's clock by its tokens, in the decoder and in `--check`'s replay.
+       - The tests include a model-based agreement with the replay study's simulator; the mutation
+         probe killed 14/14.
+       - `ds4n-glm53-decode --prompt-file` was added: a 40K prompt does not fit in one argument.
+     - **Speed** (64K, RAM tier 38):
+       - λ 0, 88 Slots: counter55 4.70 against LRU's 4.50 tok/s (+4.4%, the same tokens, as the
+         replay predicted). A pure gain.
+       - λ 0.03, 90 Slots, all four corpus prompts: **6.85 → 7.54 tok/s (+10.1%)**, faster on every
+         prompt.
+       - A first single-prompt λ run said −11%. The same prompt at 90 Slots said +14.6%: free
+         generation under λ is chaotic, so pool prompts.
+     - **KL at λ 0.03** (oracle, teacher-forced corpus, 84 Slots):
+       - counter55 0.0720 against LRU's 0.0684;
+       - misses 14.16% against 15.02%.
+       - That is about LRU at λ ≈ 0.033: under λ, counter55 moves along the quality/speed frontier
+         rather than beating it.
+     - **Decision:** the code default stays LRU and production does not change. Serving counter55 under
+       λ is the owner's call.
+     - **Cohort gate 1 passes:** the hash `bec364f75ef70233` is equal across Cohorts 512/1024/16K and
+       `--prefill rounds`.
+     - **Cohort gate 2:** the 1,100-token replays were stopped (~19 h, exact CPU attention is
+       quadratic). It is now short checks: 192 tokens across 3 Cohorts plus 64 tokens under λ, both
+       policies. Results are in the report.
+     - **Ledger gate: drift check passed, Slots one short** (98/88/82). The reserve had been calibrated
+       on nvidia-smi's card size, but open uses CUDA's, 101,973,491,712 B (`glm53::kRtxPro6000Bytes`).
+       - Recalibrated, the reserve was 4 GiB, and the GPUs opened exactly the Ledger's 99 / **90** at
+         64K / 83.
+       - CUDA's total then moved: GPU 0's driver reservation grew 3 MiB, and 64K had 5.7 MiB to spare.
+         The Ledger now plans each card in whole 256 MiB (`glm53::planned_card_bytes`, `SlotPlan::card`)
+         with a **3.75 GiB** reserve (interval [3.390, 4.057] GiB). The same 99 / 90 / 83 were
+         confirmed on the GPUs, and a driver's MiB cannot move a Slot.
+       - The peak while serving at 90 Slots (a 39.2K prompt + λ decode) was 94,070 MiB on GPU 0, which
+         leaves 3.1 GiB never touched: room for ~3 more Slots per layer, pending a serving-path peak.
+     - **Cohort size:** a 39.2K cold prompt takes 90 s at 16K Cohorts and 66 s as one Cohort, but one
+       Cohort costs 6 Slots per layer. 16K stays the default.
    - **Next, in order:**
-     1. One GPU window for the owed gates of Cohorts and the Ledger, together; then move
-        `DS4N_COMMIT`.
+     1. Move `DS4N_COMMIT` to `glm53/counter-eviction`'s head once the short checks pass (Cohorts,
+        the Ledger on the planned card, LRU default: 90 Slots at 64K instead of 83). This is the
+        owner's call.
      2. Phase 5: CyberGym subset + harm rubric against the Flash primaries; λ above 0.03 only
         after those task benchmarks.
-     3. The replay study's policy (counter55, KL re-measured under λ 0.03) and per-layer Slot
-        weights through the Ledger.
-     4. The second NVMe (`M.2_3`/`M.2_4`). MTP is deprioritized by the replay study.
-     5. Merge `glm53/engine-core` into main once Phase 5 decides keep (DS4.1's sources are
+     3. Per-layer Slot weights through the Ledger (the replay study's +3–4%, at λ 0). Judge a policy
+        under λ by teacher-forced KL and misses plus a multi-prompt speed run, never by one prompt's
+        free generation. A KL-matched run (LRU at λ 0.033 vs counter55 at 0.03) decides whether
+        counter55 beats the frontier.
+     4. The reserve below 4 GiB, from a peak measured on the serving path at its longest prompts
+        (each 0.70 GiB is a Slot per layer).
+     5. The second NVMe (`M.2_3`/`M.2_4`). MTP is deprioritized by the replay study.
+     6. Merge `glm53/engine-core` into main once Phase 5 decides keep (DS4.1's sources are
         untouched on the branch).
 
 ## Environment facts (the things that cost time to rediscover)
@@ -326,6 +372,14 @@ An independent audit (python, read-only, against the index) found:
   check slows the 30-thread KL runs only a little. List containers and kill only your own:
   never a blanket `docker kill` over the dev image (other sessions share it).
 - ssh desktop: `scp` is broken (sftp channel) — pipe files: `ssh desktop 'cat > path' < local`.
+- **Two card sizes:** nvidia-smi's `memory.total` (97,887 MiB on an RTX PRO 6000) counts the driver's
+  own reservation; `cudaMemGetInfo`'s total (97,249.5 MiB) is what can be allocated. That reservation
+  also moves by a few MiB (GPU 0: 638 → 641 MiB in one day), so the Ledger plans the CUDA total
+  rounded down to whole 256 MiB. Calibrate anything VRAM-sized on that planned size.
+- **`--check` replays are quadratic in tokens** (exact CPU attention over every earlier position):
+  27 tokens ~44 s a layer, 1,116 tokens ~860 s a layer (~19 h). Keep checked prompts to a few hundred
+  tokens and cross Cohorts with a small `--wave`/`--cohort`. A replaying process keeps its CUDA
+  context (~560 MiB per GPU) and several GB of RAM until it exits.
 - **A `tar` sync restores source mtimes**, so after a mutation probe in the synced tree ninja keeps
   the last mutant's object (its object is newer than the restored source). Rebuild once after
   restoring, or `touch` the mutated file before the next build.
@@ -349,6 +403,7 @@ An independent audit (python, read-only, against the index) found:
 | GLM-5.3 served: report (design, gates, measurements, the Sessions bug) | `ds4-native/docs/bench/glm53-serve/2026-11-21-serve.md` |
 | GLM-5.3 VRAM: a position's cost and Cohorts; the GLM Ledger | `ds4-native/docs/bench/glm53-capacity/2026-11-22-{capacity,ledger}.md` |
 | GLM-5.3 cache policies replayed (counter55, per-layer Slots, MTP) | `ds4-native/docs/bench/glm53-replay/2026-11-22-replay-report.md` (branch `glm53/replay-study`) |
+| counter55 on the GPUs (λ 0 +4.4%; λ 0.03 +10% at KL 0.072 vs 0.068), the Cohort and Ledger GPU gates, the reserve recalibrated | `ds4-native/docs/bench/glm53-counter/2026-11-22-counter-report.md` (branch `glm53/counter-eviction`) |
 | GLM-5.3 ops runbook (primary `glm-native`) | `.dotfiles/scripts/inference/runbooks/glm53-native-runbook-2026-11-21.md` |
 | Hyperflare/GLM-Flash-uncensored story | `.dotfiles/scripts/inference/runbooks/glm53-flash-hyperflare-tp2-v16-runbook-2026-11-13.md` |
 

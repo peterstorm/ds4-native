@@ -6,6 +6,7 @@
 // by the head and the logits, and the Slots never grow with the capacity.
 #include <doctest/doctest.h>
 
+#include <array>
 #include <fstream>
 #include <random>
 #include <sstream>
@@ -49,7 +50,7 @@ std::array<Claims, 2> claims(int capacity, int cohort, int wave = 512) {
 }
 
 constexpr uint64_t kGiB = 1ull << 30;
-constexpr uint64_t kCard = kRtxPro6000Bytes;  // an RTX PRO 6000's VRAM, as CUDA reports it
+constexpr uint64_t kCard = kRtxPro6000Bytes;  // an RTX PRO 6000's VRAM, as CUDA reports it (idle)
 
 }  // namespace
 
@@ -102,10 +103,13 @@ TEST_CASE("Ledger: the Slots are the cards' bytes past the claims and the reserv
     return plan_vram(released(), kShapes, settings(capacity, 16384), {kCard, kCard}, 4 * kGiB, asked);
   };
   const auto p = plan(65536).value();
-  // By hand: the larger GPU's claims (GPU 0's), the reserve, 75 Sparse layers of a Half each.
-  const uint64_t row = 75 * kHalfPayloadBytes;
-  CHECK(static_cast<uint64_t>(p.per_layer) == (kCard - 4 * kGiB - p.claims[0].total()) / row);
-  CHECK(p.unused[0] == kCard - 4 * kGiB - p.claims[0].total() - p.per_layer * row);
+  // By hand: the card in whole 256 MiB, the larger GPU's claims (GPU 0's), the reserve, 75 Sparse layers
+  // of a Half each.
+  const uint64_t row = 75 * kHalfPayloadBytes, card = 379 * (256ull << 20);  // 97,024 MiB
+  CHECK(p.card[0] == card);
+  CHECK(p.card[1] == card);
+  CHECK(static_cast<uint64_t>(p.per_layer) == (card - 4 * kGiB - p.claims[0].total()) / row);
+  CHECK(p.unused[0] == card - 4 * kGiB - p.claims[0].total() - p.per_layer * row);
   CHECK(p.unused[1] > p.unused[0]);
   int last = 256;
   for (int capacity = 4096; capacity <= 400000; capacity += 12288) {
@@ -132,27 +136,55 @@ TEST_CASE("Ledger: the default reserve gives the Slots free-memory sizing gave, 
   CHECK(at(4096, kDefaultRuntimeReserve) == 99);
   CHECK(at(65536, kDefaultRuntimeReserve) == 83);
   // Each end of the interval that reproduces both: below it a Slot more at 4K, above it one fewer at 64K.
-  CHECK(at(4096, 3'876'751'528) == 100);
-  CHECK(at(4096, 3'876'751'529) == 99);
-  CHECK(at(65536, 4'592'988'328) == 83);
-  CHECK(at(65536, 4'592'988'329) == 82);
+  CHECK(at(4096, 3'640'297'640) == 100);
+  CHECK(at(4096, 3'640'297'641) == 99);
+  CHECK(at(65536, 4'356'534'440) == 83);
+  CHECK(at(65536, 4'356'534'441) == 82);
 }
 
-TEST_CASE("Ledger: the first calibration's Slots are what the GPUs opened with, a Slot short everywhere") {
-  // The 2026-11-22 GPU gate (docs/bench/glm53-counter): with 4.75 GiB, taken against nvidia-smi's card
-  // size, Decoder::open opened 98 Slots at 4K, 88 at 64K with 16K Cohorts and 82 with one 64K Cohort:
-  // one fewer than the receipts' 99 and 83, on CUDA's card size. The plan open makes is this one, so the
-  // new default's 99 / 90 / 83 are what the GPUs will open (90: 0.01 GB to spare, by arithmetic alone).
-  const auto at = [](int capacity, int cohort, uint64_t reserve) {
-    return plan_vram(released(), kShapes, settings(capacity, cohort), {kCard, kCard}, reserve, 0).value().per_layer;
+TEST_CASE("Ledger: the Slots the GPUs opened, whatever the driver's reservation takes from the card") {
+  // The 2026-11-22 GPU gate (docs/bench/glm53-counter): 99 Slots at 4K, 90 at 64K with 16K Cohorts, 83
+  // with one 64K Cohort, while GPU 0's CUDA total went from 97,249.5 to 97,246.5 MiB. Planned unrounded,
+  // 64K's 90 had 5.7 MiB to spare; planned in whole quanta, any card in the quantum opens alike, and one
+  // quantum less is a Slot less at 64K.
+  const auto at = [](int capacity, int cohort, uint64_t card) {
+    return plan_vram(released(), kShapes, settings(capacity, cohort), {card, card}, kDefaultRuntimeReserve, 0)
+        .value()
+        .per_layer;
   };
-  constexpr uint64_t kFirst = (19ull << 30) / 4;
-  CHECK(at(4096, 16384, kFirst) == 98);
-  CHECK(at(65536, 16384, kFirst) == 88);
-  CHECK(at(65536, 65536, kFirst) == 82);
-  CHECK(at(4096, 16384, kDefaultRuntimeReserve) == 99);
-  CHECK(at(65536, 16384, kDefaultRuntimeReserve) == 90);
-  CHECK(at(65536, 65536, kDefaultRuntimeReserve) == 83);
+  const uint64_t planned = planned_card_bytes(kCard);
+  for (const uint64_t card : std::array<uint64_t, 4>{kCard, kCard - (3ull << 20), planned, planned + kCardQuantum - 1}) {
+    CAPTURE(card);
+    CHECK(at(4096, 16384, card) == 99);
+    CHECK(at(65536, 16384, card) == 90);
+    CHECK(at(65536, 65536, card) == 83);
+  }
+  CHECK(at(65536, 16384, planned - 1) == 89);
+}
+
+TEST_CASE("Ledger: a card counts in whole quanta, and more of it never plans fewer Slots") {
+  std::mt19937_64 rng(11);
+  const auto plan = [](int capacity, uint64_t card) {
+    return plan_vram(released(), kShapes, settings(capacity, 16384), {card, card}, kDefaultRuntimeReserve, 0);
+  };
+  for (int trial = 0; trial < 200; trial++) {
+    const int capacity = std::uniform_int_distribution<int>(4096, 131072)(rng);
+    const uint64_t card = std::uniform_int_distribution<uint64_t>(90 * kGiB, 128 * kGiB)(rng);
+    const uint64_t same = planned_card_bytes(card) + std::uniform_int_distribution<uint64_t>(0, kCardQuantum - 1)(rng);
+    const uint64_t more = card + std::uniform_int_distribution<uint64_t>(0, 8 * kGiB)(rng);
+    CAPTURE(capacity);
+    CAPTURE(card);
+    const auto a = plan(capacity, card), b = plan(capacity, same), c = plan(capacity, more);
+    REQUIRE(static_cast<bool>(a) == static_cast<bool>(b));
+    if (!a) continue;
+    CHECK(a.value().per_layer == b.value().per_layer);
+    CHECK(a.value().unused == b.value().unused);
+    CHECK(a.value().card == b.value().card);
+    CHECK(a.value().card[0] <= card);
+    CHECK(card - a.value().card[0] < kCardQuantum);
+    REQUIRE(c);
+    CHECK(c.value().per_layer >= a.value().per_layer);
+  }
 }
 
 TEST_CASE("Ledger: refusals — no capacity, a context that leaves too few Slots, a reserve past the card") {

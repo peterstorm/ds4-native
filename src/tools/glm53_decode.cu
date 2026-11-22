@@ -331,8 +331,9 @@ int main(int argc, char** argv) {
     for (size_t g = 0; g < 2; g++) {  // the Ledger's account (core/glm53/ledger), and what the reserve left free
       const eng::VramReport& v = dec.vram();
       const uint64_t claims = v.plan.claims[g].total();
-      const uint64_t slots = v.total[g] - claims - args.decoder.runtime_reserve_bytes - v.plan.unused[g];
-      std::printf("vram GPU %zu: card %.2f GB, claims %.2f GB (", g, v.total[g] / 1e9, claims / 1e9);
+      const uint64_t slots = v.plan.card[g] - claims - args.decoder.runtime_reserve_bytes - v.plan.unused[g];
+      std::printf("vram GPU %zu: card %.2f GB (planned %.2f), claims %.2f GB (", g, v.total[g] / 1e9,
+                  v.plan.card[g] / 1e9, claims / 1e9);
       for (glm53::Claim k : glm53::kClaims)
         std::printf("%s%s %.3f", k == glm53::Claim::Exchange ? "" : ", ", std::string(glm53::name(k)).c_str(),
                     v.plan.claims[g][k] / 1e9);

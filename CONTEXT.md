@@ -69,7 +69,7 @@ The sequence of every layer step's needed Experts and Near-misses as the Expert 
 Byte arithmetic that fixes Slot counts per GPU and phase from mandatory state, never from free-memory readings. GLM-5.3's is `core/glm53/ledger` (its **Claims**, then DS4.1's `ledger::plan_slots`).
 
 **Runtime reserve**:
-VRAM per GPU the Ledger leaves outside every claim: the CUDA context, kernel images, allocator rounding and headroom. A setting (`DecoderConfig::runtime_reserve_bytes`), never a reading; free memory after open shows what it really held.
+VRAM per GPU the Ledger leaves outside every claim: the CUDA context, kernel images, allocator rounding and headroom. A setting (`DecoderConfig::runtime_reserve_bytes`), never a reading; free memory after open shows what it really held. The GLM Ledger takes it from the card's *planned* size: CUDA's total (not nvidia-smi's, which counts the driver's reservation) rounded down to whole 256 MiB (`glm53::planned_card_bytes`), so the MiB a driver's reservation moves by never move a Slot.
 
 ### Execution
 

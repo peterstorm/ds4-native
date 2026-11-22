@@ -173,9 +173,11 @@ Result<SlotPlan, LedgerError> plan_vram(const Config& config, const EngineShapes
                    "] (a Round's Experts must fit), not " + std::to_string(asked)});
   // DS4.1's arithmetic: a "Slot" there is one per Sparse layer here, a Half each, on both GPUs.
   std::array<ledger::GpuClaims, 2> gpus{};
+  std::array<uint64_t, 2> card{};
   for (size_t g = 0; g < 2; g++) {
     const Claims& c = claims.value()[g];
-    gpus[g] = {.vram_total = vram_total[g],
+    card[g] = planned_card_bytes(vram_total[g]);
+    gpus[g] = {.vram_total = card[g],
                .runtime_reserve = runtime_reserve,
                .backbone = c[Claim::Backbone],
                .draft = 0,
@@ -191,7 +193,7 @@ Result<SlotPlan, LedgerError> plan_vram(const Config& config, const EngineShapes
   // An asked count below the fit leaves the difference unused.
   const int per_layer = asked != 0 ? asked : static_cast<int>(fit.value().slots);
   const uint64_t spare = (fit.value().slots - static_cast<uint32_t>(per_layer)) * bounds.slot_bytes;
-  return R::ok(SlotPlan{per_layer, claims.value(), {fit.value().unused[0] + spare, fit.value().unused[1] + spare}});
+  return R::ok(SlotPlan{per_layer, claims.value(), {fit.value().unused[0] + spare, fit.value().unused[1] + spare}, card});
 }
 
 }  // namespace ds4n::glm53

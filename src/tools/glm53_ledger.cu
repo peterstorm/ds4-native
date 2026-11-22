@@ -7,7 +7,8 @@
 //                     [--reserve-gib G] [--slots-per-layer S] [--claims]
 //
 // --vram-mib is each card's size as CUDA reports it (cudaMemGetInfo's total; default an RTX PRO 6000's,
-// 97,249.5 MiB: nvidia-smi's 97,887 also counts the driver's own reservation, and over-counts a Slot);
+// 97,249.5 MiB: nvidia-smi's 97,887 also counts the driver's own reservation, and over-counts a Slot),
+// planned in whole 256 MiB as Decoder::open plans it (glm53::planned_card_bytes);
 // --reserve-gib (default DecoderConfig's runtime_reserve_bytes) what stays outside the claims;
 // --claims prints each GPU's claims by kind. A capacity whose Slots do not fit prints why.
 #include <cstdint>
@@ -79,8 +80,8 @@ int main(int argc, char** argv) {
   if (!size) die(size.error().what);
   const auto reserve = static_cast<uint64_t>(reserve_gib * static_cast<double>(1ull << 30));
 
-  std::printf("cards %.2f GB, runtime reserve %.2f GB, wave %d, Cohort %d, a Cache position %llu B per GPU\n", gb(vram),
-              gb(reserve), wave, size.value().tokens(),
+  std::printf("cards %.2f GB (planned %.2f GB), runtime reserve %.2f GB, wave %d, Cohort %d, a Cache position %llu B per GPU\n",
+              gb(vram), gb(g53::planned_card_bytes(vram)), gb(reserve), wave, size.value().tokens(),
               static_cast<unsigned long long>(g53::position_bytes(config.value())));
   std::printf("%10s %12s %12s %12s\n", "capacity", "Slots/layer", "claims GB", "unused GB");
   for (const int capacity : capacities) {

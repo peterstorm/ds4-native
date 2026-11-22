@@ -3,8 +3,10 @@
 // from the model's widths and the engine's settings, and the Expert Slots that
 // fit beside them -- byte arithmetic over mandatory state, never a free-memory
 // reading (DS4.1's ledger::plan_slots does the last step). The same settings on
-// the same cards always give the same Slots, which matters beyond speed: under
-// cache-conditional routing the Slots decide what is resident, so what is routed.
+// the same cards always give the same Slots (a card is planned in whole
+// kCardQuantum, so the MiB its driver's reservation moves by do not count), which
+// matters beyond speed: under cache-conditional routing the Slots decide what is
+// resident, so what is routed.
 //
 // It restates engine/glm53/decoder's and cuda/glm53/attention_layer's
 // allocations, buffer by buffer. Decoder::open counts what it allocates and
@@ -85,33 +87,46 @@ Result<std::array<Claims, 2>, LedgerError> vram_claims(const Config& config, con
 uint64_t position_bytes(const Config& config);
 
 /**
- * An RTX PRO 6000's VRAM as CUDA sees it: cudaMemGetInfo's total, what Decoder::open plans against.
- * 637.5 MiB below the 97,887 MiB nvidia-smi reports, which counts the driver's own reservation too
- * (measured 2026-11-22, docs/bench/glm53-counter/2026-11-22-counter-report.md).
+ * An RTX PRO 6000's VRAM as CUDA sees it: cudaMemGetInfo's total on an idle card, what Decoder::open
+ * reads (measured 2026-11-22, docs/bench/glm53-counter/2026-11-22-counter-report.md). 637.5 MiB below
+ * the 97,887 MiB nvidia-smi reports, which counts the driver's own reservation too, and that reservation
+ * moves: GPU 0 read 3 MiB less later the same day. The Ledger plans it at planned_card_bytes, 97,024 MiB.
  */
 inline constexpr uint64_t kRtxPro6000Bytes = 101'973'491'712;
 
 /**
- * The runtime reserve the engine keeps by default: 4 GiB, a reserve that reproduces the Slots
+ * The granularity the Ledger plans a card in. A card's total moves by the MiB the driver reserves, and
+ * a plan with less spare than that would open a Slot fewer on one boot than on the next (64K positions
+ * with 16K Cohorts had 5.7 MiB): planned in whole quanta, the same settings give the same Slots unless
+ * the card loses a whole quantum.
+ */
+inline constexpr uint64_t kCardQuantum = 256ull << 20;
+
+/** The bytes the Ledger plans a card of `total` bytes at: `total` rounded down to whole kCardQuantum. */
+constexpr uint64_t planned_card_bytes(uint64_t total) { return total / kCardQuantum * kCardQuantum; }
+
+/**
+ * The runtime reserve the engine keeps by default: 3.75 GiB, a reserve that reproduces the Slots
  * free-memory sizing gave on two RTX PRO 6000s before the Ledger (99 per layer at 4K positions, 83 at
  * 64K, a sweep then taking the whole capacity), so adopting the Ledger changed no Slot count. Any reserve
- * in [3.611, 4.278] GiB does, on kRtxPro6000Bytes (docs/bench/glm53-capacity/2026-11-22-ledger.md; the
- * first calibration, 4.75 GiB, took nvidia-smi's size and opened a Slot short on the GPUs, 98 and 82).
- * At 64K a decode's peak left ~3.1 GiB of it unused: each 0.70 GiB less is a Slot per layer more.
+ * in [3.390, 4.057] GiB does, on the planned kRtxPro6000Bytes (docs/bench/glm53-counter/2026-11-22-
+ * counter-report.md, §4). On the card itself it keeps 3.97 GiB, the quantum's remainder with it; a 64K
+ * decode's peak left ~3.1 GiB of that unused: each 0.70 GiB less is a Slot per layer more.
  */
-inline constexpr uint64_t kDefaultRuntimeReserve = 4ull << 30;
+inline constexpr uint64_t kDefaultRuntimeReserve = 15ull << 28;
 
 struct SlotPlan {
   int per_layer;                    // Expert Slots per Sparse layer, on each GPU (one Half each)
   std::array<Claims, 2> claims;     // as vram_claims
-  std::array<uint64_t, 2> unused;   // each GPU's bytes past its claims, the reserve and the Slots
+  std::array<uint64_t, 2> unused;   // each GPU's planned bytes past its claims, the reserve and the Slots
+  std::array<uint64_t, 2> card;     // each GPU's planned bytes: planned_card_bytes of its total
 };
 
 /**
- * Slots per Sparse layer beside `config`'s claims at `s` on GPUs of `vram_total` bytes, each keeping
- * `runtime_reserve` bytes outside the claims (the CUDA context, kernel images, allocator rounding):
- * `asked`, or as many as fit when `asked` is 0, at most the Experts. An error when fewer than a Round's
- * Experts (moe_plan::kMaxJobs) would fit, or when more are asked than fit.
+ * Slots per Sparse layer beside `config`'s claims at `s` on GPUs of `vram_total` bytes (each planned at
+ * planned_card_bytes), each keeping `runtime_reserve` bytes outside the claims (the CUDA context, kernel
+ * images, allocator rounding): `asked`, or as many as fit when `asked` is 0, at most the Experts. An
+ * error when fewer than a Round's Experts (moe_plan::kMaxJobs) would fit, or when more are asked than fit.
  */
 Result<SlotPlan, LedgerError> plan_vram(const Config& config, const EngineShapes& e, const VramSettings& s,
                                         std::array<uint64_t, 2> vram_total, uint64_t runtime_reserve, int asked);
