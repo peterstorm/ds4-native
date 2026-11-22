@@ -89,6 +89,12 @@ void linear_f32(const __nv_bfloat16* w, const float* x, int rows, int k, int tok
   sum_planes_f32(planes, splits, rows, tokens, out, s);
 }
 
+/** The device bytes of every array named. */
+template <class... A>
+uint64_t bytes_of(const A&... a) {
+  return (uint64_t{0} + ... + a.bytes());
+}
+
 constexpr int kVHead = 256;  // v_head_dim
 constexpr int kPerHead = kNope + kVHead;  // kv_b rows per head: W_k, then W_v
 constexpr size_t kRows = kMaxRound;  // a Round's rows: the attention core's, the index scores', the head's
@@ -235,6 +241,25 @@ Result<int, std::string> DeviceAttention::load_cache(const g53::LayerCache& past
 uint64_t DeviceAttention::position_bytes() const {
   return (static_cast<uint64_t>(kKeyWidth) + (index_keys_.get() ? kIndexHeadDim : 0)) * sizeof(__nv_bfloat16);
 }
+
+uint64_t DeviceAttention::weight_bytes() const {
+  return bytes_of(q_a_, q_b_, kv_a_, wk_t_, kv_b_, o_, wq_b_, wk_, weights_proj_, input_norm_, post_norm_, q_a_norm_,
+                  kv_a_norm_, k_norm_w_, k_norm_b_, freqs_);
+}
+
+uint64_t DeviceAttention::cache_bytes() const { return bytes_of(rows_, index_keys_); }
+
+uint64_t LayerScratch::bytes() const {
+  return bytes_of(planes_, pos_, selected_, h_f32_, q_resid_f32_, heads_f32_, head_w_, scores_, m_, l_, o_part_, h_,
+                  q_a_out_, q_resid_, q_, ckv_, queries_, ctx_, heads_, index_q_, head_w_bf16_, mlp_x_, gate_sum_,
+                  up_sum_, hid_, hid_half_, ones_);
+}
+
+uint64_t DeviceDenseMlp::bytes() const { return bytes_of(gate_, up_, down_); }
+
+uint64_t DeviceHead::weight_bytes() const { return bytes_of(head_, norm_); }
+
+uint64_t DeviceHead::scratch_bytes() const { return bytes_of(h_, h_f32_, planes_); }
 
 Result<HostPositions, std::string> DeviceAttention::save_positions(int64_t n, cudaStream_t s) const {
   using R = Result<HostPositions, std::string>;

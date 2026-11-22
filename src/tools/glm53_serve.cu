@@ -10,7 +10,8 @@
 //
 // --max-context N (default 16384): positions every layer's cache holds, the context Maya reports (its
 // dashboard restarts the engine with another). Each 1K positions take ~0.1 GB of VRAM per GPU (the
-// caches, 95.2 KB a position): ~0.13 Expert Slots per layer.
+// caches, 95.2 KB a position): ~0.13 Expert Slots per layer. The Slots are the Ledger's
+// (core/glm53/ledger): `ds4n-glm53-ledger --capacity N` prints them for any N without a GPU.
 // --cohort K (default 16384, rounded down to whole waves): a longer prompt is read as a sweep per K tokens; the
 // sweep's buffers take ~101 KB a token of min(K, N) on each GPU (16K: ~1.7 GB, ~2.2 Slots per layer).
 // --lambda λ (default 0): cache-conditional routing for the reply's tokens; prompts route exactly.
@@ -209,6 +210,9 @@ int main(int argc, char** argv) {
                "checkpoints %.1f GB (%.1f KB a token)\n",
                dec.stats().load_s, dc.capacity, dec.slots_per_layer(), dec.ram_per_layer(), static_cast<double>(dc.route_bonus),
                checkpoint_gb, static_cast<double>(dec.position_bytes()) / 1e3);
+  for (size_t g = 0; g < 2; g++)  // the Ledger's account (core/glm53/ledger): ds4n-glm53-ledger predicts it
+    std::fprintf(stderr, "ds4n-glm53-serve: vram GPU %zu: card %.2f GB, claims %.2f GB, free after open %.2f GB\n", g,
+                 dec.vram().total[g] / 1e9, dec.vram().plan.claims[g].total() / 1e9, dec.vram().free_after_open[g] / 1e9);
 
   Lines in;
   std::mt19937_64 seeds(std::random_device{}());  // a GEN naming no seed samples with a fresh one

@@ -8,6 +8,8 @@
 //                     [--prefill sweep|rounds] [--wave W] [--cohort K] [--capacity C] [--devices A,B]
 //                     [--threads T] [--then "ID ID ..."] [--logits-hash] [--check]
 // --store takes replicas of one store, one per drive (the decoder spreads its reads over them).
+// The Slots are the Ledger's (core/glm53/ledger; ds4n-glm53-ledger prints them without a GPU): the
+// "vram" lines give each GPU's claims, Slots and what stayed free, the runtime reserve's real use.
 // --ram-per-layer auto sizes the RAM tier to the host's available memory less --ram-reserve-gib (10).
 // --then "ID ID ..." sweeps a second prompt after the generated tokens, as a next turn would arrive:
 // prefill against a warm cache (not with --check).
@@ -310,6 +312,17 @@ int main(int argc, char** argv) {
                 "replica(s), capacity %d, λ %g\n",
                 dec.stats().load_s, slots_per_layer, 100.0 * slots_per_layer / d.experts, dec.ram_per_layer(),
                 args.stores.size(), args.decoder.capacity, static_cast<double>(args.decoder.route_bonus));
+    for (size_t g = 0; g < 2; g++) {  // the Ledger's account (core/glm53/ledger), and what the reserve left free
+      const eng::VramReport& v = dec.vram();
+      const uint64_t claims = v.plan.claims[g].total();
+      const uint64_t slots = v.total[g] - claims - args.decoder.runtime_reserve_bytes - v.plan.unused[g];
+      std::printf("vram GPU %zu: card %.2f GB, claims %.2f GB (", g, v.total[g] / 1e9, claims / 1e9);
+      for (glm53::Claim k : glm53::kClaims)
+        std::printf("%s%s %.3f", k == glm53::Claim::Exchange ? "" : ", ", std::string(glm53::name(k)).c_str(),
+                    v.plan.claims[g][k] / 1e9);
+      std::printf("), Slots %.2f GB, reserve %.2f GB, free after open %.2f GB\n", slots / 1e9,
+                  args.decoder.runtime_reserve_bytes / 1e9, v.free_after_open[g] / 1e9);
+    }
     std::optional<uint64_t> digest;  // --logits-hash: every prompt token's logits
     if (args.logits_hash) digest = kFnvBasis;
     auto run = [&](std::span<const int32_t> tokens, bool prompt) {

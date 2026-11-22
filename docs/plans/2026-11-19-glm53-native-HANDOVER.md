@@ -47,7 +47,7 @@ CyberGym verdict decides keep/archive.
 | Fetch tool | `ds4-native` main: `tools/glm53-store/fetch-kitaniai.sh`; deployed desktop-side at `/models/glm53-native/fetch-kitaniai.sh` | download complete 15:26 (`hf exit=0`) |
 | Desktop reclaim (353.3 GB freed) | only export-source `model-*.safetensors` deleted; receipts `/models/glm53-hyperflare/archive-receipt-{fp4-local,uncensored}-shards.json` | done, flare untouched and still serving |
 | Inference reorg (dotfiles) | `.dotfiles` main `a157e3b6` (pushed) | done |
-| **Served (Phase 4, 2026-11-21)** | engine `1849006`/`26ea3db`/`6866989`: `core/glm53/sessions`, `Decoder::save/restore/rewind`, `engine/glm53/conversation`, `ds4n-glm53-serve`, `ds4n-glm53-serve-check`, `tools/glm53-serve/write_tokenizer.py`; `.dotfiles` `1ef77094`/`55d87bf2`: `glm53/glm53-native/run-glm53-native.sh`, primary `glm-native`, Pi catalog, contract, runbook; report `docs/bench/glm53-serve/2026-11-21-serve.md` | **live on desktop `:8000`** (container `glm53-native`, `restart=unless-stopped`). 6.2–7.1 tok/s decode at λ 0.03, 64K; 4.5K-token prompt at 197 tok/s; next turns read 8–12 tokens; displaced conversations resume from Checkpoints. Bit-exact save/restore (0 of ~46.5M logits). Sessions bug found end to end and fixed. Round trip via `switch-primary.sh` 67 s / 91 s. **Open: a GLM Ledger** (Slots sized from free VRAM) |
+| **Served (Phase 4, 2026-11-21)** | engine `1849006`/`26ea3db`/`6866989`: `core/glm53/sessions`, `Decoder::save/restore/rewind`, `engine/glm53/conversation`, `ds4n-glm53-serve`, `ds4n-glm53-serve-check`, `tools/glm53-serve/write_tokenizer.py`; `.dotfiles` `1ef77094`/`55d87bf2`: `glm53/glm53-native/run-glm53-native.sh`, primary `glm-native`, Pi catalog, contract, runbook; report `docs/bench/glm53-serve/2026-11-21-serve.md` | **live on desktop `:8000`** (container `glm53-native`, `restart=unless-stopped`). 6.2–7.1 tok/s decode at λ 0.03, 64K; 4.5K-token prompt at 197 tok/s; next turns read 8–12 tokens; displaced conversations resume from Checkpoints. Bit-exact save/restore (0 of ~46.5M logits). Sessions bug found end to end and fixed. Round trip via `switch-primary.sh` 67 s / 91 s. **GLM Ledger built 2026-11-22** on `glm53/chunked-sweeps` (item 7; not served, GPU gates owed) |
 
 ### State of the pool
 
@@ -251,12 +251,44 @@ An independent audit (python, read-only, against the index) found:
      floor. The unit tests and a mutation probe (6/6) pass. **The GPU gates are still owed** (report
      `docs/bench/glm53-capacity/2026-11-22-capacity.md`, "Gates still owed"), and `DS4N_COMMIT` moves
      only after them.
+   - **The GLM Ledger, 2026-11-22** (same branch; report
+     `docs/bench/glm53-capacity/2026-11-22-ledger.md`):
+     - `core/glm53/ledger` plans every Claim per GPU (Exchange, Backbone, Cache, LayerScratch,
+       Round, Sweep) and the Slots from the cards' *total* VRAM and a runtime reserve, never from
+       free memory.
+     - `Decoder::open` plans before loading (a context that cannot fit fails in seconds), counts
+       its `cudaMalloc` bytes per Claim, and refuses to open on any drift.
+     - The default reserve, 4.75 GiB, reproduces the free-memory receipts (99 Slots at 4K, 83 at
+       64K), so no Slot count changed.
+     - `ds4n-glm53-ledger --capacity N` prints the Slots for any context without a GPU: 89 at 64K,
+       the 64-Slot floor at 268,288.
+     - `DecoderConfig::reserve_bytes` became `runtime_reserve_bytes`. Decode and serve print a
+       `vram GPU g` line with the free memory after open.
+     - 8 Ledger cases pass; the mutation probe killed 12/12. **GPU gates owed** (report, "Gates
+       still owed"): open must pass the drift check, the Slots must match, and each GPU's free
+       memory after open must be recorded.
+   - **The replay study, 2026-11-22** (branch `glm53/replay-study` `e06fb9a`, worktree
+     `~/dev/ds4-native-glm53-replay`; report `docs/bench/glm53-replay/2026-11-22-replay-report.md`
+     on that branch). Recorded routes were replayed offline through the engine's cache model.
+     Gains at λ 0:
+     - A counter policy halved every 55 tokens: +4.8–5.0% tok/s over LRU.
+     - Per-layer fitted Slot weights (floor 64; layers 3–12 take 100–212): +3–4% on top.
+     - Both together: +6–10%. At 89 Slots, LRU 3.35, counter55 3.51, fitted + counter55 3.64 tok/s.
+     - Not worth it:
+       - MTP: best ~+10% before its VRAM cost;
+       - admission on a repeat miss: −0.3 to −0.6%;
+       - warm start: helps the first ~100 tokens only.
+     - Under λ the policy decides what is routed: counter55 needs its KL re-measured before it
+       serves. The per-layer weights need the Ledger (now built) to give layers unequal Slots.
    - **Next, in order:**
-     1. A GLM Ledger (plan Phase 4: Slots are sized from free VRAM today).
+     1. One GPU window for the owed gates of Cohorts and the Ledger, together; then move
+        `DS4N_COMMIT`.
      2. Phase 5: CyberGym subset + harm rubric against the Flash primaries; λ above 0.03 only
         after those task benchmarks.
-     3. The second NVMe (`M.2_3`/`M.2_4`), then MTP.
-     4. Merge `glm53/engine-core` into main once Phase 5 decides keep (DS4.1's sources are
+     3. The replay study's policy (counter55, KL re-measured under λ 0.03) and per-layer Slot
+        weights through the Ledger.
+     4. The second NVMe (`M.2_3`/`M.2_4`). MTP is deprioritized by the replay study.
+     5. Merge `glm53/engine-core` into main once Phase 5 decides keep (DS4.1's sources are
         untouched on the branch).
 
 ## Environment facts (the things that cost time to rediscover)
@@ -294,6 +326,9 @@ An independent audit (python, read-only, against the index) found:
   check slows the 30-thread KL runs only a little. List containers and kill only your own:
   never a blanket `docker kill` over the dev image (other sessions share it).
 - ssh desktop: `scp` is broken (sftp channel) — pipe files: `ssh desktop 'cat > path' < local`.
+- **A `tar` sync restores source mtimes**, so after a mutation probe in the synced tree ninja keeps
+  the last mutant's object (its object is newer than the restored source). Rebuild once after
+  restoring, or `touch` the mutated file before the next build.
 - `/models` root-owned: `sudo mkdir/chown` (passwordless sudo works); user is peterstorm.
 
 ## Doc map
@@ -303,7 +338,7 @@ An independent audit (python, read-only, against the index) found:
 | The plan (phases, decisions, budget of truth) | `ds4-native/docs/plans/2026-11-19-glm53-native.md` |
 | This handover | `ds4-native/docs/plans/2026-11-19-glm53-native-HANDOVER.md` |
 | Pinned GLM-5.3 reference + why | `ds4-native/ref/glm-5.3/README.md` |
-| GLM terms (Selection, Full/Shared layer, Latent row, Backbone part, Semantics oracle, Activation precision, Route margin) | `ds4-native/CONTEXT.md`, GLM-5.3 section |
+| GLM terms (Selection, Full/Shared layer, Latent row, Backbone part, Semantics oracle, Activation precision, Claim, Route margin) | `ds4-native/CONTEXT.md`, GLM-5.3 section |
 | GLM-5.3 Reference configuration (MoE fixed; attention by operation) | `ds4-native/docs/design/glm53-reference-configuration.md` |
 | Speed trade-offs (decode and prefill cost model, levers) | `ds4-native/docs/research/2026-11-20-glm53-speed-tradeoffs.md` |
 | Findings reports (one per measurement: method, results, interpretation, receipts) | `ds4-native/docs/bench/glm53-*/*-report.md`: `glm53-oracle/2026-11-19-gpu-moe-report.md` (GPU MoE gate + departures KL), `glm53-chat/2026-11-20-chat-report.md` (first answers), `glm53-backbone-b/2026-11-20-backbone-b-report.md` (cyber Backbone), `glm53-locality/2026-11-20-locality-report.md` (Expert miss rate → decode speed), `glm53-cc/2026-11-20-cc-report.md` (cache-conditional routing), `glm53-slim/2026-11-20-slim-report.md` (pruning, λ 0.1, KL floor) |
@@ -312,6 +347,8 @@ An independent audit (python, read-only, against the index) found:
 | Inference map (primaries, runbooks) | `.dotfiles/scripts/inference/INDEX.md` |
 | Native-engine ops runbook | `.dotfiles/scripts/inference/runbooks/ds41-1017-native-runbook-2026-11-19.md` |
 | GLM-5.3 served: report (design, gates, measurements, the Sessions bug) | `ds4-native/docs/bench/glm53-serve/2026-11-21-serve.md` |
+| GLM-5.3 VRAM: a position's cost and Cohorts; the GLM Ledger | `ds4-native/docs/bench/glm53-capacity/2026-11-22-{capacity,ledger}.md` |
+| GLM-5.3 cache policies replayed (counter55, per-layer Slots, MTP) | `ds4-native/docs/bench/glm53-replay/2026-11-22-replay-report.md` (branch `glm53/replay-study`) |
 | GLM-5.3 ops runbook (primary `glm-native`) | `.dotfiles/scripts/inference/runbooks/glm53-native-runbook-2026-11-21.md` |
 | Hyperflare/GLM-Flash-uncensored story | `.dotfiles/scripts/inference/runbooks/glm53-flash-hyperflare-tp2-v16-runbook-2026-11-13.md` |
 

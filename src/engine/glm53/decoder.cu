@@ -81,10 +81,14 @@ class Allocations {
   template <class T>
   T* alloc(size_t n) {
     void* p = nullptr;
-    ck(cudaMalloc(&p, std::max<size_t>(n, 1) * sizeof(T)), "cudaMalloc");
+    const size_t bytes = std::max<size_t>(n, 1) * sizeof(T);
+    ck(cudaMalloc(&p, bytes), "cudaMalloc");
     ptrs_.push_back(p);
+    bytes_ += bytes;
     return static_cast<T*>(p);
   }
+  /** The bytes cudaMalloc was asked for so far: what the Ledger's claims are checked against. */
+  uint64_t bytes() const { return bytes_; }
   template <class T>
   T* upload(std::span<const T> host) {
     T* d = alloc<T>(host.size());
@@ -94,6 +98,7 @@ class Allocations {
 
  private:
   std::vector<void*> ptrs_;
+  uint64_t bytes_ = 0;
 };
 
 std::vector<__nv_bfloat16> bf16_of(std::span<const float> v, const char* what) {
@@ -126,6 +131,9 @@ constexpr int kRing = 4;  // pinned uploads in flight per GPU: a host copy waits
 constexpr int kGroupBatch = 64;  // a sweep batch's groups: within MoeBuffers' kJobSlots slots
 constexpr float kNoLimit = std::numeric_limits<float>::infinity();  // GLM's SwiGLU: DS4.1's grouped one, unclamped
 constexpr int kRecords = moe_plan::kMaxJobs;  // staging records: one Expert's two Halves each
+// VRAM a GPU must still have free once open() has allocated everything: what a first launch's lazy
+// allocations (kernel local memory) take. Below it open() fails, naming the runtime reserve.
+constexpr uint64_t kMinFreeAfterOpen = 1ull << 30;
 
 /** A Round's rows on one GPU: the residual stream, the post-attention residual, the FFN input. */
 struct Rows {
@@ -231,6 +239,7 @@ struct Decoder::State {
   std::vector<uint16_t> embed;                    // [vocab][hidden] BF16 bits
   std::vector<std::optional<g53::LayerExpertCache>> caches;  // [layer], Sparse layers
   int slots_per_layer = 0;
+  VramReport vram;  // the Ledger's plan, checked against what open() allocated
   int router_planes = 0;
   size_t max_group_columns = 0;  // a sweep's group columns (8 per group), at most
   int64_t length = 0;
@@ -437,6 +446,33 @@ int Decoder::capacity() const { return s_->config.capacity; }
 int Decoder::slots_per_layer() const { return s_->slots_per_layer; }
 int Decoder::ram_per_layer() const { return s_->ram_per_layer; }
 DecoderStats Decoder::stats() const { return s_->stats; }
+const VramReport& Decoder::vram() const { return s_->vram; }
+
+g53::EngineShapes engine_shapes() {
+  static_assert(cuda::kMaxTokens == kMaxRound, "a Round's GEMV columns are its tokens");
+  return {.exchange_inbox_floats = cuda::kExchangeInboxFloats,
+          .exchange_blocks = cuda::kExchangeMaxBlocks,
+          .round_rows = kMaxRound,
+          .latent_splits = gpu::kMaxLatentSplits,
+          .job_slots = gpu::kJobSlots,
+          .group_batch = kGroupBatch,
+          .gemv_job_bytes = sizeof(cuda::GemvJob),
+          .job_upload_bytes = sizeof(JobUpload)};
+}
+
+namespace {
+
+/** The claims that differ between `planned` and `allocated` on GPU `g`, as a message; empty when none do. */
+std::string ledger_drift(int g, const g53::Claims& planned, const g53::Claims& allocated) {
+  std::string out;
+  for (g53::Claim k : g53::kClaims)
+    if (planned[k] != allocated[k])
+      out += "GPU " + std::to_string(g) + " " + std::string(g53::name(k)) + ": the Ledger plans " +
+             std::to_string(planned[k]) + " B, open() allocated " + std::to_string(allocated[k]) + " B; ";
+  return out;
+}
+
+}  // namespace
 
 Result<std::unique_ptr<Decoder>, std::string> Decoder::open(const g53::Config& config, const io::BackboneParts& parts,
                                                             const std::vector<std::string>& store_replicas,
@@ -455,6 +491,20 @@ Result<std::unique_ptr<Decoder>, std::string> Decoder::open(const g53::Config& c
   s.d = d;
   s.config = c;
   try {
+    // The Ledger first (core/glm53/ledger): every claim and the Slots from byte arithmetic over the cards'
+    // sizes, never from what happens to be free, and a context that cannot fit refused before any load.
+    for (int g = 0; g < 2; g++) {
+      ck(cudaSetDevice(c.devices[g]), "cudaSetDevice");
+      size_t free_b = 0, total_b = 0;
+      ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
+      s.vram.total[g] = total_b;
+    }
+    auto plan = g53::plan_vram(config, engine_shapes(), {c.capacity, c.wave, s.cohort}, s.vram.total,
+                               c.runtime_reserve_bytes, c.slots_per_layer);
+    if (!plan) return R::err("the Ledger: " + plan.error().what);
+    s.vram.plan = plan.value();
+    std::array<g53::Claims, 2> allocated{};  // what open() asks cudaMalloc for, by claim: checked against the plan
+
     // The Expert store's replicas, read with O_DIRECT through io_uring.
     auto replicas = io::open_store_replicas(store_replicas, io::Access::ReadDirect);
     if (!replicas) return R::err(replicas.error().what);
@@ -484,12 +534,14 @@ Result<std::unique_ptr<Decoder>, std::string> Decoder::open(const g53::Config& c
       G.link.sent = G.mem.alloc<uint32_t>(cuda::kExchangeMaxBlocks);
       ck(cudaMemset(G.link.flags, 0, cuda::kExchangeMaxBlocks * sizeof(uint32_t)), "memset");
       ck(cudaMemset(G.link.sent, 0, cuda::kExchangeMaxBlocks * sizeof(uint32_t)), "memset");
+      allocated[g][g53::Claim::Exchange] = G.mem.bytes();
       G.attention.resize(static_cast<size_t>(d.layers));
       G.dense.resize(static_cast<size_t>(d.layers));
       G.sparse.resize(static_cast<size_t>(d.layers));
       auto scratch = gpu::LayerScratch::create(d, c.wave, c.capacity);
       if (!scratch) return R::err("the layer scratch: " + scratch.error());
       G.layer_scratch.emplace(std::move(scratch).value());
+      allocated[g][g53::Claim::LayerScratch] = G.layer_scratch->bytes();
     }
     for (int g = 0; g < 2; g++) {
       s.gpus[g]->link.peer_inbox = s.gpus[1 - g]->link.inbox;
@@ -501,6 +553,7 @@ Result<std::unique_ptr<Decoder>, std::string> Decoder::open(const g53::Config& c
     if (!planes) return R::err("the hidden width does not split into GEMV planes");
     s.router_planes = *planes;
     s.caches.resize(static_cast<size_t>(d.layers));
+    const std::array<uint64_t, 2> before_backbone{s.gpus[0]->mem.bytes(), s.gpus[1]->mem.bytes()};
     for (int L = 0; L < d.layers; L++) {
       const auto where = "layer " + std::to_string(L) + ": ";
       const auto weights = parts.load_layer(L, c.threads);
@@ -525,10 +578,13 @@ Result<std::unique_ptr<Decoder>, std::string> Decoder::open(const g53::Config& c
         auto t = gpu::DeviceAttention::upload(a.value(), g, c.capacity);
         if (!t) return R::err(where + t.error());
         G.attention[L].emplace(std::move(t).value());
+        allocated[g][g53::Claim::Backbone] += G.attention[L]->weight_bytes();
+        allocated[g][g53::Claim::Cache] += G.attention[L]->cache_bytes();
         if (mlp) {
           auto m = gpu::DeviceDenseMlp::upload(*mlp, g);
           if (!m) return R::err(where + m.error());
           G.dense[L].emplace(std::move(m).value());
+          allocated[g][g53::Claim::Backbone] += G.dense[L]->bytes();
         } else {
           const auto router = bf16_of(moe->router.w, "the router");
           const auto tiles = exact::half_tiles(*shared, static_cast<size_t>(g));
@@ -544,6 +600,8 @@ Result<std::unique_ptr<Decoder>, std::string> Decoder::open(const g53::Config& c
         }
       }
     }
+    for (int g = 0; g < 2; g++)  // the Sparse layers' routers, biases, shared Halves and Slot tables
+      allocated[g][g53::Claim::Backbone] += s.gpus[g]->mem.bytes() - before_backbone[g];
     // The head on GPU 0, the embeddings on the host (BF16 bits).
     {
       auto head = parts.load("lm_head.weight");
@@ -554,6 +612,8 @@ Result<std::unique_ptr<Decoder>, std::string> Decoder::open(const g53::Config& c
       auto h = gpu::DeviceHead::upload(d, norm.value().values, g53::Matrix{head.value().values, d.vocab, d.hidden});
       if (!h) return R::err("head: " + h.error());
       s.gpus[0]->head.emplace(std::move(h).value());
+      allocated[0][g53::Claim::Backbone] += s.gpus[0]->head->weight_bytes();
+      allocated[0][g53::Claim::Round] += s.gpus[0]->head->scratch_bytes();
     }
     {
       auto embed = parts.load("model.embed_tokens.weight");
@@ -573,6 +633,7 @@ Result<std::unique_ptr<Decoder>, std::string> Decoder::open(const g53::Config& c
     for (int g = 0; g < 2; g++) {
       Gpu& G = *s.gpus[g];
       ck(cudaSetDevice(G.device), "cudaSetDevice");
+      const uint64_t round_from = G.mem.bytes();
       const size_t H = static_cast<size_t>(kMaxRound) * kDim, W = static_cast<size_t>(c.wave) * kDim;
       G.x = G.mem.alloc<float>(H);
       G.partial = G.mem.alloc<float>(W);
@@ -600,6 +661,8 @@ Result<std::unique_ptr<Decoder>, std::string> Decoder::open(const g53::Config& c
       ck(cudaHostAlloc(reinterpret_cast<void**>(&G.ring), kRing * sizeof(JobUpload), cudaHostAllocPortable), "upload ring");
       for (auto& e : G.ring_done) ck(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "upload ring");
       if (g == 0) G.logits = G.mem.alloc<float>(static_cast<size_t>(kMaxRound) * d.vocab);
+      allocated[g][g53::Claim::Round] += G.mem.bytes() - round_from;
+      const uint64_t sweep_from = G.mem.bytes();
       // The sweep buffers, for one Cohort: no prompt sweep takes more tokens than a Cohort or the capacity.
       const auto sweep_tokens = static_cast<size_t>(std::min(s.cohort.tokens(), c.capacity));
       const size_t C = sweep_tokens * kDim;
@@ -625,6 +688,7 @@ Result<std::unique_ptr<Decoder>, std::string> Decoder::open(const g53::Config& c
       G.g_token_slots = G.mem.alloc<moe::TokenSlots>(s.max_group_columns);
       G.g_jobs = G.mem.alloc<cuda::GemvJob>(3 * s.max_group_columns / kMaxRound);
       G.g_first = G.mem.alloc<int>(3 * s.max_group_columns / kMaxRound);
+      allocated[g][g53::Claim::Sweep] = G.mem.bytes() - sweep_from;
       G.batch_ready.resize(s.max_group_columns / kMaxRound / kGroupBatch + 2);
       G.staged.resize(kRecords);
       for (auto* v : {&G.batch_ready, &G.staged})
@@ -632,32 +696,34 @@ Result<std::unique_ptr<Decoder>, std::string> Decoder::open(const g53::Config& c
       ck(cudaEventCreateWithFlags(&G.routed, cudaEventDisableTiming), "sweep events");
     }
 
-    // The Slots: an equal share per Sparse layer, as many as fit beside the reserve on both GPUs.
+    // Every claim is what the Ledger planned, byte for byte: otherwise its Slots would be a guess.
+    for (int g = 0; g < 2; g++)
+      if (const std::string drift = ledger_drift(g, s.vram.plan.claims[g], allocated[g]); !drift.empty())
+        return R::err("the Ledger does not match the allocations (core/glm53/ledger): " + drift);
+
+    // The Slots: the Ledger's equal share per Sparse layer. Free memory only checks them: a card that
+    // cannot hold them (another process on it, or a reserve too small for what CUDA itself took) fails here.
     std::vector<int> sparse_layers;
     for (int L = 0; L < d.layers; L++)
       if (s.gpus[0]->sparse[L]) sparse_layers.push_back(L);
-    int per_layer = c.slots_per_layer;
-    if (per_layer == 0) {
-      uint64_t fit = UINT64_MAX;
-      for (int g = 0; g < 2; g++) {
-        ck(cudaSetDevice(s.gpus[g]->device), "cudaSetDevice");
-        size_t free_b = 0, total_b = 0;
-        ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
-        fit = std::min<uint64_t>(fit, free_b > c.reserve_bytes ? (free_b - c.reserve_bytes) / kHalfBytes : 0);
-      }
-      per_layer = static_cast<int>(std::min<uint64_t>(fit / sparse_layers.size(), static_cast<uint64_t>(d.experts)));
-    }
-    if (per_layer < moe_plan::kMaxJobs || per_layer > d.experts)
-      return R::err("Slots per layer must be in [" + std::to_string(moe_plan::kMaxJobs) + ", " +
-                    std::to_string(d.experts) + "] (a Round's Experts must fit); " + std::to_string(per_layer) +
-                    " fit");
+    const int per_layer = s.vram.plan.per_layer;
     s.slots_per_layer = per_layer;
     const uint64_t layer_bytes = static_cast<uint64_t>(per_layer) * kHalfBytes;
     for (int g = 0; g < 2; g++) {
       Gpu& G = *s.gpus[g];
       ck(cudaSetDevice(G.device), "cudaSetDevice");
-      auto* pool = G.mem.alloc<uint8_t>(layer_bytes * sparse_layers.size());
+      const uint64_t pool_bytes = layer_bytes * sparse_layers.size();
+      size_t free_b = 0, total_b = 0;
+      ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
+      if (free_b < pool_bytes + kMinFreeAfterOpen)
+        return R::err("GPU " + std::to_string(g) + ": the Ledger's " + std::to_string(per_layer) + " Slots per layer (" +
+                      std::to_string(pool_bytes) + " B) and " + std::to_string(kMinFreeAfterOpen) + " B of headroom need " +
+                      "more than the " + std::to_string(free_b) + " B free: another process holds VRAM, or the runtime " +
+                      "reserve (" + std::to_string(c.runtime_reserve_bytes) + " B) is below what CUDA itself takes");
+      auto* pool = G.mem.alloc<uint8_t>(pool_bytes);
       for (size_t i = 0; i < sparse_layers.size(); i++) G.sparse[sparse_layers[i]]->slots = pool + i * layer_bytes;
+      ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
+      s.vram.free_after_open[g] = free_b;
     }
     for (int L : sparse_layers) {
       auto cache = g53::LayerExpertCache::create(d.experts, per_layer);

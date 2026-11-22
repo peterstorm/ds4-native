@@ -34,6 +34,7 @@ add_library(ds4n_core STATIC
   src/core/glm53/victim_tier.cpp
   src/core/glm53/sessions.cpp
   src/core/glm53/cohort.cpp
+  src/core/glm53/ledger.cpp
   src/core/meminfo.cpp
   src/core/glm53/pruning.cpp
   src/core/indexer.cpp
@@ -165,6 +166,9 @@ if(DS4N_CUDA)
   add_executable(ds4n-glm53-decode src/tools/glm53_decode.cu)
   target_compile_options(ds4n-glm53-decode PRIVATE ${DS4N_CUDA_FLAGS})
   target_link_libraries(ds4n-glm53-decode PRIVATE ds4n_glm53_engine)
+  add_executable(ds4n-glm53-ledger src/tools/glm53_ledger.cu)
+  target_compile_options(ds4n-glm53-ledger PRIVATE ${DS4N_CUDA_FLAGS})
+  target_link_libraries(ds4n-glm53-ledger PRIVATE ds4n_glm53_engine)
   add_executable(ds4n-glm53-serve src/tools/glm53_serve.cu)
   target_compile_options(ds4n-glm53-serve PRIVATE ${DS4N_CUDA_FLAGS})
   target_link_libraries(ds4n-glm53-serve PRIVATE ds4n_glm53_engine)
@@ -208,6 +212,7 @@ add_executable(ds4n_tests
   tests/core/glm53/test_victim_tier.cpp
   tests/core/glm53/test_sessions.cpp
   tests/core/glm53/test_cohort.cpp
+  tests/core/glm53/test_ledger.cpp
   tests/core/test_meminfo.cpp
   tests/core/glm53/test_pruning.cpp
   tests/core/test_indexer.cpp

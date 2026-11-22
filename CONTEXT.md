@@ -62,7 +62,10 @@ _Avoid_: candidate (the indexer's candidate blocks), runner-up
 The sequence of every layer step's needed Experts and Near-misses as the Expert cache saw them, saved for replaying policies offline against Belady's optimal eviction (`core/cache_replay`).
 
 **Ledger**:
-Byte arithmetic that fixes Slot counts per GPU and phase from mandatory state, never from free-memory readings.
+Byte arithmetic that fixes Slot counts per GPU and phase from mandatory state, never from free-memory readings. GLM-5.3's is `core/glm53/ledger` (its **Claims**, then DS4.1's `ledger::plan_slots`).
+
+**Runtime reserve**:
+VRAM per GPU the Ledger leaves outside every claim: the CUDA context, kernel images, allocator rounding and headroom. A setting (`DecoderConfig::runtime_reserve_bytes`), never a reading; free memory after open shows what it really held.
 
 ### Execution
 
@@ -190,6 +193,10 @@ GLM-5.3's FP32 CPU oracle (`core/glm53/reference`). It agrees with the pinned re
 The number format a GLM-5.3 Expert's linears read their inputs in (the feed-forward input, and silu(gate) × up before down_proj), for routed and shared Experts alike (`core/glm53/precision`): FP32 (the Semantics oracle), BF16 (W4A16), E4M3 (DS4.1's kernels) or MXFP4 (W4A4, as kitaniai's checkpoint declares it, with Quark's "even" scale). Attention, routers, indexers and the Dense layers' MLPs are not Experts and stay out of it. Choosing it is a Reference configuration decision, measured as KL against FP32 (`ds4n-glm53-oracle-run --activations`). The engine's is **E4M3** (plan, settled decision 8).
 _Avoid_: "A4"/"A8" alone (say which format), activation dtype
 
+**Claim**:
+One kind of mandatory VRAM the GLM Ledger counts on each GPU (`glm53::Claim`): **Exchange**, **Backbone** (with the Slot tables, and the head on GPU 0), **Cache** (Latent rows and index keys, every position of the capacity), **LayerScratch** (a Wave's attention and Dense MLP scratch, one Round's index scores), **Round** (a Round's activations, MoE buffers and logits) and **Sweep** (one Cohort's rows, routing and group lists, and the Expert scratch). Only Cache and LayerScratch grow with the capacity, the Sweep with the Cohort; the Slots are what the card holds past the Claims and the Runtime reserve. `Decoder::open` counts what it allocates by Claim and refuses to open when a count differs from the Ledger's.
+_Avoid_: budget, usage (a Claim is planned bytes, not a reading)
+
 **Route margin**:
 How close one token's Expert choice on one Sparse GLM layer is to a tie: the worst chosen Expert's biased router score (sigmoid + `e_score_correction_bias`) minus the best unchosen one's (`Route::margin`). A route whose margin is within an engine's arithmetic noise can choose differently in that engine; on real weights the median is ~3.5e-3, about one BF16 step.
 _Avoid_: router confidence, gap (unqualified)
@@ -198,6 +205,7 @@ _Avoid_: router confidence, gap (unqualified)
 
 - An **Expert** has one **Expert record** in the **Expert store** and, under tensor parallelism, two **Halves**
 - A **Slot** holds at most one **Expert**; the **Ledger** fixes how many **Slots** each GPU has
+- On GLM-5.3 a GPU's VRAM is its **Claims**, its **Slots** and the **Runtime reserve**; a longer capacity takes **Slots**, a larger **Cohort** too, nothing else does
 - A **Miss** is served from the **RAM tier** if present there, otherwise from the **Expert store**
 - A **Round** contains one to eight rows; a **Step** is a one-row **Round**; a **Round**'s **Routing plan** is the union of its rows' Experts, whatever their **Lanes**
 - A live **Session** occupies one **Lane**; a **KV checkpoint** is a Session in no Lane

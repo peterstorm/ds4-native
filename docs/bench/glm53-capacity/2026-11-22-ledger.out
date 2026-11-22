@@ -1,0 +1,51 @@
+$ ds4n-glm53-ledger (defaults: Cohort 16384, wave 512, reserve 4.75 GiB, cards 97887 MiB)
+cards 102.64 GB, runtime reserve 5.10 GB, wave 512, Cohort 16384, a Cache position 95232 B per GPU
+  capacity  Slots/layer    claims GB    unused GB
+      4096           99        22.89         0.20
+           GPU 0: Exchange 1640000 Backbone 19041805056 Cache 390070272 LayerScratch 399347712 Round 76712472 Sweep 2984604672 (total 22894180184 B)
+           GPU 1: Exchange 1640000 Backbone 17138615040 Cache 390070272 LayerScratch 399347712 Round 41724440 Sweep 2984604672 (total 20956002136 B)
+     16384           96        25.31         0.04
+           GPU 0: Exchange 1640000 Backbone 19041805056 Cache 1560281088 LayerScratch 399740928 Round 76712472 Sweep 4227640320 (total 25307819864 B)
+           GPU 1: Exchange 1640000 Backbone 17138615040 Cache 1560281088 LayerScratch 399740928 Round 41724440 Sweep 4227640320 (total 23369641816 B)
+     65536           89        29.99         0.62
+           GPU 0: Exchange 1640000 Backbone 19041805056 Cache 6241124352 LayerScratch 401313792 Round 76712472 Sweep 4227640320 (total 29990235992 B)
+           GPU 1: Exchange 1640000 Backbone 17138615040 Cache 6241124352 LayerScratch 401313792 Round 41724440 Sweep 4227640320 (total 28052057944 B)
+    131072           81        36.23         0.39
+           GPU 0: Exchange 1640000 Backbone 19041805056 Cache 12482248704 LayerScratch 403410944 Round 76712472 Sweep 4227640320 (total 36233457496 B)
+           GPU 1: Exchange 1640000 Backbone 17138615040 Cache 12482248704 LayerScratch 403410944 Round 41724440 Sweep 4227640320 (total 34295279448 B)
+    202752           72        43.06         0.33
+           GPU 0: Exchange 1640000 Backbone 19041805056 Cache 19308478464 LayerScratch 405704704 Round 76712472 Sweep 4227640320 (total 43061981016 B)
+           GPU 1: Exchange 1640000 Backbone 17138615040 Cache 19308478464 LayerScratch 405704704 Round 41724440 Sweep 4227640320 (total 41123802968 B)
+    262144           64        48.72         0.69
+           GPU 0: Exchange 1640000 Backbone 19041805056 Cache 24964497408 LayerScratch 407605248 Round 76712472 Sweep 4227640320 (total 48719900504 B)
+           GPU 1: Exchange 1640000 Backbone 17138615040 Cache 24964497408 LayerScratch 407605248 Round 41724440 Sweep 4227640320 (total 46781722456 B)
+    409600  46 Slots fit beside 1 Lane, fewer than the 64 the engine needs (Slots per Sparse layer; 75 Sparse layers)
+
+$ ds4n-glm53-ledger --capacity 4096 --cohort 4096   # the old layout (a sweep over the whole capacity)
+      4096           99        22.89         0.20
+$ ds4n-glm53-ledger --capacity 65536 --cohort 65536
+     65536           83        34.96         0.16
+
+$ ds4n-glm53-ledger --capacity 266240,268288,270336,272384   # the reach at the 64-Slot floor
+    266240           64        49.11         0.30
+    268288           64        49.31         0.11
+    270336  63 Slots fit beside 1 Lane, fewer than the 64 the engine needs (Slots per Sparse layer; 75 Sparse layers)
+    272384  63 Slots fit beside 1 Lane, fewer than the 64 the engine needs (Slots per Sparse layer; 75 Sparse layers)
+
+$ ds4n-glm53-ledger --cohort 8192 --capacity 65536,131072,202752,262144,270336,276480
+     65536           90        29.16         0.70
+    131072           82        35.40         0.47
+    202752           73        42.23         0.41
+    262144           66        47.89         0.02
+    270336           64        48.67         0.74
+    276480           64        49.26         0.16
+
+$ for c in 135168 137216 139264; do ds4n-glm53-ledger --capacity $c --cohort $c; done   # old layout's reach at 64
+    135168           65        48.64         0.02
+    137216           64        49.04         0.37
+    139264  63 Slots fit beside 1 Lane, fewer than the 64 the engine needs (Slots per Sparse layer; 75 Sparse layers)
+
+$ ds4n-glm53-ledger --capacity 116736,118784,120832   # Cohorts' reach at today's 83
+    116736           83        34.87         0.26
+    118784           83        35.06         0.06
+    120832           82        35.26         0.62

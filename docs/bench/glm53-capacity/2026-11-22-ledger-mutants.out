@@ -1,0 +1,13 @@
+KILLED       scores_ dropped  (TEST CASE:  Ledger: with a sweep over the whole capacity, a position costs the audit's 196,422.5 B)
+KILLED       index keys dropped  (TEST CASE:  Ledger: with a sweep over the whole capacity, a position costs the audit's 196,422.5 B)
+KILLED       Sweep sized by capacity  (TEST CASE:  Ledger: past the Cohort, only the caches and one Round's index scores grow with the capacity)
+KILLED       head off GPU 0  (TEST CASE:  Ledger: GPU 0 holds the head and the logits besides GPU 1's claims)
+KILLED       head on GPU 1  (TEST CASE:  Ledger: GPU 0 holds the head and the logits besides GPU 1's claims)
+KILLED       Expert scratch dropped  (TEST CASE:  Ledger: the default reserve gives the Slots free-memory sizing gave, at both receipts' capacities)
+KILLED       Sweep outside the Slot fit  (TEST CASE:  Ledger: the Slots are the cards' bytes past the claims and the reserve, never more with more context)
+KILLED       asked floor 1  (TEST CASE:  Ledger: the Slots are the cards' bytes past the claims and the reserve, never more with more context)
+KILLED       asked above fit accepted  (TEST CASE:  Ledger: the Slots are the cards' bytes past the claims and the reserve, never more with more context)
+KILLED       spare not returned  (TEST CASE:  Ledger: the Slots are the cards' bytes past the claims and the reserve, never more with more context)
+KILLED       Round gate/up planes halved  (TEST CASE:  Ledger: the default reserve gives the Slots free-memory sizing gave, at both receipts' capacities)
+KILLED       Full-layer indexer weights dropped  (TEST CASE:  Ledger: the default reserve gives the Slots free-memory sizing gave, at both receipts' capacities)
+killed 12 of 12

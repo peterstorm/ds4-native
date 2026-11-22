@@ -25,6 +25,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -49,6 +50,8 @@ class DeviceArray {
   explicit DeviceArray(size_t n);
   T* get() const { return p_.get(); }
   size_t size() const { return n_; }
+  /** The bytes cudaMalloc was asked for (an empty array still takes one element); 0 when none was. */
+  uint64_t bytes() const { return p_ ? std::max<size_t>(n_, 1) * sizeof(T) : 0; }
 
  private:
   struct Free {
@@ -79,6 +82,8 @@ class LayerScratch {
   static Result<LayerScratch, std::string> create(const ds4n::glm53::Dims& d, int wave, int capacity);
   int wave() const { return wave_; }
   int capacity() const { return capacity_; }
+  /** Its device bytes (core/glm53/ledger's LayerScratch claim). */
+  uint64_t bytes() const;
 
  private:
   friend class DeviceAttention;
@@ -134,6 +139,9 @@ class DeviceAttention {
 
   /** One position's cache bytes: its Latent row and, on a Full layer, its index key. */
   uint64_t position_bytes() const;
+  /** Device bytes of its weights, and of its caches (core/glm53/ledger's Backbone and Cache claims). */
+  uint64_t weight_bytes() const;
+  uint64_t cache_bytes() const;
   /** Positions [0, n) of the caches (n in 0 .. capacity), copied to host memory once `stream`'s work before is done. */
   Result<HostPositions, std::string> save_positions(int64_t n, cudaStream_t stream) const;
   /**
@@ -189,6 +197,8 @@ class DeviceDenseMlp {
    * another count or a scratch of another intermediate width.
    */
   cudaError_t run(const __nv_bfloat16* ffn_in, int tokens, LayerScratch& scratch, float* partial, cudaStream_t stream);
+  /** Its device bytes: weights only. */
+  uint64_t bytes() const;
 
  private:
   DeviceDenseMlp() = default;
@@ -203,6 +213,9 @@ class DeviceHead {
                                                 const ds4n::glm53::Matrix& head);
   /** logits (device FP32 [tokens][vocab]) of the residual streams x (device FP32 [tokens][hidden]). */
   void logits(const float* x, int tokens, float* logits, cudaStream_t stream);
+  /** Device bytes of its weights (the head, the final norm), and of its scratch for a Round. */
+  uint64_t weight_bytes() const;
+  uint64_t scratch_bytes() const;
 
  private:
   DeviceHead() = default;

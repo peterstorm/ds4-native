@@ -67,6 +67,7 @@
 #include <vector>
 
 #include "core/glm53/config.hpp"
+#include "core/glm53/ledger.hpp"
 #include "core/result.hpp"
 #include "io/glm53_weights.hpp"
 
@@ -85,10 +86,14 @@ using RamTierSize = std::variant<RamTierFixed, RamTierFit>;
 struct DecoderConfig {
   std::array<int, 2> devices{0, 1};  // the GPU of Half 0, of Half 1
   int capacity = 4096;               // positions every layer's cache holds
-  int slots_per_layer = 0;           // Expert Slots per Sparse layer; 0: as many as fit
+  int slots_per_layer = 0;           // Expert Slots per Sparse layer; 0: as many as the Ledger fits
   float route_bonus = 0.0f;          // cache-conditional routing (λ); 0: exact routing
   unsigned threads = 16;             // Backbone load threads
-  uint64_t reserve_bytes = 3ull << 30;  // VRAM per GPU left free when sizing the Slots
+  // VRAM per GPU outside the Ledger's claims (core/glm53/ledger): the CUDA context, kernel images,
+  // allocator rounding and headroom. The Slots are the card's bytes past the claims and this, so the
+  // same settings give the same Slots on every open; a card that cannot hold them fails open instead.
+  // The default reproduces the Slots free-memory sizing gave (see kDefaultRuntimeReserve).
+  uint64_t runtime_reserve_bytes = ds4n::glm53::kDefaultRuntimeReserve;
   RamTierSize ram_tier = RamTierFixed{};  // the RAM tier below the Slots (pinned host memory)
   // A sweep reads the next Sparse layer's non-resident Experts ahead when at least this share of this
   // layer's was routed (a long prompt routes nearly all; a short one's guesses would only take the drive
@@ -114,6 +119,16 @@ struct DecoderStats {
   uint64_t unrouted_reads = 0;  // of them, read ahead by a sweep and then not routed
   double load_s = 0.0;    // open(): the Backbone into VRAM, the RAM tier pinned
   double round_s = 0.0, store_s = 0.0;  // in round(): all, and serving Misses (reads, copies up and down)
+};
+
+/** The engine's kernel and struct sizes core/glm53/ledger's arithmetic needs (no GPU is touched). */
+ds4n::glm53::EngineShapes engine_shapes();
+
+/** Each GPU's VRAM as open() planned it and found it. */
+struct VramReport {
+  ds4n::glm53::SlotPlan plan;                   // the Ledger's claims and Slots (equal to what was allocated)
+  std::array<uint64_t, 2> total{};              // the cards' bytes
+  std::array<uint64_t, 2> free_after_open{};    // free once every claim and Slot was allocated: the reserve's use
 };
 
 /** Positions [0, positions()) of every layer's caches in host memory (pageable): only Decoder::save makes one. */
@@ -180,6 +195,7 @@ class Decoder {
   int slots_per_layer() const;
   int ram_per_layer() const;  // the RAM tier's Experts per Sparse layer, as sized; 0: none
   DecoderStats stats() const;
+  const VramReport& vram() const;
 
  private:
   struct State;
