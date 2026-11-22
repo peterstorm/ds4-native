@@ -1,0 +1,115 @@
+self-test: ok
+trace: 4 sessions of [700, 700, 700, 700] positions x 75 Sparse layers; session 0 warms the cache uncounted; cost Cost(fixed=21.8, expert=0.007, ram=0.55, store=2.25, draft=1.5)
+
+## Policies at 83 Slots per layer, RAM tier 38 per layer (2100 counted tokens)
+                                   miss/tok    ram  store       m   tok/s
+lru (engine today)                    177.8   62.8  115.0   29.6%    3.13
+counter, halve 55 (DS4.1's period)    169.9   61.0  108.9   28.3%    3.28
+counter, halve 16                     174.0   60.3  113.7   29.0%    3.17
+counter, halve 32                     169.5   58.6  110.9   28.2%    3.25
+counter, halve 55, cap 15             169.7   60.9  108.8   28.3%    3.29
+counter, halve 128, cap 255           176.9   68.2  108.7   29.5%    3.25
+counter, halve 256, cap 255           185.4   75.1  110.3   30.9%    3.17
+counter, halve 128, cap 15            175.1   67.1  108.0   29.2%    3.27
+lru + admit on repeat miss <= 64      188.0   75.4  112.6   31.3%    3.12
+counter 128 + admit <= 64             184.3   75.2  109.1   30.7%    3.20
+
+## Policies at 89 Slots per layer, RAM tier 38 per layer (2100 counted tokens)
+                                   miss/tok    ram  store       m   tok/s
+lru (engine today)                    166.6   60.0  106.6   27.8%    3.35
+counter, halve 55 (DS4.1's period)    158.8   57.8  101.0   26.5%    3.51
+counter, halve 16                     163.8   58.1  105.6   27.3%    3.38
+counter, halve 32                     159.0   55.9  103.1   26.5%    3.46
+counter, halve 55, cap 15             158.7   57.7  101.0   26.4%    3.51
+counter, halve 128, cap 255           165.3   64.8  100.5   27.5%    3.48
+counter, halve 256, cap 255           173.5   71.4  102.1   28.9%    3.39
+counter, halve 128, cap 15            163.6   63.7  100.0   27.3%    3.50
+lru + admit on repeat miss <= 64      176.9   72.5  104.3   29.5%    3.33
+counter 128 + admit <= 64             172.6   71.7  100.9   28.8%    3.42
+
+## Policies at 97 Slots per layer, RAM tier 38 per layer (2100 counted tokens)
+                                   miss/tok    ram  store       m   tok/s
+lru (engine today)                    152.4   56.3   96.1   25.4%    3.66
+counter, halve 55 (DS4.1's period)    144.8   53.7   91.1   24.1%    3.84
+counter, halve 16                     150.7   55.2   95.5   25.1%    3.69
+counter, halve 32                     145.7   52.6   93.1   24.3%    3.78
+counter, halve 55, cap 15             144.7   53.7   91.0   24.1%    3.84
+counter, halve 128, cap 255           150.6   60.3   90.3   25.1%    3.81
+counter, halve 256, cap 255           158.4   66.6   91.8   26.4%    3.72
+counter, halve 128, cap 15            149.2   59.4   89.9   24.9%    3.83
+lru + admit on repeat miss <= 64      162.6   68.8   93.8   27.1%    3.64
+counter 128 + admit <= 64             157.8   67.1   90.7   26.3%    3.74
+
+## Per-layer Slot weights, 6225 Slots in all (mean 83), RAM tier 38 per layer
+                                   miss/tok    ram  store       m   tok/s
+fit s1, test s2-3: equal, lru         179.4   63.3  116.1   29.9%    3.10
+fit s1, test s2-3: fitted, lru        177.1   65.7  111.4   29.5%    3.20
+fit s1, test s2-3: equal, counter55    169.0   60.3  108.7   28.2%    3.29
+fit s1, test s2-3: fitted, counter55    167.6   63.3  104.2   27.9%    3.39
+   fitted Slots per layer (fit s1, test s2-3): min 64, max 190; by layer: [137, 190, 158, 133, 130, 129, 115, 117, 121, 66, 115, 102, 98, 82, 69, 64, 72, 65, 69, 75, 95, 93, 78, 84, 76, 71, 67, 64, 66, 64, 66, 69, 71, 80, 76, 69, 80, 71, 82, 65, 71, 67, 70, 83, 82, 81, 86, 71, 72, 73, 81, 69, 79, 64, 75, 74, 78, 65, 74, 67, 82, 66, 88, 67, 79, 81, 73, 65, 81, 77, 83, 76, 78, 65, 88]
+fit s2-3, test s1: equal, lru         174.5   61.9  112.7   29.1%    3.19
+fit s2-3, test s1: fitted, lru        172.6   64.6  107.9   28.8%    3.28
+fit s2-3, test s1: equal, counter55    171.6   62.5  109.2   28.6%    3.27
+fit s2-3, test s1: fitted, counter55    171.1   66.8  104.3   28.5%    3.36
+   fitted Slots per layer (fit s2-3, test s1): min 64, max 200; by layer: [172, 122, 159, 176, 200, 136, 119, 120, 108, 81, 115, 105, 76, 68, 72, 64, 66, 65, 68, 65, 100, 97, 99, 79, 81, 66, 69, 64, 65, 64, 66, 69, 71, 68, 68, 65, 76, 74, 65, 67, 67, 79, 71, 78, 77, 75, 65, 64, 78, 67, 71, 74, 64, 72, 71, 87, 64, 68, 69, 74, 72, 66, 88, 68, 79, 74, 80, 80, 71, 67, 88, 77, 81, 79, 90]
+
+## Per-layer Slot weights, 6675 Slots in all (mean 89), RAM tier 38 per layer
+                                   miss/tok    ram  store       m   tok/s
+fit s1, test s2-3: equal, lru         168.2   60.6  107.7   28.0%    3.32
+fit s1, test s2-3: fitted, lru        165.2   62.7  102.4   27.5%    3.44
+fit s1, test s2-3: equal, counter55    158.0   57.3  100.8   26.3%    3.52
+fit s1, test s2-3: fitted, counter55    156.0   60.3   95.7   26.0%    3.64
+   fitted Slots per layer (fit s1, test s2-3): min 64, max 197; by layer: [137, 197, 185, 133, 142, 157, 140, 120, 121, 105, 122, 102, 98, 87, 69, 64, 74, 68, 69, 76, 95, 104, 104, 86, 76, 71, 78, 64, 66, 64, 66, 69, 71, 86, 76, 69, 80, 81, 90, 100, 71, 67, 70, 83, 98, 88, 89, 80, 80, 92, 81, 69, 79, 64, 83, 74, 78, 65, 74, 83, 82, 85, 97, 67, 88, 81, 73, 78, 81, 92, 83, 76, 92, 82, 88]
+fit s2-3, test s1: equal, lru         163.4   58.8  104.5   27.2%    3.41
+fit s2-3, test s1: fitted, lru        161.0   61.6   99.4   26.8%    3.53
+fit s2-3, test s1: equal, counter55    160.4   58.9  101.5   26.7%    3.49
+fit s2-3, test s1: fitted, counter55    159.6   63.7   95.9   26.6%    3.61
+   fitted Slots per layer (fit s2-3, test s1): min 64, max 212; by layer: [212, 122, 164, 193, 201, 161, 158, 139, 130, 101, 115, 105, 76, 68, 72, 69, 66, 65, 68, 68, 100, 122, 99, 82, 81, 66, 73, 64, 65, 65, 66, 70, 74, 74, 68, 71, 76, 74, 71, 78, 73, 83, 71, 79, 94, 83, 65, 75, 84, 69, 71, 74, 64, 72, 77, 91, 81, 68, 79, 76, 87, 66, 100, 68, 86, 89, 80, 80, 71, 90, 88, 90, 88, 79, 92]
+
+## Warm start from a routing profile: session 0 from an empty cache vs a profiled one (83 Slots)
+                                   miss/tok    ram  store       m   tok/s
+first 100 tokens, empty               189.3   35.5  153.8   31.5%    2.55
+first 100 tokens, profile             171.1   50.1  121.0   28.5%    3.07
+first 700 tokens, empty               214.1   71.7  142.4   35.7%    2.59
+first 700 tokens, profile             211.5   73.8  137.7   35.3%    2.66
+
+## MTP verify Rounds at 89 Slots per layer, RAM tier 38 (draft 1.5 ms per drafted token)
+# Rounds' cost with every draft accepted (optimistic routes): reads per Round and per committed token
+  w  Experts/layer/Round  miss/Round  miss/token
+  1                  8.0       166.6       166.6
+  2                 14.0       328.9       164.5
+  3                 19.2       485.5       162.3
+  4                 24.2       641.1       160.3
+  5                 28.7       791.5       158.3
+
+# tok/s by width w and per-draft acceptance p (lru (engine today)); E[committed/Round] in brackets
+  optimistic rejected-row Routes
+    w           p=0.5           p=0.6           p=0.7           p=0.8           p=0.9
+    1     3.35 [1.00]     3.35 [1.00]     3.35 [1.00]     3.35 [1.00]     3.35 [1.00]
+    2     3.43 [1.49]     3.45 [1.58]     3.47 [1.69]     3.48 [1.79]     3.49 [1.90]
+    3     3.46 [1.77]     3.48 [1.93]     3.52 [2.19]     3.55 [2.46]     3.57 [2.75]
+    4     3.46 [1.87]     3.51 [2.19]     3.55 [2.57]     3.59 [2.94]     3.62 [3.45]
+    5     3.45 [1.92]     3.51 [2.32]     3.56 [2.72]     3.61 [3.29]     3.67 [4.12]
+  pessimistic rejected-row Routes
+    w           p=0.5           p=0.6           p=0.7           p=0.8           p=0.9
+    1     3.35 [1.00]     3.35 [1.00]     3.35 [1.00]     3.35 [1.00]     3.35 [1.00]
+    2     2.05 [1.49]     2.27 [1.58]     2.54 [1.69]     2.81 [1.79]     3.13 [1.90]
+    3     1.49 [1.77]     1.68 [1.93]     2.03 [2.19]     2.45 [2.46]     2.99 [2.75]
+    4     1.11 [1.87]     1.37 [2.19]     1.70 [2.57]     2.08 [2.94]     2.72 [3.45]
+    5     0.89 [1.92]     1.13 [2.32]     1.37 [2.72]     1.80 [3.29]     2.55 [4.12]
+
+# tok/s by width w and per-draft acceptance p (counter, halve 55 (DS4.1's period)); E[committed/Round] in brackets
+  optimistic rejected-row Routes
+    w           p=0.5           p=0.6           p=0.7           p=0.8           p=0.9
+    1     3.51 [1.00]     3.51 [1.00]     3.51 [1.00]     3.51 [1.00]     3.51 [1.00]
+    2     3.61 [1.49]     3.62 [1.58]     3.65 [1.69]     3.66 [1.79]     3.68 [1.90]
+    3     3.64 [1.77]     3.66 [1.93]     3.70 [2.19]     3.73 [2.46]     3.77 [2.75]
+    4     3.64 [1.87]     3.69 [2.19]     3.74 [2.57]     3.77 [2.94]     3.82 [3.45]
+    5     3.62 [1.92]     3.69 [2.32]     3.75 [2.72]     3.80 [3.29]     3.86 [4.12]
+  pessimistic rejected-row Routes
+    w           p=0.5           p=0.6           p=0.7           p=0.8           p=0.9
+    1     3.51 [1.00]     3.51 [1.00]     3.51 [1.00]     3.51 [1.00]     3.51 [1.00]
+    2     2.26 [1.49]     2.48 [1.58]     2.76 [1.69]     3.03 [1.79]     3.33 [1.90]
+    3     1.67 [1.77]     1.87 [1.93]     2.24 [2.19]     2.67 [2.46]     3.21 [2.75]
+    4     1.26 [1.87]     1.54 [2.19]     1.89 [2.57]     2.28 [2.94]     2.93 [3.45]
+    5     1.01 [1.92]     1.27 [2.32]     1.53 [2.72]     1.98 [3.29]     2.76 [4.12]

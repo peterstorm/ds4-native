@@ -1,0 +1,10 @@
+killed: s/victim = min((u, k) for k, u in resident.items() if k not in need)\[1\]/victim = max((u, k) for k, u in resident.items() if k not in need)[1]/
+SURVIVED: s/d = 10 \*\* 9 if j is None else 1 + prefix(start) - prefix(j + 1)/d = 10 ** 9 if j is None else 1 + prefix(i) - prefix(j + 1)/
+killed: s/            down(victim)/            pass/
+killed: s/            if in_tier:\n                del tier\[e\]//; s/                del tier\[e\]/                pass/
+killed: s/            i += a$/            i += width/
+killed: s/                count\[k\] >>= 1/                count[k] >>= 0/
+killed: s/victim = min((count\[k\], u, k)/victim = min((-count[k], u, k)/
+killed: s/                        or clock - last_miss.get(e, -10 \*\* 9) <= policy.admit_window)/                        or True)/
+killed: s/        alloc\[best\] += 1/        alloc[best] += 2/
+killed: s/            routes += \[sessions\[ps\]\[pi\]\[layer\] for ps, pi in proxies\]/            routes += [sess[i][layer] for ps, pi in proxies]/
