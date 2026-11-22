@@ -2,9 +2,12 @@
 """GLM-5.3's Expert cache at the engine's own geometry, replayed on recorded Routes (stdlib only):
 eviction and admission policies, per-layer Slot weights, a warm start, and MTP verify Rounds.
 
-    engine_replay.py ROUTES.tsv[.gz] [--arithmetic exact] [--jobs 8] [--ram 38] [--slots 89 (mtp)]
-                     [--section all|policies|weights|warm|mtp]
+    engine_replay.py ROUTES.tsv[.gz] [--arithmetic exact] [--jobs 8] [--ram 38] [--slots 89 (mtp, profile)]
+                     [--section all|policies|weights|warm|mtp|profile]
     engine_replay.py --self-test
+
+`--section profile` prints the engine's per-layer Slot profile (`--slot-profile` of ds4n-glm53-decode and
+-serve): the held-out comparison at a mean of --slots, then the Slots fitted on every counted session.
 
 ROUTES.tsv comes from `ds4n-glm53-oracle-run --routes` (8 Experts per Sparse layer per position).
 The model is causal, so a teacher-forced text's Routes, in position order, are what decoding that
@@ -346,25 +349,42 @@ def section_policies(sessions, layers, cost, ram):
             print(report_line(pol.name, run_layers(calls, slots, ram, pol), tokens, cost), flush=True)
 
 
-def section_weights(sessions, layers, cost, ram):
+def fitted_alloc(sessions, layers, cost, ram, total, fit_on):
+    """The per-layer Slots fitted on sessions `fit_on`, `total` in all."""
+    fit_calls = [decode_calls(sessions, L, fit_on) for L in range(layers)]
+    sizes = range(MIN_SLOTS, EXPERTS + 1)
+    jobs = [(c, ram, sizes) for c in fit_calls]
+    curves = POOL.map(_curve, jobs) if POOL else list(map(_curve, jobs))
+    return fit_weights(curves, total, cost)
+
+
+def held_out(sessions, layers, cost, ram, slots):
+    """Equal against fitted Slots at a mean of `slots`, each fold fitted on some sessions and tested on the rest."""
     folds = [("fit s1, test s2-3", {1}, {2, 3}), ("fit s2-3, test s1", {2, 3}, {1})]
+    total = slots * layers
+    print(f"\n## Per-layer Slot weights, {total} Slots in all (mean {slots}), RAM tier {ram} per layer")
+    print(HEADER)
+    for name, fit_on, test_on in folds:
+        alloc = fitted_alloc(sessions, layers, cost, ram, total, fit_on)
+        test_calls = [decode_calls(sessions, L, test_on) for L in range(layers)]
+        tokens = sum(len(sessions[s]) for s in test_on)
+        for short, pol in (("lru", POLICIES[0]), ("counter55", BEST)):
+            print(report_line(f"{name}: equal, {short}", run_layers(test_calls, slots, ram, pol), tokens, cost))
+            print(report_line(f"{name}: fitted, {short}", run_layers(test_calls, alloc, ram, pol), tokens,
+                              cost), flush=True)
+        print(f"   fitted Slots per layer ({name}): min {min(alloc)}, max {max(alloc)}; by layer: {alloc}")
+
+
+def section_weights(sessions, layers, cost, ram):
     for slots in (83, 89):
-        total = slots * layers
-        print(f"\n## Per-layer Slot weights, {total} Slots in all (mean {slots}), RAM tier {ram} per layer")
-        print(HEADER)
-        for name, fit_on, test_on in folds:
-            fit_calls = [decode_calls(sessions, L, fit_on) for L in range(layers)]
-            sizes = range(MIN_SLOTS, EXPERTS + 1)
-            jobs = [(c, ram, sizes) for c in fit_calls]
-            curves = POOL.map(_curve, jobs) if POOL else list(map(_curve, jobs))
-            alloc = fit_weights(curves, total, cost)
-            test_calls = [decode_calls(sessions, L, test_on) for L in range(layers)]
-            tokens = sum(len(sessions[s]) for s in test_on)
-            for short, pol in (("lru", POLICIES[0]), ("counter55", BEST)):
-                print(report_line(f"{name}: equal, {short}", run_layers(test_calls, slots, ram, pol), tokens, cost))
-                print(report_line(f"{name}: fitted, {short}", run_layers(test_calls, alloc, ram, pol), tokens,
-                                  cost), flush=True)
-            print(f"   fitted Slots per layer ({name}): min {min(alloc)}, max {max(alloc)}; by layer: {alloc}")
+        held_out(sessions, layers, cost, ram, slots)
+
+
+def section_profile(sessions, layers, cost, ram, slots):
+    """The engine's Slot profile: held out at a mean of `slots`, then fitted on every counted session."""
+    held_out(sessions, layers, cost, ram, slots)
+    alloc = fitted_alloc(sessions, layers, cost, ram, slots * layers, set(range(1, len(sessions))))
+    print(f"\nprofile (mean {slots}, sessions 1-{len(sessions) - 1}): {','.join(map(str, alloc))}")
 
 
 def section_warm(sessions, layers, cost, ram, slots=83):
@@ -519,6 +539,8 @@ def main(argv):
                 fn(sessions, layers, cost, ram, int(opts["--slots"]))
             else:
                 fn(sessions, layers, cost, ram)
+    if opts["--section"] == "profile":  # not part of "all": it is the engine's input, asked for by name
+        section_profile(sessions, layers, cost, ram, int(opts["--slots"]))
 
 
 if __name__ == "__main__":

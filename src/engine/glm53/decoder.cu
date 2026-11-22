@@ -238,7 +238,8 @@ struct Decoder::State {
   std::array<std::unique_ptr<Gpu>, 2> gpus;
   std::vector<uint16_t> embed;                    // [vocab][hidden] BF16 bits
   std::vector<std::optional<g53::LayerExpertCache>> caches;  // [layer], Sparse layers
-  int slots_per_layer = 0;
+  int slots_per_layer = 0;  // the Ledger's share
+  std::vector<int> slots;   // [layer]: each Sparse layer's Slots, that share or the profile's shape of it; 0: Dense
   VramReport vram;  // the Ledger's plan, checked against what open() allocated
   int router_planes = 0;
   size_t max_group_columns = 0;  // a sweep's group columns (8 per group), at most
@@ -444,6 +445,7 @@ uint64_t Decoder::position_bytes() const {
 int64_t Decoder::length() const { return s_->length; }
 int Decoder::capacity() const { return s_->config.capacity; }
 int Decoder::slots_per_layer() const { return s_->slots_per_layer; }
+std::span<const int> Decoder::slots() const { return s_->slots; }
 int Decoder::ram_per_layer() const { return s_->ram_per_layer; }
 DecoderStats Decoder::stats() const { return s_->stats; }
 const VramReport& Decoder::vram() const { return s_->vram; }
@@ -701,18 +703,27 @@ Result<std::unique_ptr<Decoder>, std::string> Decoder::open(const g53::Config& c
       if (const std::string drift = ledger_drift(g, s.vram.plan.claims[g], allocated[g]); !drift.empty())
         return R::err("the Ledger does not match the allocations (core/glm53/ledger): " + drift);
 
-    // The Slots: the Ledger's equal share per Sparse layer. Free memory only checks them: a card that
-    // cannot hold them (another process on it, or a reserve too small for what CUDA itself took) fails here.
+    // The Slots: the Ledger's share per Sparse layer, equal or in the profile's shape (the same total, so
+    // the same pool). Free memory only checks them: a card that cannot hold them (another process on it, or
+    // a reserve too small for what CUDA itself took) fails here.
     std::vector<int> sparse_layers;
     for (int L = 0; L < d.layers; L++)
       if (s.gpus[0]->sparse[L]) sparse_layers.push_back(L);
     const int per_layer = s.vram.plan.per_layer;
     s.slots_per_layer = per_layer;
-    const uint64_t layer_bytes = static_cast<uint64_t>(per_layer) * kHalfBytes;
+    std::vector<int> shaped(sparse_layers.size(), per_layer);
+    if (c.slot_profile) {
+      auto sh = g53::shape_slots(*c.slot_profile, per_layer, d.experts);
+      if (!sh) return R::err("the Slot profile: " + sh.error().what);
+      if (sh.value().size() != sparse_layers.size()) return R::err("the Slot profile is not one count per Sparse layer");
+      shaped = std::move(sh).value();
+    }
+    s.slots.assign(static_cast<size_t>(d.layers), 0);
+    for (size_t i = 0; i < sparse_layers.size(); i++) s.slots[static_cast<size_t>(sparse_layers[i])] = shaped[i];
     for (int g = 0; g < 2; g++) {
       Gpu& G = *s.gpus[g];
       ck(cudaSetDevice(G.device), "cudaSetDevice");
-      const uint64_t pool_bytes = layer_bytes * sparse_layers.size();
+      const uint64_t pool_bytes = static_cast<uint64_t>(per_layer) * kHalfBytes * sparse_layers.size();
       size_t free_b = 0, total_b = 0;
       ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
       if (free_b < pool_bytes + kMinFreeAfterOpen)
@@ -721,12 +732,17 @@ Result<std::unique_ptr<Decoder>, std::string> Decoder::open(const g53::Config& c
                       "more than the " + std::to_string(free_b) + " B free: another process holds VRAM, or the runtime " +
                       "reserve (" + std::to_string(c.runtime_reserve_bytes) + " B) is below what CUDA itself takes");
       auto* pool = G.mem.alloc<uint8_t>(pool_bytes);
-      for (size_t i = 0; i < sparse_layers.size(); i++) G.sparse[sparse_layers[i]]->slots = pool + i * layer_bytes;
+      uint64_t at = 0;
+      for (size_t i = 0; i < sparse_layers.size(); i++) {
+        G.sparse[sparse_layers[i]]->slots = pool + at;
+        at += static_cast<uint64_t>(shaped[i]) * kHalfBytes;
+      }
+      if (at != pool_bytes) return R::err("the Slots per layer do not add up to the Ledger's pool");
       ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
       s.vram.free_after_open[g] = free_b;
     }
     for (int L : sparse_layers) {
-      auto cache = g53::LayerExpertCache::create(d.experts, per_layer, c.eviction);
+      auto cache = g53::LayerExpertCache::create(d.experts, s.slots[static_cast<size_t>(L)], c.eviction);
       if (!cache) return R::err(cache.error().what);
       s.caches[L].emplace(std::move(cache).value());
     }

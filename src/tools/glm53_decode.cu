@@ -4,6 +4,7 @@
 //
 //   ds4n-glm53-decode --config CONFIG --backbone DIR --store FILE[,FILE...] (--prompt "ID ID ..." | --prompt-file FILE)
 //                     [--generate N] [--round R] [--lambda λ] [--eviction lru|counter:N] [--slots-per-layer S]
+//                     [--slot-profile N,N,...] [--runtime-reserve-gib G]
 //                     [--ram-per-layer R|auto] [--ram-reserve-gib G] [--read-ahead SHARE]
 //                     [--prefill sweep|rounds] [--wave W] [--cohort K] [--capacity C] [--devices A,B]
 //                     [--threads T] [--then "ID ID ..."] [--logits-hash] [--check]
@@ -12,6 +13,9 @@
 // than one command-line argument may be (Linux's MAX_ARG_STRLEN, 128 KiB).
 // The Slots are the Ledger's (core/glm53/ledger; ds4n-glm53-ledger prints them without a GPU): the
 // "vram" lines give each GPU's claims, Slots and what stayed free, the runtime reserve's real use.
+// --slot-profile spends the Ledger's Slots in a fitted shape, one count per Sparse layer (core/glm53/slot_profile;
+// tools/glm53-golden/engine_replay.py --section profile fits one); --runtime-reserve-gib sets the VRAM the Ledger
+// leaves outside its claims (default kDefaultRuntimeReserve): less reserve, more Slots, if CUDA fits in it.
 // --ram-per-layer auto sizes the RAM tier to the host's available memory less --ram-reserve-gib (10).
 // --then "ID ID ..." sweeps a second prompt after the generated tokens, as a next turn would arrive:
 // prefill against a warm cache (not with --check).
@@ -49,6 +53,7 @@
 #include <numeric>
 #include <set>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <sstream>
 #include <string>
@@ -97,6 +102,7 @@ struct Args {
   int generate = 0, round = 8;
   std::string prefill = "sweep";  // or "rounds"; a sweep routes the prompt exactly, also under λ
   eng::DecoderConfig decoder;
+  std::string slot_profile;  // parsed against the config in main
   bool check = false, logits_hash = false;
 };
 
@@ -104,7 +110,8 @@ Args parse(int argc, char** argv) {
   const std::string usage =
       "usage: --config CONFIG --backbone DIR --store FILE[,FILE...] (--prompt \"ID ID ...\" | --prompt-file FILE) "
       "[--generate N] [--round R] "
-      "[--prefill sweep|rounds] [--lambda λ] [--eviction lru|counter:N] [--slots-per-layer S] [--ram-per-layer R|auto] [--ram-reserve-gib G] "
+      "[--prefill sweep|rounds] [--lambda λ] [--eviction lru|counter:N] [--slots-per-layer S] [--slot-profile N,N,...] [--runtime-reserve-gib G] "
+      "[--ram-per-layer R|auto] [--ram-reserve-gib G] "
       "[--read-ahead SHARE] [--wave W] [--cohort K] [--capacity C] [--devices A,B] [--threads T] [--then \"ID ID ...\"] "
       "[--logits-hash] [--check]";
   std::optional<uint64_t> reserve_gib;
@@ -133,6 +140,12 @@ Args parse(int argc, char** argv) {
       if (!e) die(e.error().what);
       a.decoder.eviction = e.value();
     } else if (k == "--slots-per-layer") a.decoder.slots_per_layer = std::stoi(v);
+    else if (k == "--slot-profile") a.slot_profile = v;
+    else if (k == "--runtime-reserve-gib") {
+      const double g = std::stod(v);
+      if (!(g >= 0.0)) die("--runtime-reserve-gib must be >= 0");
+      a.decoder.runtime_reserve_bytes = static_cast<uint64_t>(g * static_cast<double>(1ull << 30));
+    }
     else if (k == "--ram-per-layer") {
       if (v == "auto")
         a.decoder.ram_tier = eng::RamTierFit{};
@@ -197,7 +210,7 @@ size_t differing(std::span<const float> want, std::span<const float> got) {
 struct ReplayRouting {
   float lambda = 0.0f;
   glm53::Eviction eviction;
-  int slots_per_layer = 0;
+  std::vector<int> slots;   // [layer]: each Sparse layer's Slots, as the decoder opened them
   size_t exact_prefix = 0;  // the swept prompt's tokens, which route exactly
 };
 
@@ -242,7 +255,7 @@ Result<LayerReplay, std::string> replay_layer(const glm53::Config& config, const
     shared = std::move(codes).value();
     layer.emplace(exact::MoeLayer{moe->router, moe->bias, *shared});
     if (routing.lambda != 0.0f) {
-      auto created = glm53::LayerExpertCache::create(d.experts, routing.slots_per_layer, routing.eviction);
+      auto created = glm53::LayerExpertCache::create(d.experts, routing.slots[static_cast<size_t>(L)], routing.eviction);
       if (!created) return R::err(where + created.error().what);
       cache.emplace(std::move(created).value());
     }
@@ -394,32 +407,41 @@ int main(int argc, char** argv) {
   const glm53::Dims& d = config.value().dims();
   auto parts = io::BackboneParts::open(args.backbone);
   if (!parts) die(parts.error().what);
+  eng::DecoderConfig dc = args.decoder;
+  if (!args.slot_profile.empty()) {
+    auto p = glm53::SlotProfile::parse(args.slot_profile, config.value());
+    if (!p) die("--slot-profile: " + p.error().what);
+    dc.slot_profile = std::move(p).value();
+  }
 
   Captured cap;
   std::vector<int32_t> generated;
   double prompt_s = 0.0, generate_s = 0.0;
-  int slots_per_layer = 0;
+  std::vector<int> slots;  // [layer], as opened: what the replay's cache models hold
   {
-    auto decoder = eng::Decoder::open(config.value(), parts.value(), args.stores, args.decoder);
+    auto decoder = eng::Decoder::open(config.value(), parts.value(), args.stores, dc);
     if (!decoder) die(decoder.error());
     eng::Decoder& dec = *decoder.value();
-    slots_per_layer = dec.slots_per_layer();
-    std::printf("open: %.1f s, %d Slots per Sparse layer (%.0f%% of the Experts), RAM tier %d per layer, %zu store "
-                "replica(s), capacity %d, λ %g, eviction %s\n",
-                dec.stats().load_s, slots_per_layer, 100.0 * slots_per_layer / d.experts, dec.ram_per_layer(),
+    const int slots_per_layer = dec.slots_per_layer();
+    slots.assign(dec.slots().begin(), dec.slots().end());
+    const auto [lo, hi] = std::ranges::minmax(slots | std::views::filter([](int n) { return n > 0; }));
+    std::printf("open: %.1f s, %d Slots per Sparse layer (%.0f%% of the Experts; %s, %d .. %d), RAM tier %d per layer, "
+                "%zu store replica(s), capacity %d, λ %g, eviction %s\n",
+                dec.stats().load_s, slots_per_layer, 100.0 * slots_per_layer / d.experts,
+                dc.slot_profile ? "profile" : "equal", lo, hi, dec.ram_per_layer(),
                 args.stores.size(), args.decoder.capacity, static_cast<double>(args.decoder.route_bonus),
                 glm53::to_string(args.decoder.eviction).c_str());
     for (size_t g = 0; g < 2; g++) {  // the Ledger's account (core/glm53/ledger), and what the reserve left free
       const eng::VramReport& v = dec.vram();
       const uint64_t claims = v.plan.claims[g].total();
-      const uint64_t slots = v.plan.card[g] - claims - args.decoder.runtime_reserve_bytes - v.plan.unused[g];
+      const uint64_t slot_bytes = v.plan.card[g] - claims - dc.runtime_reserve_bytes - v.plan.unused[g];
       std::printf("vram GPU %zu: card %.2f GB (planned %.2f), claims %.2f GB (", g, v.total[g] / 1e9,
                   v.plan.card[g] / 1e9, claims / 1e9);
       for (glm53::Claim k : glm53::kClaims)
         std::printf("%s%s %.3f", k == glm53::Claim::Exchange ? "" : ", ", std::string(glm53::name(k)).c_str(),
                     v.plan.claims[g][k] / 1e9);
-      std::printf("), Slots %.2f GB, reserve %.2f GB, free after open %.2f GB\n", slots / 1e9,
-                  args.decoder.runtime_reserve_bytes / 1e9, v.free_after_open[g] / 1e9);
+      std::printf("), Slots %.2f GB, reserve %.2f GB, free after open %.2f GB\n", slot_bytes / 1e9,
+                  dc.runtime_reserve_bytes / 1e9, v.free_after_open[g] / 1e9);
     }
     std::optional<uint64_t> digest;  // --logits-hash: every prompt token's logits
     if (args.logits_hash) digest = kFnvBasis;
@@ -505,7 +527,7 @@ int main(int argc, char** argv) {
   }
   if (!args.check) return 0;
   std::fflush(stdout);
-  const ReplayRouting routing{args.decoder.route_bonus, args.decoder.eviction, slots_per_layer,
+  const ReplayRouting routing{args.decoder.route_bonus, args.decoder.eviction, slots,
                               args.prefill == "sweep" ? args.prompt.size() : 0};
   const bool ok = replay(config.value(), parts.value(), args.stores.front(), cap, routing, args.decoder.threads);
   std::printf("%s\n", ok ? "PASS: every layer and logit bit-identical to the Reference configuration"

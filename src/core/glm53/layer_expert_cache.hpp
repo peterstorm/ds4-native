@@ -15,7 +15,8 @@
 // output; under cache-conditional routing it decides what is resident, so what is
 // routed: the engine and the oracle must run the same one.
 //
-// Each Sparse layer owns an equal share of the engine's Slots. Every layer is
+// Each Sparse layer owns its share of the engine's Slots: an equal one, or the
+// Ledger's total in a fitted shape (core/glm53/slot_profile). Every layer is
 // called exactly once per token (or per Round), so per-layer caches track one
 // global cache closely (measured on GLM-5.3: 29.3% against 29.1% misses at 33%
 // residency, docs/bench/glm53-locality/2026-11-20-locality-report.md), and the

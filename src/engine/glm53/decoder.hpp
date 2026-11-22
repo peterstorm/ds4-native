@@ -13,7 +13,9 @@
 // Expert's, combine; Exchange; residual.
 //
 // The Expert cache is core/glm53/layer_expert_cache, one per Sparse layer with
-// an equal share of the Slots: the oracle's cache model itself, so the
+// the Ledger's equal share of the Slots, or that total in a fitted shape
+// (DecoderConfig::slot_profile, core/glm53/slot_profile: the early Sparse layers
+// reuse their Experts most): the oracle's cache model itself, so the
 // residency a cache-conditional router (route_bonus, λ) sees is the one
 // ds4n-glm53-oracle-run's -cc streams model, token for token. The host places
 // each Round after routing (it reads the Plan), reads the Misses from the
@@ -64,6 +66,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <variant>
@@ -72,6 +75,7 @@
 #include "core/glm53/config.hpp"
 #include "core/glm53/layer_expert_cache.hpp"
 #include "core/glm53/ledger.hpp"
+#include "core/glm53/slot_profile.hpp"
 #include "core/result.hpp"
 #include "io/glm53_weights.hpp"
 
@@ -91,6 +95,9 @@ struct DecoderConfig {
   std::array<int, 2> devices{0, 1};  // the GPU of Half 0, of Half 1
   int capacity = 4096;               // positions every layer's cache holds
   int slots_per_layer = 0;           // Expert Slots per Sparse layer; 0: as many as the Ledger fits
+  // The Slots per Sparse layer in this shape (core/glm53/slot_profile), the Ledger's total unchanged;
+  // none: an equal share. Under λ it decides what is resident, so what is routed: --check replays it.
+  std::optional<ds4n::glm53::SlotProfile> slot_profile;
   float route_bonus = 0.0f;          // cache-conditional routing (λ); 0: exact routing
   // Which Expert a full layer's Slots give up (core/glm53/layer_expert_cache). Under exact routing it
   // changes only the reads; under λ it decides what is resident, so what is routed: --check replays it.
@@ -199,7 +206,8 @@ class Decoder {
 
   int64_t length() const;
   int capacity() const;
-  int slots_per_layer() const;
+  int slots_per_layer() const;     // the Ledger's share: the Slots per Sparse layer on average
+  std::span<const int> slots() const;  // [layer]: each Sparse layer's Slots as opened (0 on a Dense layer)
   int ram_per_layer() const;  // the RAM tier's Experts per Sparse layer, as sized; 0: none
   DecoderStats stats() const;
   const VramReport& vram() const;

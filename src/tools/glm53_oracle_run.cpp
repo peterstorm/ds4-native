@@ -5,8 +5,8 @@
 //   ds4n-glm53-oracle-run --config ref/glm-5.3/config.json --backbone DIR --store FILE
 //                         --prompt ID,ID,... [--prompt ID,...]... [--activations fp32,bf16,e4m3,mxfp4,exact,...]
 //                         [--generate N] [--threads T] [--resident E] [--report FILE] [--routes FILE]
-//                         [--moe-roundings FILE] [--slots N] [--eviction lru|counter:N] [--warm N] [--kept FILE]
-//                         [--gpu N]
+//                         [--moe-roundings FILE] [--slots N] [--slot-profile N,N,...] [--eviction lru|counter:N]
+//                         [--warm N] [--kept FILE] [--gpu N]
 //
 // Each prompt runs once per arithmetic listed — a stream, with its own caches
 // and residual stream — teacher-forced on the prompt's tokens. fp32, bf16,
@@ -32,7 +32,9 @@
 // The Expert cache model: every stream keeps, per Sparse layer, a cache of
 // --slots Slots (default 84 per layer: the ~33% of Experts two 96 GB cards
 // hold, docs/bench/glm53-locality) evicting by --eviction (default lru;
-// core/glm53/layer_expert_cache), and records each token's Route in it, in
+// core/glm53/layer_expert_cache); with --slot-profile, --slots is the mean and
+// each layer gets its share in the profile's shape (core/glm53/slot_profile, as
+// the engine's DecoderConfig::slot_profile), and records each token's Route in it, in
 // position order, prefill as decode (one token at a time, as the engine decodes).
 // Reported per arithmetic: the share of Expert picks that miss it, prompt and
 // generated tokens apart, from position --warm on (default 32: the empty cache
@@ -101,6 +103,7 @@
 #include "core/glm53/precision.hpp"
 #include "core/glm53/pruning.hpp"
 #include "core/glm53/reference.hpp"
+#include "core/glm53/slot_profile.hpp"
 #include "io/glm53_store.hpp"
 #include "io/glm53_weights.hpp"
 #include "io/parallel_for.hpp"
@@ -213,7 +216,8 @@ struct Args {
   std::string routes;  // FILE, or empty: no Route dump
   std::string moe_roundings;  // FILE, or empty: no MoE rounding study
   std::string kept;           // FILE: the pruned streams' kept Experts (required by and only with them)
-  int slots = 84;             // the Expert cache model's Slots per Sparse layer
+  int slots = 84;             // the Expert cache model's Slots per Sparse layer (with a profile: on average)
+  std::string slot_profile;   // N,N,...: the Slots in this shape (parsed against the config in main), or empty
   glm53::Eviction eviction = glm53::Lru{};  // and its eviction policy
   size_t warm = 32;           // positions before the cache model's misses count
   std::vector<std::vector<int32_t>> prompts;
@@ -244,6 +248,7 @@ bool parse_args(int argc, char** argv, Args& a) {
     else if (s == "--threads") a.threads = static_cast<unsigned>(std::stoul(v));
     else if (s == "--resident") a.resident = std::stoul(v);
     else if (s == "--slots") a.slots = std::stoi(v);
+    else if (s == "--slot-profile") a.slot_profile = v;
     else if (s == "--eviction") {
       auto e = glm53::parse_eviction(v);
       if (!e) return false;
@@ -777,7 +782,8 @@ int main(int argc, char** argv) {
     die("usage: --config FILE --backbone DIR --store FILE --prompt ID,ID,... [--prompt ...] "
         "[--activations fp32,bf16,e4m3,mxfp4,exact[-DEPARTURE][-attn][-pruned][-ccλ] (distinct; the first is the baseline)] "
         "[--generate N] [--threads T] [--resident E>=8] [--report FILE] [--routes FILE] "
-        "[--moe-roundings FILE (baseline fp32)] [--slots N (per Sparse layer)] [--eviction lru|counter:N] [--warm N] "
+        "[--moe-roundings FILE (baseline fp32)] [--slots N (per Sparse layer)] [--slot-profile N,N,...] "
+        "[--eviction lru|counter:N] [--warm N] "
         "[--kept FILE (with and only with -pruned)] [--gpu N (CUDA builds)]");
   const auto t0 = std::chrono::steady_clock::now();
 
@@ -814,8 +820,23 @@ int main(int argc, char** argv) {
 
   // Streams: prompt-major, the baseline arithmetic first within each prompt.
   const glm53::Dims& d = m.config.dims();
-  const auto expert_cache = glm53::LayerExpertCache::create(d.experts, args.slots, args.eviction);
-  if (!expert_cache) die("--slots: " + expert_cache.error().what);
+  // The Expert cache model's layers: --slots each, or that mean in --slot-profile's shape (the engine's).
+  std::vector<int> layer_slots(static_cast<size_t>(d.layers), args.slots);
+  if (!args.slot_profile.empty()) {
+    auto profile = glm53::SlotProfile::parse(args.slot_profile, m.config);
+    if (!profile) die("--slot-profile: " + profile.error().what);
+    auto shaped = glm53::shape_slots(profile.value(), args.slots, d.experts);
+    if (!shaped) die("--slot-profile: " + shaped.error().what);
+    size_t i = 0;
+    for (int L = 0; L < d.layers; L++)
+      if (m.config.mlp(L) == glm53::MlpKind::Sparse) layer_slots[static_cast<size_t>(L)] = shaped.value()[i++];
+  }
+  std::vector<glm53::LayerExpertCache> expert_caches;
+  for (const int n : layer_slots) {
+    auto cache = glm53::LayerExpertCache::create(d.experts, n, args.eviction);
+    if (!cache) die("--slots: " + cache.error().what);
+    expert_caches.push_back(std::move(cache).value());
+  }
   const size_t P = args.arithmetics.size();
   std::vector<Stream> streams;
   std::vector<std::vector<int32_t>> feed;
@@ -827,7 +848,7 @@ int main(int argc, char** argv) {
       s.baseline = q == 0;
       s.caches.resize(static_cast<size_t>(d.layers));
       s.routes.resize(static_cast<size_t>(d.layers));
-      s.expert_caches.assign(static_cast<size_t>(d.layers), expert_cache.value());
+      s.expert_caches = expert_caches;
       s.misses.resize(static_cast<size_t>(d.layers));
       streams.push_back(std::move(s));
       feed.push_back(args.prompts[p]);
@@ -956,8 +977,9 @@ int main(int argc, char** argv) {
                 quantile(c.kl, 0.9), quantile(c.kl, 1.0), c.kl.size(), c.agree, c.kl.size(), perplexity(c), c.routes_differing,
                 c.routes);
   }
-  std::printf("Expert cache model (%s, %d Slots per Sparse layer, positions %zu on): misses of picks, prompt | generated\n",
-              glm53::to_string(args.eviction).c_str(), args.slots, args.warm);
+  std::printf("Expert cache model (%s, %d Slots per Sparse layer%s, positions %zu on): misses of picks, prompt | generated\n",
+              glm53::to_string(args.eviction).c_str(), args.slots, args.slot_profile.empty() ? "" : " in the profile's shape",
+              args.warm);
   for (size_t q = 0; q < P; q++)
     std::printf("  %-24s %6.2f%% of %zu | %6.2f%% of %zu\n", name_of(args.arithmetics[q]).c_str(),
                 100.0 * share(cmp[q].misses[0], cmp[q].picks[0]), cmp[q].picks[0],
@@ -1027,7 +1049,8 @@ int main(int argc, char** argv) {
           << ",\"routes\":" << c.routes << ",\"routes_differing\":" << c.routes_differing;
       r << "}";
     }
-    r << "},\"cache_slots\":" << args.slots << ",\"cache_eviction\":\"" << glm53::to_string(args.eviction)
+    r << "},\"cache_slots\":" << args.slots << ",\"cache_slot_profile\":\"" << args.slot_profile
+      << "\",\"cache_eviction\":\"" << glm53::to_string(args.eviction)
       << "\",\"cache_warm\":" << args.warm << ",\"route_margins\":[";
     for (size_t i = 0; i < margins.size(); i++) r << (i ? "," : "") << margins[i];
     r << "],\"selections\":" << selections << ",\"selections_dropping\":" << dropping
