@@ -34,7 +34,9 @@
 // the layers. Under --lambda the replay keeps the same Expert cache model
 // (core/glm53/layer_expert_cache, the same --eviction) per layer, token by token,
 // each swept Round with its own token count, so the routing it replays saw the
-// residency the decoder's did. Any difference exits 1.
+// residency the decoder's did. Any difference exits 1. The replay runs --threads layers at a time
+// (the Full layers, then the Shared ones that take their Selections), each layer's Experts read once
+// and run over all the tokens they serve: ~1.1 GB of RAM per layer in flight (256 tokens).
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -43,6 +45,8 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <mutex>
+#include <numeric>
 #include <set>
 #include <optional>
 #include <span>
@@ -58,6 +62,7 @@
 #include "engine/glm53/decoder.hpp"
 #include "io/glm53_store.hpp"
 #include "io/glm53_weights.hpp"
+#include "io/parallel_for.hpp"
 
 using namespace ds4n;
 namespace exact = ds4n::glm53::exact;
@@ -188,118 +193,194 @@ size_t differing(std::span<const float> want, std::span<const float> got) {
   return bad;
 }
 
-/** The CPU replay (see top). Returns whether every layer and logit was bit-identical. */
+/** What the replay routes by: λ, the Expert cache model it favours, and how many leading tokens were swept. */
+struct ReplayRouting {
+  float lambda = 0.0f;
+  glm53::Eviction eviction;
+  int slots_per_layer = 0;
+  size_t exact_prefix = 0;  // the swept prompt's tokens, which route exactly
+};
+
+/** One layer replayed: how many of its output values differ from the next capture, and a Full layer's Selections. */
+struct LayerReplay {
+  size_t bad = 0;
+  double seconds = 0.0;
+  std::vector<std::vector<int32_t>> selection;  // [token] on a Full layer; empty on a Shared one
+};
+
+/**
+ * Layer L replayed on the decoder's captured inputs. Attention and routing go token by token: each
+ * token attends the oracle's rows of the tokens before it, and under λ the cache model takes the
+ * Routes in order. Then each routed Expert is read once and run over every token it serves, and
+ * each token finishes. A Shared layer attends `shared_selection`, its Full layer's Selections.
+ */
+Result<LayerReplay, std::string> replay_layer(const glm53::Config& config, const io::BackboneParts& parts,
+                                              const io::StoreReader& store, const Captured& cap, int L,
+                                              std::span<const std::vector<int32_t>> shared_selection,
+                                              const ReplayRouting& routing) {
+  using R = Result<LayerReplay, std::string>;
+  const auto t0 = std::chrono::steady_clock::now();
+  const glm53::Dims& d = config.dims();
+  const auto where = "layer " + std::to_string(L) + ": ";
+  const auto weights = parts.load_layer(L, 1);
+  if (!weights) return R::err(where + weights.error().what);
+  const auto bound = glm53::bind_layer(config, L, io::lookup_of(weights.value()));
+  if (!bound) return R::err(where + bound.error().what);
+  const auto a = exact::attention_layer(config, L, bound.value());
+  if (!a) return R::err(where + a.error().what);
+  const bool full = a.value().indexer() == glm53::IndexerKind::Full;
+  const auto* mlp = std::get_if<glm53::Mlp>(&bound.value().mlp);
+  const auto* moe = std::get_if<glm53::MoeWeights>(&bound.value().mlp);
+  std::optional<exact::Fp4Expert> shared;
+  std::optional<exact::MoeLayer> layer;
+  std::optional<glm53::LayerExpertCache> cache;
+  if (moe) {
+    auto raw = parts.load_shared_expert(L);
+    if (!raw) return R::err(where + raw.error().what);
+    auto codes = exact::fp4_expert(raw.value());
+    if (!codes) return R::err(where + codes.error().what);
+    shared = std::move(codes).value();
+    layer.emplace(exact::MoeLayer{moe->router, moe->bias, *shared});
+    if (routing.lambda != 0.0f) {
+      auto created = glm53::LayerExpertCache::create(d.experts, routing.slots_per_layer, routing.eviction);
+      if (!created) return R::err(where + created.error().what);
+      cache.emplace(std::move(created).value());
+    }
+  }
+
+  const size_t T = cap.logits.size();
+  LayerReplay out;
+  if (full) out.selection.resize(T);
+  glm53::LayerCache past;
+  std::vector<glm53::LayerStart> starts;
+  std::vector<exact::MoeStart> routed;  // a Sparse layer's: each token's Route and its Experts' input
+  std::set<int32_t> round_union;
+  for (size_t t = 0; t < T; t++) {
+    auto start = exact::begin_layer(a.value(), past, cap.x[static_cast<size_t>(L)][t],
+                                    full ? std::span<const int32_t>{} : std::span<const int32_t>(shared_selection[t]));
+    if (!start) return R::err(where + start.error().what);
+    glm53::append(past, start.value().row);
+    if (full) out.selection[t] = start.value().selection;
+    if (moe) {
+      // A swept prompt's tokens route exactly; the cache records each Round of 8 of them (the last, the
+      // rest) as one Route of its tokens, its Experts' union ascending (the sweep's Plans). Later tokens
+      // route with λ, one by one.
+      const bool swept = t < routing.exact_prefix;
+      exact::RouteChoice choice;
+      if (cache && !swept) choice.bonus = exact::ResidentBonus{routing.lambda, cache->resident()};
+      auto ms = exact::begin_moe(d, *layer, start.value().ffn_in, choice);
+      if (!ms) return R::err(where + ms.error().what);
+      if (cache && swept) {
+        round_union.insert(ms.value().route.expert.begin(), ms.value().route.expert.end());
+        if ((t + 1) % 8 == 0 || t + 1 == routing.exact_prefix) {
+          if (!cache->place(std::vector<int32_t>(round_union.begin(), round_union.end()), static_cast<int>(t % 8) + 1))
+            return R::err(where + "the cache model refused a Round");
+          round_union.clear();
+        }
+      } else if (cache && !cache->place(ms.value().route.expert)) {
+        return R::err(where + "the cache model refused a Route");
+      }
+      routed.push_back(std::move(ms).value());
+    }
+    starts.push_back(std::move(start).value());
+  }
+
+  // The routed Experts, Expert-major: each read once, run over every (token, Route slot) it serves, dropped.
+  std::vector<std::vector<exact::Halves>> halves(routed.size());
+  std::map<int32_t, std::vector<std::pair<size_t, size_t>>> uses;
+  for (size_t t = 0; t < routed.size(); t++) {
+    halves[t].resize(routed[t].route.expert.size());
+    for (size_t k = 0; k < routed[t].route.expert.size(); k++) uses[routed[t].route.expert[k]].emplace_back(t, k);
+  }
+  for (const auto& [e, served] : uses) {
+    auto tensors = store.read_tensors({static_cast<uint32_t>(L), static_cast<uint32_t>(e)});
+    if (!tensors) return R::err(where + tensors.error().what);
+    const auto codes = exact::fp4_expert(tensors.value());
+    if (!codes) return R::err(where + codes.error().what);
+    for (const auto& [t, k] : served) {
+      auto h = exact::expert_halves(codes.value(), routed[t].input, routed[t].route.weight[k]);
+      if (!h) return R::err(where + h.error().what);
+      halves[t][k] = std::move(h).value();
+    }
+  }
+
+  for (size_t t = 0; t < T; t++) {
+    glm53::FeedForward ffn;
+    if (mlp) {
+      auto y = exact::dense_mlp(*mlp, starts[t].ffn_in);
+      if (!y) return R::err(where + y.error().what);
+      ffn.out = std::move(y).value().out;
+    } else {
+      auto moe_out = exact::finish_moe(*layer, routed[t], halves[t]);
+      if (!moe_out) return R::err(where + moe_out.error().what);
+      ffn = {std::move(moe_out).value().out, routed[t].route};
+    }
+    auto step = glm53::finish_layer(config, std::move(starts[t]), std::move(ffn));
+    if (!step) return R::err(where + step.error().what);
+    out.bad += differing(step.value().out, cap.x[static_cast<size_t>(L) + 1][t]);
+  }
+  out.seconds = seconds_since(t0);
+  return R::ok(std::move(out));
+}
+
+/**
+ * The CPU replay (see top), `threads` layers at a time: every layer replays from its own captured
+ * input, so the layers are independent but for the Selections, which a Shared layer takes from the
+ * nearest Full layer below it. The Full layers go first, then the Shared ones, then the head's
+ * logits. Returns whether every layer and logit was bit-identical.
+ */
 bool replay(const glm53::Config& config, const io::BackboneParts& parts, const std::string& store_path,
-            const Captured& cap, float lambda, const glm53::Eviction& eviction, int slots_per_layer, unsigned threads,
-            size_t exact_prefix) {
+            const Captured& cap, const ReplayRouting& routing, unsigned threads) {
+  const auto t0 = std::chrono::steady_clock::now();
   const glm53::Dims& d = config.dims();
   auto store = io::StoreReader::open(store_path);
   if (!store) die(store.error().what);
   const size_t T = cap.logits.size();
-  std::vector<std::vector<int32_t>> selection(T);  // each token's Selection from the last Full layer
-  bool ok = true;
-  for (int L = 0; L < d.layers; L++) {
-    const auto t0 = std::chrono::steady_clock::now();
-    const auto where = "layer " + std::to_string(L) + ": ";
-    const auto weights = parts.load_layer(L, threads);
-    if (!weights) die(where + weights.error().what);
-    const auto bound = glm53::bind_layer(config, L, io::lookup_of(weights.value()));
-    if (!bound) die(where + bound.error().what);
-    const auto a = exact::attention_layer(config, L, bound.value());
-    if (!a) die(where + a.error().what);
-    const auto* mlp = std::get_if<glm53::Mlp>(&bound.value().mlp);
-    const auto* moe = std::get_if<glm53::MoeWeights>(&bound.value().mlp);
-    std::optional<exact::Fp4Expert> shared;
-    std::optional<exact::MoeLayer> layer;
-    std::optional<glm53::LayerExpertCache> cache;
-    if (moe) {
-      auto raw = parts.load_shared_expert(L);
-      if (!raw) die(where + raw.error().what);
-      auto codes = exact::fp4_expert(raw.value());
-      if (!codes) die(where + codes.error().what);
-      shared = std::move(codes).value();
-      layer.emplace(exact::MoeLayer{moe->router, moe->bias, *shared});
-      if (lambda != 0.0f) cache.emplace(glm53::LayerExpertCache::create(d.experts, slots_per_layer, eviction).value());
-    }
-    std::map<int32_t, exact::Fp4Expert> experts;
-    std::set<int32_t> round_union;
-    glm53::LayerCache past;
-    size_t bad = 0;
-    for (size_t t = 0; t < T; t++) {
-      const auto& x = cap.x[static_cast<size_t>(L)][t];
-      auto start = exact::begin_layer(a.value(), past, x, selection[t]);
-      if (!start) die(where + start.error().what);
-      const auto& row = start.value().row;
-      past.latent.insert(past.latent.end(), row.latent.begin(), row.latent.end());
-      past.k_rope.insert(past.k_rope.end(), row.k_rope.begin(), row.k_rope.end());
-      past.index_keys.insert(past.index_keys.end(), row.index_key.begin(), row.index_key.end());
-      past.length++;
-      if (a.value().indexer() == glm53::IndexerKind::Full) selection[t] = start.value().selection;
-      glm53::FeedForward ffn;
-      if (mlp) {
-        auto y = exact::dense_mlp(*mlp, start.value().ffn_in);
-        if (!y) die(where + y.error().what);
-        ffn.out = std::move(y).value().out;
-      } else {
-        // A swept prompt's tokens route exactly; the cache records each Round of 8 of them (the last, the
-        // rest) as one Route of its tokens, its Experts' union ascending (the sweep's Plans). Later tokens
-        // route with λ, one by one.
-        const bool swept = t < exact_prefix;
-        exact::RouteChoice choice;
-        if (cache && !swept) choice.bonus = exact::ResidentBonus{lambda, cache->resident()};
-        auto ms = exact::begin_moe(d, *layer, start.value().ffn_in, choice);
-        if (!ms) die(where + ms.error().what);
-        if (cache && swept) {
-          round_union.insert(ms.value().route.expert.begin(), ms.value().route.expert.end());
-          if ((t + 1) % 8 == 0 || t + 1 == exact_prefix) {
-            if (!cache->place(std::vector<int32_t>(round_union.begin(), round_union.end()), static_cast<int>(t % 8) + 1))
-              die(where + "the cache model refused a Round");
-            round_union.clear();
-          }
-        } else if (cache && !cache->place(ms.value().route.expert)) {
-          die(where + "the cache model refused a Route");
-        }
-        std::vector<exact::Halves> halves;
-        for (size_t k = 0; k < ms.value().route.expert.size(); k++) {
-          const int32_t e = ms.value().route.expert[k];
-          if (!experts.contains(e)) {
-            auto tensors = store.value().read_tensors({static_cast<uint32_t>(L), static_cast<uint32_t>(e)});
-            if (!tensors) die(where + tensors.error().what);
-            auto codes = exact::fp4_expert(tensors.value());
-            if (!codes) die(where + codes.error().what);
-            experts.emplace(e, std::move(codes).value());
-          }
-          auto h = exact::expert_halves(experts.at(e), ms.value().input, ms.value().route.weight[k]);
-          if (!h) die(where + h.error().what);
-          halves.push_back(std::move(h).value());
-        }
-        auto out = exact::finish_moe(*layer, ms.value(), halves);
-        if (!out) die(where + out.error().what);
-        ffn = {std::move(out).value().out, ms.value().route};
+  std::vector<int> full_layers, shared_layers;
+  for (int L = 0; L < d.layers; L++)
+    (config.indexer(L) == glm53::IndexerKind::Full ? full_layers : shared_layers).push_back(L);
+  std::vector<std::optional<LayerReplay>> done(static_cast<size_t>(d.layers));
+  std::mutex report;
+  for (const auto* layers : {&full_layers, &shared_layers}) {
+    const auto failed = io::parallel_for(layers->size(), threads, [&](size_t i) -> std::optional<std::string> {
+      const int L = (*layers)[i];
+      std::span<const std::vector<int32_t>> selection;
+      if (config.indexer(L) == glm53::IndexerKind::Shared) {
+        int below = L - 1;  // layer 0 is Full (glm53::parse_config), and the Full layers are done
+        while (config.indexer(below) != glm53::IndexerKind::Full) below--;
+        selection = done[static_cast<size_t>(below)]->selection;
       }
-      auto step = glm53::finish_layer(config, std::move(start).value(), std::move(ffn));
-      if (!step) die(where + step.error().what);
-      bad += differing(step.value().out, cap.x[static_cast<size_t>(L) + 1][t]);
-    }
-    std::printf("layer %2d (%s, %s): %zu tokens, %zu values differ  [%.1f s]\n", L,
-                a.value().indexer() == glm53::IndexerKind::Full ? "Full" : "Shared", mlp ? "Dense" : "Sparse", T, bad,
-                seconds_since(t0));
-    std::fflush(stdout);
-    ok = ok && bad == 0;
+      auto r = replay_layer(config, parts, store.value(), cap, L, selection, routing);
+      if (!r) return r.error();
+      const std::lock_guard lock(report);
+      std::printf("layer %2d (%s, %s): %zu tokens, %zu values differ  [%.1f s]\n", L,
+                  config.indexer(L) == glm53::IndexerKind::Full ? "Full" : "Shared",
+                  config.mlp(L) == glm53::MlpKind::Dense ? "Dense" : "Sparse", T, r.value().bad, r.value().seconds);
+      std::fflush(stdout);
+      done[static_cast<size_t>(L)] = std::move(r).value();
+      return std::nullopt;
+    });
+    if (failed) die(*failed);
   }
+  const bool layers_ok = std::ranges::all_of(done, [](const auto& r) { return r->bad == 0; });
+
   auto head = parts.load("lm_head.weight");
   if (!head) die(head.error().what);
   auto norm = parts.load("model.norm.weight");
   if (!norm) die(norm.error().what);
   const glm53::Matrix m{head.value().values, d.vocab, d.hidden};
-  size_t bad = 0;
-  for (size_t t = 0; t < T; t++) {
+  std::vector<size_t> bad(T);
+  const auto failed = io::parallel_for(T, threads, [&](size_t t) -> std::optional<std::string> {
     auto want = exact::logits(d, norm.value().values, m, cap.x[static_cast<size_t>(d.layers)][t]);
-    if (!want) die(want.error().what);
-    bad += differing(want.value(), cap.logits[t]);
-  }
-  std::printf("head: %zu tokens x %d logits, %zu differ\n", T, d.vocab, bad);
-  return ok && bad == 0;
+    if (!want) return "head: " + want.error().what;
+    bad[t] = differing(want.value(), cap.logits[t]);
+    return std::nullopt;
+  });
+  if (failed) die(*failed);
+  const size_t head_bad = std::accumulate(bad.begin(), bad.end(), size_t{0});
+  std::printf("head: %zu tokens x %d logits, %zu differ\n", T, d.vocab, head_bad);
+  std::printf("replay: %d layers and the head in %.1f s, %u at a time\n", d.layers, seconds_since(t0), threads);
+  return layers_ok && head_bad == 0;
 }
 
 }  // namespace
@@ -424,8 +505,9 @@ int main(int argc, char** argv) {
   }
   if (!args.check) return 0;
   std::fflush(stdout);
-  const bool ok = replay(config.value(), parts.value(), args.stores.front(), cap, args.decoder.route_bonus, args.decoder.eviction, slots_per_layer,
-                         args.decoder.threads, args.prefill == "sweep" ? args.prompt.size() : 0);
+  const ReplayRouting routing{args.decoder.route_bonus, args.decoder.eviction, slots_per_layer,
+                              args.prefill == "sweep" ? args.prompt.size() : 0};
+  const bool ok = replay(config.value(), parts.value(), args.stores.front(), cap, routing, args.decoder.threads);
   std::printf("%s\n", ok ? "PASS: every layer and logit bit-identical to the Reference configuration"
                          : "FAIL: the decoder differs from the Reference configuration");
   return ok ? 0 : 1;

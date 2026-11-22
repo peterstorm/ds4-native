@@ -306,9 +306,9 @@ An independent audit (python, read-only, against the index) found:
        λ is the owner's call.
      - **Cohort gate 1 passes:** the hash `bec364f75ef70233` is equal across Cohorts 512/1024/16K and
        `--prefill rounds`.
-     - **Cohort gate 2:** the 1,100-token replays were stopped (~19 h, exact CPU attention is
-       quadratic). It is now short checks: 192 tokens across 3 Cohorts plus 64 tokens under λ, both
-       policies. Results are in the report.
+     - **Cohort gate 2:** the 1,100-token replays were stopped (~19 h: the replay ran on one thread).
+       It is now short checks, 192 tokens across 3 Cohorts plus 64 tokens under λ, both policies, on a
+       replay that runs `--threads` layers at a time. Results are in the report.
      - **Ledger gate: drift check passed, Slots one short** (98/88/82). The reserve had been calibrated
        on nvidia-smi's card size, but open uses CUDA's, 101,973,491,712 B (`glm53::kRtxPro6000Bytes`).
        - Recalibrated, the reserve was 4 GiB, and the GPUs opened exactly the Ledger's 99 / **90** at
@@ -376,10 +376,12 @@ An independent audit (python, read-only, against the index) found:
   own reservation; `cudaMemGetInfo`'s total (97,249.5 MiB) is what can be allocated. That reservation
   also moves by a few MiB (GPU 0: 638 → 641 MiB in one day), so the Ledger plans the CUDA total
   rounded down to whole 256 MiB. Calibrate anything VRAM-sized on that planned size.
-- **`--check` replays are quadratic in tokens** (exact CPU attention over every earlier position):
-  27 tokens ~44 s a layer, 1,116 tokens ~860 s a layer (~19 h). Keep checked prompts to a few hundred
-  tokens and cross Cohorts with a small `--wave`/`--cohort`. A replaying process keeps its CUDA
-  context (~560 MiB per GPU) and several GB of RAM until it exits.
+- **`--check` replays are long, not quadratic:** on one CPU thread a token costs ~0.6–0.8 s on a Dense
+  layer and ~3.5 s on a Sparse one, so 1,116 tokens would have taken ~19 h. The replay now runs
+  `--threads` layers at a time (~1.1 GB of RAM a layer at 256 tokens): 256 tokens take ~2.5 h with two
+  replays sharing 32 threads. Keep checked prompts to a few hundred tokens, and cross Cohorts with a
+  small `--wave`/`--cohort`. A replaying process keeps its CUDA context (~560 MiB per GPU) until it
+  exits.
 - **A `tar` sync restores source mtimes**, so after a mutation probe in the synced tree ninja keeps
   the last mutant's object (its object is newer than the restored source). Rebuild once after
   restoring, or `touch` the mutated file before the next build.

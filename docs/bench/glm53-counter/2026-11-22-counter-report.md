@@ -255,10 +255,11 @@ generated under λ 0.03, once with LRU and once with counter:55.
 - **The GPU parts finished.**
   - LRU: prompt 70.2 s, 16 tokens at 3.92 tok/s, misses 15.8%.
   - counter55: prompt 69.8 s, 16 tokens at 4.44 tok/s, misses 13.4%.
-- **Both replays were bit-identical on layer 0, but took ~860 s each for that one layer.** The oracle's
-  exact attention runs on the CPU, one token at a time, over every earlier position, so its cost is
-  quadratic in the tokens. All 78 layers would have taken ~19 h. Each replay also holds a CUDA context
-  (~560 MiB per GPU) and a few GB of host RAM, which WARMIND needs back. Both were stopped after layer 0
+- **Both replays were bit-identical on layer 0, but took ~860 s each for that one layer.** The replay
+  ran on one thread, layer after layer and token after token: ~0.77 s a token on a Dense layer, more
+  with the Experts on a Sparse one. All 78 layers would have taken ~19 h. (Not quadratic, as first
+  written here: 256 tokens took 0.61 s a token on the same layers.) Each replay also holds a CUDA
+  context (~560 MiB per GPU) and host RAM, which WARMIND needs back. Both were stopped after layer 0
   (`check-l0.03-*.partial.out`).
 - **The short checks replace them, with the same logic:**
   - 192 tokens across 3 Cohorts (`--wave 64 --cohort 64`, the decode tool's documented way to cross
@@ -270,6 +271,21 @@ What these checks cover:
 
 - The swept prompt is checked exactly as a λ 0 run would check it, so they cover the gate's λ 0 run as well.
 - The λ tokens are replayed against the residency the Cohorts left, under each policy.
+
+**The short checks' first replays were serial too.** A Sparse layer took ~890 s, the whole replay ~18
+h. They were stopped after layer 3, bit-identical so far under both policies
+(`check-short-l0.03-*.partial.out`).
+
+**The replay now runs layers in parallel** (`ds4n-glm53-decode --check`, `--threads` layers at a time).
+Every layer replays from its own captured input, so the layers are independent, except that a Shared
+layer attends its Full layer's Selections. The 21 Full layers go first, then the 57 Shared ones. Within
+a layer, attention and routing still go token by token: each token attends the rows before it, and the
+cache model takes the Routes in order. Then each routed Expert is read once and run over every token
+it serves. Each Expert's output does not depend on the order, so the results are the serial replay's
+bit for bit. Layers 0–3 match the serial replay. A layer in flight holds ~1.1 GB of RAM at 256 tokens.
+The `io::parallel_for` it uses is the oracle's, moved to `src/io/parallel_for.hpp` for both tools.
+
+Rerun with the same commands (`2026-11-22-check-parallel.sh`), both policies at once, 16 layers each:
 
 [PENDING: short check replays, `check-short-l0.03-{lru,counter55}.out`.]
 

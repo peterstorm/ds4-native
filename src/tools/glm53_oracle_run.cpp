@@ -77,7 +77,6 @@
 // candidate's relative RMS error and its error energy relative to E4M3's.
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -85,13 +84,11 @@
 #include <fstream>
 #include <iterator>
 #include <map>
-#include <mutex>
 #include <numeric>
 #include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <variant>
 #include <vector>
 
@@ -106,6 +103,7 @@
 #include "core/glm53/reference.hpp"
 #include "io/glm53_store.hpp"
 #include "io/glm53_weights.hpp"
+#include "io/parallel_for.hpp"
 #ifdef DS4N_GLM53_GPU
 #include "core/glm53/expert_tiles.hpp"
 #include "cuda/glm53/grouped_moe.hpp"
@@ -113,6 +111,7 @@
 
 using namespace ds4n;
 using glm53::ActivationPrecision;
+using io::parallel_for;
 namespace exact = glm53::exact;
 
 namespace {
@@ -280,27 +279,6 @@ bool parse_args(int argc, char** argv, Args& a) {
 
 double seconds_since(std::chrono::steady_clock::time_point t0) {
   return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-}
-
-/** fn(i) for i in [0, n) on `threads` threads; the first error message wins. */
-template <class Fn>
-std::optional<std::string> parallel_for(size_t n, unsigned threads, Fn fn) {
-  std::atomic<size_t> next{0};
-  std::mutex m;
-  std::optional<std::string> failure;
-  auto worker = [&] {
-    for (size_t i = next++; i < n; i = next++) {
-      if (auto e = fn(i)) {
-        const std::lock_guard lock(m);
-        if (!failure) failure = std::move(e);
-        return;
-      }
-    }
-  };
-  std::vector<std::thread> pool;
-  for (unsigned t = 0; t < std::min<size_t>(threads, std::max<size_t>(n, 1)); t++) pool.emplace_back(worker);
-  for (auto& t : pool) t.join();
-  return failure;
 }
 
 /** What stays loaded for the whole run. */
