@@ -6,7 +6,8 @@
 //   ds4n-glm53-ledger --config CONFIG [--capacity N[,N...]] [--cohort K] [--wave W] [--vram-mib M]
 //                     [--reserve-gib G] [--slots-per-layer S] [--claims]
 //
-// --vram-mib (default 97887, an RTX PRO 6000 as nvidia-smi reports it) is each card's size;
+// --vram-mib is each card's size as CUDA reports it (cudaMemGetInfo's total; default an RTX PRO 6000's,
+// 97,249.5 MiB: nvidia-smi's 97,887 also counts the driver's own reservation, and over-counts a Slot);
 // --reserve-gib (default DecoderConfig's runtime_reserve_bytes) what stays outside the claims;
 // --claims prints each GPU's claims by kind. A capacity whose Slots do not fit prints why.
 #include <cstdint>
@@ -44,7 +45,7 @@ int main(int argc, char** argv) {
   std::string config_path;
   std::vector<int> capacities;
   int cohort = defaults.cohort, wave = defaults.wave, asked = 0;
-  uint64_t vram = 97887ull << 20;
+  uint64_t vram = g53::kRtxPro6000Bytes;
   double reserve_gib = static_cast<double>(defaults.runtime_reserve_bytes) / static_cast<double>(1ull << 30);
   bool claims = false;
   for (int i = 1; i < argc; i++) {

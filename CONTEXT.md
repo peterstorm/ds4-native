@@ -41,6 +41,10 @@ _Avoid_: cache line, entry
 The set of Slots and the policy that decides which Experts occupy them.
 _Avoid_: hotlist (that is antirez's preload table)
 
+**Eviction policy**:
+Which resident Expert a full layer's Slots give up for a Miss, never one the Route needs. GLM-5.3's are `Lru` and `CounterDecay` (`core/glm53/layer_expert_cache`, `--eviction lru|counter:N`): a counter adds one per Route naming the Expert, halves every count each N tokens, and evicts the lowest (count, last use, id). `counter:55` is the replay study's policy.
+_Avoid_: replacement strategy, LFU (the halving makes it neither pure LFU nor LRU)
+
 **RAM tier**:
 Pinned host memory holding Expert records a Miss can come from over PCIe instead of the store (3,000 records, 56 GB). As a **victim tier** (`RamPolicy::Victim`) it holds what the Slots evicted -- each evicted Expert copied down from its Slot, a Load found there moving up and leaving it -- so the Slots and the tier hold distinct Experts, about one least-recently-used cache of both sizes. Inclusive (`popular`, `recent`), every decode Load's store read lands in it, so it holds Experts the Slots hold too.
 _Avoid_: CPU lane (Maya computes on CPU; we do not)
@@ -214,6 +218,7 @@ _Avoid_: router confidence, gap (unqualified)
 - A **Resume** takes KV from a **Lane** (in place, or its prefix borrowed into another) or a **KV checkpoint**, and rings from that state, a **KV checkpoint**'s turn, or a **Rewind point** — whichever reads fewest of the prompt's tokens
 - Every busy **Lane** has a row in every **Shared Round**; a **Prompt sweep** holds the GPUs alone, the other **Lanes** pausing
 - **Cache-conditional routing** makes outputs depend on **Expert cache** contents; with λ = 0 every policy is **Exact**
+- Under **Cache-conditional routing** the **Eviction policy** decides what is routed, so the engine, `--check`'s replay and the **Oracle** must run the same one, each **Round** advancing a counter's clock by its tokens
 - On GLM-5.3 every **Shared layer** attends the **Selection** of the nearest **Full layer** below it; only **Full layers**' **Latent rows** carry index keys
 - A GLM-5.3 **Expert** (routed or shared) runs as two **Halves**, each GPU summing its routed **Halves** in **Routing plan** order and then its shared **Half**, and the **Exchange** gives the MoE output; the routing weight is folded in before down_proj, a different rounding from the pinned reference's order, never a different mathematics
 - Every tensor of a GLM-5.3 source shard goes to exactly one of an **Expert record** and its shard's **Backbone part**; the shard may be deleted only when every one of them is verified there — per tensor (equal to its slice of its decoded **Expert record**), never per layer, since a shard may hold two layers' **Experts** and an **Expert** may span two shards

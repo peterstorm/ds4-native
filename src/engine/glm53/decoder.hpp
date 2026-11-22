@@ -21,10 +21,13 @@
 // Experts are placed together, so none evicts another. Under λ a Round is one
 // token: the router of token t + 1 must see the residency token t left.
 //
+// The Slots give up Experts by DecoderConfig::eviction: least recently used, or
+// a use counter halved every N tokens (counter:55 misses ~5% fewer on GLM-5.3).
+//
 // Below the Slots, optionally, the RAM tier (core/glm53/victim_tier): every
 // Expert a Load evicts is copied down into pinned host memory, and a Miss found
-// there moves up over PCIe instead of being read from the store. Slots and tier
-// then act as one LRU cache of both sizes. Routing never sees the tier.
+// there moves up over PCIe instead of being read from the store; the tier keeps
+// the most recently evicted. Routing never sees the tier.
 //
 // A prompt runs faster as a sweep (prefill): layer by layer, every token of it
 // through layer L before any goes on, so a layer's Experts are read once for the
@@ -67,6 +70,7 @@
 #include <vector>
 
 #include "core/glm53/config.hpp"
+#include "core/glm53/layer_expert_cache.hpp"
 #include "core/glm53/ledger.hpp"
 #include "core/result.hpp"
 #include "io/glm53_weights.hpp"
@@ -88,7 +92,10 @@ struct DecoderConfig {
   int capacity = 4096;               // positions every layer's cache holds
   int slots_per_layer = 0;           // Expert Slots per Sparse layer; 0: as many as the Ledger fits
   float route_bonus = 0.0f;          // cache-conditional routing (λ); 0: exact routing
-  unsigned threads = 16;             // Backbone load threads
+  // Which Expert a full layer's Slots give up (core/glm53/layer_expert_cache). Under exact routing it
+  // changes only the reads; under λ it decides what is resident, so what is routed: --check replays it.
+  ds4n::glm53::Eviction eviction = ds4n::glm53::Lru{};
+  unsigned threads = 16;            // Backbone load threads
   // VRAM per GPU outside the Ledger's claims (core/glm53/ledger): the CUDA context, kernel images,
   // allocator rounding and headroom. The Slots are the card's bytes past the claims and this, so the
   // same settings give the same Slots on every open; a card that cannot hold them fails open instead.

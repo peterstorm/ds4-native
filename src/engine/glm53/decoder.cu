@@ -726,7 +726,7 @@ Result<std::unique_ptr<Decoder>, std::string> Decoder::open(const g53::Config& c
       s.vram.free_after_open[g] = free_b;
     }
     for (int L : sparse_layers) {
-      auto cache = g53::LayerExpertCache::create(d.experts, per_layer);
+      auto cache = g53::LayerExpertCache::create(d.experts, per_layer, c.eviction);
       if (!cache) return R::err(cache.error().what);
       s.caches[L].emplace(std::move(cache).value());
     }
@@ -912,7 +912,7 @@ void Decoder::State::moe(int L, int n, const std::array<Rows, 2>& rows) {
   launch_route(L, n, rows);
   const moe_plan::Plan plan = read_plan(L);
   g53::LayerExpertCache& cache = *caches[static_cast<size_t>(L)];
-  auto loads = cache.place(std::span<const int32_t>(plan.expert, static_cast<size_t>(plan.jobs)));
+  auto loads = cache.place(std::span<const int32_t>(plan.expert, static_cast<size_t>(plan.jobs)), n);
   if (!loads) throw Failure("layer " + std::to_string(L) + ": " + loads.error().what);
   stats.picks += static_cast<uint64_t>(plan.jobs);
   stats.misses += loads.value().size();
@@ -1148,9 +1148,11 @@ void Decoder::State::sweep_moe(int L, int tokens) {
     }
   }
 
-  // The cache records each Round as round() would (the tier too).
-  for (const moe_plan::Plan& plan : plans) {
-    auto loads = cache.place(std::span<const int32_t>(plan.expert, static_cast<size_t>(plan.jobs)));
+  // The cache records each Round as round() would (the tier too): Rounds of 8, the last the rest.
+  for (int r = 0; r < rounds; r++) {
+    const moe_plan::Plan& plan = plans[static_cast<size_t>(r)];
+    auto loads = cache.place(std::span<const int32_t>(plan.expert, static_cast<size_t>(plan.jobs)),
+                             std::min(kMaxRound, tokens - r * kMaxRound));
     if (!loads) throw Failure("layer " + std::to_string(L) + ": " + loads.error().what);
     if (tier)
       if (auto m = tier->serve(t, loads.value()); !m) throw Failure("RAM tier: " + m.error().what);

@@ -4,7 +4,7 @@
 // ARGS...` and speaks GEN / T / DONE with it over stdin and stdout.
 //
 //   ds4n-glm53-serve --serve --config CONFIG --backbone DIR --store FILE[,FILE...] [--max-context N]
-//                    [--lambda λ] [--slots-per-layer S] [--ram-per-layer R|auto] [--ram-reserve-gib G]
+//                    [--lambda λ] [--eviction lru|counter:N] [--slots-per-layer S] [--ram-per-layer R|auto] [--ram-reserve-gib G]
 //                    [--checkpoint-gb G] [--stops ID,ID,...] [--wave W] [--cohort K] [--devices A,B]
 //                    [--threads T]
 //
@@ -15,6 +15,7 @@
 // --cohort K (default 16384, rounded down to whole waves): a longer prompt is read as a sweep per K tokens; the
 // sweep's buffers take ~101 KB a token of min(K, N) on each GPU (16K: ~1.7 GB, ~2.2 Slots per layer).
 // --lambda λ (default 0): cache-conditional routing for the reply's tokens; prompts route exactly.
+// --eviction lru|counter:N (default lru): which Expert a full layer's Slots give up (core/glm53/layer_expert_cache).
 // --checkpoint-gb G (default 4): host memory for conversations set aside (engine/glm53/conversation),
 // 95.2 KB a token (Decoder::position_bytes; 4 GB hold ~42K tokens); with --ram-per-layer auto the RAM
 // tier leaves it free beside --ram-reserve-gib (10).
@@ -42,6 +43,7 @@
 #include <vector>
 
 #include "core/glm53/config.hpp"
+#include "core/glm53/layer_expert_cache.hpp"
 #include "core/wire.hpp"
 #include "engine/glm53/conversation.hpp"
 #include "engine/glm53/decoder.hpp"
@@ -152,6 +154,11 @@ int main(int argc, char** argv) {
     }
     else if (a == "--max-context") dc.capacity = std::stoi(v);
     else if (a == "--lambda") dc.route_bonus = std::stof(v);
+    else if (a == "--eviction") {
+      auto e = glm53::parse_eviction(v);
+      if (!e) die(e.error().what);
+      dc.eviction = e.value();
+    }
     else if (a == "--slots-per-layer") dc.slots_per_layer = std::stoi(v);
     else if (a == "--ram-per-layer") dc.ram_tier = v == "auto" ? eng::RamTierSize{eng::RamTierFit{}} : eng::RamTierFixed{std::stoi(v)};
     else if (a == "--ram-reserve-gib") reserve_gib = std::stoull(v);
@@ -171,7 +178,7 @@ int main(int argc, char** argv) {
   }
   if (!serve || config_path.empty() || backbone.empty() || stores.empty())
     die("usage: ds4n-glm53-serve --serve --config CONFIG --backbone DIR --store FILE[,FILE...] [--max-context N] [--lambda λ] "
-        "[--slots-per-layer S] [--ram-per-layer R|auto] [--ram-reserve-gib G] [--checkpoint-gb G] [--stops ID,...] "
+        "[--eviction lru|counter:N] [--slots-per-layer S] [--ram-per-layer R|auto] [--ram-reserve-gib G] [--checkpoint-gb G] [--stops ID,...] "
         "[--wave W] [--cohort K] [--devices A,B] [--threads T]");
   if (!(checkpoint_gb >= 0.0)) die("--checkpoint-gb must be >= 0");
   const auto checkpoint_bytes = static_cast<uint64_t>(checkpoint_gb * 1e9);
@@ -207,9 +214,9 @@ int main(int argc, char** argv) {
   out(wire::ready_line(dc.capacity, lane::LaneCount::of(1).value()));
   std::fprintf(stderr,
                "ds4n-glm53-serve: ready in %.0f s: context %d, %d Slots per Sparse layer, RAM tier %d per layer, λ %g, "
-               "checkpoints %.1f GB (%.1f KB a token)\n",
+               "eviction %s, checkpoints %.1f GB (%.1f KB a token)\n",
                dec.stats().load_s, dc.capacity, dec.slots_per_layer(), dec.ram_per_layer(), static_cast<double>(dc.route_bonus),
-               checkpoint_gb, static_cast<double>(dec.position_bytes()) / 1e3);
+               glm53::to_string(dc.eviction).c_str(), checkpoint_gb, static_cast<double>(dec.position_bytes()) / 1e3);
   for (size_t g = 0; g < 2; g++)  // the Ledger's account (core/glm53/ledger): ds4n-glm53-ledger predicts it
     std::fprintf(stderr, "ds4n-glm53-serve: vram GPU %zu: card %.2f GB, claims %.2f GB, free after open %.2f GB\n", g,
                  dec.vram().total[g] / 1e9, dec.vram().plan.claims[g].total() / 1e9, dec.vram().free_after_open[g] / 1e9);

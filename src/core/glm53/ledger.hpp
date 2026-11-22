@@ -85,14 +85,21 @@ Result<std::array<Claims, 2>, LedgerError> vram_claims(const Config& config, con
 uint64_t position_bytes(const Config& config);
 
 /**
- * The runtime reserve the engine keeps by default: 4.75 GiB, a reserve that reproduces the Slots
+ * An RTX PRO 6000's VRAM as CUDA sees it: cudaMemGetInfo's total, what Decoder::open plans against.
+ * 637.5 MiB below the 97,887 MiB nvidia-smi reports, which counts the driver's own reservation too
+ * (measured 2026-11-22, docs/bench/glm53-counter/2026-11-22-counter-report.md).
+ */
+inline constexpr uint64_t kRtxPro6000Bytes = 101'973'491'712;
+
+/**
+ * The runtime reserve the engine keeps by default: 4 GiB, a reserve that reproduces the Slots
  * free-memory sizing gave on two RTX PRO 6000s before the Ledger (99 per layer at 4K positions, 83 at
  * 64K, a sweep then taking the whole capacity), so adopting the Ledger changed no Slot count. Any reserve
- * in (4.23, 4.90] GiB does; so CUDA itself took 1.3 to 2.0 GB beside the 3 GiB that sizing kept free
- * (docs/bench/glm53-capacity/2026-11-22-ledger.md). Each 0.70 GiB less is a Slot per layer more, once
- * a GPU run's free memory after open shows the headroom goes unused.
+ * in [3.611, 4.278] GiB does, on kRtxPro6000Bytes (docs/bench/glm53-capacity/2026-11-22-ledger.md; the
+ * first calibration, 4.75 GiB, took nvidia-smi's size and opened a Slot short on the GPUs, 98 and 82).
+ * At 64K a decode's peak left ~3.1 GiB of it unused: each 0.70 GiB less is a Slot per layer more.
  */
-inline constexpr uint64_t kDefaultRuntimeReserve = (19ull << 30) / 4;
+inline constexpr uint64_t kDefaultRuntimeReserve = 4ull << 30;
 
 struct SlotPlan {
   int per_layer;                    // Expert Slots per Sparse layer, on each GPU (one Half each)

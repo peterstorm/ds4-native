@@ -2,12 +2,14 @@
 // Rounds, then greedy generation, with timings; --check gates every layer of
 // every token against the CPU oracle, bit for bit.
 //
-//   ds4n-glm53-decode --config CONFIG --backbone DIR --store FILE[,FILE...] --prompt "ID ID ..."
-//                     [--generate N] [--round R] [--lambda λ] [--slots-per-layer S]
+//   ds4n-glm53-decode --config CONFIG --backbone DIR --store FILE[,FILE...] (--prompt "ID ID ..." | --prompt-file FILE)
+//                     [--generate N] [--round R] [--lambda λ] [--eviction lru|counter:N] [--slots-per-layer S]
 //                     [--ram-per-layer R|auto] [--ram-reserve-gib G] [--read-ahead SHARE]
 //                     [--prefill sweep|rounds] [--wave W] [--cohort K] [--capacity C] [--devices A,B]
 //                     [--threads T] [--then "ID ID ..."] [--logits-hash] [--check]
 // --store takes replicas of one store, one per drive (the decoder spreads its reads over them).
+// --prompt-file reads the ids (whitespace-separated) from FILE: a prompt past ~20K tokens is longer
+// than one command-line argument may be (Linux's MAX_ARG_STRLEN, 128 KiB).
 // The Slots are the Ledger's (core/glm53/ledger; ds4n-glm53-ledger prints them without a GPU): the
 // "vram" lines give each GPU's claims, Slots and what stayed free, the runtime reserve's real use.
 // --ram-per-layer auto sizes the RAM tier to the host's available memory less --ram-reserve-gib (10).
@@ -30,8 +32,9 @@
 // head's logits against exact::logits. A layer that is exact on the decoder's
 // inputs at every token makes the whole run the oracle's run, by induction over
 // the layers. Under --lambda the replay keeps the same Expert cache model
-// (core/glm53/layer_expert_cache) per layer, token by token, so the routing it
-// replays saw the residency the decoder's did. Any difference exits 1.
+// (core/glm53/layer_expert_cache, the same --eviction) per layer, token by token,
+// each swept Round with its own token count, so the routing it replays saw the
+// residency the decoder's did. Any difference exits 1.
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -94,8 +97,9 @@ struct Args {
 
 Args parse(int argc, char** argv) {
   const std::string usage =
-      "usage: --config CONFIG --backbone DIR --store FILE[,FILE...] --prompt \"ID ID ...\" [--generate N] [--round R] "
-      "[--prefill sweep|rounds] [--lambda λ] [--slots-per-layer S] [--ram-per-layer R|auto] [--ram-reserve-gib G] "
+      "usage: --config CONFIG --backbone DIR --store FILE[,FILE...] (--prompt \"ID ID ...\" | --prompt-file FILE) "
+      "[--generate N] [--round R] "
+      "[--prefill sweep|rounds] [--lambda λ] [--eviction lru|counter:N] [--slots-per-layer S] [--ram-per-layer R|auto] [--ram-reserve-gib G] "
       "[--read-ahead SHARE] [--wave W] [--cohort K] [--capacity C] [--devices A,B] [--threads T] [--then \"ID ID ...\"] "
       "[--logits-hash] [--check]";
   std::optional<uint64_t> reserve_gib;
@@ -119,7 +123,11 @@ Args parse(int argc, char** argv) {
     else if (k == "--prefill") a.prefill = v;
     else if (k == "--round") a.round = std::stoi(v);
     else if (k == "--lambda") a.decoder.route_bonus = std::stof(v);
-    else if (k == "--slots-per-layer") a.decoder.slots_per_layer = std::stoi(v);
+    else if (k == "--eviction") {
+      auto e = glm53::parse_eviction(v);
+      if (!e) die(e.error().what);
+      a.decoder.eviction = e.value();
+    } else if (k == "--slots-per-layer") a.decoder.slots_per_layer = std::stoi(v);
     else if (k == "--ram-per-layer") {
       if (v == "auto")
         a.decoder.ram_tier = eng::RamTierFit{};
@@ -136,6 +144,11 @@ Args parse(int argc, char** argv) {
     } else if (k == "--prompt" || k == "--then") {
       std::istringstream in(v);
       for (int32_t t; in >> t;) (k == "--prompt" ? a.prompt : a.then).push_back(t);
+    } else if (k == "--prompt-file") {
+      std::ifstream in(v);
+      if (!in) die("cannot read " + v);
+      for (int32_t t; in >> t;) a.prompt.push_back(t);
+      if (!in.eof()) die(v + ": not a list of token ids");
     } else die("unknown argument " + k + "\n" + usage);
   }
   if (a.config.empty() || a.backbone.empty() || a.stores.empty() || a.prompt.empty()) die(usage);
@@ -177,7 +190,8 @@ size_t differing(std::span<const float> want, std::span<const float> got) {
 
 /** The CPU replay (see top). Returns whether every layer and logit was bit-identical. */
 bool replay(const glm53::Config& config, const io::BackboneParts& parts, const std::string& store_path,
-            const Captured& cap, float lambda, int slots_per_layer, unsigned threads, size_t exact_prefix) {
+            const Captured& cap, float lambda, const glm53::Eviction& eviction, int slots_per_layer, unsigned threads,
+            size_t exact_prefix) {
   const glm53::Dims& d = config.dims();
   auto store = io::StoreReader::open(store_path);
   if (!store) die(store.error().what);
@@ -205,7 +219,7 @@ bool replay(const glm53::Config& config, const io::BackboneParts& parts, const s
       if (!codes) die(where + codes.error().what);
       shared = std::move(codes).value();
       layer.emplace(exact::MoeLayer{moe->router, moe->bias, *shared});
-      if (lambda != 0.0f) cache.emplace(glm53::LayerExpertCache::create(d.experts, slots_per_layer).value());
+      if (lambda != 0.0f) cache.emplace(glm53::LayerExpertCache::create(d.experts, slots_per_layer, eviction).value());
     }
     std::map<int32_t, exact::Fp4Expert> experts;
     std::set<int32_t> round_union;
@@ -227,8 +241,9 @@ bool replay(const glm53::Config& config, const io::BackboneParts& parts, const s
         if (!y) die(where + y.error().what);
         ffn.out = std::move(y).value().out;
       } else {
-        // A swept prompt's tokens route exactly; the cache records each Round of 8 of them as one
-        // Route, its Experts' union ascending (the sweep's Plans). Later tokens route with λ, one by one.
+        // A swept prompt's tokens route exactly; the cache records each Round of 8 of them (the last, the
+        // rest) as one Route of its tokens, its Experts' union ascending (the sweep's Plans). Later tokens
+        // route with λ, one by one.
         const bool swept = t < exact_prefix;
         exact::RouteChoice choice;
         if (cache && !swept) choice.bonus = exact::ResidentBonus{lambda, cache->resident()};
@@ -237,7 +252,7 @@ bool replay(const glm53::Config& config, const io::BackboneParts& parts, const s
         if (cache && swept) {
           round_union.insert(ms.value().route.expert.begin(), ms.value().route.expert.end());
           if ((t + 1) % 8 == 0 || t + 1 == exact_prefix) {
-            if (!cache->place(std::vector<int32_t>(round_union.begin(), round_union.end())))
+            if (!cache->place(std::vector<int32_t>(round_union.begin(), round_union.end()), static_cast<int>(t % 8) + 1))
               die(where + "the cache model refused a Round");
             round_union.clear();
           }
@@ -309,9 +324,10 @@ int main(int argc, char** argv) {
     eng::Decoder& dec = *decoder.value();
     slots_per_layer = dec.slots_per_layer();
     std::printf("open: %.1f s, %d Slots per Sparse layer (%.0f%% of the Experts), RAM tier %d per layer, %zu store "
-                "replica(s), capacity %d, λ %g\n",
+                "replica(s), capacity %d, λ %g, eviction %s\n",
                 dec.stats().load_s, slots_per_layer, 100.0 * slots_per_layer / d.experts, dec.ram_per_layer(),
-                args.stores.size(), args.decoder.capacity, static_cast<double>(args.decoder.route_bonus));
+                args.stores.size(), args.decoder.capacity, static_cast<double>(args.decoder.route_bonus),
+                glm53::to_string(args.decoder.eviction).c_str());
     for (size_t g = 0; g < 2; g++) {  // the Ledger's account (core/glm53/ledger), and what the reserve left free
       const eng::VramReport& v = dec.vram();
       const uint64_t claims = v.plan.claims[g].total();
@@ -407,7 +423,7 @@ int main(int argc, char** argv) {
   }
   if (!args.check) return 0;
   std::fflush(stdout);
-  const bool ok = replay(config.value(), parts.value(), args.stores.front(), cap, args.decoder.route_bonus, slots_per_layer,
+  const bool ok = replay(config.value(), parts.value(), args.stores.front(), cap, args.decoder.route_bonus, args.decoder.eviction, slots_per_layer,
                          args.decoder.threads, args.prefill == "sweep" ? args.prompt.size() : 0);
   std::printf("%s\n", ok ? "PASS: every layer and logit bit-identical to the Reference configuration"
                          : "FAIL: the decoder differs from the Reference configuration");

@@ -49,7 +49,7 @@ std::array<Claims, 2> claims(int capacity, int cohort, int wave = 512) {
 }
 
 constexpr uint64_t kGiB = 1ull << 30;
-constexpr uint64_t kCard = 97887ull << 20;  // an RTX PRO 6000's VRAM, as nvidia-smi reports it
+constexpr uint64_t kCard = kRtxPro6000Bytes;  // an RTX PRO 6000's VRAM, as CUDA reports it
 
 }  // namespace
 
@@ -132,10 +132,27 @@ TEST_CASE("Ledger: the default reserve gives the Slots free-memory sizing gave, 
   CHECK(at(4096, kDefaultRuntimeReserve) == 99);
   CHECK(at(65536, kDefaultRuntimeReserve) == 83);
   // Each end of the interval that reproduces both: below it a Slot more at 4K, above it one fewer at 64K.
-  CHECK(at(4096, 4'545'218'728) == 100);
-  CHECK(at(4096, 4'545'218'729) == 99);
-  CHECK(at(65536, 5'261'455'528) == 83);
-  CHECK(at(65536, 5'261'455'529) == 82);
+  CHECK(at(4096, 3'876'751'528) == 100);
+  CHECK(at(4096, 3'876'751'529) == 99);
+  CHECK(at(65536, 4'592'988'328) == 83);
+  CHECK(at(65536, 4'592'988'329) == 82);
+}
+
+TEST_CASE("Ledger: the first calibration's Slots are what the GPUs opened with, a Slot short everywhere") {
+  // The 2026-11-22 GPU gate (docs/bench/glm53-counter): with 4.75 GiB, taken against nvidia-smi's card
+  // size, Decoder::open opened 98 Slots at 4K, 88 at 64K with 16K Cohorts and 82 with one 64K Cohort:
+  // one fewer than the receipts' 99 and 83, on CUDA's card size. The plan open makes is this one, so the
+  // new default's 99 / 90 / 83 are what the GPUs will open (90: 0.01 GB to spare, by arithmetic alone).
+  const auto at = [](int capacity, int cohort, uint64_t reserve) {
+    return plan_vram(released(), kShapes, settings(capacity, cohort), {kCard, kCard}, reserve, 0).value().per_layer;
+  };
+  constexpr uint64_t kFirst = (19ull << 30) / 4;
+  CHECK(at(4096, 16384, kFirst) == 98);
+  CHECK(at(65536, 16384, kFirst) == 88);
+  CHECK(at(65536, 65536, kFirst) == 82);
+  CHECK(at(4096, 16384, kDefaultRuntimeReserve) == 99);
+  CHECK(at(65536, 16384, kDefaultRuntimeReserve) == 90);
+  CHECK(at(65536, 65536, kDefaultRuntimeReserve) == 83);
 }
 
 TEST_CASE("Ledger: refusals — no capacity, a context that leaves too few Slots, a reserve past the card") {
