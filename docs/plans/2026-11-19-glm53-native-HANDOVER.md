@@ -308,7 +308,8 @@ An independent audit (python, read-only, against the index) found:
        `--prefill rounds`.
      - **Cohort gate 2:** the 1,100-token replays were stopped (~19 h: the replay ran on one thread).
        It is now short checks, 192 tokens across 3 Cohorts plus 64 tokens under λ, both policies, on a
-       replay that runs `--threads` layers at a time. Results are in the report.
+       replay that runs `--threads` layers at a time. **PASS:** all 78 layers and the head bit-identical,
+       LRU and counter:55 (receipts `check-short-l0.03-*.out`).
      - **Ledger gate: drift check passed, Slots one short** (98/88/82). The reserve had been calibrated
        on nvidia-smi's card size, but open uses CUDA's, 101,973,491,712 B (`glm53::kRtxPro6000Bytes`).
        - Recalibrated, the reserve was 4 GiB, and the GPUs opened exactly the Ledger's 99 / **90** at
@@ -322,7 +323,7 @@ An independent audit (python, read-only, against the index) found:
      - **Cohort size:** a 39.2K cold prompt takes 90 s at 16K Cohorts and 66 s as one Cohort, but one
        Cohort costs 6 Slots per layer. 16K stays the default.
    - **Next, in order:**
-     1. Move `DS4N_COMMIT` to `glm53/counter-eviction`'s head once the short checks pass (Cohorts,
+     1. Move `DS4N_COMMIT` to `glm53/counter-eviction`'s head: every gate has passed (Cohorts,
         the Ledger on the planned card, LRU default: 90 Slots at 64K instead of 83). This is the
         owner's call.
      2. Phase 5: CyberGym subset + harm rubric against the Flash primaries; λ above 0.03 only

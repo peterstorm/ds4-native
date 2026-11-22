@@ -73,3 +73,17 @@
 2026-11-22T13:03:25+01:00 end planned-64k-cohort64k exit 0
 2026-11-22T13:03:25+01:00 start planned-64k
 2026-11-22T13:05:10+01:00 end planned-64k exit 0
+2026-11-22T13:18:18+01:00 stopped the short replays after layer 3 (0 values differ, both): a Sparse layer took ~890 s, the replay evaluates Experts one at a time (~18 h); WARMIND still stopped
+2026-11-22T13:24:03+01:00 start check-short-l0.03-lru (detached, parallel replay)
+2026-11-22T13:24:03+01:00 check-short-l0.03-lru: GPU part done, replay running
+2026-11-22T13:24:03+01:00 start check-short-l0.03-counter55 (detached, parallel replay)
+2026-11-22T13:24:03+01:00 check-short-l0.03-counter55: GPU part done, replay running
+2026-11-22T13:24:48+01:00 check-parallel: first launch stopped at once (old .out files passed the GPU-part wait; both decoders opened together)
+2026-11-22T13:24:59+01:00 start check-short-l0.03-lru (detached, parallel replay)
+2026-11-22T13:27:15+01:00 check-short-l0.03-lru: GPU part done, replay running
+2026-11-22T13:27:15+01:00 start check-short-l0.03-counter55 (detached, parallel replay)
+2026-11-22T13:30:02+01:00 check-short-l0.03-counter55: GPU part done, replay running
+2026-11-22T15:34:10+01:00 short checks done: PASS: every layer and logit bit-identical to the Reference configuration PASS: every layer and logit bit-identical to the Reference configuration 
+2026-11-22T15:34:10+01:00 restoring WARMIND
+2026-11-22T15:34:10+01:00 ds41-1017-native started
+2026-11-22T16:01:51+01:00 smi sampler stopped; window closed

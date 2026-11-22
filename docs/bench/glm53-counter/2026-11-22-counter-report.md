@@ -10,12 +10,13 @@ WARMIND stopped.
   - `-ledger-confirm.sh`;
   - `-after-kl.sh`, stopped at its second step;
   - `-fair-speed.sh`;
-  - `-planned-confirm.sh`.
+  - `-planned-confirm.sh`;
+  - `-check-parallel.sh` (the short checks on the parallel replay, then WARMIND back).
 - Their outputs are in `receipts/`:
   - every run's `.out`;
   - the oracle's `kl.out.gz`, `kl.report.json.gz` and `kl.routes.tsv.gz`;
   - nvidia-smi sampled each second, in `smi.csv.gz`;
-  - the drivers' logs and `status`;
+  - the drivers' logs, `status` and host memory during the replays (`mem.txt`);
   - the CUDA-total probe, `2026-11-22-cuda-total.{cu,out}`.
 - The mutation probe is `2026-11-22-counter-mutants.{sh,out}`.
 
@@ -24,7 +25,8 @@ WARMIND stopped.
 - **counter55 is ported and exact.** `core/glm53/layer_expert_cache` takes an Eviction policy (`Lru`,
   `CounterDecay`; `--eviction lru|counter:N` on decode, serve and oracle-run). The unit tests check it
   against a transliteration of the replay study's simulator call by call, and the mutation probe kills
-  14 of 14. On the GPUs: [CHECK RESULT].
+  14 of 14. On the GPUs, `--check` under λ 0.03 is **bit-identical to the oracle** on every layer and
+  logit, for counter:55 and for LRU.
 - **At λ 0 it is the gain the replay predicted:** decode 4.50 → 4.70 tok/s (+4.4%; the replay said
   +4.8–5.0%). Misses fell from 21.2% to 19.8%, and the 256 generated tokens are identical, as exactness
   requires.
@@ -45,7 +47,9 @@ WARMIND stopped.
 - **The owed gates.**
   - The Cohort bits are identical every way. The logits hash `bec364f75ef70233` over 2,800 tokens is the
     same for Cohorts of 512, 1024 and 16K and for `--prefill rounds`.
-  - Cohorts against the oracle: [CHECK RESULT].
+  - **Cohorts against the oracle: PASS.** 192 tokens across 3 Cohorts plus 64 λ tokens replay bit for
+    bit, all 78 layers and the head, under both policies. The replay now runs layers in parallel
+    (~2 h instead of ~18 h).
   - **The Ledger gate failed by one Slot, and is fixed.** The reserve was calibrated against nvidia-smi's
     card size, 97,887 MiB. `Decoder::open` plans against CUDA's, which is 101,973,491,712 B (97,249.5 MiB).
     Every open therefore came out one Slot per layer short: 98 at 4K, 88 at 64K and 82 with one 64K Cohort,
@@ -287,7 +291,16 @@ The `io::parallel_for` it uses is the oracle's, moved to `src/io/parallel_for.hp
 
 Rerun with the same commands (`2026-11-22-check-parallel.sh`), both policies at once, 16 layers each:
 
-[PENDING: short check replays, `check-short-l0.03-{lru,counter55}.out`.]
+| policy | GPU part (prompt, 64 λ tokens) | layers exact | head logits | replay |
+|---|---|---|---|---|
+| LRU | 100 Slots, 4.86 tok/s, misses 12.2% | 78 / 78 | 256 × 154,880, 0 differ | 7,445 s |
+| counter:55 | 100 Slots, 5.15 tok/s, misses 11.2% | 78 / 78 | 256 × 154,880, 0 differ | 7,427 s |
+
+**PASS, both:** every layer and logit is bit-identical to the Reference configuration. The swept prompt
+crossed 3 Cohorts, and the λ tokens were routed against the residency each policy left. Both generated
+the same 64 tokens: here the two residencies changed no greedy token. The GPU parts
+regenerated exactly what the serial runs had. A Sparse layer took ~1,300 s with 32 layers in flight on
+the 32-thread host (890 s alone); host memory stayed above 37 GB available. WARMIND was back at 15:34.
 
 ### Gate 3: Ledger and memory
 
