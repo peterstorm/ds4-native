@@ -11,8 +11,10 @@
 #   3. --check, λ 0.03, counter:55, the profile at a 2.25 GiB reserve: the gate-2 shape (the short p192
 #      prompt in Cohorts of 64, 64 generated, no RAM tier: it changes no bit) at 64K: the GPU part, then
 #      its CPU replay detached;
-#   4. the oracle's KL at 92 Slots, one run per GPU, beside the replay: counter:55 with the profile
-#      (exact, exact-cc0.03, exact-cc0.035), and counter:55 with equal Slots (exact, exact-cc0.03).
+#   4. the oracle's KL at 92 Slots with the profile, counter:55 (exact, exact-cc0.03, exact-cc0.035), on
+#      GPU 0 beside the replay, 16 threads each (two oracles beside it took ~300 s a layer: ~6 h).
+#      As run: ~100 s a Sparse layer beside the replay (2 h 18 min); its control, equal Slots at 92,
+#      followed alone (2026-11-22-equal92-kl.sh).
 set -uo pipefail
 SRC="$PWD"
 OUT="${OUT:-/tmp/glm53-counter-run}"
@@ -65,12 +67,10 @@ done
 sleep 20  # the Decoder's VRAM is freed as the replay begins
 log "$name: GPU part done, replay running"
 
-# 4. KL at 92 Slots, one oracle per GPU.
+# 4. KL at 92 Slots with the profile.
 P=$(docker run --rm "${mounts[@]}" "$IMAGE" python3 -I -c "import json;print(\" \".join(\"--prompt \"+\",\".join(map(str,p[\"ids\"])) for p in json.load(open(\"docs/bench/glm53-locality/2026-11-20-corpus-prompts.json\"))))")
 ORACLE="./build/ds4n-glm53-oracle-run --config ref/glm-5.3/config.json --backbone /store/backbone-uncensored --store /store/experts.ds4n $P --threads 16 --resident 160 --slots 92 --warm 32 --eviction counter:55"
-log "start kl92-profile (GPU 0) and kl92-equal (GPU 1)"
+log "start kl92-profile (GPU 0)"
 docker run -d --name glm53-counter-kl92-profile --gpus device=0 "${mounts[@]}" "$IMAGE" bash -c \
   "$ORACLE --gpu 0 --slot-profile $PROFILE --activations exact,exact-cc0.03,exact-cc0.035 --report /out/kl92-profile.report.json --routes /out/kl92-profile.routes.tsv > /out/kl92-profile.out 2> /out/kl92-profile.err" >/dev/null
-docker run -d --name glm53-counter-kl92-equal --gpus device=1 "${mounts[@]}" "$IMAGE" bash -c \
-  "$ORACLE --gpu 0 --activations exact,exact-cc0.03 --report /out/kl92-equal.report.json > /out/kl92-equal.out 2> /out/kl92-equal.err" >/dev/null
-log "kl92 runs launched; the check replay continues"
+log "kl92-profile launched; the check replay continues"

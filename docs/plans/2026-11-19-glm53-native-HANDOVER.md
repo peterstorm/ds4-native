@@ -1,4 +1,4 @@
-# HANDOVER: GLM-5.3 full uncensored on ds4-native — session state 2026-11-21 (served: primary `glm-native`)
+# HANDOVER: GLM-5.3 full uncensored on ds4-native — session state 2026-11-22 (served: primary `glm-native`)
 
 Resume point for any fresh session. Companion to
 [`2026-11-19-glm53-native.md`](2026-11-19-glm53-native.md) (the plan — read it first; its
@@ -322,20 +322,35 @@ An independent audit (python, read-only, against the index) found:
          leaves 3.1 GiB never touched: room for ~3 more Slots per layer, pending a serving-path peak.
      - **Cohort size:** a 39.2K cold prompt takes 90 s at 16K Cohorts and 66 s as one Cohort, but one
        Cohort costs 6 Slots per layer. 16K stays the default.
+   - **Every speed lever, 2026-11-22** (owner: "more speed at an acceptable quality loss"; WARMIND
+     stopped for the GPUs; same branch, `ce206e2` + docs; report
+     `docs/bench/glm53-counter/2026-11-22-frontier-report.md`, receipts beside it):
+     - **Built:** `core/glm53/slot_profile` (`SlotProfile::parse`, `shape_slots`: the Ledger's total
+       in a fitted per-layer shape, floor 64, largest remainder; property and mutation tested, 8/9
+       killed, the survivor equivalent). `--slot-profile` on decode, serve and oracle-run;
+       `--runtime-reserve-gib` on decode and serve. `engine_replay.py --section profile` fits one.
+     - **Served config (proposed):** λ 0.03, `--eviction counter:55`, the profile
+       (`receipts/profile.txt`, fitted on λ 0.03 Routes), `--runtime-reserve-gib 2.25` → 92 Slots at
+       64K. 7.95 tok/s pooled over 4 prompts vs LRU-90's 6.91 (+15%); teacher-forced misses 12.06%
+       vs LRU-84's 15.02%; KL 0.0710, top-1 89.6%. `--check` PASS with it (78 layers + head).
+     - **λ 0.035 / 0.04 rejected:** +5–7% speed for ~57% of positions worse (paired sign test),
+       top-1 −1.2 points.
+     - **The profile on λ Routes** is the opposite shape of the exact-Route one (late layers more).
+       Against equal 92 it is KL-neutral (paired +0.0003, signs 1339/1341) with 4% fewer misses.
+     - **Reserve:** the 92-Slot peak on the serving shape (39.2K prompt + λ decode) was 95,504 MiB,
+       1.7 GiB under the card, as predicted to the MiB. 93 Slots (1.5 GiB) opens but leaves ~1 GiB.
+     - **Lesson (environment facts):** under λ a KL difference under ~±0.004 between residency
+       configurations is re-rolled Routes, not a quality change; decide with the paired sign test.
    - **Next, in order:**
-     1. Move `DS4N_COMMIT` to `glm53/counter-eviction`'s head: every gate has passed (Cohorts,
-        the Ledger on the planned card, LRU default: 90 Slots at 64K instead of 83). This is the
-        owner's call.
-     2. Phase 5: CyberGym subset + harm rubric against the Flash primaries; λ above 0.03 only
-        after those task benchmarks.
-     3. Per-layer Slot weights through the Ledger (the replay study's +3–4%, at λ 0). Judge a policy
-        under λ by teacher-forced KL and misses plus a multi-prompt speed run, never by one prompt's
-        free generation. A KL-matched run (LRU at λ 0.033 vs counter55 at 0.03) decides whether
-        counter55 beats the frontier.
-     4. The reserve below 4 GiB, from a peak measured on the serving path at its longest prompts
-        (each 0.70 GiB is a Slot per layer).
-     5. The second NVMe (`M.2_3`/`M.2_4`). MTP is deprioritized by the replay study.
-     6. Merge `glm53/engine-core` into main once Phase 5 decides keep (DS4.1's sources are
+     1. **Owner's call:** push `glm53/counter-eviction`, then merge dotfiles `inference/glm53-speed`
+        (moves `DS4N_COMMIT` to this branch's head; adds `EVICTION`, `RUNTIME_RESERVE_GIB`,
+        `SLOT_SHAPE` with the fitted profile), `--install`, and relaunch. Record the server's own
+        decode speed at the first launch.
+     2. Phase 5: CyberGym subset + harm rubric against the Flash primaries.
+     3. counter:55 vs LRU at equal Slots under λ, by the paired test (one oracle run): the counter
+        report's +0.0036 is inside the re-roll spread.
+     4. The second NVMe (`M.2_3`/`M.2_4`). MTP is deprioritized by the replay study.
+     5. Merge `glm53/engine-core` into main once Phase 5 decides keep (DS4.1's sources are
         untouched on the branch).
 
 ## Environment facts (the things that cost time to rediscover)
@@ -387,6 +402,13 @@ An independent audit (python, read-only, against the index) found:
   the last mutant's object (its object is newer than the restored source). Rebuild once after
   restoring, or `touch` the mutated file before the next build.
 - `/models` root-owned: `sudo mkdir/chown` (passwordless sudo works); user is peterstorm.
+- **Under λ, KL is chaotic across residency configurations.** Slots, shape and policy each re-roll
+  some Routes on the same teacher-forced text: counter:55 at λ 0.03 measured 0.0720 / 0.0668 / 0.0707
+  at 84 / 90 / 92 Slots. Compare with `kl_paired.py` (rename each report's `exact-ccλ` stream per run,
+  or it refuses differing same-named streams) and read the sign counts: ~50/50 is noise, ~57/43 (a λ
+  step) is real. Never call a ±0.004 mean difference a finding from one pair of runs.
+- An oracle KL run with 2–4 streams takes ~70–145 s a layer alone on 32 threads (~1.5–3 h); two
+  oracles at 16 threads each, or one beside a `--check` replay, ~100–300 s a layer.
 
 ## Doc map
 
@@ -407,6 +429,7 @@ An independent audit (python, read-only, against the index) found:
 | GLM-5.3 VRAM: a position's cost and Cohorts; the GLM Ledger | `ds4-native/docs/bench/glm53-capacity/2026-11-22-{capacity,ledger}.md` |
 | GLM-5.3 cache policies replayed (counter55, per-layer Slots, MTP) | `ds4-native/docs/bench/glm53-replay/2026-11-22-replay-report.md` (branch `glm53/replay-study`) |
 | counter55 on the GPUs (λ 0 +4.4%; λ 0.03 +10% at KL 0.072 vs 0.068), the Cohort and Ledger GPU gates, the reserve recalibrated | `ds4-native/docs/bench/glm53-counter/2026-11-22-counter-report.md` (branch `glm53/counter-eviction`) |
+| Every speed lever at λ 0.03 (counter:55, the Slot profile, the reserve, λ 0.035/0.04; the paired KL test) | `ds4-native/docs/bench/glm53-counter/2026-11-22-frontier-report.md` (branch `glm53/counter-eviction`) |
 | GLM-5.3 ops runbook (primary `glm-native`) | `.dotfiles/scripts/inference/runbooks/glm53-native-runbook-2026-11-21.md` |
 | Hyperflare/GLM-Flash-uncensored story | `.dotfiles/scripts/inference/runbooks/glm53-flash-hyperflare-tp2-v16-runbook-2026-11-13.md` |
 

@@ -6,6 +6,9 @@
 #      the settings of 2026-11-22-fair-speed.sh (64K, RAM tier 38, 256 tokens);
 #   2. the oracle's teacher-forced KL at 90 Slots, two runs at once, one per GPU: counter:55 with λ
 #      0.03, 0.035, 0.04 streams, and LRU with a λ 0.03 stream (today's production at 90 Slots).
+#      As run: both were stopped after 2 layers (~300 s a layer each, 24 streams on 16 threads apiece:
+#      ~6 h), and the counter:55 one relaunched alone with --threads 32 (the same command otherwise);
+#      the LRU one was dropped (the 84-Slot LRU KL, 0.0684, stays the reference).
 set -uo pipefail
 SRC="$PWD"
 OUT="${OUT:-/tmp/glm53-counter-run}"

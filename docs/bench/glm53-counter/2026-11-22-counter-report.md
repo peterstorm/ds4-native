@@ -22,6 +22,12 @@ WARMIND stopped.
 
 ## Summary
 
+> **Correction (later the same day, `2026-11-22-frontier-report.md` §2).** The KL price below
+> (0.0684 → 0.0720) is not resolved. Under λ every residency change re-rolls some Routes: counter:55
+> alone measured 0.0720 / 0.0668 / 0.0707 at 84 / 90 / 92 Slots, and a paired test puts such changes
+> at a coin flip per position. The +0.0036 is inside that spread, so "+10% decode for +5% KL" overstates
+> the cost, and the "frontier" reading in §3 rests on it. The speed results and the gates stand.
+
 - **counter55 is ported and exact.** `core/glm53/layer_expert_cache` takes an Eviction policy (`Lru`,
   `CounterDecay`; `--eviction lru|counter:N` on decode, serve and oracle-run). The unit tests check it
   against a transliteration of the replay study's simulator call by call, and the mutation probe kills
