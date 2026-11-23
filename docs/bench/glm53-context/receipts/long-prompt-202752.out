@@ -1,0 +1,7 @@
+usage: {"prompt_tokens":165942,"completion_tokens":64,"total_tokens":166006,"prompt_tokens_details":{"cached_tokens":10}}
+reply: This is a large C++/CUDA inference engine (CPU "oracle" reference implementations and matching GPU kernels) for running DeepSeek V4.1 on two GPUs — covering BF16/MXFP4/FP8 quantized matrix math, attention with KV compression/indexing/sparse selection, MoE routing with an
+ds4n-glm53-serve: prompt 165942 tokens = 10 reused + 165932 read in 369844 ms (448.7 tok/s)
+ds4n-glm53-serve: 64 written in 11938 ms (5.36 tok/s), length; misses 6633 of 37800 (2348 RAM tier, 4285 store, 7601 ms waited)
+peak GPU 0: 95166 MiB
+peak GPU 1: 93290 MiB
+DONE
