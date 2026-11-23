@@ -39,7 +39,7 @@ past production. The frontier past the bar is measured too, for the owner's call
 | lever | what it is | cost, measured |
 |---|---|---|
 | `DS4N_COMMIT` bump | Cohorts and the recalibrated Ledger: **90 Slots at 64K instead of production's 83** | none: bit-exact (gates 1 and 2 passed) |
-| `--eviction counter:55` | evict by a use count halved every 55 tokens | none resolved (counter report's +0.0036 KL is inside the re-roll spread, §2) |
+| `--eviction counter:55` | evict by a use count halved every 55 tokens | none: direct paired test against LRU — 1355 positions better, 1331 worse, CI spans zero (§2) |
 | λ above 0.03 | a larger resident bonus | **real**: ~57% of positions worse, top-1 −1.2 points |
 | `--slot-profile` | the Ledger's Slots in a fitted per-layer shape | none: paired Δ KL +0.0003, signs 1339 / 1341 (§3) |
 | `--runtime-reserve-gib 2.25` | less VRAM held back for CUDA, so 92 Slots instead of 90 | none: the peak leaves 1.7 GiB of the card untouched (§4) |
@@ -99,7 +99,7 @@ is one sample of that chaos. At λ 0.03, counter:55, five such samples:
 More Slots do **not** lower λ's KL (a first reading of the 90-Slot run said so; the 92-Slot control
 refuted it). The spread, about ±0.003 KL and ±12 top-1 positions, is what a change of residency does
 by itself. It covers the counter report's "+5% KL for counter:55" (0.0720 against LRU's 0.0684 at 84)
-as well: that difference was never resolved either.
+as well — and that difference is now settled directly (§2.1).
 
 `tools/glm53-golden/kl_paired.py`, every stream against equal 92 at λ 0.03, position by position
 (receipt `kl-paired-cc.out`; streams renamed per run so the script can pair them):
@@ -117,6 +117,28 @@ positions both ways at a coin flip's rate; it reshuffles *which* positions lose 
 moves ~57% of positions the wrong way: it makes most of them worse. (The bootstrap interval treats
 positions as independent, which they are not, so the means' intervals overstate their certainty; the
 equal-90 interval excludes zero with a 50/50 sign split.)
+
+### 2.1 counter:55 against LRU, settled directly (2026-11-23)
+
+The table above pairs residency changes against an *equal-92 counter:55* baseline; it never pairs
+counter:55 against LRU, so the counter report's headline "+5% KL for the policy" stayed inferred from
+the spread rather than measured. That last comparison needed no new run: the λ study's LRU stream
+(`docs/bench/glm53-cc/2026-11-20-cc.report.json.gz`, default eviction) and the counter report's
+counter:55 stream (`receipts/kl.report.json.gz`, `--eviction counter:55`) were both oracle runs at **84
+Slots, λ 0.03, on this same 2,800-position corpus, teacher-forced** — identical but for the one flag.
+Paired position by position (`2026-11-23-policy-paired.sh`, receipt `kl-paired-policy.out`; no GPU):
+
+| stream (84 Slots, λ 0.03) | KL mean | paired Δ vs LRU | 95% CI (optimistic) | positions lower / higher |
+|---|---|---|---|---|
+| LRU (`cc.report`, the reference) | 0.06838 | — | — | — |
+| counter:55 (`kl.report`) | 0.07198 | +0.0036 (+5%) | [−0.0018, +0.0108] | **1355 / 1331** |
+
+The +5% aggregate — the counter report's "price" — is a **coin flip per position**: counter:55 is
+better at 1355 positions and worse at 1331 (the rest tied). The CI spans zero, and the trimmed mean
+(three largest moves each way dropped) is **+0.0010**, so a handful of re-rolled Routes carry the whole
+mean — prompt 3 alone jumps +19% while prompt 2 improves. This is the same signature as `equal 90`
+(1355 / 1330) and nothing like a λ step's ~57% one-way shift. **The eviction policy is a residency
+perturbation, not a quality change: counter:55 costs no real quality against LRU at λ 0.03.**
 
 ## 3. The per-layer Slot profile
 
@@ -222,8 +244,9 @@ The serve flags, beside the launcher's existing ones:
   sign test.
 - **What is not measured here:**
   - the serving path (Maya + `ds4n-glm53-serve`) at these settings: every speed here is
-    `ds4n-glm53-decode`'s, and the first launch should record the server's own;
-  - the counter:55-vs-LRU KL at equal Slots, which the paired test would settle in one more oracle run.
+    `ds4n-glm53-decode`'s, and the first launch should record the server's own.
+  - *(Settled 2026-11-23.)* The counter:55-vs-LRU KL at equal Slots — see §2.1: the two 84-Slot oracle
+    streams already existed, so it took no new run, and the policy is a coin flip per position.
 
 The launcher change is dotfiles branch `inference/glm53-speed`. It moves `DS4N_COMMIT` to this branch's
 head, which `--install` fetches from origin, so the branch must be pushed first.
