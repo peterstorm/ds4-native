@@ -1,0 +1,51 @@
+10:30:54	prompt  11336	prefill    40 s	decode    52 tok	
+10:31:15	prompt   6430	prefill    21 s	decode     0 tok	set aside a conversation of 11387 tokens; 
+10:31:43	prompt   5926	prefill    21 s	decode     6 tok	set aside a conversation of 6430 tokens; 
+10:32:44	prompt   6260	prefill    21 s	decode   231 tok	set aside a conversation of 5931 tokens; 
+10:34:14	prompt   6301	prefill    21 s	decode   217 tok	set aside a conversation of 6492 tokens; 
+10:35:26	prompt   6341	prefill    21 s	decode   231 tok	set aside a conversation of 6519 tokens; 
+10:36:26	prompt   6789	prefill    21 s	decode   228 tok	set aside a conversation of 6571 tokens; 
+10:37:39	prompt   6536	prefill    21 s	decode   236 tok	set aside a conversation of 7018 tokens; 
+10:38:37	prompt   6420	prefill    21 s	decode   114 tok	set aside a conversation of 6773 tokens; 
+10:39:38	prompt   6023	prefill    20 s	decode   238 tok	set aside a conversation of 6533 tokens; resumed a conversation set aside, at 267 tokens; 
+10:40:36	prompt   3596	prefill    20 s	decode     6 tok	set aside a conversation of 6262 tokens; 
+10:46:51	prompt  11950	prefill    22 s	decode   385 tok	set aside a conversation of 3601 tokens; 
+10:51:41	prompt  14040	prefill    20 s	decode  1020 tok	
+10:52:32	prompt  15305	prefill    17 s	decode   192 tok	
+10:52:53	prompt  15604	prefill    13 s	decode    41 tok	
+10:53:33	prompt  16930	prefill    19 s	decode   109 tok	
+10:58:03	prompt  18881	prefill    20 s	decode  1576 tok	
+11:00:31	prompt  20985	prefill    20 s	decode   812 tok	
+11:05:36	prompt  24094	prefill    21 s	decode  1789 tok	
+11:14:15	prompt  26712	prefill    16 s	decode  3264 tok	
+11:23:38	prompt  33111	prefill    19 s	decode  3582 tok	
+11:28:10	prompt  37438	prefill    20 s	decode  1631 tok	
+11:38:18	prompt  42091	prefill    18 s	decode  3709 tok	set aside a conversation of 39068 tokens; 
+11:46:20	prompt  47193	prefill    21 s	decode  2855 tok	
+11:57:36	prompt   5802	prefill    15 s	decode  3826 tok	
+12:23:46	prompt   7019	prefill    27 s	decode  8950 tok	set aside a conversation of 9627 tokens; 
+12:32:28	prompt  33981	prefill    53 s	decode  2906 tok	set aside a conversation of 15968 tokens; 
+12:35:48	prompt  40028	prefill    21 s	decode  1110 tok	
+12:43:48	prompt  44373	prefill    21 s	decode  2792 tok	
+12:59:27	prompt  49004	prefill    18 s	decode  5789 tok	
+13:27:02	prompt   9641	prefill    13 s	decode 10172 tok	resumed a conversation set aside, at 71 tokens; 
+13:28:28	prompt    215	prefill    14 s	decode   473 tok	set aside a conversation of 19812 tokens; resumed a conversation set aside, at 73 tokens; 
+13:41:38	prompt  31420	prefill    46 s	decode  4462 tok	set aside a conversation of 687 tokens; 
+13:41:43	prompt     19	prefill     4 s	decode     4 tok	set aside a conversation of 35881 tokens; 
+13:47:23	prompt  37367	prefill    21 s	decode  1883 tok	resumed a conversation set aside, at 33182 tokens; 
+13:55:11	prompt  40138	prefill    19 s	decode  2828 tok	
+14:06:23	prompt  44696	prefill    21 s	decode  3963 tok	
+14:38:01	prompt   5473	prefill    11 s	decode 11701 tok	resumed a conversation set aside, at 67 tokens; 
+14:58:27	prompt   2209	prefill    16 s	decode  6775 tok	set aside a conversation of 17173 tokens; resumed a conversation set aside, at 75 tokens; 
+15:07:06	prompt  38420	prefill    68 s	decode  2747 tok	set aside a conversation of 8983 tokens; 
+15:16:45	prompt  44855	prefill    20 s	decode  3576 tok	
+15:52:54	prompt   7617	prefill    14 s	decode 12283 tok	resumed a conversation set aside, at 73 tokens; 
+16:11:02	prompt   3644	prefill    26 s	decode  6370 tok	set aside a conversation of 19899 tokens; resumed a conversation set aside, at 73 tokens; 
+16:19:19	prompt  37534	prefill    67 s	decode  2539 tok	set aside a conversation of 10013 tokens; 
+16:22:09	prompt  42196	prefill    20 s	decode   877 tok	
+16:31:15	prompt  44980	prefill    23 s	decode  3243 tok	
+16:38:14	prompt  48489	prefill    20 s	decode  2447 tok	
+17:10:07	prompt   9964	prefill    21 s	decode 11163 tok	resumed a conversation set aside, at 73 tokens; 
+17:27:00	prompt   3296	prefill    14 s	decode  5693 tok	set aside a conversation of 21126 tokens; resumed a conversation set aside, at 73 tokens; 
+17:28:30	prompt      0	prefill    90 s	decode     0 tok	set aside a conversation of 8989 tokens; 
+TOTAL prefill 1201 s, decode 23383 s

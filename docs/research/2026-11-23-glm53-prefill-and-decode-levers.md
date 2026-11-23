@@ -14,7 +14,39 @@ GPU run backs a number here unless it says so.
 - Every lever was checked against this engine's code at `fec4e0c`.
 - One new measurement on our Route trace (the "tail" below, receipts in `2026-11-23-receipts/`).
 
-## Summary
+## Measured the same day, at power-on (read this first)
+
+The owner then said "desktop should be on, do your recommendations". Step 1 was to measure P1 and P3.
+**Both came out near zero, and the workload itself moved the priority to decode.**
+
+- **The real workload** (receipt `maya-2026-11-21-requests.tsv`, derived from the production
+  `glm53-native` log, 2026-11-21 10:24–17:39):
+  - **Prefill: 1,201 s. Decode: 23,383 s. Prefill is ~5% of the day.**
+  - Replies are long: thinking runs 2–12K tokens at ~6 tok/s.
+  - Prefill time is `T − n/rate` per request, from the `done:` lines.
+  - 45 ordinary turns averaged **19.4 s** of prefill. That is the short-turn read floor; it does not
+    depend on how many tokens the turn adds.
+  - Four full re-reads of displaced 31–38K conversations cost 46–68 s each: **234 s in all**.
+- **P1 (spill Checkpoints): worth ~234 s a day (<1% of wall time), and blocked.**
+  - rpool is 96% full (13 GB free).
+  - A bigger `--checkpoint-gb` in RAM would come out of the RAM tier, and so out of decode.
+  - Revisit with the second NVMe.
+- **P3 (the I/O gap): closed.** Receipt `io-fio.txt`.
+  - The 9100 PRO on a healthy PCIe 5.0 x4 link delivers **~11.0 GB/s through ZFS at any queue depth
+    from 4 up**, and ~10.6 GB/s raw. ZFS costs nothing.
+  - The engine's sweeps already reach ~10–10.6 GB/s. The "13.0 GB/s" in the cost model is not
+    reproducible today; use **11 GB/s**.
+- **P2 at real turn sizes is small.**
+  - Turns append 1–3K tokens. The tail shrinks fast with turn size (23% of reads at 700 tokens,
+    m=4), so expect single-digit percent at 2K.
+  - That is ~1–2 s of a 19 s turn: ~0.3% of the day.
+- **P4 and P5** help only the few long full reads: tens of seconds a day.
+
+**Conclusion:** at this workload, no prefill software lever is worth more than ~1% of the day. The
+19 s turn floor moves with bandwidth or RAM (second NVMe ~1.6×). Engineering time belongs to decode
+(D1, D2), where 95% of the time is.
+
+## Summary (the ranking as written before power-on)
 
 | # | prefill lever | exact? | who it helps | expected | first step |
 |---|---|---|---|---|---|
