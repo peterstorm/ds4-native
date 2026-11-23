@@ -1,0 +1,101 @@
+{
+ "regraded": true,
+ "summary": {
+  "tasks": 8,
+  "graded": 8,
+  "passed": 8,
+  "failed": 0,
+  "empty": 0,
+  "error": 0,
+  "pass_rate": 1.0,
+  "mean_latency_s": 0.0,
+  "by_category": {
+   "cve-id": {
+    "n": 2,
+    "pass": 2
+   },
+   "decode": {
+    "n": 2,
+    "pass": 2
+   },
+   "analysis": {
+    "n": 4,
+    "pass": 4
+   }
+  }
+ },
+ "results": [
+  {
+   "task_id": "cve-heartbleed",
+   "category": "cve-id",
+   "klass": "pass",
+   "detail": "cve-2014-0160",
+   "content_chars": 467,
+   "reasoning_chars": 26,
+   "latency_s": 0.0
+  },
+  {
+   "task_id": "cve-log4shell",
+   "category": "cve-id",
+   "klass": "pass",
+   "detail": "cve-2021-44228",
+   "content_chars": 952,
+   "reasoning_chars": 26,
+   "latency_s": 0.0
+  },
+  {
+   "task_id": "decode-base64",
+   "category": "decode",
+   "klass": "pass",
+   "detail": "FLAG{quant_oracle_7f3}",
+   "content_chars": 22,
+   "reasoning_chars": 22,
+   "latency_s": 0.0
+  },
+  {
+   "task_id": "decode-rot13",
+   "category": "decode",
+   "klass": "pass",
+   "detail": "the_misses_defer_one_layer",
+   "content_chars": 26,
+   "reasoning_chars": 268,
+   "latency_s": 0.0
+  },
+  {
+   "task_id": "hash-identify",
+   "category": "analysis",
+   "klass": "pass",
+   "detail": "bcrypt",
+   "content_chars": 598,
+   "reasoning_chars": 36,
+   "latency_s": 0.0
+  },
+  {
+   "task_id": "jwt-alg-none",
+   "category": "analysis",
+   "klass": "pass",
+   "detail": "alg none",
+   "content_chars": 1324,
+   "reasoning_chars": 264,
+   "latency_s": 0.0
+  },
+  {
+   "task_id": "log-traversal",
+   "category": "analysis",
+   "klass": "pass",
+   "detail": "path traversal",
+   "content_chars": 470,
+   "reasoning_chars": 43,
+   "latency_s": 0.0
+  },
+  {
+   "task_id": "privesc-sudo-find",
+   "category": "analysis",
+   "klass": "pass",
+   "detail": "all",
+   "content_chars": 538,
+   "reasoning_chars": 22,
+   "latency_s": 0.0
+  }
+ ]
+}

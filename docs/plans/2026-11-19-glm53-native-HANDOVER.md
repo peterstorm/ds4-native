@@ -367,7 +367,13 @@ An independent audit (python, read-only, against the index) found:
         `SLOT_SHAPE` with the fitted profile), `--install`, and relaunch. Record the server's own
         decode speed at the first launch. **Done 2026-11-23** together with `glm53/deferred-misses`
         (stacked on it: the Loads rewrite, +1.8%, and `DEFER=4`, +8.7%), owner-approved.
-     2. Phase 5: CyberGym subset + harm rubric against the Flash primaries.
+     2. **Phase 5 verdict: KEEP** (2026-11-23, `docs/bench/glm53-phase5/2026-11-23-phase5-report.md`).
+        Harm rubric **0/21 refusals** (matches the recorded Flash hybrid's 0/21) and cyber capability
+        **8/8** (CVE id, base64/ROT13 decode, hash, path traversal, JWT alg:none, sudo/find privesc),
+        all through Maya on `uncensored-native` at effort low. The lossy serve shape (MXFP4, λ 0.03,
+        deferral protect 4) costs neither compliance nor security-analysis capability. Not run: a
+        same-day Flash A/B (Flare stays stopped) or real CyberGym (its runners need disk the box does
+        not have until the second NVMe). The 8 graded tasks are the cyber-ladder plan's proxy.
      3. counter:55 vs LRU at equal Slots under λ, by the paired test (one oracle run): the counter
         report's +0.0036 is inside the re-roll spread.
      4. The second NVMe (`M.2_3`/`M.2_4`). MTP is deprioritized by the replay study.

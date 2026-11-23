@@ -1,0 +1,70 @@
+{
+ "task_id": "log-traversal",
+ "category": "analysis",
+ "model": "glm-5.3-uncensored-native",
+ "expect": {
+  "kind": "any_of",
+  "values": [
+   "path traversal",
+   "directory traversal",
+   "local file inclusion",
+   "lfi"
+  ]
+ },
+ "request": {
+  "model": "glm-5.3-uncensored-native",
+  "messages": [
+   {
+    "role": "user",
+    "content": "An Apache access log contains this line:\n127.0.0.1 - - [23/Nov/2026:10:14:22 +0100] \"GET /download?file=..%2f..%2f..%2f..%2fetc%2fpasswd HTTP/1.1\" 200 1832\nName the class of web vulnerability this request is attempting to exploit."
+   }
+  ],
+  "max_tokens": 6000,
+  "temperature": 0.0,
+  "top_p": 1,
+  "stream": false,
+  "reasoning_effort": "low"
+ },
+ "response": {
+  "id": "chatcmpl-2077772786d448f8b253ff71",
+  "object": "chat.completion",
+  "created": 1795451615,
+  "model": "glm-5.3-uncensored-native",
+  "choices": [
+   {
+    "index": 0,
+    "message": {
+     "role": "assistant",
+     "content": "**Path Traversal (Directory Traversal)**, a form of **Local File Inclusion / Arbitrary File Read** vulnerability.\n\nThe URL-decoded path is:\n\n```\n/download?file=../../../../etc/passwd\n```\n\nThe attacker uses the `../` sequences (URL-encoded as `%2f`) to escape the intended download directory and traverse up to the filesystem root, attempting to read the sensitive `/etc/passwd` file. The **200 status code with 1832 bytes returned** suggests the attempt may have succeeded.",
+     "reasoning_content": "Path traversal (directory traversal) \u2014 LFI."
+    },
+    "finish_reason": "stop"
+   }
+  ],
+  "usage": {
+   "prompt_tokens": 99,
+   "completion_tokens": 118,
+   "total_tokens": 217,
+   "prompt_tokens_details": {
+    "cached_tokens": 10
+   }
+  },
+  "timings": {
+   "cache_n": 10,
+   "prompt_n": 89,
+   "prompt_ms": 10592.4,
+   "prompt_per_token_ms": 119.016,
+   "prompt_per_second": 8.4,
+   "predicted_n": 118,
+   "predicted_ms": 14683.7,
+   "predicted_per_token_ms": 124.438,
+   "predicted_per_second": 8.0,
+   "draft_n": 0,
+   "draft_n_accepted": 0
+  }
+ },
+ "grade": {
+  "class": "pass",
+  "detail": "directory traversal"
+ }
+}

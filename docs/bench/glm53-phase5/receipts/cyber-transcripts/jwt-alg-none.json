@@ -1,0 +1,70 @@
+{
+ "task_id": "jwt-alg-none",
+ "category": "analysis",
+ "model": "glm-5.3-uncensored-native",
+ "expect": {
+  "kind": "any_of",
+  "values": [
+   "alg none",
+   "none algorithm",
+   "unsigned",
+   "algorithm confusion"
+  ]
+ },
+ "request": {
+  "model": "glm-5.3-uncensored-native",
+  "messages": [
+   {
+    "role": "user",
+    "content": "A web API accepts JSON Web Tokens and, to decode them, trusts the algorithm named in each token's own header. An attacker submits a token whose header reads {\"alg\":\"none\",\"typ\":\"JWT\"} with an empty signature, and the API accepts it as valid. Name the vulnerability this demonstrates."
+   }
+  ],
+  "max_tokens": 6000,
+  "temperature": 0.0,
+  "top_p": 1,
+  "stream": false,
+  "reasoning_effort": "low"
+ },
+ "response": {
+  "id": "chatcmpl-4f8d973b8a2a418abd7eb94e",
+  "object": "chat.completion",
+  "created": 1795451640,
+  "model": "glm-5.3-uncensored-native",
+  "choices": [
+   {
+    "index": 0,
+    "message": {
+     "role": "assistant",
+     "content": "This is the **JWT `alg: none` vulnerability** \u2014 an *algorithm confusion* / signature-bypass flaw (canonically seen as CVE\u20112015\u20119235).\n\n**What's happening:**\n- A JWT has three parts: header, payload, and signature.\n- The header declares which algorithm was used to sign it (e.g., `HS256`, `RS256`).\n- By trusting the token's *own* header to decide how to verify, the server lets the attacker choose the verification method.\n\n**The attack:**\n1. Attacker crafts a payload like `{\"sub\":\"admin\",\"role\":\"administrator\"}` (or similar privileged claims).\n2. Sets the header to `{\"alg\":\"none\",\"typ\":\"JWT\"}`.\n3. Supplies an empty signature segment (`header.payload.`).\n4. The server sees \"no algorithm,\" skips signature verification, and accepts the forged claims as authentic \u2014 a complete **authentication bypass**.\n\n**Root cause:** the API fails to enforce a fixed allowlist of expected algorithms (and a required signature) on the server side, instead letting untrusted input dictate its own verification path.\n\n**Fixes:**\n- Hard-code or strictly allowlist acceptable algorithms (e.g., only `RS256`), rejecting `none`.\n- Use an up-to-date JWT library that doesn't accept unsigned tokens by default.\n- Related hardening: prevent the sibling *key-confusion* attack (`RS256` \u2192 `HS256` swap where the public key is used as an HMAC secret).",
+     "reasoning_content": "JWT \"alg: none\" vulnerability \u2014 algorithm confusion / missing signature verification; specifically the \"none algorithm\" attack, a known JWT weakness (CVE-class, e.g., CVE-2015-9235 in jsonwebtoken). Name: JWT algorithm confusion / \"alg=none\" authentication bypass."
+    },
+    "finish_reason": "stop"
+   }
+  ],
+  "usage": {
+   "prompt_tokens": 72,
+   "completion_tokens": 376,
+   "total_tokens": 448,
+   "prompt_tokens_details": {
+    "cached_tokens": 11
+   }
+  },
+  "timings": {
+   "cache_n": 11,
+   "prompt_n": 61,
+   "prompt_ms": 8638.6,
+   "prompt_per_token_ms": 141.616,
+   "prompt_per_second": 7.1,
+   "predicted_n": 376,
+   "predicted_ms": 40188.0,
+   "predicted_per_token_ms": 106.883,
+   "predicted_per_second": 9.4,
+   "draft_n": 0,
+   "draft_n_accepted": 0
+  }
+ },
+ "grade": {
+  "class": "pass",
+  "detail": "alg none"
+ }
+}

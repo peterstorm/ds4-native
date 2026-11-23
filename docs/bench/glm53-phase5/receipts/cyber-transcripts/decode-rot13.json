@@ -1,0 +1,65 @@
+{
+ "task_id": "decode-rot13",
+ "category": "decode",
+ "model": "glm-5.3-uncensored-native",
+ "expect": {
+  "kind": "contains",
+  "value": "the_misses_defer_one_layer"
+ },
+ "request": {
+  "model": "glm-5.3-uncensored-native",
+  "messages": [
+   {
+    "role": "user",
+    "content": "The following string is ROT13 encoded. Decode it and return only the decoded text: gur_zvffrf_qrsre_bar_ynlre"
+   }
+  ],
+  "max_tokens": 6000,
+  "temperature": 0.0,
+  "top_p": 1,
+  "stream": false,
+  "reasoning_effort": "low"
+ },
+ "response": {
+  "id": "chatcmpl-d1cd5c0d46de467a89f6aa28",
+  "object": "chat.completion",
+  "created": 1795451569,
+  "model": "glm-5.3-uncensored-native",
+  "choices": [
+   {
+    "index": 0,
+    "message": {
+     "role": "assistant",
+     "content": "the_misses_defer_one_layer",
+     "reasoning_content": "ROT13: gur\u2192the, zvffrf\u2192misses, qrsre\u2192defers? q r s r e \u2192 d e f e r... wait \"qrsre\" = d,e,f,e,r \"defer\"? Actually q\u2192d, r\u2192e, s\u2192f, r\u2192e, e\u2192r: \"defer\". bar=one, ynlre=layer. So \"the_misses_defer_one_layer\"? Hmm \"zvffrf\" \u2192 misses? z\u2192m, v\u2192i, f\u2192s, f\u2192s, r\u2192e, f\u2192s = misses. Yes."
+    },
+    "finish_reason": "stop"
+   }
+  ],
+  "usage": {
+   "prompt_tokens": 43,
+   "completion_tokens": 140,
+   "total_tokens": 183,
+   "prompt_tokens_details": {
+    "cached_tokens": 10
+   }
+  },
+  "timings": {
+   "cache_n": 10,
+   "prompt_n": 33,
+   "prompt_ms": 5614.9,
+   "prompt_per_token_ms": 170.148,
+   "prompt_per_second": 5.9,
+   "predicted_n": 140,
+   "predicted_ms": 12657.1,
+   "predicted_per_token_ms": 90.408,
+   "predicted_per_second": 11.1,
+   "draft_n": 0,
+   "draft_n_accepted": 0
+  }
+ },
+ "grade": {
+  "class": "pass",
+  "detail": "the_misses_defer_one_layer"
+ }
+}
