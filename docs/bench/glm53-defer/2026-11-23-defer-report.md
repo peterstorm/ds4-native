@@ -31,9 +31,10 @@ fitted profile at 92 Slots): KL 0.0710, top-1 2508 (89.57%), 7.67 tok/s.
   estimate leans down and lands **7 positions under the 89% bar**, just below the 2490–2515 spread
   the frontier study saw from re-rolled Routes alone. **`--defer 2` fails the bar** as λ 0.035 did
   (the same top-1, −29, p 0.07, with a real KL cost); **`--defer 0` is out.**
-- **Not deployed.** Serve takes `--defer N` (default off); nothing on the desktop changed.
-- **The gate:** `--check` with `--defer 0` (the most deferral) and without deferral (the Loads
-  rewrite alone): see §4.
+- **Adopted** (owner, 2026-11-23: "go ahead with --defer 4"). Serve takes `--defer N` (default off);
+  the dotfiles launcher passes `DEFER=4`.
+- **The gate passes:** `--check` with `--defer 0` (every Miss deferred) and without deferral (the Loads
+  rewrite alone) are both bit-identical on all 78 layers and the head (§4).
 
 ## 1. What deferral is
 
@@ -99,13 +100,24 @@ runs the same core as the oracle: each deferring layer's slots from the cache mo
 before `place`, `finish_split`, and a sequential pass that adds each Sparse layer's carry to the next
 one's immediate output (`with_carry`) before `finish_layer`.
 
-- `--defer 0`: PENDING
-- no deferral: PENDING
+Both PASS: every layer and the head bit-identical (256 tokens × 154,880 logits, 0 differ).
+
+| run | open | generated (64) | replay | deferral pass |
+|---|---|---|---|---|
+| `--defer 0` | 94 Slots, RAM tier 38 | 7.94 tok/s; 69.8 picks deferred a token | 78 layers + head, 7,501 s on 16 threads | 75 Sparse layers, 2,685 token-layers with a carry, 0 values differ |
+| no deferral | 94 Slots, RAM tier 38 | 6.28 tok/s | 78 layers + head, 7,385 s | — |
+
+- Without deferral the build generates **the same 64 tokens as the previous gate**
+  (`../glm53-counter/receipts/check-profile92.out`, run with no RAM tier): the Loads rewrite and the
+  tier's copies up change no bit. `--defer 0` agrees with it for 39 tokens, then its lossy Routes part.
+- The two runs' speeds are not a measurement (64 tokens of different text, one replay already running
+  beside the second open): §3 is.
+- `ds4n_tests` at this build: 358 test cases, 20,205,341 assertions, green.
 
 ## 5. What is left
 
-- **The owner's call on `--defer 4`.** If adopted: add `--defer 4` to the serve command (Maya's
-  engine args) at the next planned restart, never under an active session.
+- **Served speed.** The first launch with `DEFER=4` records decode through Maya (the dotfiles
+  runbook's measured tables).
 - **The drive is still the floor.** At 35.9 store reads a token and 2.34 ms each, reads are ~84 ms of
   a 116 ms token under df4: deferral hides part of them behind compute, it does not remove them.
   The remaining decode levers are the ones that read less (a second NVMe in M.2_3/M.2_4, more RAM

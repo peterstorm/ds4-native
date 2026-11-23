@@ -356,15 +356,15 @@ An independent audit (python, read-only, against the index) found:
        `--defer 4` **+8.7%** (8.61 tok/s), KL 0.0699 (Δ −0.001, free), top-1 2485 (−23, p 0.15: 7 under
        the 89% bar); `--defer 2` +14%, KL +11% (real), top-1 −29 — fails as λ 0.035 did; `--defer 0`
        +18%, KL +81%, top-1 −102 — out.
-     - **Gate:** `--check` with `--defer 0` and without deferral: PENDING.
-     - **Not deployed.** `--defer 4` is the owner's call.
+     - **Gate PASS:** `--check` with `--defer 0` (2,685 token-layers with a carry) and without deferral,
+       all 78 layers and the head bit-identical; without deferral the same 64 tokens as the previous gate.
+     - **Adopted** (owner: "go ahead with --defer 4"): dotfiles `inference/glm53-speed` gains `DEFER=4`.
    - **Next, in order:**
      1. **Owner's call:** push `glm53/counter-eviction`, then merge dotfiles `inference/glm53-speed`
         (moves `DS4N_COMMIT` to this branch's head; adds `EVICTION`, `RUNTIME_RESERVE_GIB`,
         `SLOT_SHAPE` with the fitted profile), `--install`, and relaunch. Record the server's own
-        decode speed at the first launch. **Then, also the owner's call:** `glm53/deferred-misses`
-        (stacked on it) for the Loads rewrite's free +1.8%, with or without `--defer 4` (+8.7%, top-1
-        at the bar's edge).
+        decode speed at the first launch. **Done 2026-11-23** together with `glm53/deferred-misses`
+        (stacked on it: the Loads rewrite, +1.8%, and `DEFER=4`, +8.7%), owner-approved.
      2. Phase 5: CyberGym subset + harm rubric against the Flash primaries.
      3. counter:55 vs LRU at equal Slots under λ, by the paired test (one oracle run): the counter
         report's +0.0036 is inside the re-roll spread.

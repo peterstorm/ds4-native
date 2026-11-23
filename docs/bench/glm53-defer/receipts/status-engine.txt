@@ -1,0 +1,48 @@
+2026-11-23T09:16:19+01:00 start gpu48
+2026-11-23T09:25:07+01:00 end gpu48 exit 0
+2026-11-23T09:25:07+01:00 start gpu12
+2026-11-23T09:28:09+01:00 end gpu12 exit 0
+2026-11-23T09:28:09+01:00 start cpu12
+2026-11-23T09:36:59+01:00 end cpu12 exit 0
+2026-11-23T09:36:59+01:00 done
+2026-11-23T09:37:16+01:00 start kl-defer (GPU 0, 32 threads)
+2026-11-23T11:29:07+01:00 end kl-defer exit 0
+2026-11-23T11:29:08+01:00 start speed-c0-base
+2026-11-23T11:31:38+01:00 end speed-c0-base exit 0
+2026-11-23T11:31:38+01:00 start speed-c0-df0
+2026-11-23T11:34:03+01:00 end speed-c0-df0 exit 0
+2026-11-23T11:34:03+01:00 start speed-c0-df2
+2026-11-23T11:36:31+01:00 end speed-c0-df2 exit 0
+2026-11-23T11:36:31+01:00 start speed-c0-df4
+2026-11-23T11:38:56+01:00 end speed-c0-df4 exit 0
+2026-11-23T11:38:56+01:00 start speed-c1-base
+2026-11-23T11:41:28+01:00 end speed-c1-base exit 0
+2026-11-23T11:41:28+01:00 start speed-c1-df0
+2026-11-23T11:43:56+01:00 end speed-c1-df0 exit 0
+2026-11-23T11:43:56+01:00 start speed-c1-df2
+2026-11-23T11:46:23+01:00 end speed-c1-df2 exit 0
+2026-11-23T11:46:23+01:00 start speed-c1-df4
+2026-11-23T11:48:51+01:00 end speed-c1-df4 exit 0
+2026-11-23T11:48:51+01:00 start speed-c2-base
+2026-11-23T11:51:25+01:00 end speed-c2-base exit 0
+2026-11-23T11:51:25+01:00 start speed-c2-df0
+2026-11-23T11:53:48+01:00 end speed-c2-df0 exit 0
+2026-11-23T11:53:48+01:00 start speed-c2-df2
+2026-11-23T11:56:14+01:00 end speed-c2-df2 exit 0
+2026-11-23T11:56:14+01:00 start speed-c2-df4
+2026-11-23T11:58:41+01:00 end speed-c2-df4 exit 0
+2026-11-23T11:58:41+01:00 start speed-c3-base
+2026-11-23T12:01:02+01:00 end speed-c3-base exit 0
+2026-11-23T12:01:02+01:00 start speed-c3-df0
+2026-11-23T12:03:22+01:00 end speed-c3-df0 exit 0
+2026-11-23T12:03:22+01:00 start speed-c3-df2
+2026-11-23T12:05:41+01:00 end speed-c3-df2 exit 0
+2026-11-23T12:05:41+01:00 start speed-c3-df4
+2026-11-23T12:08:05+01:00 end speed-c3-df4 exit 0
+2026-11-23T12:08:05+01:00 speed: c0-base 7.83 c0-df0 9.09 c0-df2 8.17 c0-df4 8.95 c1-base 7.21 c1-df0 8.34 c1-df2 8.79 c1-df4 8.25 c2-base 6.76 c2-df0 9.50 c2-df2 8.64 c2-df4 8.39 c3-base 10.53 c3-df0 10.76 c3-df2 10.90 c3-df4 9.27 
+2026-11-23T12:08:05+01:00 start check-df0 (detached, parallel replay)
+2026-11-23T12:10:36+01:00 check-df0: GPU part done, replay running
+2026-11-23T12:10:36+01:00 start check-base (detached, parallel replay)
+2026-11-23T12:13:47+01:00 check-base: GPU part done, replay running
+2026-11-23T14:16:52+01:00 checks done: /tmp/glm53-defer-run/check-base.out:PASS: every layer and logit bit-identical to the Reference configuration /tmp/glm53-defer-run/check-df0.out:PASS: every layer and logit bit-identical to the Reference configuration 
+2026-11-23T14:16:52+01:00  engine done
