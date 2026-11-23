@@ -401,10 +401,10 @@ An independent audit (python, read-only, against the index) found:
      4. The second NVMe (`M.2_3`/`M.2_4`). MTP is deprioritized by the replay study.
      5. Merge `glm53/engine-core` into main once Phase 5 decides keep (DS4.1's sources are
         untouched on the branch).
-     6. **Owner's call: serve the Latent split.** Move `DS4N_COMMIT` to `glm53/latent-split`'s head,
-        `--install`, relaunch at `CONTEXT=202752` (86 Slots), and record the served speed. Raising
-        `CONTEXT` toward 409,600 (72 Slots, about what 202,752 cost before) is a second, separate call;
-        its quality under λ at 72 Slots is the λ study's to measure.
+     6. ~~Serve the Latent split~~ **Done 2026-11-23** (owner: "serve the split, but we're fine at 200k
+        for now"): dotfiles `9feeacf6` on branch `inference/glm53-context-202k` (`DS4N_COMMIT=d398fae0`),
+        86 Slots at 202,752, **8.16 tok/s served** against 6.84 (+19%). Raising `CONTEXT` toward 409,600
+        (72 Slots) is deferred by the owner; its quality under λ at 72 Slots is unmeasured.
 
 ## Environment facts (the things that cost time to rediscover)
 
