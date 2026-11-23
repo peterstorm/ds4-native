@@ -39,7 +39,7 @@ constexpr EngineShapes kShapes{.exchange_inbox_floats = 2 * 200 * 1024,
                                .job_slots = 65,
                                .group_batch = 64,
                                .gemv_job_bytes = 64,
-                               .job_upload_bytes = 14288};
+                               .job_upload_bytes = 16664};
 
 VramSettings settings(int capacity, int cohort, int wave = 512) {
   return {capacity, wave, CohortSize::fit(cohort, wave).value()};
@@ -136,10 +136,11 @@ TEST_CASE("Ledger: the default reserve gives the Slots free-memory sizing gave, 
   CHECK(at(4096, kDefaultRuntimeReserve) == 99);
   CHECK(at(65536, kDefaultRuntimeReserve) == 83);
   // Each end of the interval that reproduces both: below it a Slot more at 4K, above it one fewer at 64K.
-  CHECK(at(4096, 3'640'297'640) == 100);
-  CHECK(at(4096, 3'640'297'641) == 99);
-  CHECK(at(65536, 4'356'534'440) == 83);
-  CHECK(at(65536, 4'356'534'441) == 82);
+  // (Deferral's carry, 8 x 6,144 BF16, and the Plan in the job upload, 2,376 B, moved both 100,680 B down.)
+  CHECK(at(4096, 3'640'196'960) == 100);
+  CHECK(at(4096, 3'640'196'961) == 99);
+  CHECK(at(65536, 4'356'433'760) == 83);
+  CHECK(at(65536, 4'356'433'761) == 82);
 }
 
 TEST_CASE("Ledger: the Slots the GPUs opened, whatever the driver's reservation takes from the card") {

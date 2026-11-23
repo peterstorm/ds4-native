@@ -1,0 +1,13 @@
+mean KL vs exact per prompt
+                                    0        1        2        3       all
+profile92-cc0.03              0.06558  0.07764  0.08004  0.06063   0.07097
+exact-cc0.03-df0              0.09534  0.15474  0.13783  0.12588   0.12845
+exact-cc0.03-df2              0.06959  0.09545  0.08506  0.06436   0.07862
+exact-cc0.03-df4              0.05303  0.08409  0.07656  0.06599   0.06992
+profile92-cc0.035             0.06624  0.08839  0.07645  0.07097   0.07551
+
+paired against profile92-cc0.03 (2800 positions)
+exact-cc0.03-df0             +0.05747 (+81%)  95% CI [+0.05005, +0.06476]  lower at 588, higher at 2212  trimmed +0.05697
+exact-cc0.03-df2             +0.00764 (+11%)  95% CI [+0.00298, +0.01197]  lower at 1147, higher at 1653  trimmed +0.00836
+exact-cc0.03-df4             -0.00106 (-1%)  95% CI [-0.00633, +0.00359]  lower at 1383, higher at 1417  trimmed +0.00021
+profile92-cc0.035            +0.00454 (+6%)  95% CI [-0.00102, +0.01019]  lower at 1267, higher at 1529  trimmed +0.00466

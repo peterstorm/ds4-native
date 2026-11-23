@@ -7,7 +7,7 @@
 //                    [--lambda λ] [--eviction lru|counter:N] [--slots-per-layer S] [--slot-profile N,N,...]
 //                    [--runtime-reserve-gib G] [--ram-per-layer R|auto] [--ram-reserve-gib G]
 //                    [--checkpoint-gb G] [--stops ID,ID,...] [--wave W] [--cohort K] [--devices A,B]
-//                    [--threads T]
+//                    [--threads T] [--defer N]
 //
 // --max-context N (default 16384): positions every layer's cache holds, the context Maya reports (its
 // dashboard restarts the engine with another). Each 1K positions take ~0.1 GB of VRAM per GPU (the
@@ -24,6 +24,8 @@
 // 95.2 KB a token (Decoder::position_bytes; 4 GB hold ~42K tokens); with --ram-per-layer auto the RAM
 // tier leaves it free beside --ram-reserve-gib (10).
 // --stops (default GLM's turn ends: <|endoftext|>, <|user|>, <|observation|>).
+// --defer N (default off): the reply's tokens defer each Miss outside their N heaviest Route slots one
+// Sparse layer (core/glm53/deferral): lossy, opt-in; the oracle's -dfN streams measure its cost.
 //
 // One request at a time (READY <context> stop, no multi=): the server queues the rest. A chat's next
 // turn and an agent's next step read only their new tokens; a conversation another one displaced comes
@@ -134,6 +136,7 @@ Overloaded(F...) -> Overloaded<F...>;
 int main(int argc, char** argv) {
   std::signal(SIGPIPE, SIG_IGN);  // a server already gone must not end us mid-write
   std::string config_path, backbone, stops, slot_profile;
+  std::optional<int> defer;  // --defer N
   std::vector<std::string> stores;
   eng::DecoderConfig dc;
   dc.capacity = 16384;
@@ -165,6 +168,7 @@ int main(int argc, char** argv) {
     }
     else if (a == "--slots-per-layer") dc.slots_per_layer = std::stoi(v);
     else if (a == "--slot-profile") slot_profile = v;  // parsed against the config below
+    else if (a == "--defer") defer = std::stoi(v);  // made a Deferral against the config below
     else if (a == "--runtime-reserve-gib") {
       const double g = std::stod(v);
       if (!(g >= 0.0)) die("--runtime-reserve-gib must be >= 0");
@@ -189,7 +193,7 @@ int main(int argc, char** argv) {
   if (!serve || config_path.empty() || backbone.empty() || stores.empty())
     die("usage: ds4n-glm53-serve --serve --config CONFIG --backbone DIR --store FILE[,FILE...] [--max-context N] [--lambda λ] "
         "[--eviction lru|counter:N] [--slots-per-layer S] [--slot-profile N,N,...] [--runtime-reserve-gib G] [--ram-per-layer R|auto] [--ram-reserve-gib G] [--checkpoint-gb G] [--stops ID,...] "
-        "[--wave W] [--cohort K] [--devices A,B] [--threads T]");
+        "[--wave W] [--cohort K] [--devices A,B] [--threads T] [--defer N]");
   if (!(checkpoint_gb >= 0.0)) die("--checkpoint-gb must be >= 0");
   const auto checkpoint_bytes = static_cast<uint64_t>(checkpoint_gb * 1e9);
   // The RAM tier is pinned at open, sized to the memory available then: the checkpoints' budget stays free beside the reserve.
@@ -203,6 +207,11 @@ int main(int argc, char** argv) {
     auto p = glm53::SlotProfile::parse(slot_profile, config.value());
     if (!p) die("--slot-profile: " + p.error().what);
     dc.slot_profile = std::move(p).value();
+  }
+  if (defer) {
+    auto rule = glm53::Deferral::create(*defer, config.value().dims().experts_per_token);
+    if (!rule) die("--defer: " + rule.error().what);
+    dc.deferral = rule.value();
   }
   const int32_t vocab = config.value().dims().vocab;
   int sparse_layers = 0;
@@ -229,10 +238,12 @@ int main(int argc, char** argv) {
   out(wire::ready_line(dc.capacity, lane::LaneCount::of(1).value()));
   std::fprintf(stderr,
                "ds4n-glm53-serve: ready in %.0f s: context %d, %d Slots per Sparse layer (%s), RAM tier %d per layer, λ %g, "
-               "eviction %s, checkpoints %.1f GB (%.1f KB a token)\n",
+               "eviction %s, deferral %s, checkpoints %.1f GB (%.1f KB a token)\n",
                dec.stats().load_s, dc.capacity, dec.slots_per_layer(), dc.slot_profile ? "profile" : "equal",
                dec.ram_per_layer(), static_cast<double>(dc.route_bonus),
-               glm53::to_string(dc.eviction).c_str(), checkpoint_gb, static_cast<double>(dec.position_bytes()) / 1e3);
+               glm53::to_string(dc.eviction).c_str(),
+               dc.deferral ? ("protect " + std::to_string(dc.deferral->protect())).c_str() : "none", checkpoint_gb,
+               static_cast<double>(dec.position_bytes()) / 1e3);
   for (size_t g = 0; g < 2; g++)  // the Ledger's account (core/glm53/ledger): ds4n-glm53-ledger predicts it
     std::fprintf(stderr, "ds4n-glm53-serve: vram GPU %zu: card %.2f GB, claims %.2f GB, free after open %.2f GB\n", g,
                  dec.vram().total[g] / 1e9, dec.vram().plan.claims[g].total() / 1e9, dec.vram().free_after_open[g] / 1e9);

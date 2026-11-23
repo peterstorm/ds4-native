@@ -119,13 +119,21 @@ struct SparseLayer {
   uint8_t* slots = nullptr;               // this layer's Slots, kHalfBytes each
 };
 
-/** What one MoE launch uploads: its two GEMV job lists, and (decode) the layer's Slot table. */
+/** What one MoE launch uploads: its two GEMV job lists, the Plan its kernels read, and (decode) the layer's Slot table. */
 struct JobUpload {
   cuda::GemvJob gate_up[2 * gpu::kJobSlots];
   int gate_up_first[2 * gpu::kJobSlots];
   cuda::GemvJob down[gpu::kJobSlots];
   int down_first[gpu::kJobSlots];
+  moe_plan::Plan plan;  // the routed Plan, or one part of it (core/glm53/deferral split_plan)
   int32_t slot_of[g53::kExperts];
+};
+
+/** What one run of a layer's Experts is (core/glm53/deferral). */
+enum class MoePart {
+  Whole,      // the Plan's Experts and the shared one on the Round's FFN input; x = mid + out
+  Immediate,  // as Whole, adding the deferred part the Sparse layer before left: x = mid + (out + carry)
+  Deferred,   // a deferring layer's deferred slots, on the input it quantized then, no shared Expert: out to the carry
 };
 constexpr int kRing = 4;  // pinned uploads in flight per GPU: a host copy waits only for the one kRing back
 constexpr int kGroupBatch = 64;  // a sweep batch's groups: within MoeBuffers' kJobSlots slots
@@ -154,8 +162,9 @@ struct Gpu {
   std::optional<gpu::DeviceHead> head;                         // GPU 0
   std::optional<gpu::LayerScratch> layer_scratch;              // every layer's attention and Dense MLP scratch
   // A Round's scratch, [kMaxRound][...]; `partial` and `out` hold a wave, [wave][hidden].
+  // `carry` holds the deferred part of the Sparse layer before, from its Exchange to this layer's residual.
   float *x = nullptr, *partial = nullptr, *mid = nullptr, *ffn_f32 = nullptr, *y = nullptr;
-  __nv_bfloat16 *out = nullptr, *ffn = nullptr;
+  __nv_bfloat16 *out = nullptr, *ffn = nullptr, *carry = nullptr;
   float *router_planes = nullptr, *weights = nullptr, *logits = nullptr;
   int32_t* experts = nullptr;
   moe_plan::Plan* plan = nullptr;
@@ -186,6 +195,7 @@ struct Gpu {
   int* g_first = nullptr;
   std::vector<cudaEvent_t> batch_ready, staged;  // per batch (and one spare, last); per staging record
   cudaEvent_t routed = nullptr;                   // a sweep layer's Routes copied to the host
+  cudaEvent_t loaded = nullptr;                   // a Round layer's Loads copied up (finish_loads)
 
   Gpu() = default;
   Gpu(const Gpu&) = delete;
@@ -197,6 +207,7 @@ struct Gpu {
     for (cudaEvent_t e : batch_ready) cudaEventDestroy(e);
     for (cudaEvent_t e : staged) cudaEventDestroy(e);
     if (routed) cudaEventDestroy(routed);
+    if (loaded) cudaEventDestroy(loaded);
     if (ring) cudaFreeHost(ring);
     if (copy) cudaStreamDestroy(copy);
     if (stream) cudaStreamDestroy(stream);
@@ -251,6 +262,27 @@ struct Decoder::State {
   std::array<size_t, 2 * kRecords> replica_of_tag{};
   std::optional<io::UringReader> reader;
   std::byte* staging = nullptr;  // pinned: kRecords records' Halves, [record][half][kHalfBytes]
+  // Staging records no read is using: a sweep's fetch and a Round's Loads take them in turn (never at once).
+  std::vector<int> free_records;
+  // A Round's Loads under way: each copied up into its Slot from the RAM tier, or from a staging record as
+  // its store reads land. A late Load (a deferred slot's Expert, core/glm53/deferral) is waited for only at
+  // the next Sparse layer, so that layer's reads queue behind it on the drive. Cleared at the Round's end.
+  struct Load {
+    int layer;
+    int32_t slot;
+    int32_t tier_up;  // the RAM tier entry it moves up from; -1: read from the store
+    bool late;
+    int halves = 0;  // Halves copied up (queued on the copy streams)
+  };
+  std::vector<Load> loads;
+  std::array<size_t, kRecords> record_load{};  // the Load a staging record's reads are for
+  // The deferred part a deferring Sparse layer left (core/glm53/deferral): its Plan, run at the next Sparse layer.
+  struct LatePart {
+    int layer;
+    moe_plan::Plan plan;
+  };
+  std::optional<LatePart> late;
+  std::vector<uint8_t> defers;  // [layer]: 1 where config.deferral applies (g53::defers)
   // A sweep layer's store reads into the scratch (Expert e to scratch e), through the staging records:
   // begun at its gather, or ahead of it (read-ahead) after the previous Sparse layer's; narrowed to the
   // Experts routed once routing is known. Ascending, so the first batches can start first.
@@ -262,7 +294,6 @@ struct Decoder::State {
     std::vector<uint8_t> submitted;  // [expert]
     std::vector<uint8_t> landed;     // [expert]: wanted, and its copies up queued
     size_t pending = 0;              // wanted, not landed
-    std::vector<int> free_records;
     std::array<int32_t, kRecords> record_expert{};
     std::array<int, kRecords> halves{};  // Halves of the record's Expert landed
   } fetch;
@@ -293,10 +324,20 @@ struct Decoder::State {
     return gpus[h]->sparse[static_cast<size_t>(L)]->slots + static_cast<uint64_t>(slot) * kHalfBytes;
   }
   /**
-   * Serve `loads` (layer L's Misses): copy each evicted Expert down into the RAM tier, then each
-   * Miss up from the tier or from the store, Half h to GPU h's Slot. Returns when every copy is done.
+   * Begin serving `loads` (layer L's Misses; late[i]: load i is a deferred slot's): on each GPU's copy
+   * stream every evicted Expert copies down into the RAM tier first, then each on-time Load found there
+   * copies up; the store reads go to the drive, on-time Loads' first.
    */
-  void serve(int L, std::span<const g53::SlotLoad> loads);
+  void begin_loads(int L, std::span<const g53::SlotLoad> loads, std::span<const uint8_t> late);
+  /** Take the store reads landed (at least one; refused with none in flight), queueing each Half's copy up into its Slot. */
+  void land_loads();
+  /**
+   * Wait for every Load under way but layer L's late ones; the compute streams then wait for their copies.
+   * Layer L's late Loads from the tier copy up behind them, for the next Sparse layer.
+   */
+  void finish_loads(int L);
+  /** A staging record free for a read, once its last copies up have left it (taking landed reads if none is free). */
+  int take_record();
   /** GPU h's scratch Half of Expert `e` (a sweep's). */
   uint8_t* scratch_ptr(size_t h, int32_t e) const { return gpus[h]->scratch + static_cast<uint64_t>(e) * kHalfBytes; }
   /** The read of Half h of layer L's Expert e into staging record `record`, from the replica with fewest in flight. */
@@ -344,14 +385,21 @@ struct Decoder::State {
   /** GPU 0's Plan of the last launch_route, checked. */
   moe_plan::Plan read_plan(int L);
   /**
-   * Layer L's Experts for a routed Round, Half h of Expert e at half(h, e): GEMVs, SwiGLU, combine
-   * with the shared Expert, Exchange, residual into rows.x. With `slot_table`, also uploads the
-   * layer's Slot table (stream-ordered after this Round's route, before the next one's).
+   * Layer L's Experts of `plan` for a routed Round, Half h of Expert e at half(h, e), as `part` says
+   * (MoePart): GEMVs, SwiGLU, combine, Exchange, then the residual into rows.x or the carry. A run that
+   * is not the Deferred part also uploads the layer's Slot table (stream-ordered after this Round's
+   * route, before the next one's).
    */
   template <class Half>
-  void run_experts(int L, int n, const std::array<Rows, 2>& rows, const moe_plan::Plan& plan,
-                   const std::array<const moe_plan::Plan*, 2>& device_plan, Half half, bool slot_table);
-  /** Layer L's MoE for a Round of `n` tokens: route, place, serve the Misses, Experts. */
+  void run_experts(int L, int n, const std::array<Rows, 2>& rows, const moe_plan::Plan& plan, Half half, MoePart part);
+  /** GPU h's Half of layer L's resident Expert e. */
+  const uint8_t* resident_half(int L, size_t h, int32_t e) const {
+    return slot_ptr(L, h, caches[static_cast<size_t>(L)]->slot_of()[static_cast<size_t>(e)]);
+  }
+  /**
+   * Layer L's MoE for a Round of `n` tokens: route, place, serve the Misses (with deferral, only those
+   * not deferred), the deferred part the Sparse layer before left, then this layer's Experts.
+   */
   void moe(int L, int n, const std::array<Rows, 2>& rows);
   /** Layer L's MoE for a sweep's Rounds: route all, gather their Experts, run them, settle the cache. */
   void sweep_moe(int L, int tokens);
@@ -516,8 +564,11 @@ Result<std::unique_ptr<Decoder>, std::string> Decoder::open(const g53::Config& c
     if (!reader) return R::err(reader.error().what);
     s.reader.emplace(std::move(reader).value());
     ck(cudaHostAlloc(reinterpret_cast<void**>(&s.staging), kRecords * 2 * kHalfBytes, cudaHostAllocPortable), "staging");
-    s.fetch.free_records.resize(kRecords);
-    std::iota(s.fetch.free_records.rbegin(), s.fetch.free_records.rend(), 0);
+    s.free_records.resize(kRecords);
+    std::iota(s.free_records.rbegin(), s.free_records.rend(), 0);
+    s.defers.assign(static_cast<size_t>(d.layers), 0);
+    if (c.deferral)
+      for (int L = 0; L < d.layers; L++) s.defers[static_cast<size_t>(L)] = g53::defers(config, L);
 
     // Both GPUs, peer access, the Exchange.
     for (int g = 0; g < 2; g++) {
@@ -644,6 +695,7 @@ Result<std::unique_ptr<Decoder>, std::string> Decoder::open(const g53::Config& c
       G.y = G.mem.alloc<float>(H);
       G.out = G.mem.alloc<__nv_bfloat16>(W);
       G.ffn = G.mem.alloc<__nv_bfloat16>(H);
+      G.carry = G.mem.alloc<__nv_bfloat16>(H);
       G.router_planes = G.mem.alloc<float>(static_cast<size_t>(s.router_planes) * d.experts * cuda::kMaxTokens);
       G.experts = G.mem.alloc<int32_t>(static_cast<size_t>(kMaxRound) * moe_plan::kTopK);
       G.weights = G.mem.alloc<float>(static_cast<size_t>(kMaxRound) * moe_plan::kTopK);
@@ -696,6 +748,7 @@ Result<std::unique_ptr<Decoder>, std::string> Decoder::open(const g53::Config& c
       for (auto* v : {&G.batch_ready, &G.staged})
         for (auto& e : *v) ck(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "sweep events");
       ck(cudaEventCreateWithFlags(&G.routed, cudaEventDisableTiming), "sweep events");
+      ck(cudaEventCreateWithFlags(&G.loaded, cudaEventDisableTiming), "Round events");
     }
 
     // Every claim is what the Ledger planned, byte for byte: otherwise its Slots would be a guess.
@@ -791,58 +844,108 @@ Result<std::unique_ptr<Decoder>, std::string> Decoder::open(const g53::Config& c
   return R::ok(std::unique_ptr<Decoder>(new Decoder(std::move(st))));
 }
 
-void Decoder::State::serve(int L, std::span<const g53::SlotLoad> loads) {
-  if (loads.empty()) return;
+// Every copy of a Round's Loads goes on its GPU's one copy stream, so stream order alone keeps them
+// apart: a copy down (queued at begin_loads) leaves its Slot before the copy up that fills it; a late
+// Load's copy up from the tier (queued at finish_loads) leaves its entry before the next layer's
+// begin_loads can copy down into it (victim_tier rests an entry moved up from until the next serve);
+// and a staging record is read again only after its event says its copies up are done.
+
+int Decoder::State::take_record() {
+  while (free_records.empty()) land_loads();
+  const int k = free_records.back();
+  free_records.pop_back();
+  for (size_t h = 0; h < 2; h++) {
+    ck(cudaSetDevice(gpus[h]->device), "cudaSetDevice");
+    ck(cudaEventSynchronize(gpus[h]->staged[static_cast<size_t>(k)]), "staging");
+  }
+  return k;
+}
+
+void Decoder::State::begin_loads(int L, std::span<const g53::SlotLoad> loads_now, std::span<const uint8_t> late) {
+  if (loads_now.empty()) return;
   const auto t0 = std::chrono::steady_clock::now();
-  std::vector<g53::TierMove> moves(loads.size(), g53::TierMove{-1, -1});
+  std::vector<g53::TierMove> moves(loads_now.size(), g53::TierMove{-1, -1});
   if (tier) {
-    auto m = tier->serve(tier_layer[static_cast<size_t>(L)], loads);
+    auto m = tier->serve(tier_layer[static_cast<size_t>(L)], loads_now);
     if (!m) throw Failure("RAM tier: " + m.error().what);
     moves = std::move(m).value();
   }
-  // The store reads first: they take longest. Then, on each GPU's copy stream, every copy down
-  // leaves its Slot before a copy up (from the tier, or from staging as a read lands) fills it.
-  std::vector<io::ReadRequest> reqs;
-  for (size_t i = 0; i < loads.size(); i++)
-    if (moves[i].up < 0)
-      for (uint32_t h = 0; h < 2; h++) reqs.push_back(half_read(L, loads[i].expert, h, i));
-  if (!reqs.empty())
-    if (auto r = reader->submit(reqs); !r) throw Failure("Expert store: " + r.error().what);
+  const size_t first = loads.size();
+  for (size_t i = 0; i < loads_now.size(); i++) loads.push_back({L, loads_now[i].slot, moves[i].up, late[i] != 0});
+  // Every copy down first: a read submitted below can land (in take_record) and queue its copy up into a
+  // Slot at once, which must come after that Slot's old Expert has left it.
   for (size_t h = 0; h < 2; h++) {
     Gpu& G = *gpus[h];
     ck(cudaSetDevice(G.device), "cudaSetDevice");
-    for (size_t i = 0; i < loads.size(); i++)
+    for (size_t i = 0; i < loads_now.size(); i++)
       if (moves[i].down >= 0)
-        ck(cudaMemcpyAsync(entry_ptr(moves[i].down, h), slot_ptr(L, h, loads[i].slot), kHalfBytes,
+        ck(cudaMemcpyAsync(entry_ptr(moves[i].down, h), slot_ptr(L, h, loads_now[i].slot), kHalfBytes,
                            cudaMemcpyDeviceToHost, G.copy),
            "copy down");
-    for (size_t i = 0; i < loads.size(); i++)
-      if (moves[i].up >= 0)
-        ck(cudaMemcpyAsync(slot_ptr(L, h, loads[i].slot), entry_ptr(moves[i].up, h), kHalfBytes,
+  }
+  // Then the store reads, on-time Loads' first (the drive serves them in order), before the tier's copies up.
+  size_t reads = 0;
+  for (const bool pass_late : {false, true})
+    for (size_t i = 0; i < loads_now.size(); i++) {
+      if (moves[i].up >= 0 || (late[i] != 0) != pass_late) continue;
+      const int k = take_record();
+      record_load[static_cast<size_t>(k)] = first + i;
+      const io::ReadRequest reqs[] = {half_read(L, loads_now[i].expert, 0, static_cast<size_t>(k)),
+                                      half_read(L, loads_now[i].expert, 1, static_cast<size_t>(k))};
+      if (auto r = reader->submit(reqs); !r) throw Failure("Expert store: " + r.error().what);
+      reads++;
+    }
+  // The on-time Loads the RAM tier holds; the late ones copy up at finish_loads, behind this layer's wait.
+  for (size_t h = 0; h < 2; h++) {
+    Gpu& G = *gpus[h];
+    ck(cudaSetDevice(G.device), "cudaSetDevice");
+    for (size_t i = 0; i < loads_now.size(); i++)
+      if (moves[i].up >= 0 && !late[i])
+        ck(cudaMemcpyAsync(slot_ptr(L, h, loads_now[i].slot), entry_ptr(moves[i].up, h), kHalfBytes,
                            cudaMemcpyHostToDevice, G.copy),
            "copy up");
   }
-  stats.ram_hits += loads.size() - reqs.size() / 2;
-  stats.store_reads += reqs.size() / 2;
-  for (size_t landed = 0; landed < reqs.size();) {
-    auto done = reader->wait(1);
-    if (!done) throw Failure("Expert store: " + done.error().what);
-    for (const io::Completion& c : done.value()) {
-      read_landed(c);
-      const size_t i = c.tag / 2, h = c.tag % 2;
-      Gpu& G = *gpus[h];
-      ck(cudaSetDevice(G.device), "cudaSetDevice");
-      ck(cudaMemcpyAsync(slot_ptr(L, h, loads[i].slot), staging + c.tag * kHalfBytes, kHalfBytes,
-                         cudaMemcpyHostToDevice, G.copy),
-         "Slot copy");
-      landed++;
-    }
+  for (size_t i = 0; i < loads_now.size(); i++)
+    if (moves[i].up >= 0 && !late[i]) loads[first + i].halves = 2;
+  stats.ram_hits += loads_now.size() - reads;
+  stats.store_reads += reads;
+  stats.store_s += seconds_since(t0);
+}
+
+void Decoder::State::land_loads() {
+  if (reader->in_flight() == 0) throw Failure("Expert store: a Load waits for a read none is in flight for");
+  auto done = reader->wait(1);
+  if (!done) throw Failure("Expert store: " + done.error().what);
+  for (const io::Completion& c : done.value()) {
+    read_landed(c);
+    const size_t k = c.tag / 2, h = c.tag % 2;
+    Load& load = loads[record_load[k]];
+    Gpu& G = *gpus[h];
+    ck(cudaSetDevice(G.device), "cudaSetDevice");
+    ck(cudaMemcpyAsync(slot_ptr(load.layer, h, load.slot), staging + c.tag * kHalfBytes, kHalfBytes,
+                       cudaMemcpyHostToDevice, G.copy),
+       "Slot copy");
+    ck(cudaEventRecord(G.staged[k], G.copy), "staging");
+    if (++load.halves == 2) free_records.push_back(static_cast<int>(k));
   }
-  // The staging buffer and the tier's entries are reused by the next layer: the copies finish first.
-  for (auto& G : gpus) {
-    ck(cudaSetDevice(G->device), "cudaSetDevice");
-    ck(cudaStreamSynchronize(G->copy), "Slot copies");
+}
+
+void Decoder::State::finish_loads(int L) {
+  const auto t0 = std::chrono::steady_clock::now();
+  auto awaited = [&](const Load& l) { return !(l.layer == L && l.late) && l.halves < 2; };
+  while (std::ranges::any_of(loads, awaited)) land_loads();
+  for (size_t h = 0; h < 2; h++) {
+    Gpu& G = *gpus[h];
+    ck(cudaSetDevice(G.device), "cudaSetDevice");
+    ck(cudaEventRecord(G.loaded, G.copy), "Loads");
+    ck(cudaStreamWaitEvent(G.stream, G.loaded, 0), "Loads");
+    for (const Load& l : loads)
+      if (l.layer == L && l.late && l.tier_up >= 0)
+        ck(cudaMemcpyAsync(slot_ptr(L, h, l.slot), entry_ptr(l.tier_up, h), kHalfBytes, cudaMemcpyHostToDevice, G.copy),
+           "copy up");
   }
+  for (Load& l : loads)
+    if (l.layer == L && l.late && l.tier_up >= 0) l.halves = 2;
   stats.store_s += seconds_since(t0);
 }
 
@@ -875,9 +978,10 @@ moe_plan::Plan Decoder::State::read_plan(int L) {
 }
 
 template <class Half>
-void Decoder::State::run_experts(int L, int n, const std::array<Rows, 2>& rows, const moe_plan::Plan& plan,
-                                 const std::array<const moe_plan::Plan*, 2>& device_plan, Half half, bool slot_table) {
+void Decoder::State::run_experts(int L, int n, const std::array<Rows, 2>& rows, const moe_plan::Plan& plan, Half half,
+                                 MoePart part) {
   const size_t N = static_cast<size_t>(n) * kDim;
+  const bool deferred = part == MoePart::Deferred;
   const int sb = cuda::split_blocks_for(kGateBlocks, kSplits);
   for (size_t h = 0; h < 2; h++) {
     Gpu& G = *gpus[h];
@@ -903,8 +1007,9 @@ void Decoder::State::run_experts(int L, int n, const std::array<Rows, 2>& rows, 
       up.down[down++] = j;
     };
     for (int j = 0; j < plan.jobs; j++) add(j, half(h, plan.expert[j]));
-    add(gpu::kSharedJob, sp.shared);
-    if (slot_table) {
+    if (!deferred) add(gpu::kSharedJob, sp.shared);
+    up.plan = plan;
+    if (!deferred) {
       const auto& table = caches[static_cast<size_t>(L)]->slot_of();
       std::copy(table.begin(), table.end(), up.slot_of);
       ck(cudaMemcpyAsync(sp.slot_of, up.slot_of, table.size() * sizeof(int32_t), cudaMemcpyHostToDevice, G.stream),
@@ -912,30 +1017,80 @@ void Decoder::State::run_experts(int L, int n, const std::array<Rows, 2>& rows, 
     }
     ck(cudaMemcpyAsync(G.jobs, &up, sizeof(JobUpload), cudaMemcpyHostToDevice, G.stream), "jobs");
     ck(cudaEventRecord(G.ring_done[static_cast<size_t>(k)], G.stream), "upload ring");
-    cuda::quantize_activations(rows[h].ffn, n, G.act, G.stream);
+    // The Deferred part's input is its own layer's, still quantized in act: only a Round's MoE quantizes into it.
+    if (!deferred) cuda::quantize_activations(rows[h].ffn, n, G.act, G.stream);
     cuda::gemv(G.jobs->gate_up, G.jobs->gate_up_first, gate_up, gate_up_warps, G.stream);
-    gpu::swiglu_quantize(device_plan[h], G.buf, G.stream);
+    gpu::swiglu_quantize(&G.jobs->plan, G.buf, G.stream);
     cuda::gemv(G.jobs->down, G.jobs->down_first, down, down_warps, G.stream);
-    gpu::combine(device_plan[h], G.buf, G.y, G.stream);
-    cuda::exchange_add(G.link, G.y, N, G.out, G.stream);
-    gpu::residual(rows[h].mid, G.out, static_cast<int>(N), rows[h].x, G.stream);
+    // Without the shared Expert its down slot is zero, so combine adds +0 to each sum (finish_split's `none`).
+    if (deferred)
+      ck(cudaMemsetAsync(G.buf.down_of(gpu::kSharedJob), 0, static_cast<size_t>(G.buf.dim) * cuda::kMaxTokens * sizeof(float),
+                         G.stream),
+         "shared down");
+    gpu::combine(&G.jobs->plan, G.buf, G.y, G.stream);
+    switch (part) {
+      case MoePart::Deferred:
+        cuda::exchange_add(G.link, G.y, N, G.carry, G.stream);
+        break;
+      case MoePart::Whole:
+        cuda::exchange_add(G.link, G.y, N, G.out, G.stream);
+        gpu::residual(rows[h].mid, G.out, static_cast<int>(N), rows[h].x, G.stream);
+        break;
+      case MoePart::Immediate:
+        cuda::exchange_add(G.link, G.y, N, G.out, G.stream);
+        gpu::residual_with_carry(rows[h].mid, G.out, G.carry, static_cast<int>(N), rows[h].x, G.stream);
+        break;
+    }
     ck(cudaGetLastError(), "MoE");
   }
 }
 
 void Decoder::State::moe(int L, int n, const std::array<Rows, 2>& rows) {
+  const auto where = "layer " + std::to_string(L) + ": ";
   // Route against the residency before this Round; the Plan places the Round's Experts.
   launch_route(L, n, rows);
   const moe_plan::Plan plan = read_plan(L);
   g53::LayerExpertCache& cache = *caches[static_cast<size_t>(L)];
-  auto loads = cache.place(std::span<const int32_t>(plan.expert, static_cast<size_t>(plan.jobs)), n);
-  if (!loads) throw Failure("layer " + std::to_string(L) + ": " + loads.error().what);
+  // Deferral: the token's Misses by that same residency, outside its protected slots (core/glm53/deferral).
+  std::optional<g53::SplitPlan> split;
+  if (defers[static_cast<size_t>(L)]) {
+    const auto route = g53::route_of(plan);
+    if (!route) throw Failure(where + route.error().what);
+    std::vector<uint8_t> resident(static_cast<size_t>(d.experts));
+    for (size_t e = 0; e < resident.size(); e++) resident[e] = cache.slot_of()[e] >= 0;
+    const auto slots = g53::deferred_slots(*config.deferral, route.value(), resident);
+    if (!slots) throw Failure(where + slots.error().what);
+    stats.deferred += slots.value().count();
+    if (slots.value().count() > 0) {
+      auto parts = g53::split_plan(plan, slots.value());
+      if (!parts) throw Failure(where + parts.error().what);
+      split = parts.value();
+    }
+  }
+  auto placed = cache.place(std::span<const int32_t>(plan.expert, static_cast<size_t>(plan.jobs)), n);
+  if (!placed) throw Failure(where + placed.error().what);
   stats.picks += static_cast<uint64_t>(plan.jobs);
-  stats.misses += loads.value().size();
-  serve(L, loads.value());
+  stats.misses += placed.value().size();
+  // A Load is late when its Expert serves only the deferred part (one token: each Expert serves one slot).
+  std::vector<uint8_t> late_loads(placed.value().size(), 0);
+  if (split) {
+    const auto* first = split->deferred.expert;
+    const auto* last = first + split->deferred.jobs;
+    for (size_t i = 0; i < late_loads.size(); i++) late_loads[i] = std::find(first, last, placed.value()[i].expert) != last;
+  }
+  begin_loads(L, placed.value(), late_loads);
+  finish_loads(L);
+  // The deferred part the Sparse layer before left first: its input is still the one quantized in act.
+  if (this->late) {
+    const int P = this->late->layer;
+    run_experts(P, n, rows, this->late->plan, [&](size_t h, int32_t e) { return resident_half(P, h, e); },
+                MoePart::Deferred);
+  }
   // The router of this layer's next Round reads the residency this one left.
-  run_experts(L, n, rows, plan, {gpus[0]->plan, gpus[1]->plan},
-              [&](size_t h, int32_t e) { return slot_ptr(L, h, cache.slot_of()[static_cast<size_t>(e)]); }, true);
+  run_experts(L, n, rows, split ? split->immediate : plan, [&](size_t h, int32_t e) { return resident_half(L, h, e); },
+              this->late ? MoePart::Immediate : MoePart::Whole);
+  this->late.reset();
+  if (split) this->late = LatePart{L, split->deferred};
 }
 
 void Decoder::State::sweep_moe(int L, int tokens) {
@@ -1254,9 +1409,9 @@ void Decoder::State::fetch_want(std::span<const int32_t> experts) {
 bool Decoder::State::fetch_pump(bool block) {
   if (fetch.layer < 0) return false;
   std::vector<io::ReadRequest> reqs;
-  while (!fetch.free_records.empty() && fetch.next < fetch.queue.size()) {
-    const int k = fetch.free_records.back();
-    fetch.free_records.pop_back();
+  while (!free_records.empty() && fetch.next < fetch.queue.size()) {
+    const int k = free_records.back();
+    free_records.pop_back();
     for (size_t h = 0; h < 2; h++) {  // its last copies up have left it
       ck(cudaSetDevice(gpus[h]->device), "cudaSetDevice");
       ck(cudaEventSynchronize(gpus[h]->staged[static_cast<size_t>(k)]), "staging");
@@ -1286,7 +1441,7 @@ bool Decoder::State::fetch_pump(bool block) {
       ck(cudaEventRecord(G.staged[k], G.copy), "staging");
     }
     if (++fetch.halves[k] < 2) continue;
-    fetch.free_records.push_back(static_cast<int>(k));
+    free_records.push_back(static_cast<int>(k));
     if (fetch.wanted[e]) {  // wanted from submission on (fetch_want only narrows): both Halves copied
       fetch.landed[e] = 1;
       fetch.pending--;
@@ -1349,10 +1504,14 @@ Result<std::vector<float>, std::string> Decoder::round(std::span<const int32_t> 
   if (n < 1 || n > kMaxRound) return R::err("a Round is 1 .. 8 tokens");
   if (s.config.route_bonus != 0.0f && n != 1)
     return R::err("under cache-conditional routing a Round is one token (its router must see the last one's residency)");
+  if (s.config.deferral && n != 1)
+    return R::err("under deferral a Round is one token (each token's Misses are its own, as the oracle models them)");
   if (auto why = s.refuse(tokens)) return R::err(*why);
   const auto t0 = std::chrono::steady_clock::now();
   const size_t N = static_cast<size_t>(n) * kDim;
   s.broken = true;  // until the Round completes
+  s.loads.clear();
+  s.late.reset();
   try {
     const std::vector<float> x = embed_rows(s.embed, tokens);
     if (capture) {
@@ -1384,6 +1543,10 @@ Result<std::vector<float>, std::string> Decoder::round(std::span<const int32_t> 
         ck(cudaStreamSynchronize(s.gpus[0]->stream), "layer");
       }
     }
+    // The last Sparse layer defers nothing and waits for every Load before it (g53::defers).
+    if (s.late || std::ranges::any_of(s.loads, [](const State::Load& l) { return l.halves < 2; }))
+      throw Failure("a deferred part or a Load outlived its Round");
+    s.loads.clear();
     Gpu& G0 = *s.gpus[0];
     ck(cudaSetDevice(G0.device), "cudaSetDevice");
     G0.head->logits(G0.x, n, G0.logits, G0.stream);
@@ -1393,6 +1556,7 @@ Result<std::vector<float>, std::string> Decoder::round(std::span<const int32_t> 
     for (auto& G : s.gpus) {
       ck(cudaSetDevice(G->device), "cudaSetDevice");
       ck(cudaStreamSynchronize(G->stream), "Round");
+      ck(cudaStreamSynchronize(G->copy), "Round");
     }
     s.length += n;
     s.broken = false;

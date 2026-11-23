@@ -4,7 +4,7 @@
 //
 //   ds4n-glm53-decode --config CONFIG --backbone DIR --store FILE[,FILE...] (--prompt "ID ID ..." | --prompt-file FILE)
 //                     [--generate N] [--round R] [--lambda λ] [--eviction lru|counter:N] [--slots-per-layer S]
-//                     [--slot-profile N,N,...] [--runtime-reserve-gib G]
+//                     [--slot-profile N,N,...] [--runtime-reserve-gib G] [--defer N]
 //                     [--ram-per-layer R|auto] [--ram-reserve-gib G] [--read-ahead SHARE]
 //                     [--prefill sweep|rounds] [--wave W] [--cohort K] [--capacity C] [--devices A,B]
 //                     [--threads T] [--then "ID ID ..."] [--logits-hash] [--check]
@@ -24,6 +24,10 @@
 // A sweep's attention and Dense MLPs take --wave tokens at once (8 .. 512, a multiple of 8; default 512).
 // A prompt longer than --cohort tokens (default 16384, rounded down to whole waves) is read as a sweep per
 // Cohort: --check with a small --cohort (one wave, say) puts a short prompt across several Cohorts.
+// --defer N defers the Misses of each token run as a Round (generated, or the prompt under --prefill rounds)
+// outside its N heaviest Route slots one Sparse layer
+// (core/glm53/deferral; lossy, the oracle's -dfN streams measure it); Rounds are then one token, and
+// --check replays the split: each Sparse layer's output with the carry of the one before.
 // --logits-hash prints an FNV-1a hash of every prompt token's logits: equal hashes across --prefill,
 // --wave and --cohort settings show a prompt too long for --check ran to the same bits every way.
 //
@@ -103,6 +107,7 @@ struct Args {
   std::string prefill = "sweep";  // or "rounds"; a sweep routes the prompt exactly, also under λ
   eng::DecoderConfig decoder;
   std::string slot_profile;  // parsed against the config in main
+  std::optional<int> defer;  // --defer N: protect N, made a Deferral against the config in main
   bool check = false, logits_hash = false;
 };
 
@@ -110,7 +115,7 @@ Args parse(int argc, char** argv) {
   const std::string usage =
       "usage: --config CONFIG --backbone DIR --store FILE[,FILE...] (--prompt \"ID ID ...\" | --prompt-file FILE) "
       "[--generate N] [--round R] "
-      "[--prefill sweep|rounds] [--lambda λ] [--eviction lru|counter:N] [--slots-per-layer S] [--slot-profile N,N,...] [--runtime-reserve-gib G] "
+      "[--prefill sweep|rounds] [--lambda λ] [--eviction lru|counter:N] [--slots-per-layer S] [--slot-profile N,N,...] [--runtime-reserve-gib G] [--defer N] "
       "[--ram-per-layer R|auto] [--ram-reserve-gib G] "
       "[--read-ahead SHARE] [--wave W] [--cohort K] [--capacity C] [--devices A,B] [--threads T] [--then \"ID ID ...\"] "
       "[--logits-hash] [--check]";
@@ -141,6 +146,7 @@ Args parse(int argc, char** argv) {
       a.decoder.eviction = e.value();
     } else if (k == "--slots-per-layer") a.decoder.slots_per_layer = std::stoi(v);
     else if (k == "--slot-profile") a.slot_profile = v;
+    else if (k == "--defer") a.defer = std::stoi(v);
     else if (k == "--runtime-reserve-gib") {
       const double g = std::stod(v);
       if (!(g >= 0.0)) die("--runtime-reserve-gib must be >= 0");
@@ -178,7 +184,7 @@ Args parse(int argc, char** argv) {
   if (a.prefill != "sweep" && a.prefill != "rounds") die(usage);
   if (!a.then.empty() && a.check) die("--then is a timing run: not with --check");
   if (a.round < 1 || a.round > 8) die("--round is 1 .. 8");
-  if (a.decoder.route_bonus != 0.0f) a.round = 1;  // the decoder's rule under λ
+  if (a.decoder.route_bonus != 0.0f || a.defer) a.round = 1;  // the decoder's rule under λ and deferral
   return a;
 }
 
@@ -206,19 +212,37 @@ size_t differing(std::span<const float> want, std::span<const float> got) {
   return bad;
 }
 
-/** What the replay routes by: λ, the Expert cache model it favours, and how many leading tokens were swept. */
+/**
+ * What the replay routes and finishes by: λ, the Expert cache model it favours, how many leading tokens
+ * were swept, and the deferral (core/glm53/deferral) the decoder's Rounds ran with.
+ */
 struct ReplayRouting {
   float lambda = 0.0f;
   glm53::Eviction eviction;
   std::vector<int> slots;   // [layer]: each Sparse layer's Slots, as the decoder opened them
-  size_t exact_prefix = 0;  // the swept prompt's tokens, which route exactly
+  size_t exact_prefix = 0;  // the swept prompt's tokens, which route exactly (and defer nothing)
+  std::optional<glm53::Deferral> deferral;
+  /** Whether layer L's replay needs the Expert cache model: its residency routes (λ) or defers. */
+  bool models_cache() const { return lambda != 0.0f || deferral.has_value(); }
 };
 
-/** One layer replayed: how many of its output values differ from the next capture, and a Full layer's Selections. */
+/** A Sparse layer's token held for the deferral pass: its layer start and its immediate feed-forward output. */
+struct Held {
+  glm53::LayerStart start;
+  std::vector<float> ffn;
+};
+
+/**
+ * One layer replayed: how many of its output values differ from the next capture, and a Full layer's
+ * Selections. Under deferral a Sparse layer's output also takes the carry of the Sparse layer before, so
+ * its tokens are held (with the carry it leaves) and compared by the deferral pass.
+ */
 struct LayerReplay {
   size_t bad = 0;
   double seconds = 0.0;
   std::vector<std::vector<int32_t>> selection;  // [token] on a Full layer; empty on a Shared one
+  std::vector<Held> held;                        // [token] under deferral, on a Sparse layer
+  std::vector<std::optional<std::vector<float>>> carry;  // [token]: the deferred part it left the next Sparse layer
 };
 
 /**
@@ -254,7 +278,7 @@ Result<LayerReplay, std::string> replay_layer(const glm53::Config& config, const
     if (!codes) return R::err(where + codes.error().what);
     shared = std::move(codes).value();
     layer.emplace(exact::MoeLayer{moe->router, moe->bias, *shared});
-    if (routing.lambda != 0.0f) {
+    if (routing.models_cache()) {
       auto created = glm53::LayerExpertCache::create(d.experts, routing.slots[static_cast<size_t>(L)], routing.eviction);
       if (!created) return R::err(where + created.error().what);
       cache.emplace(std::move(created).value());
@@ -267,6 +291,8 @@ Result<LayerReplay, std::string> replay_layer(const glm53::Config& config, const
   glm53::LayerCache past;
   std::vector<glm53::LayerStart> starts;
   std::vector<exact::MoeStart> routed;  // a Sparse layer's: each token's Route and its Experts' input
+  std::vector<std::optional<glm53::DeferredSlots>> deferred;  // [token] on a deferring layer's Rounds
+  const bool defers = moe && routing.deferral && glm53::defers(config, L);
   std::set<int32_t> round_union;
   for (size_t t = 0; t < T; t++) {
     auto start = exact::begin_layer(a.value(), past, cap.x[static_cast<size_t>(L)][t],
@@ -280,9 +306,16 @@ Result<LayerReplay, std::string> replay_layer(const glm53::Config& config, const
       // route with λ, one by one.
       const bool swept = t < routing.exact_prefix;
       exact::RouteChoice choice;
-      if (cache && !swept) choice.bonus = exact::ResidentBonus{routing.lambda, cache->resident()};
+      if (cache && !swept && routing.lambda != 0.0f) choice.bonus = exact::ResidentBonus{routing.lambda, cache->resident()};
       auto ms = exact::begin_moe(d, *layer, start.value().ffn_in, choice);
       if (!ms) return R::err(where + ms.error().what);
+      // A Round of one token defers by the residency its Route saw (a sweep defers nothing).
+      deferred.emplace_back();
+      if (defers && !swept) {
+        auto slots = glm53::deferred_slots(*routing.deferral, ms.value().route, cache->resident());
+        if (!slots) return R::err(where + slots.error().what);
+        deferred.back() = std::move(slots).value();
+      }
       if (cache && swept) {
         round_union.insert(ms.value().route.expert.begin(), ms.value().route.expert.end());
         if ((t + 1) % 8 == 0 || t + 1 == routing.exact_prefix) {
@@ -317,16 +350,27 @@ Result<LayerReplay, std::string> replay_layer(const glm53::Config& config, const
     }
   }
 
+  if (moe && routing.deferral) out.carry.resize(T);
   for (size_t t = 0; t < T; t++) {
     glm53::FeedForward ffn;
     if (mlp) {
       auto y = exact::dense_mlp(*mlp, starts[t].ffn_in);
       if (!y) return R::err(where + y.error().what);
       ffn.out = std::move(y).value().out;
+    } else if (deferred[t]) {
+      auto split = glm53::finish_split(*layer, routed[t], halves[t], *deferred[t]);
+      if (!split) return R::err(where + split.error().what);
+      ffn = {std::move(split.value().immediate), routed[t].route};
+      out.carry[t] = std::move(split.value().deferred);
     } else {
       auto moe_out = exact::finish_moe(*layer, routed[t], halves[t]);
       if (!moe_out) return R::err(where + moe_out.error().what);
       ffn = {std::move(moe_out).value().out, routed[t].route};
+    }
+    if (moe && routing.deferral) {  // its output waits for the carry of the Sparse layer before
+      starts[t].ffn_in = {};
+      out.held.push_back({std::move(starts[t]), std::move(ffn.out)});
+      continue;
     }
     auto step = glm53::finish_layer(config, std::move(starts[t]), std::move(ffn));
     if (!step) return R::err(where + step.error().what);
@@ -366,14 +410,45 @@ bool replay(const glm53::Config& config, const io::BackboneParts& parts, const s
       auto r = replay_layer(config, parts, store.value(), cap, L, selection, routing);
       if (!r) return r.error();
       const std::lock_guard lock(report);
-      std::printf("layer %2d (%s, %s): %zu tokens, %zu values differ  [%.1f s]\n", L,
-                  config.indexer(L) == glm53::IndexerKind::Full ? "Full" : "Shared",
-                  config.mlp(L) == glm53::MlpKind::Dense ? "Dense" : "Sparse", T, r.value().bad, r.value().seconds);
+      const auto kind = std::string(config.indexer(L) == glm53::IndexerKind::Full ? "Full" : "Shared") + ", " +
+                        (config.mlp(L) == glm53::MlpKind::Dense ? "Dense" : "Sparse");
+      if (r.value().held.empty())
+        std::printf("layer %2d (%s): %zu tokens, %zu values differ  [%.1f s]\n", L, kind.c_str(), T, r.value().bad,
+                    r.value().seconds);
+      else
+        std::printf("layer %2d (%s): %zu tokens replayed, compared in the deferral pass  [%.1f s]\n", L, kind.c_str(), T,
+                    r.value().seconds);
       std::fflush(stdout);
       done[static_cast<size_t>(L)] = std::move(r).value();
       return std::nullopt;
     });
     if (failed) die(*failed);
+  }
+  // The deferral pass: each Sparse layer's output is its immediate part plus the carry the Sparse layer
+  // before it left (with_carry), then the residual (finish_layer), as the decoder's Immediate runs do.
+  if (routing.deferral) {
+    const LayerReplay* before = nullptr;
+    for (int L = 0; L < d.layers; L++) {
+      LayerReplay& r = *done[static_cast<size_t>(L)];
+      if (r.held.empty()) continue;
+      size_t deferred_in = 0;
+      for (size_t t = 0; t < T; t++) {
+        std::vector<float> ffn = std::move(r.held[t].ffn);
+        if (before && before->carry[t]) {
+          auto added = glm53::with_carry(std::move(ffn), *before->carry[t]);
+          if (!added) die("layer " + std::to_string(L) + ": " + added.error().what);
+          ffn = std::move(added).value();
+          deferred_in++;
+        }
+        auto step = glm53::finish_layer(config, std::move(r.held[t].start), glm53::FeedForward{std::move(ffn), {}});
+        if (!step) die("layer " + std::to_string(L) + ": " + step.error().what);
+        r.bad += differing(step.value().out, cap.x[static_cast<size_t>(L) + 1][t]);
+      }
+      r.held.clear();
+      std::printf("layer %2d (Sparse, deferral pass): %zu tokens (%zu with a carry), %zu values differ\n", L, T, deferred_in,
+                  r.bad);
+      before = &r;
+    }
   }
   const bool layers_ok = std::ranges::all_of(done, [](const auto& r) { return r->bad == 0; });
 
@@ -413,6 +488,11 @@ int main(int argc, char** argv) {
     if (!p) die("--slot-profile: " + p.error().what);
     dc.slot_profile = std::move(p).value();
   }
+  if (args.defer) {
+    auto rule = glm53::Deferral::create(*args.defer, d.experts_per_token);
+    if (!rule) die("--defer: " + rule.error().what);
+    dc.deferral = rule.value();
+  }
 
   Captured cap;
   std::vector<int32_t> generated;
@@ -426,11 +506,12 @@ int main(int argc, char** argv) {
     slots.assign(dec.slots().begin(), dec.slots().end());
     const auto [lo, hi] = std::ranges::minmax(slots | std::views::filter([](int n) { return n > 0; }));
     std::printf("open: %.1f s, %d Slots per Sparse layer (%.0f%% of the Experts; %s, %d .. %d), RAM tier %d per layer, "
-                "%zu store replica(s), capacity %d, λ %g, eviction %s\n",
+                "%zu store replica(s), capacity %d, λ %g, eviction %s, deferral %s\n",
                 dec.stats().load_s, slots_per_layer, 100.0 * slots_per_layer / d.experts,
                 dc.slot_profile ? "profile" : "equal", lo, hi, dec.ram_per_layer(),
                 args.stores.size(), args.decoder.capacity, static_cast<double>(args.decoder.route_bonus),
-                glm53::to_string(args.decoder.eviction).c_str());
+                glm53::to_string(args.decoder.eviction).c_str(),
+                dc.deferral ? ("protect " + std::to_string(dc.deferral->protect())).c_str() : "none");
     for (size_t g = 0; g < 2; g++) {  // the Ledger's account (core/glm53/ledger), and what the reserve left free
       const eng::VramReport& v = dec.vram();
       const uint64_t claims = v.plan.claims[g].total();
@@ -507,12 +588,13 @@ int main(int argc, char** argv) {
     if (args.generate > 0) {
       const auto picks = st.picks - after_prompt.picks, misses = st.misses - after_prompt.misses;
       const auto ram = st.ram_hits - after_prompt.ram_hits;
-      std::printf("generate: %d tokens in %.2f s (%.2f tok/s); misses %.1f%% (%.1f per token: %.1f from RAM, %.1f store reads), "
-                  "miss wait %.2f s\n",
+      std::printf("generate: %d tokens in %.2f s (%.2f tok/s); misses %.1f%% (%.1f per token: %.1f from RAM, %.1f store reads; "
+                  "%.1f deferred), miss wait %.2f s\n",
                   args.generate, generate_s, args.generate / generate_s,
                   picks ? 100.0 * static_cast<double>(misses) / static_cast<double>(picks) : 0.0,
                   static_cast<double>(misses) / args.generate, static_cast<double>(ram) / args.generate,
-                  static_cast<double>(misses - ram) / args.generate, st.store_s - after_prompt.store_s);
+                  static_cast<double>(misses - ram) / args.generate,
+                  static_cast<double>(st.deferred - after_prompt.deferred) / args.generate, st.store_s - after_prompt.store_s);
       std::printf("generated:");
       for (int32_t t : generated) std::printf(" %d", t);
       std::printf("\n");
@@ -528,7 +610,7 @@ int main(int argc, char** argv) {
   if (!args.check) return 0;
   std::fflush(stdout);
   const ReplayRouting routing{args.decoder.route_bonus, args.decoder.eviction, slots,
-                              args.prefill == "sweep" ? args.prompt.size() : 0};
+                              args.prefill == "sweep" ? args.prompt.size() : 0, dc.deferral};
   const bool ok = replay(config.value(), parts.value(), args.stores.front(), cap, routing, args.decoder.threads);
   std::printf("%s\n", ok ? "PASS: every layer and logit bit-identical to the Reference configuration"
                          : "FAIL: the decoder differs from the Reference configuration");

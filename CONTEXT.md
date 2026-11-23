@@ -205,6 +205,13 @@ _Avoid_: budget, usage (a Claim is planned bytes, not a reading)
 How close one token's Expert choice on one Sparse GLM layer is to a tie: the worst chosen Expert's biased router score (sigmoid + `e_score_correction_bias`) minus the best unchosen one's (`Route::margin`). A route whose margin is within an engine's arithmetic noise can choose differently in that engine; on real weights the median is ~3.5e-3, about one BF16 step.
 _Avoid_: router confidence, gap (unqualified)
 
+**Deferral**:
+Running a token's Misses one Sparse layer late, after KTransformers' Expert Deferral: on a Sparse layer that is not the last, each Route slot whose Expert was not resident when it routed, outside the token's `protect` heaviest slots, is **deferred** (`core/glm53/deferral`, `--defer N`; opt-in, lossy, Rounds of one token). The layer's output is its **immediate part** (the shared Expert and the slots not deferred); its **deferred part** (the deferred slots on that layer's own input, no shared Expert) is the **carry**, added in FP32 to the next Sparse layer's output before its residual: x = mid + (immediate + carry). The engine reads a deferred slot's Expert as a **late Load**, waited for only at the next Sparse layer, so a layer's compute no longer waits for every one of its Misses. Its cost is measured as KL by the oracle's `-dfN` streams, and `--check` replays it bit for bit.
+_Avoid_: delayed experts, lazy loading (the Expert is still loaded on time for its own part)
+
+**Load**:
+A Miss being served in a Round (`Decoder::State::Load`): its Expert's evicted predecessor copied down into the RAM tier, then the Expert copied up into its Slot from the tier or, as its store reads land, from a staging record. On time, the layer waits for it; late (Deferral), the next Sparse layer does.
+
 ## Relationships
 
 - An **Expert** has one **Expert record** in the **Expert store** and, under tensor parallelism, two **Halves**
@@ -219,6 +226,7 @@ _Avoid_: router confidence, gap (unqualified)
 - Every busy **Lane** has a row in every **Shared Round**; a **Prompt sweep** holds the GPUs alone, the other **Lanes** pausing
 - **Cache-conditional routing** makes outputs depend on **Expert cache** contents; with λ = 0 every policy is **Exact**
 - Under **Cache-conditional routing** the **Eviction policy** decides what is routed, so the engine, `--check`'s replay and the **Oracle** must run the same one, each **Round** advancing a counter's clock by its tokens
+- **Deferral** is never **Exact** against λ's own stream: a deferred slot's contribution reaches the residual one Sparse layer late; `--check` holds the engine to the deferral replay, the **Oracle**'s KL holds the replay to the model
 - On GLM-5.3 every **Shared layer** attends the **Selection** of the nearest **Full layer** below it; only **Full layers**' **Latent rows** carry index keys
 - A GLM-5.3 **Expert** (routed or shared) runs as two **Halves**, each GPU summing its routed **Halves** in **Routing plan** order and then its shared **Half**, and the **Exchange** gives the MoE output; the routing weight is folded in before down_proj, a different rounding from the pinned reference's order, never a different mathematics
 - Every tensor of a GLM-5.3 source shard goes to exactly one of an **Expert record** and its shard's **Backbone part**; the shard may be deleted only when every one of them is verified there — per tensor (equal to its slice of its decoded **Expert record**), never per layer, since a shard may hold two layers' **Experts** and an **Expert** may span two shards

@@ -341,11 +341,30 @@ An independent audit (python, read-only, against the index) found:
        1.7 GiB under the card, as predicted to the MiB. 93 Slots (1.5 GiB) opens but leaves ~1 GiB.
      - **Lesson (environment facts):** under λ a KL difference under ~±0.004 between residency
        configurations is re-rolled Routes, not a quality change; decide with the paired sign test.
+   - **Deferring Misses one Sparse layer, 2026-11-23** (owner: "ok switch to decode, go": decode lever
+     D1, KTransformers' Expert Deferral; branch `glm53/deferred-misses` from `83c84d7`, worktree
+     `~/dev/ds4-native-glm53-defer`; report `docs/bench/glm53-defer/2026-11-23-defer-report.md`):
+     - **Built:** `core/glm53/deferral` (`Deferral::create(protect)`, `deferred_slots`, `split_plan`,
+       `finish_split`, `with_carry`; 9 tests). Oracle streams `exact-ccλ-dfN`. In the engine the per-layer
+       I/O became **Loads** (`begin_loads`/`land_loads`/`finish_loads`: the compute stream waits on an
+       event, not the host), a deferred slot's Expert is a late Load the next Sparse layer waits for,
+       and `MoePart {Whole, Immediate, Deferred}` runs the carry through the Exchange
+       (`residual_with_carry`). `--defer N` on decode, serve and oracle-run (default off; Rounds of one
+       token). +100,680 B a GPU in the Ledger, no Slot moved. `--check` replays the split exactly.
+     - **The Loads rewrite alone:** +1.8%, the same 256 tokens as the frontier receipts on all 4 prompts.
+     - **Deferral** (pooled at equal store reads, 2.34 ms a read; paired against λ 0.03 on the corpus):
+       `--defer 4` **+8.7%** (8.61 tok/s), KL 0.0699 (Δ −0.001, free), top-1 2485 (−23, p 0.15: 7 under
+       the 89% bar); `--defer 2` +14%, KL +11% (real), top-1 −29 — fails as λ 0.035 did; `--defer 0`
+       +18%, KL +81%, top-1 −102 — out.
+     - **Gate:** `--check` with `--defer 0` and without deferral: PENDING.
+     - **Not deployed.** `--defer 4` is the owner's call.
    - **Next, in order:**
      1. **Owner's call:** push `glm53/counter-eviction`, then merge dotfiles `inference/glm53-speed`
         (moves `DS4N_COMMIT` to this branch's head; adds `EVICTION`, `RUNTIME_RESERVE_GIB`,
         `SLOT_SHAPE` with the fitted profile), `--install`, and relaunch. Record the server's own
-        decode speed at the first launch.
+        decode speed at the first launch. **Then, also the owner's call:** `glm53/deferred-misses`
+        (stacked on it) for the Loads rewrite's free +1.8%, with or without `--defer 4` (+8.7%, top-1
+        at the bar's edge).
      2. Phase 5: CyberGym subset + harm rubric against the Flash primaries.
      3. counter:55 vs LRU at equal Slots under λ, by the paired test (one oracle run): the counter
         report's +0.0036 is inside the re-roll spread.
@@ -407,6 +426,12 @@ An independent audit (python, read-only, against the index) found:
   at 84 / 90 / 92 Slots. Compare with `kl_paired.py` (rename each report's `exact-ccλ` stream per run,
   or it refuses differing same-named streams) and read the sign counts: ~50/50 is noise, ~57/43 (a λ
   step) is real. Never call a ±0.004 mean difference a finding from one pair of runs.
+- **Speed under λ compares different work.** Each setting generates its own text, so its own Misses:
+  fit ms a token against store reads a token with one common slope (~2.3 ms a read) and compare the
+  offsets (`docs/bench/glm53-defer/speed.awk` prints the per-run columns). From `glm53/deferred-misses`
+  on, the printed "miss wait" is the host's wait only (the copies are the compute stream's): not
+  comparable with receipts before it. Top-1 is paired with `docs/bench/glm53-defer/top1_paired.py`
+  (McNemar), as KL is with `kl_paired.py`.
 - An oracle KL run with 2–4 streams takes ~70–145 s a layer alone on 32 threads (~1.5–3 h); two
   oracles at 16 threads each, or one beside a `--check` replay, ~100–300 s a layer.
 
@@ -430,6 +455,7 @@ An independent audit (python, read-only, against the index) found:
 | GLM-5.3 cache policies replayed (counter55, per-layer Slots, MTP) | `ds4-native/docs/bench/glm53-replay/2026-11-22-replay-report.md` (branch `glm53/replay-study`) |
 | counter55 on the GPUs (λ 0 +4.4%; λ 0.03 +10% at KL 0.072 vs 0.068), the Cohort and Ledger GPU gates, the reserve recalibrated | `ds4-native/docs/bench/glm53-counter/2026-11-22-counter-report.md` (branch `glm53/counter-eviction`) |
 | Every speed lever at λ 0.03 (counter:55, the Slot profile, the reserve, λ 0.035/0.04; the paired KL test) | `ds4-native/docs/bench/glm53-counter/2026-11-22-frontier-report.md` (branch `glm53/counter-eviction`) |
+| Deferring Misses one Sparse layer (`--defer N`; the Loads rewrite; KL, top-1, speed at equal reads) | `ds4-native/docs/bench/glm53-defer/2026-11-23-defer-report.md` (branch `glm53/deferred-misses`) |
 | GLM-5.3 ops runbook (primary `glm-native`) | `.dotfiles/scripts/inference/runbooks/glm53-native-runbook-2026-11-21.md` |
 | Hyperflare/GLM-Flash-uncensored story | `.dotfiles/scripts/inference/runbooks/glm53-flash-hyperflare-tp2-v16-runbook-2026-11-13.md` |
 

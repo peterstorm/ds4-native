@@ -130,7 +130,7 @@ Result<std::array<Claims, 2>, LedgerError> vram_claims(const Config& config, con
     const uint64_t round_h = rows8 * H, wave_h = W * H, slots = u(e.job_slots), gemv = rows8;
     const uint64_t plane = u(exact::kExpertSplits) * kHalfRows * gemv;
     c[Claim::Round] = round_h * 4 * kF32 + wave_h * kF32                             // x, mid, ffn_f32, y; partial
-                      + wave_h * kBf16 + round_h * kBf16                             // out, ffn
+                      + wave_h * kBf16 + 2 * round_h * kBf16                         // out; ffn, carry
                       + router_planes * E * gemv * kF32                              // router_planes
                       + rows8 * topk * (kI32 + kF32) + sizeof(moe_plan::Plan)        // experts, weights, plan
                       + kGateUpBlocks * (256 + 8)                                    // act: codes, scales

@@ -1,0 +1,6 @@
+top-1 agreement with the exact stream (2800 positions)
+exact-cc0.03-df0              2406 (85.93%)  vs profile92-cc0.03: -102; only it agrees at 112, only the reference at 214; McNemar p 0.000
+exact-cc0.03-df2              2479 (88.54%)  vs profile92-cc0.03: -29; only it agrees at 101, only the reference at 130; McNemar p 0.065
+exact-cc0.03-df4              2485 (88.75%)  vs profile92-cc0.03: -23; only it agrees at 107, only the reference at 130; McNemar p 0.153
+profile92-cc0.03              2508 (89.57%)
+profile92-cc0.035             2479 (88.54%)  vs profile92-cc0.03: -29; only it agrees at 105, only the reference at 134; McNemar p 0.070

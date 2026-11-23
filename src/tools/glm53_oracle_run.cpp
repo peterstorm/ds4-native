@@ -8,6 +8,11 @@
 //                         [--moe-roundings FILE] [--slots N] [--slot-profile N,N,...] [--eviction lru|counter:N]
 //                         [--warm N] [--kept FILE] [--gpu N]
 //
+// `-dfN` last (exact streams with no Departure) defers each Miss outside the
+// token's N heaviest slots one Sparse layer (core/glm53/deferral; the Miss as
+// the Expert cache model sees it): exact-cc0.03-df2. On the GPU a token with
+// deferred slots runs its MoE twice at full width (deferral's zero-weight Routes).
+//
 // Each prompt runs once per arithmetic listed — a stream, with its own caches
 // and residual stream — teacher-forced on the prompt's tokens. fp32, bf16,
 // e4m3 and mxfp4 are the Semantics oracle with the Experts' activations at
@@ -80,6 +85,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <deque>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -95,6 +101,7 @@
 #include <vector>
 
 #include "core/glm53/config.hpp"
+#include "core/glm53/deferral.hpp"
 #include "core/glm53/dequant.hpp"
 #include "core/glm53/exact_attention.hpp"
 #include "core/glm53/exact_moe.hpp"
@@ -130,16 +137,18 @@ struct ExactMoe {
   bool attention = false;  // the attention side in the Reference configuration too (-attn)
   bool pruned = false;
   std::optional<float> resident_bonus;
+  std::optional<int> deferral;  // -dfN: Misses outside the N heaviest slots wait a layer (core/glm53/deferral)
   friend auto operator<=>(const ExactMoe&, const ExactMoe&) = default;
 };
 
 /** How a stream runs its Experts: the Semantics oracle at an activation precision, or the Reference configuration. */
 using Arithmetic = std::variant<ActivationPrecision, ExactMoe>;
 
-/** The suffixes of an exact arithmetic, in this order: exact-attn-pruned-cc0.05. */
+/** The suffixes of an exact arithmetic, in this order: exact-attn-pruned-cc0.05-df2. */
 constexpr std::string_view kAttention = "-attn";
 constexpr std::string_view kPruned = "-pruned";
 constexpr std::string_view kCacheConditional = "-cc";
+constexpr std::string_view kDeferral = "-df";
 
 std::string name_of(const Arithmetic& a) {
   if (const auto* p = std::get_if<ActivationPrecision>(&a)) return std::string(glm53::name_of(*p));
@@ -152,10 +161,19 @@ std::string name_of(const Arithmetic& a) {
     bonus << *e.resident_bonus;  // %g: 0.05 reads back as the same float
     name += std::string(kCacheConditional) + bonus.str();
   }
+  if (e.deferral) name += std::string(kDeferral) + std::to_string(*e.deferral);
   return name;
 }
 
 std::optional<Arithmetic> parse_arithmetic(std::string name) {
+  std::optional<int> deferral;
+  if (const auto df = name.rfind(kDeferral); df != std::string::npos) {
+    const std::string text = name.substr(df + kDeferral.size());
+    if (text.empty() || text.size() > 2 || !std::ranges::all_of(text, [](char c) { return c >= '0' && c <= '9'; }))
+      return std::nullopt;
+    deferral = std::stoi(text);  // its upper bound, the Route width, is checked against the config (main)
+    name.resize(df);
+  }
   std::optional<float> bonus;
   if (const auto cc = name.rfind(kCacheConditional); cc != std::string::npos) {
     const std::string text = name.substr(cc + kCacheConditional.size());
@@ -170,9 +188,19 @@ std::optional<Arithmetic> parse_arithmetic(std::string name) {
   const bool attention = name.ends_with(kAttention);
   if (attention) name.resize(name.size() - kAttention.size());
   for (const auto d : exact::kDepartures)
-    if (name == name_of(Arithmetic{ExactMoe{d}})) return Arithmetic{ExactMoe{d, attention, pruned, bonus}};
-  if (const auto p = glm53::parse_activation_precision(name); p && !attention && !pruned && !bonus) return Arithmetic{*p};
+    if (name == name_of(Arithmetic{ExactMoe{d}})) {
+      // A deferred token's MoE finishes in two parts with combine's arithmetic: the Reference configuration's only.
+      if (deferral && d != exact::Departure::None) return std::nullopt;
+      return Arithmetic{ExactMoe{d, attention, pruned, bonus, deferral}};
+    }
+  if (const auto p = glm53::parse_activation_precision(name); p && !attention && !pruned && !bonus && !deferral)
+    return Arithmetic{*p};
   return std::nullopt;
+}
+
+std::optional<int> deferral_of(const Arithmetic& a) {
+  const auto* e = std::get_if<ExactMoe>(&a);
+  return e ? e->deferral : std::nullopt;
 }
 
 bool is_pruned(const Arithmetic& a) { return std::holds_alternative<ExactMoe>(a) && std::get<ExactMoe>(a).pruned; }
@@ -307,6 +335,7 @@ struct Stream {
   std::vector<std::vector<uint8_t>> misses;               // [layer][position] the Route's Misses in it
   std::vector<float> route_margins;                       // baseline only
   size_t selections = 0, selections_dropping = 0;         // baseline only
+  size_t deferred_picks = 0;                              // a deferring stream's picks that waited a layer
 };
 
 /** A routed Expert's use: token `token` of stream `stream`, in slot `slot` of its Route. */
@@ -371,9 +400,27 @@ std::vector<std::vector<std::vector<float>>> run_round(const Model& m, const Arg
   auto on_gpu = [&](const Stream& st) {
     return gpu_moe != nullptr && is_exact(st.arithmetic) && gpu_runs(departure_of(st.arithmetic));
   };
+#ifdef DS4N_GLM53_GPU
+  // A deferring stream's deferred parts on the GPU: the shared expert is the silent one (core/glm53/deferral).
+  std::optional<exact::ExpertTiles> silent_tiles;
+#endif
+  // Each deferring stream's rule, and the one that defers nothing (every slot protected) for the
+  // layers that do not defer.
+  const auto keep_all = glm53::Deferral::create(d.experts_per_token, d.experts_per_token);
+  if (!keep_all) die(keep_all.error().what);
+  std::vector<std::optional<glm53::Deferral>> rules(S);
+  for (size_t s = 0; s < S; s++)
+    if (const auto n = deferral_of(streams[s].arithmetic)) {
+      auto rule = glm53::Deferral::create(*n, d.experts_per_token);
+      if (!rule) die(name_of(streams[s].arithmetic) + ": " + rule.error().what);
+      rules[s] = rule.value();
+    }
+  // [stream][token]: the deferred part a Sparse layer left for the next, added to its feed-forward output.
+  std::vector<std::vector<std::optional<std::vector<float>>>> carry(S);
   std::vector<std::vector<std::vector<float>>> x(S);
   std::vector<std::vector<std::vector<int32_t>>> selection(S);
   for (size_t s = 0; s < S; s++) {
+    carry[s].resize(tokens[s].size());
     for (int32_t t : tokens[s]) {
       auto row = m.parts.load_row("model.embed_tokens.weight", static_cast<uint64_t>(t));
       if (!row) die(row.error().what);
@@ -419,11 +466,14 @@ std::vector<std::vector<std::vector<float>>> run_round(const Model& m, const Arg
     std::vector<std::vector<glm53::LayerStart>> starts(S);
     std::vector<std::vector<std::optional<exact::MoeStart>>> exact_tokens(S);
     std::vector<std::vector<std::optional<exact::MoeStart>>> study_starts(S);  // the baseline's Route, exact's input
+    std::vector<std::vector<std::optional<glm53::DeferredSlots>>> deferred(S);  // a deferring stream's, per token
+    const bool layer_defers = glm53::defers(config, L);
     if (auto e = parallel_for(S, args.threads, [&](size_t s) -> std::optional<std::string> {
           Stream& st = streams[s];
           auto& cache = st.caches[static_cast<size_t>(L)];
           exact_tokens[s].resize(tokens[s].size());
           study_starts[s].resize(tokens[s].size());
+          deferred[s].resize(tokens[s].size());
           for (size_t i = 0; i < tokens[s].size(); i++) {
             auto r = begin_token(config, bound.value(), L, exact_attention(st.arithmetic) ? &*attention : nullptr, cache,
                                  x[s][i], selection[s][i]);
@@ -452,6 +502,12 @@ std::vector<std::vector<std::vector<float>>> run_round(const Model& m, const Arg
               study_starts[s][i] = exact::MoeStart{r.value().route, std::move(input).value()};
             }
             const auto& route = exact_tokens[s][i] ? exact_tokens[s][i]->route : r.value().route;
+            if (rules[s] && exact_tokens[s][i]) {  // read the residency before this Route changes it
+              auto slots = glm53::deferred_slots(layer_defers ? *rules[s] : keep_all.value(), route, expert_cache.resident());
+              if (!slots) return where + slots.error().what;
+              st.deferred_picks += slots.value().count();
+              deferred[s][i] = std::move(slots).value();
+            }
             if (!route.expert.empty()) {
               const auto missed = expert_cache.use(route.expert);
               if (!missed) return where + missed.error().what;
@@ -597,7 +653,11 @@ std::vector<std::vector<std::vector<float>>> run_round(const Model& m, const Arg
 
     // The GPU streams: one Grouped MoE per Departure over all of its tokens of the layer.
     std::vector<std::vector<std::optional<std::vector<float>>>> gpu_out(S);  // the MoE output of a GPU token
-    for (size_t s = 0; s < S; s++) gpu_out[s].resize(starts[s].size());
+    std::vector<std::vector<std::optional<std::vector<float>>>> gpu_late(S);  // a deferring GPU token's deferred part
+    for (size_t s = 0; s < S; s++) {
+      gpu_out[s].resize(starts[s].size());
+      gpu_late[s].resize(starts[s].size());
+    }
     double gpu_s = 0.0;
 #ifdef DS4N_GLM53_GPU
     std::map<exact::Departure, std::vector<std::pair<size_t, size_t>>> gpu_tokens;
@@ -610,13 +670,39 @@ std::vector<std::vector<std::vector<float>>> run_round(const Model& m, const Arg
       if (!shared_tiles) die(where + "shared expert: " + shared_tiles.error().what);
       std::map<int32_t, const exact::ExpertTiles*> tile_of;
       for (const auto& [id, t] : layer_tiles) tile_of.emplace(id, &t);
+      // A token with deferred slots runs twice at full width (core/glm53/deferral): its immediate
+      // Route with the shared expert, then its deferred Route with the silent one.
+      std::deque<glm53::Route> split_routes;  // stable addresses for the MoeTokens
+      std::vector<std::pair<size_t, size_t>> late_items;
+      std::vector<cuda::glm53::MoeToken> late_tokens;
       for (const auto& [dep, items] : gpu_tokens) {
         std::vector<cuda::glm53::MoeToken> moe_tokens;
-        for (const auto& [s, i] : items) moe_tokens.push_back({starts[s][i].ffn_in, &exact_tokens[s][i]->route});
+        for (const auto& [s, i] : items) {
+          const glm53::Route* route = &exact_tokens[s][i]->route;
+          if (deferred[s][i] && deferred[s][i]->count() > 0) {
+            late_tokens.push_back({starts[s][i].ffn_in, &split_routes.emplace_back(glm53::deferred_route(*route, *deferred[s][i]))});
+            late_items.emplace_back(s, i);
+            route = &split_routes.emplace_back(glm53::immediate_route(*route, *deferred[s][i]));
+          }
+          moe_tokens.push_back({starts[s][i].ffn_in, route});
+        }
         auto out = gpu_moe->run(dep, shared_tiles.value(), moe_tokens, tile_of);
         if (!out) die(where + out.error().what);
         for (size_t q = 0; q < items.size(); q++)
           gpu_out[items[q].first][items[q].second] = std::move(out.value()[q].out);
+      }
+      if (!late_tokens.empty()) {
+        if (!silent_tiles) {
+          auto silent = glm53::silent_expert(d.hidden, d.shared_intermediate());
+          if (!silent) die(silent.error().what);
+          auto tiles = exact::expert_tiles(silent.value());
+          if (!tiles) die("silent expert: " + tiles.error().what);
+          silent_tiles = std::move(tiles).value();
+        }
+        auto out = gpu_moe->run(exact::Departure::None, *silent_tiles, late_tokens, tile_of);
+        if (!out) die(where + out.error().what);
+        for (size_t q = 0; q < late_items.size(); q++)
+          gpu_late[late_items[q].first][late_items[q].second] = std::move(out.value()[q].out);
       }
       gpu_s = seconds_since(tg);
     }
@@ -664,7 +750,23 @@ std::vector<std::vector<std::vector<float>>> run_round(const Model& m, const Arg
             if (!exact_tokens[s][i]) return glm53::finish_layer(config, bound.value(), std::move(starts[s][i]), routed[s][i]);
             exact::MoeStart& t = *exact_tokens[s][i];
             std::vector<float> out;
-            if (gpu_out[s][i]) {
+            if (deferred[s][i]) {  // a deferring stream: the immediate part, plus what the layer before left
+              glm53::SplitMoe split;
+              if (gpu_out[s][i]) {
+                split = glm53::SplitMoe{std::move(*gpu_out[s][i]), std::move(gpu_late[s][i])};
+              } else {
+                auto cpu = glm53::finish_split(*exact_layer, t, routed_halves[s][i], *deferred[s][i]);
+                if (!cpu) return Result<glm53::LayerStep, glm53::StepError>::err({cpu.error().what});
+                split = std::move(cpu).value();
+              }
+              out = std::move(split.immediate);
+              if (carry[s][i]) {
+                auto added = glm53::with_carry(std::move(out), *carry[s][i]);
+                if (!added) return Result<glm53::LayerStep, glm53::StepError>::err({added.error().what});
+                out = std::move(added).value();
+              }
+              carry[s][i] = std::move(split.deferred);
+            } else if (gpu_out[s][i]) {
               out = std::move(*gpu_out[s][i]);
             } else {
               auto o = exact::departed_finish(departure_of(streams[s].arithmetic), *exact_layer, t, routed_halves[s][i]);
@@ -694,6 +796,10 @@ std::vector<std::vector<std::vector<float>>> run_round(const Model& m, const Arg
                  "%6.1f s\n",
                  L, load_s, attend_s, ids.size(), experts_s, gpu_s, seconds_since(t3));
   }
+  // The last Sparse layer defers nothing, so every deferred part has joined the residual stream.
+  for (const auto& per_token : carry)
+    for (const auto& c : per_token)
+      if (c) die("a deferred part outlived the last Sparse layer");
   return x;
 }
 
@@ -780,7 +886,7 @@ int main(int argc, char** argv) {
   Args args;
   if (!parse_args(argc, argv, args))
     die("usage: --config FILE --backbone DIR --store FILE --prompt ID,ID,... [--prompt ...] "
-        "[--activations fp32,bf16,e4m3,mxfp4,exact[-DEPARTURE][-attn][-pruned][-ccλ] (distinct; the first is the baseline)] "
+        "[--activations fp32,bf16,e4m3,mxfp4,exact[-DEPARTURE][-attn][-pruned][-ccλ][-dfN] (distinct; the first is the baseline)] "
         "[--generate N] [--threads T] [--resident E>=8] [--report FILE] [--routes FILE] "
         "[--moe-roundings FILE (baseline fp32)] [--slots N (per Sparse layer)] [--slot-profile N,N,...] "
         "[--eviction lru|counter:N] [--warm N] "
@@ -984,6 +1090,17 @@ int main(int argc, char** argv) {
     std::printf("  %-24s %6.2f%% of %zu | %6.2f%% of %zu\n", name_of(args.arithmetics[q]).c_str(),
                 100.0 * share(cmp[q].misses[0], cmp[q].picks[0]), cmp[q].picks[0],
                 100.0 * share(cmp[q].misses[1], cmp[q].picks[1]), cmp[q].picks[1]);
+  // Deferral: the share of all picks (every Sparse layer and position, warm-up included) that waited a layer.
+  for (size_t q = 0; q < P; q++) {
+    if (!deferral_of(args.arithmetics[q])) continue;
+    size_t picks = 0, waited = 0;
+    for (size_t s = q; s < streams.size(); s += P) {
+      waited += streams[s].deferred_picks;
+      for (const auto& layer : streams[s].routes) picks += layer.size() * static_cast<size_t>(d.experts_per_token);
+    }
+    std::printf("deferral %s: %zu of %zu picks waited a layer (%.2f%%)\n", name_of(args.arithmetics[q]).c_str(), waited,
+                picks, 100.0 * share(waited, picks));
+  }
   for (size_t s = 0; s < streams.size() && args.generate > 0; s++) {
     std::printf("prompt %zu %s generated", streams[s].prompt, name_of(streams[s].arithmetic).c_str());
     for (int32_t t : generated[s]) std::printf(" %d", t);

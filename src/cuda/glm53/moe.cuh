@@ -23,6 +23,7 @@
 //   [GEMV down]        same slots
 //   combine            FP32 per token: routed slots in Plan order (ascending id), then the shared slot
 //   add_round_bf16     after the Exchange: bf16(GPU 0 + GPU 1)
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -71,6 +72,14 @@ void swiglu_quantize(const moe_plan::Plan* plan, MoeBuffers buf, cudaStream_t st
 
 /** y[n][r] = 0 + the routed slots serving token n in Plan order + the shared slot's, FP32; y is [tokens][dim]. */
 void combine(const moe_plan::Plan* plan, MoeBuffers buf, float* y, cudaStream_t stream);
+
+/**
+ * x[i] = mid[i] + (out[i] + carry[i]), FP32 from the BF16 `out` and `carry`, n values: the residual of a
+ * Sparse layer that adds the deferred part the Sparse layer before it left (core/glm53/deferral's
+ * with_carry, then finish_layer's add).
+ */
+void residual_with_carry(const float* mid, const __nv_bfloat16* out, const __nv_bfloat16* carry, int n, float* x,
+                         cudaStream_t stream);
 
 /**
  * Each hidden value as swiglu_quantize computes it before act_quant: the gate and

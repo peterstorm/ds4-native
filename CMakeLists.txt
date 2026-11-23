@@ -36,6 +36,7 @@ add_library(ds4n_core STATIC
   src/core/glm53/cohort.cpp
   src/core/glm53/ledger.cpp
   src/core/glm53/slot_profile.cpp
+  src/core/glm53/deferral.cpp
   src/core/meminfo.cpp
   src/core/glm53/pruning.cpp
   src/core/indexer.cpp
@@ -215,6 +216,7 @@ add_executable(ds4n_tests
   tests/core/glm53/test_cohort.cpp
   tests/core/glm53/test_ledger.cpp
   tests/core/glm53/test_slot_profile.cpp
+  tests/core/glm53/test_deferral.cpp
   tests/core/test_meminfo.cpp
   tests/core/glm53/test_pruning.cpp
   tests/core/test_indexer.cpp

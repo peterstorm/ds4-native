@@ -26,6 +26,15 @@
 // The Slots give up Experts by DecoderConfig::eviction: least recently used, or
 // a use counter halved every N tokens (counter:55 misses ~5% fewer on GLM-5.3).
 //
+// Optionally (DecoderConfig::deferral; lossy, opt-in), a Sparse layer below the
+// last defers its Misses outside each token's heaviest slots one Sparse layer
+// (core/glm53/deferral): it waits only for the rest, runs them (the immediate
+// part), and the next Sparse layer, after routing and queueing its own reads
+// behind them, runs the deferred Experts on the input they were routed on and
+// adds their output to its own before the residual. So the drive keeps reading
+// while the GPUs work. A Round is then one token (the oracle's -dfN streams
+// model exactly that), and --check replays the split.
+//
 // Below the Slots, optionally, the RAM tier (core/glm53/victim_tier): every
 // Expert a Load evicts is copied down into pinned host memory, and a Miss found
 // there moves up over PCIe instead of being read from the store; the tier keeps
@@ -73,6 +82,7 @@
 #include <vector>
 
 #include "core/glm53/config.hpp"
+#include "core/glm53/deferral.hpp"
 #include "core/glm53/layer_expert_cache.hpp"
 #include "core/glm53/ledger.hpp"
 #include "core/glm53/slot_profile.hpp"
@@ -102,6 +112,8 @@ struct DecoderConfig {
   // Which Expert a full layer's Slots give up (core/glm53/layer_expert_cache). Under exact routing it
   // changes only the reads; under λ it decides what is resident, so what is routed: --check replays it.
   ds4n::glm53::Eviction eviction = ds4n::glm53::Lru{};
+  // Deferred Misses (core/glm53/deferral): an approximation, so --check replays it. None: every Miss waits.
+  std::optional<ds4n::glm53::Deferral> deferral;
   unsigned threads = 16;            // Backbone load threads
   // VRAM per GPU outside the Ledger's claims (core/glm53/ledger): the CUDA context, kernel images,
   // allocator rounding and headroom. The Slots are the card's bytes past the claims and this, so the
@@ -128,6 +140,7 @@ struct DecoderStats {
   uint64_t rounds = 0, tokens = 0;
   uint64_t picks = 0;   // Expert placements asked for (a Round's distinct Experts, per Sparse layer)
   uint64_t misses = 0;    // of them, not in a Slot
+  uint64_t deferred = 0;  // Route slots whose output joined the next Sparse layer (DecoderConfig::deferral)
   uint64_t ram_hits = 0;  // Experts copied up from the RAM tier (round(): Misses; prefill(): scratch fills)
   uint64_t store_reads = 0;   // Experts read from the store
   uint64_t unrouted_reads = 0;  // of them, read ahead by a sweep and then not routed
@@ -176,7 +189,7 @@ class Decoder {
   Decoder& operator=(const Decoder&) = delete;
 
   /**
-   * Run `tokens` (1..8; 1 under route_bonus) at positions length() .. length() + n - 1 and append
+   * Run `tokens` (1..8; 1 under route_bonus or deferral) at positions length() .. length() + n - 1 and append
    * them to the cache. Returns each token's logits, [n][vocab]. With `capture`, (*capture)[L] is
    * every token's residual stream entering layer L ([n][hidden]), L = 0 .. layers (the last after
    * layer layers - 1): what --check replays. A Round that fails part way leaves the caches out of

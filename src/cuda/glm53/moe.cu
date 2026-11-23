@@ -234,6 +234,12 @@ __global__ void combine_kernel(const moe_plan::Plan* __restrict__ plan, MoeBuffe
   for (int n = 0; n < tokens; n++) y[static_cast<size_t>(n) * buf.dim + r] = acc[n];
 }
 
+__global__ void residual_with_carry_kernel(const float* __restrict__ mid, const __nv_bfloat16* __restrict__ out,
+                                           const __nv_bfloat16* __restrict__ carry, int n, float* __restrict__ x) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) x[i] = __fadd_rn(mid[i], __fadd_rn(__bfloat162float(out[i]), __bfloat162float(carry[i])));
+}
+
 /** accumulate_tokens' chain (cuda/moe.cu) with each down output weighted first. */
 __global__ void __launch_bounds__(256) accumulate_weighted_kernel(const moe::TokenSlots* __restrict__ tokens,
                                                                   const int32_t* __restrict__ slots,
@@ -278,6 +284,11 @@ void hidden_values(const float* gate_sum, const float* up_sum, const float* weig
 
 void combine(const moe_plan::Plan* plan, MoeBuffers buf, float* y, cudaStream_t stream) {
   combine_kernel<<<(buf.dim + 127) / 128, 128, 0, stream>>>(plan, buf, y);
+}
+
+void residual_with_carry(const float* mid, const __nv_bfloat16* out, const __nv_bfloat16* carry, int n, float* x,
+                         cudaStream_t stream) {
+  if (n > 0) residual_with_carry_kernel<<<(n + 255) / 256, 256, 0, stream>>>(mid, out, carry, n, x);
 }
 
 }  // namespace ds4n::cuda::glm53
