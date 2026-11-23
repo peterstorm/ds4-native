@@ -30,7 +30,7 @@ routing (λ 0.03 Routes, counter:55, RAM tier 38, a fitted profile tested held o
 ## Served at 202,752: measured (2026-11-23, evening)
 
 The owner took the cap. `uncensored-native` was relaunched with `CONTEXT=202752` on the same engine
-(`1ceb9d49`) and settings (receipts `served-202752.log`, `long-prompt-202752.*`):
+(`1ceb9d49`) and settings (receipts `served-202752.out`, `long-prompt-202752.*`):
 
 - **Opened as the Ledger planned:** `ready in 78 s: context 202752, 74 Slots per Sparse layer`, RAM
   tier 37 a layer (38 before: it is sized from free host memory at load). Free after open 2.30 / 4.27 GB.

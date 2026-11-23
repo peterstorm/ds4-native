@@ -1,0 +1,10 @@
+ds4n-glm53-serve: ready in 78 s: context 202752, 74 Slots per Sparse layer (profile), RAM tier 37 per layer, λ 0.03, eviction counter:55, deferral protect 4, checkpoints 4.0 GB (95.2 KB a token)
+ds4n-glm53-serve: vram GPU 0: card 101.97 GB, claims 43.06 GB, free after open 2.30 GB
+ds4n-glm53-serve: vram GPU 1: card 101.97 GB, claims 41.12 GB, free after open 4.27 GB
+ds4n-glm53-serve: prompt 32 tokens = 0 reused + 32 read in 15867 ms (2.0 tok/s)
+ds4n-glm53-serve: 300 written in 43799 ms (6.85 tok/s), length; misses 24936 of 179400 (10196 RAM tier, 14740 store, 26318 ms waited)
+ds4n-glm53-serve: 300 written in 46744 ms (6.42 tok/s), length; misses 27032 of 179400 (10759 RAM tier, 16273 store, 28994 ms waited)
+ds4n-glm53-serve: prompt 33 tokens = 10 reused + 23 read in 6669 ms (3.4 tok/s)
+ds4n-glm53-serve: 300 written in 40947 ms (7.33 tok/s), length; misses 23096 of 179400 (9956 RAM tier, 13140 store, 23891 ms waited)
+ds4n-glm53-serve: prompt 36 tokens = 10 reused + 26 read in 7060 ms (3.7 tok/s)
+ds4n-glm53-serve: 300 written in 44044 ms (6.81 tok/s), length; misses 25065 of 179400 (10468 RAM tier, 14597 store, 26639 ms waited)
