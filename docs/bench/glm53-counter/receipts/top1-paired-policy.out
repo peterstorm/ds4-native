@@ -1,0 +1,3 @@
+top-1 agreement with the exact stream (2800 positions)
+counter55_84                  2506 (89.50%)  vs lru84: +3; only it agrees at 102, only the reference at 99; McNemar p 0.888
+lru84                         2503 (89.39%)

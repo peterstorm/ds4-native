@@ -126,12 +126,17 @@ the spread rather than measured. That last comparison needed no new run: the λ 
 (`docs/bench/glm53-cc/2026-11-20-cc.report.json.gz`, default eviction) and the counter report's
 counter:55 stream (`receipts/kl.report.json.gz`, `--eviction counter:55`) were both oracle runs at **84
 Slots, λ 0.03, on this same 2,800-position corpus, teacher-forced** — identical but for the one flag.
-Paired position by position (`2026-11-23-policy-paired.sh`, receipt `kl-paired-policy.out`; no GPU):
+Paired position by position (`2026-11-23-policy-paired.sh`, receipts `kl-paired-policy.out` and
+`top1-paired-policy.out`; no GPU):
 
-| stream (84 Slots, λ 0.03) | KL mean | paired Δ vs LRU | 95% CI (optimistic) | positions lower / higher |
-|---|---|---|---|---|
-| LRU (`cc.report`, the reference) | 0.06838 | — | — | — |
-| counter:55 (`kl.report`) | 0.07198 | +0.0036 (+5%) | [−0.0018, +0.0108] | **1355 / 1331** |
+| stream (84 Slots, λ 0.03) | KL mean | paired Δ vs LRU | 95% CI (optimistic) | positions lower / higher | top-1 | only it / only LRU agrees | McNemar p |
+|---|---|---|---|---|---|---|---|
+| LRU (`cc.report`, the reference) | 0.06838 | — | — | — | 2503 | — | — |
+| counter:55 (`kl.report`) | 0.07198 | +0.0036 (+5%) | [−0.0018, +0.0108] | **1355 / 1331** | 2506 | 102 / 99 | **0.888** |
+
+`top1_paired.py` also checks that the two reports' `exact` streams agree at every position. They do,
+which proves the two runs, two days apart, saw the same text through the same exact model: the pair is
+valid.
 
 The +5% aggregate — the counter report's "price" — is a **coin flip per position**: counter:55 is
 better at 1355 positions and worse at 1331 (the rest tied). The CI spans zero, and the trimmed mean

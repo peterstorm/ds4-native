@@ -27,7 +27,7 @@ WARMIND stopped.
 > loss.** Under λ every residency change re-rolls some Routes: counter:55 alone measured 0.0720 /
 > 0.0668 / 0.0707 at 84 / 90 / 92 Slots, and a direct paired test of these two 84-Slot streams puts the
 > policy at **a coin flip per position — 1355 positions better, 1331 worse, CI [−0.0018, +0.0108]
-> spanning zero, trimmed mean +0.0010.** The +0.0036 aggregate is a handful of re-rolled Routes
+> spanning zero, trimmed mean +0.0010; top-1 2506 vs 2503, McNemar p 0.888.** The +0.0036 aggregate is a handful of re-rolled Routes
 > (prompt 3 alone +19%), so "+10% decode for +5% KL" overstates the cost: the decode is real, the KL
 > cost is not. The speed results and the gates stand, and counter:55 is the adopted serve policy.
 
@@ -247,8 +247,9 @@ paired position by position, the two streams above are indistinguishable.
 two streams differ in nothing but `--eviction`, so pairing them isolates the policy — no new oracle run
 needed. counter:55 is lower-KL than LRU at **1355 of 2,800 positions and higher at 1331** (the rest
 tied); the 95% CI [−0.0018, +0.0108] spans zero; the trimmed mean (three largest moves each way
-dropped) is **+0.0010**. The +5.3% aggregate is carried by a few re-rolled Routes — prompt 3 jumps +19%
-while prompt 2 *improves*. This is the coin-flip signature every residency lever shows in the frontier
+dropped) is **+0.0010**. Top-1 agrees too: 2506 against 2503, discordant 102 / 99, McNemar p 0.888
+(`top1-paired-policy.out`). The +5.3% aggregate is carried by a few re-rolled Routes — prompt 3 jumps
++19% while prompt 2 *improves*. This is the coin-flip signature every residency lever shows in the frontier
 report, and nothing like a λ step's ~57% one-way shift. **counter:55 is neither a free gain nor a
 regression under λ: it costs no real quality against LRU.**
 

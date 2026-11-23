@@ -374,8 +374,11 @@ An independent audit (python, read-only, against the index) found:
         deferral protect 4) costs neither compliance nor security-analysis capability. Not run: a
         same-day Flash A/B (Flare stays stopped) or real CyberGym (its runners need disk the box does
         not have until the second NVMe). The 8 graded tasks are the cyber-ladder plan's proxy.
-     3. counter:55 vs LRU at equal Slots under λ, by the paired test (one oracle run): the counter
-        report's +0.0036 is inside the re-roll spread.
+     3. ~~counter:55 vs LRU at equal Slots under λ, by the paired test~~ **Done 2026-11-23, no run
+        needed**: the λ study's LRU stream and the counter run's counter:55 stream were already a
+        matched pair (84 Slots, λ 0.03, same corpus, identical `exact` streams). KL 1355 better / 1331
+        worse, CI spans zero; top-1 2506 vs 2503, McNemar p 0.888. The adopted policy costs no
+        quality (`docs/bench/glm53-counter/2026-11-23-policy-paired.sh`, frontier report §2.1).
      4. The second NVMe (`M.2_3`/`M.2_4`). MTP is deprioritized by the replay study.
      5. Merge `glm53/engine-core` into main once Phase 5 decides keep (DS4.1's sources are
         untouched on the branch).
