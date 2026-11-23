@@ -97,7 +97,11 @@ costs what 202,752 cost before, and 202,752 costs what ~110K did.
   behaviour: `DS4N_HD` taken from `core/det_math.hpp` (the same definition), `latent_position` deleted
   (no production caller), `latent_slot`/`first_slot` renamed `latent_index`/`first_index` (CONTEXT.md
   reserves Slot for Experts). The CUDA build compiles clean after them and the 365 CPU tests pass.
-- **Not served yet.** Moving `DS4N_COMMIT` to this branch is the owner's call.
+- **Served since 2026-11-23 23:10** (owner: "serve the split, but we're fine at 200k for now"; dotfiles
+  `9feeacf6`, `DS4N_COMMIT=d398fae0`, `CONTEXT` 202,752): opened 86 Slots, claims 34.21 GB a GPU (43.06
+  before). The four served-speed chats (`glm53-context/2026-11-23-served-speed.sh`, receipt
+  `receipts/served-202752.out`): **8.16 tok/s pooled against 6.84** before the split (+19%), store reads
+  37.8 a token against 49.0.
 
 ## Reproduce
 
