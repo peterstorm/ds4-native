@@ -358,7 +358,9 @@ An independent audit (python, read-only, against the index) found:
        +18%, KL +81%, top-1 −102 — out.
      - **Gate PASS:** `--check` with `--defer 0` (2,685 token-layers with a carry) and without deferral,
        all 78 layers and the head bit-identical; without deferral the same 64 tokens as the previous gate.
-     - **Adopted** (owner: "go ahead with --defer 4"): dotfiles `inference/glm53-speed` gains `DEFER=4`.
+     - **Adopted and served** (owner: "go ahead with --defer 4"): dotfiles `70f446d3` on main
+       (`DEFER=4`, `DS4N_COMMIT=1ceb9d49`), primary `uncensored-native` relaunched: 92 Slots, **8.50
+       tok/s served** through Maya (four 300-token chats; 6.2–7.1 on 2026-11-21).
    - **Next, in order:**
      1. **Owner's call:** push `glm53/counter-eviction`, then merge dotfiles `inference/glm53-speed`
         (moves `DS4N_COMMIT` to this branch's head; adds `EVICTION`, `RUNTIME_RESERVE_GIB`,

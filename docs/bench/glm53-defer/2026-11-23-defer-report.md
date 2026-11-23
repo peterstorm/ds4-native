@@ -116,8 +116,10 @@ Both PASS: every layer and the head bit-identical (256 tokens × 154,880 logits,
 
 ## 5. What is left
 
-- **Served speed.** The first launch with `DEFER=4` records decode through Maya (the dotfiles
-  runbook's measured tables).
+- **Served (2026-11-23, dotfiles `70f446d3`, primary `uncensored-native`):** 92 Slots, `deferral
+  protect 4`; four chats through Maya, 300 tokens each, no reasoning (`2026-11-23-served-speed.sh`,
+  `receipts/served-speed.log`): **8.50 tok/s pooled** (8.15–8.80) at 35.7 store reads a token, against
+  §3's 8.61 at 35.9, and 6.2–7.1 served on 2026-11-21 (83 Slots, LRU).
 - **The drive is still the floor.** At 35.9 store reads a token and 2.34 ms each, reads are ~84 ms of
   a 116 ms token under df4: deferral hides part of them behind compute, it does not remove them.
   The remaining decode levers are the ones that read less (a second NVMe in M.2_3/M.2_4, more RAM
