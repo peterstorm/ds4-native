@@ -1,0 +1,15 @@
+reply: 300 tokens, finish length: # How a B-Tree Keeps Itself Balanced  ## Core Idea  A B-tree of minimum degree *t* is a mu
+reply: 300 tokens, finish length: # ISO 8601 Duration Parser  ```python import re  # Regex for the full ISO 8601 duration fo
+reply: 300 tokens, finish length: # The 1929 Stock Market Crash  ## Causes  The crash was driven by a combination of factors
+reply: 300 tokens, finish length: # TLS 1.3 Session Key Establishment  TLS 1.3 uses an (EC)DHE key exchange with authenticat
+ds4n-glm53-serve: prompt 32 tokens = 0 reused + 32 read in 15626 ms (2.0 tok/s)
+ds4n-glm53-serve: 300 written in 39759 ms (7.55 tok/s), length; misses 20901 of 179400 (8274 RAM tier, 12627 store, 23381 ms waited)
+ds4n-glm53-serve: prompt 45904 tokens = 10 reused + 45894 read in 82662 ms (555.2 tok/s)
+ds4n-glm53-serve: prompt 40 tokens = 10 reused + 30 read in 7102 ms (4.2 tok/s)
+ds4n-glm53-serve: 300 written in 35710 ms (8.40 tok/s), length; misses 18281 of 179400 (7060 RAM tier, 11221 store, 20440 ms waited)
+ds4n-glm53-serve: prompt 45707 tokens = 10 reused + 45697 read in 84381 ms (541.6 tok/s)
+ds4n-glm53-serve: prompt 33 tokens = 10 reused + 23 read in 5475 ms (4.2 tok/s)
+ds4n-glm53-serve: 300 written in 36073 ms (8.32 tok/s), length; misses 18514 of 179400 (7524 RAM tier, 10990 store, 20361 ms waited)
+ds4n-glm53-serve: prompt 48249 tokens = 10 reused + 48239 read in 89947 ms (536.3 tok/s)
+ds4n-glm53-serve: prompt 36 tokens = 10 reused + 26 read in 6135 ms (4.2 tok/s)
+ds4n-glm53-serve: 300 written in 35607 ms (8.43 tok/s), length; misses 18575 of 179400 (8073 RAM tier, 10502 store, 19732 ms waited)

@@ -1,0 +1,18 @@
+KILLED       counts never halved  (TEST CASE:  LayerExpertCache agrees with the replay's model, call by call, under both policies)
+KILLED       halving one token late  (TEST CASE:  LayerExpertCache agrees with the replay's model, call by call, under both policies)
+KILLED       clock counts Routes, not tokens  (TEST CASE:  LayerExpertCache agrees with the replay's model, call by call, under both policies)
+KILLED       halving rebased on the clock  (TEST CASE:  LayerExpertCache agrees with the replay's model, call by call, under both policies)
+KILLED       count is recency only  (TEST CASE:  LayerExpertCache agrees with the replay's model, call by call, under both policies)
+KILLED       victim ignores the count  (TEST CASE:  LayerExpertCache agrees with the replay's model, call by call, under both policies)
+KILLED       victim ignores last use  (TEST CASE:  LayerExpertCache: evicts the least recently used, never an Expert the Route needs)
+KILLED       ties to the higher id  (TEST CASE:  LayerExpertCache: evicts the least recently used, never an Expert the Route needs)
+KILLED       a Route's Expert evictable  (TEST CASE:  LayerExpertCache: a Route is resident after use, and its Misses were exactly its non-resident Experts)
+KILLED       zero tokens accepted  (TEST CASE:  Eviction: parsed from its text and back, and refused otherwise)
+KILLED       period 0 accepted  (TEST CASE:  Eviction: parsed from its text and back, and refused otherwise)
+KILLED       trailing text accepted  (TEST CASE:  Eviction: parsed from its text and back, and refused otherwise)
+KILLED       lru spelled loosely  (TEST CASE:  Eviction: parsed from its text and back, and refused otherwise)
+KILLED       to_string misprints the period  (TEST CASE:  Eviction: parsed from its text and back, and refused otherwise)
+killed 14 of 14
+[doctest] test cases:      341 |      341 passed | 0 failed | 0 skipped
+[doctest] assertions: 18544094 | 18544094 passed | 0 failed |
+[doctest] Status: SUCCESS!

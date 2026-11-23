@@ -1,0 +1,4 @@
+open: 78.7 s, 95 Slots per Sparse layer (37% of the Experts), RAM tier 24 per layer, capacity 4096, λ 0.03
+prompt (sweep): 700 tokens in 39.30 s (17.8 tok/s); 18237 store reads, 0 from RAM, miss wait 35.59 s
+generate: 128 tokens in 20.45 s (6.26 tok/s); misses 12.0% (71.9 per token: 22.8 from RAM, 49.2 store reads), miss wait 17.22 s
+generated: 101175 320 477 6138 760 576 18672 10792 220 17 29348 33 817 3950 320 477 35159 2411 220 104029 4 315 33234 320 2660 39100 8 429 374 21056 230 220 15 13 16 9824 817 3950 13 760 13646 50174 99317 9245 91 3070 785 18672 594 51223 334 320 49 3

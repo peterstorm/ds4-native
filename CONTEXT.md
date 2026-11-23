@@ -41,6 +41,10 @@ _Avoid_: cache line, entry
 The set of Slots and the policy that decides which Experts occupy them.
 _Avoid_: hotlist (that is antirez's preload table)
 
+**Eviction policy**:
+Which resident Expert a full layer's Slots give up for a Miss, never one the Route needs. GLM-5.3's are `Lru` and `CounterDecay` (`core/glm53/layer_expert_cache`, `--eviction lru|counter:N`): a counter adds one per Route naming the Expert, halves every count each N tokens, and evicts the lowest (count, last use, id). `counter:55` is the replay study's policy.
+_Avoid_: replacement strategy, LFU (the halving makes it neither pure LFU nor LRU)
+
 **RAM tier**:
 Pinned host memory holding Expert records a Miss can come from over PCIe instead of the store (3,000 records, 56 GB). As a **victim tier** (`RamPolicy::Victim`) it holds what the Slots evicted -- each evicted Expert copied down from its Slot, a Load found there moving up and leaving it -- so the Slots and the tier hold distinct Experts, about one least-recently-used cache of both sizes. Inclusive (`popular`, `recent`), every decode Load's store read lands in it, so it holds Experts the Slots hold too.
 _Avoid_: CPU lane (Maya computes on CPU; we do not)
@@ -62,7 +66,10 @@ _Avoid_: candidate (the indexer's candidate blocks), runner-up
 The sequence of every layer step's needed Experts and Near-misses as the Expert cache saw them, saved for replaying policies offline against Belady's optimal eviction (`core/cache_replay`).
 
 **Ledger**:
-Byte arithmetic that fixes Slot counts per GPU and phase from mandatory state, never from free-memory readings.
+Byte arithmetic that fixes Slot counts per GPU and phase from mandatory state, never from free-memory readings. GLM-5.3's is `core/glm53/ledger` (its **Claims**, then DS4.1's `ledger::plan_slots`).
+
+**Runtime reserve**:
+VRAM per GPU the Ledger leaves outside every claim: the CUDA context, kernel images, allocator rounding and headroom. A setting (`DecoderConfig::runtime_reserve_bytes`), never a reading; free memory after open shows what it really held. The GLM Ledger takes it from the card's *planned* size: CUDA's total (not nvidia-smi's, which counts the driver's reservation) rounded down to whole 256 MiB (`glm53::planned_card_bytes`), so the MiB a driver's reservation moves by never move a Slot.
 
 ### Execution
 
@@ -94,7 +101,7 @@ The rows a verify Round takes: the Anchor and that many minus one drafted tokens
 The time of a Step with zero Misses.
 
 **Cohort**:
-A group of prefill rows whose routed Experts are loaded once per layer and shared: a prompt sweep's chunk (up to 64K tokens; a longer prompt is read as several).
+A group of prefill rows whose routed Experts are loaded once per layer and shared: a prompt sweep's chunk (up to 64K tokens; a longer prompt is read as several). GLM-5.3's is `DecoderConfig::cohort` (default 16K, a multiple of the Wave, `core/glm53/cohort`): every Cohort starts at a multiple of the Wave, so its Waves and Rounds are the whole prompt's and so are the bits, and a sweep's buffers are sized for one Cohort, not for the capacity.
 
 **Prompt sweep**:
 A Cohort's pass through the model layer by layer: every row through layer L before any goes on, so each layer's Experts are read once per Cohort (`Decoder::prefill`).
@@ -107,7 +114,7 @@ The last `kDecoderTail` (3,053 = 640 + 19 × 127) rows of a prompt read, the onl
 _Avoid_: YOCO skip, replay trim (DeepSeek's lossy 128-row form)
 
 **Grouped MoE**:
-A prompt sweep's MoE per layer: each routed Expert run once over all the Cohort's tokens it serves, in groups of 8 token columns, accumulated in the Round's combine order (`core/moe_groups`). An Expert's consecutive groups (an **Expert run**) share one GEMV job, each weight read feeding all of them; the accumulation runs per token, its columns in group order.
+A prompt sweep's MoE per layer: each routed Expert run once over all the Cohort's tokens it serves, in groups of 8 token columns, accumulated in the Round's combine order (`core/moe_groups`). An Expert's consecutive groups (an **Expert run**) share one GEMV job, each weight read feeding all of them; the accumulation runs per token, its columns in group order. GLM-5.3's is `cuda/glm53/grouped_moe` (`GroupedMoe`): its groups come from `core/glm53/moe_plan` `group_tokens`, the shared Expert's after the routed ones, and it runs the Reference configuration or a `moe_roundings` Departure (the oracle tool's `--gpu`).
 
 **Exchange**:
 The two GPUs' sum of a tensor-parallel FP32 partial (attention output, MoE output, Engram KV): both end with bf16(GPU 0's + GPU 1's), the same bits whichever way it travels. The kernel exchange pushes over P2P and spins on the peer's flags (decode, Engram KV); a prompt sweep's attention and MoE exchanges go by the copy engines on a link stream beside compute (`SweepLink`).
@@ -164,10 +171,56 @@ An independent slow implementation (antirez/ds4, Maya's `ref.py`, or the HF refe
 **Mix invariance**:
 A request's prompt-end logits and Reply are bit-identical whether it ran alone or shared Rounds with any other requests, in any Lane: sharing changes timing, never output. The gate of Shared Rounds, as Slot-count invariance is the Expert cache's.
 
+### GLM-5.3 (the second architecture)
+
+The engine's second model, GLM-5.3 (`GlmMoeDsa`), has its own Backbone, Expert store layout (`core/glm53/store`) and executor, under `core/glm53/` and beside DS4.1's, never inside it. Terms above are DS4.1's unless a GLM entry here redefines them. Its pinned reference is transformers 5.16.0 (`ref/glm-5.3/README.md`).
+
+**Selection**:
+The key positions one query attends on one GLM layer: the indexer's best `index_topk` (2048) of the positions up to its own (all of them while there are fewer), ties going to the lower position.
+_Avoid_: mask, topk indices (in prose), candidates (DS4.1's indexer's first level)
+
+**Full layer** / **Shared layer**:
+A Full layer runs its own indexer and makes the token's Selection. A Shared layer has no indexer and attends the Selection of the nearest Full layer below it for the same token. Layer 0 is always Full. The released schedule is `FFF`, then `SSSF` repeated (`indexer_types`, or `index_topk_freq` 4 / `index_skip_topk_offset` 3).
+
+**Latent row**:
+One position's MLA cache entry on one GLM layer: its KV latent (512 values, the `kv_a_layernorm` output) and its rotated shared RoPE key (64), plus its index key (128) on Full layers. Attention reads the latent through each head's slice of `kv_b_proj` (the absorbed form) and never expands it to per-head keys and values.
+_Avoid_: compressed row (DS4.1's compressor), KV head
+
+**Latent split**:
+How the two GPUs share the Latent rows (`core/glm53/latent_split`): GPU 0 holds the even positions' rows and GPU 1 the odd ones', each at **index** position / 2 of its **half**, so each GPU's cache costs half the rows; the index keys stay on both, since each GPU's indexer scans every position. Attention reads the bytes the replicated cache held, in the same order, so the bits are unchanged: a **Round** **gathers** its selected rows from both halves (the peer's over P2P) into staging, and a **Prompt sweep** **stages** each layer's rows whole once per **Cohort**, its Waves reading them there (`RowSource`: `FromHalves`, `FromStaged`). A **KV checkpoint** holds both halves in the replicated layout.
+_Avoid_: slot (a row's place in its half is its index; a **Slot** holds an **Expert**), shard (a GPU's share of an Expert is a **Half**), KV sharding
+
+**Backbone part**:
+The GLM-5.3 Backbone tensors of one kitaniai source shard, copied byte for byte into their own safetensors file (`backbone-NNNNN-of-00282.safetensors`, `core/glm53/backbone`). GLM's Backbone is exactly what its Expert store does not hold (`is_backbone`), which includes the MTP block's own Experts. One part per shard lets a shard leave the disk as soon as both of its halves are verified: its stored Expert tensors, each against its slice of its record, and its part.
+_Avoid_: backbone shard (a shard is a source file), slice
+
+**Semantics oracle**:
+GLM-5.3's FP32 CPU oracle (`core/glm53/reference`). It agrees with the pinned reference to FP32 noise, checked by golden activations (`tests/data/glm53-golden.safetensors`), and runs the real weights a layer at a time (`ds4n-glm53-oracle-run`): a layer is begun (attention and routing, `begin_layer`), each Expert the Routes name is read once and run over every token it serves (`expert_outputs`), and the layer is finished with its Route's outputs (`finish_layer`), so no more than one layer's Backbone and the Experts in use are ever held. It is not a Reference configuration: the quantized GPU executor gets its own bit-exact oracle beside it, as DS4.1's did. The MoE's is `core/glm53/exact_moe` (`docs/design/glm53-reference-configuration.md`): the Expert codes themselves, never their FP32 values, on DS4.1's kernel arithmetic, with every rounding and summation order fixed; `ds4n-glm53-oracle-run --activations exact` runs it inside the Semantics oracle to measure what it loses. Everything else (attention, the indexer and its Selection, the Dense layers' MLP, the head) is `core/glm53/exact_attention`, the design's "attention side".
+
+**Activation precision**:
+The number format a GLM-5.3 Expert's linears read their inputs in (the feed-forward input, and silu(gate) × up before down_proj), for routed and shared Experts alike (`core/glm53/precision`): FP32 (the Semantics oracle), BF16 (W4A16), E4M3 (DS4.1's kernels) or MXFP4 (W4A4, as kitaniai's checkpoint declares it, with Quark's "even" scale). Attention, routers, indexers and the Dense layers' MLPs are not Experts and stay out of it. Choosing it is a Reference configuration decision, measured as KL against FP32 (`ds4n-glm53-oracle-run --activations`). The engine's is **E4M3** (plan, settled decision 8).
+_Avoid_: "A4"/"A8" alone (say which format), activation dtype
+
+**Claim**:
+One kind of mandatory VRAM the GLM Ledger counts on each GPU (`glm53::Claim`): **Exchange**, **Backbone** (with the Slot tables, and the head on GPU 0), **Cache** (its half of the Latent rows under the **Latent split**, and every position's index key), **LayerScratch** (a Wave's attention and Dense MLP scratch, one Round's index scores, the split's gather staging and one staged layer), **Round** (a Round's activations, MoE buffers and logits) and **Sweep** (one Cohort's rows, routing and group lists, and the Expert scratch). Only Cache and LayerScratch grow with the capacity, the Sweep with the Cohort; the Slots are what the card holds past the Claims and the Runtime reserve. `Decoder::open` counts what it allocates by Claim and refuses to open when a count differs from the Ledger's.
+_Avoid_: budget, usage (a Claim is planned bytes, not a reading)
+
+**Route margin**:
+How close one token's Expert choice on one Sparse GLM layer is to a tie: the worst chosen Expert's biased router score (sigmoid + `e_score_correction_bias`) minus the best unchosen one's (`Route::margin`). A route whose margin is within an engine's arithmetic noise can choose differently in that engine; on real weights the median is ~3.5e-3, about one BF16 step.
+_Avoid_: router confidence, gap (unqualified)
+
+**Deferral**:
+Running a token's Misses one Sparse layer late, after KTransformers' Expert Deferral: on a Sparse layer that is not the last, each Route slot whose Expert was not resident when it routed, outside the token's `protect` heaviest slots, is **deferred** (`core/glm53/deferral`, `--defer N`; opt-in, lossy, Rounds of one token). The layer's output is its **immediate part** (the shared Expert and the slots not deferred); its **deferred part** (the deferred slots on that layer's own input, no shared Expert) is the **carry**, added in FP32 to the next Sparse layer's output before its residual: x = mid + (immediate + carry). The engine reads a deferred slot's Expert as a **late Load**, waited for only at the next Sparse layer, so a layer's compute no longer waits for every one of its Misses. Its cost is measured as KL by the oracle's `-dfN` streams, and `--check` replays it bit for bit.
+_Avoid_: delayed experts, lazy loading (the Expert is still loaded on time for its own part)
+
+**Load**:
+A Miss being served in a Round (`Decoder::State::Load`): its Expert's evicted predecessor copied down into the RAM tier, then the Expert copied up into its Slot from the tier or, as its store reads land, from a staging record. On time, the layer waits for it; late (Deferral), the next Sparse layer does.
+
 ## Relationships
 
 - An **Expert** has one **Expert record** in the **Expert store** and, under tensor parallelism, two **Halves**
 - A **Slot** holds at most one **Expert**; the **Ledger** fixes how many **Slots** each GPU has
+- On GLM-5.3 a GPU's VRAM is its **Claims**, its **Slots** and the **Runtime reserve**; a longer capacity takes **Slots**, a larger **Cohort** too, nothing else does
 - A **Miss** is served from the **RAM tier** if present there, otherwise from the **Expert store**
 - A **Round** contains one to eight rows; a **Step** is a one-row **Round**; a **Round**'s **Routing plan** is the union of its rows' Experts, whatever their **Lanes**
 - A live **Session** occupies one **Lane**; a **KV checkpoint** is a Session in no Lane
@@ -176,6 +229,12 @@ A request's prompt-end logits and Reply are bit-identical whether it ran alone o
 - A **Resume** takes KV from a **Lane** (in place, or its prefix borrowed into another) or a **KV checkpoint**, and rings from that state, a **KV checkpoint**'s turn, or a **Rewind point** — whichever reads fewest of the prompt's tokens
 - Every busy **Lane** has a row in every **Shared Round**; a **Prompt sweep** holds the GPUs alone, the other **Lanes** pausing
 - **Cache-conditional routing** makes outputs depend on **Expert cache** contents; with λ = 0 every policy is **Exact**
+- Under **Cache-conditional routing** the **Eviction policy** decides what is routed, so the engine, `--check`'s replay and the **Oracle** must run the same one, each **Round** advancing a counter's clock by its tokens
+- **Deferral** is never **Exact** against λ's own stream: a deferred slot's contribution reaches the residual one Sparse layer late; `--check` holds the engine to the deferral replay, the **Oracle**'s KL holds the replay to the model
+- On GLM-5.3 every **Shared layer** attends the **Selection** of the nearest **Full layer** below it; only **Full layers**' **Latent rows** carry index keys
+- Under the **Latent split** each **Latent row** lives on exactly one GPU, but every **Selection** is made on both (each holds every index key), so each GPU knows which of its rows the other's attention needs; the split moves rows, never arithmetic, and a **Slot** count it frees changes outputs only through **Cache-conditional routing**
+- A GLM-5.3 **Expert** (routed or shared) runs as two **Halves**, each GPU summing its routed **Halves** in **Routing plan** order and then its shared **Half**, and the **Exchange** gives the MoE output; the routing weight is folded in before down_proj, a different rounding from the pinned reference's order, never a different mathematics
+- Every tensor of a GLM-5.3 source shard goes to exactly one of an **Expert record** and its shard's **Backbone part**; the shard may be deleted only when every one of them is verified there — per tensor (equal to its slice of its decoded **Expert record**), never per layer, since a shard may hold two layers' **Experts** and an **Expert** may span two shards
 
 ## Example Dialogue
 

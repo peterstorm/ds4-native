@@ -1,0 +1,72 @@
+2026-11-23T20:41:13+01:00 glm53-native quiet for 10 min: stopping it
+2026-11-23T20:41:18+01:00 start attn
+2026-11-23T20:49:32+01:00 end attn exit 0
+2026-11-23T20:49:32+01:00 start gate2-base
+2026-11-23T20:51:43+01:00 end gate2-base exit 0
+2026-11-23T20:51:43+01:00 start gate2-split
+2026-11-23T20:53:53+01:00 end gate2-split exit 0
+2026-11-23T20:53:53+01:00 start gate2-base-df0
+2026-11-23T20:56:03+01:00 end gate2-base-df0 exit 0
+2026-11-23T20:56:03+01:00 start gate2-split-df0
+2026-11-23T20:58:11+01:00 end gate2-split-df0 exit 0
+2026-11-23T20:58:11+01:00 start hash-base
+2026-11-23T21:00:16+01:00 end hash-base exit 0
+2026-11-23T21:00:16+01:00 start hash-split
+2026-11-23T21:02:21+01:00 end hash-split exit 0
+2026-11-23T21:02:21+01:00 start hash-split-c512
+2026-11-23T21:06:12+01:00 end hash-split-c512 exit 0
+2026-11-23T21:06:12+01:00 start hash-split-rounds
+2026-11-23T21:17:33+01:00 end hash-split-rounds exit 0
+2026-11-23T21:17:33+01:00 start serve
+2026-11-23T21:17:34+01:00 end serve exit 1
+2026-11-23T21:17:34+01:00 start speed-c0-base
+2026-11-23T21:20:07+01:00 end speed-c0-base exit 0
+2026-11-23T21:20:07+01:00 start speed-c0-split-pinned
+2026-11-23T21:22:40+01:00 end speed-c0-split-pinned exit 0
+2026-11-23T21:22:40+01:00 start speed-c0-split
+2026-11-23T21:25:12+01:00 end speed-c0-split exit 0
+2026-11-23T21:25:12+01:00 start speed-c1-base
+2026-11-23T21:27:52+01:00 end speed-c1-base exit 0
+2026-11-23T21:27:52+01:00 start speed-c1-split-pinned
+2026-11-23T21:30:33+01:00 end speed-c1-split-pinned exit 0
+2026-11-23T21:30:33+01:00 start speed-c1-split
+2026-11-23T21:33:07+01:00 end speed-c1-split exit 0
+2026-11-23T21:33:07+01:00 start speed-c0-split-r2
+2026-11-23T21:35:39+01:00 end speed-c0-split-r2 exit 0
+2026-11-23T21:35:39+01:00 start speed-c0-split-pinned-r2
+2026-11-23T21:38:12+01:00 end speed-c0-split-pinned-r2 exit 0
+2026-11-23T21:38:12+01:00 start speed-c0-base-r2
+2026-11-23T21:40:45+01:00 end speed-c0-base-r2 exit 0
+2026-11-23T21:40:45+01:00 start speed-c1-split-r2
+2026-11-23T21:43:19+01:00 end speed-c1-split-r2 exit 0
+2026-11-23T21:43:19+01:00 start speed-c1-split-pinned-r2
+2026-11-23T21:46:00+01:00 end speed-c1-split-pinned-r2 exit 0
+2026-11-23T21:46:00+01:00 start speed-c1-base-r2
+2026-11-23T21:48:41+01:00 end speed-c1-base-r2 exit 0
+2026-11-23T21:48:41+01:00 start long-base
+2026-11-23T21:51:35+01:00 end long-base exit 0
+2026-11-23T21:51:35+01:00 start long-split
+2026-11-23T21:54:29+01:00 end long-split exit 0
+2026-11-23T21:54:29+01:00 start 400k
+2026-11-23T21:57:00+01:00 end 400k exit 0
+2026-11-23T21:57:00+01:00 summary
+2026-11-23T21:57:00+01:00 done
+2026-11-23T21:57:00+01:00 starting glm53-native again
+2026-11-23T21:57:12+01:00 followup: stopping glm53-native again
+2026-11-23T21:57:22+01:00 start gate2-split-pinned
+2026-11-23T21:59:37+01:00 end gate2-split-pinned exit 0
+2026-11-23T21:59:37+01:00 start gate2-split-pinned-df0
+2026-11-23T22:01:46+01:00 end gate2-split-pinned-df0 exit 0
+2026-11-23T22:01:46+01:00 start serve
+2026-11-23T22:07:30+01:00 end serve exit 0
+2026-11-23T22:07:30+01:00 followup done
+2026-11-23T22:07:30+01:00 followup: starting glm53-native again
+2026-11-23T22:07:57+01:00 longdecode: stopping glm53-native again
+2026-11-23T22:08:07+01:00 start longdec-base
+2026-11-23T22:12:02+01:00 end longdec-base exit 0
+2026-11-23T22:12:02+01:00 start longdec-split-pinned
+2026-11-23T22:16:03+01:00 end longdec-split-pinned exit 0
+2026-11-23T22:16:03+01:00 start longdec-split
+2026-11-23T22:20:00+01:00 end longdec-split exit 0
+2026-11-23T22:20:00+01:00 longdecode done
+2026-11-23T22:20:00+01:00 longdecode: starting glm53-native again

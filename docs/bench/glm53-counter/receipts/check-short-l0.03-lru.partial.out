@@ -1,0 +1,10 @@
+open: 73.3 s, 100 Slots per Sparse layer (39% of the Experts), RAM tier 0 per layer, 1 store replica(s), capacity 4096, λ 0.03, eviction lru
+vram GPU 0: card 101.97 GB, claims 22.14 GB (Exchange 0.002, Backbone 19.042, Cache 0.390, LayerScratch 0.065, Round 0.060, Sweep 2.577), Slots 75.20 GB, reserve 4.29 GB, free after open 3.66 GB
+vram GPU 1: card 101.97 GB, claims 20.20 GB (Exchange 0.002, Backbone 17.139, Cache 0.390, LayerScratch 0.065, Round 0.025, Sweep 2.577), Slots 75.20 GB, reserve 4.29 GB, free after open 5.63 GB
+prompt (sweep, wave 64, cohort 64): 192 tokens in 43.60 s (4.4 tok/s); 22274 store reads (0 read ahead, not routed), 0 from RAM, miss wait 42.77 s
+generate: 64 tokens in 13.16 s (4.86 tok/s); misses 12.2% (73.0 per token: 0.0 from RAM, 73.0 store reads), miss wait 11.29 s
+generated: 280 630 1004 32013 8232 486 9712 368 341 220 1460 486 7559 34310 4950 7265 1507 5456 4950 408 1507 220 15 317 220 1460 486 7559 23295 15938 4950 7265 1507 1537 15938 4950 408 1507 220 15 317 220 1460 486 7559 4857 27471 4950 7265 1507 1376 27471 4950 408 1507 481 16 317 220 1460 486 7559 43474 3097
+layer  0 (Full, Dense): 256 tokens, 0 values differ  [166.9 s]
+layer  1 (Full, Dense): 256 tokens, 0 values differ  [155.5 s]
+layer  2 (Full, Dense): 256 tokens, 0 values differ  [155.1 s]
+layer  3 (Shared, Sparse): 256 tokens, 0 values differ  [886.3 s]

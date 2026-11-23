@@ -1,0 +1,7 @@
+open: 79.8 s, 86 Slots per Sparse layer (34% of the Experts; profile, 64 .. 106), RAM tier 38 per layer, 1 store replica(s), capacity 202752, λ 0.03, eviction counter:55, deferral protect 4
+vram GPU 0: card 101.97 GB (planned 101.74), claims 34.21 GB (Exchange 0.002, Backbone 19.042, Cache 10.199, LayerScratch 0.658, Round 0.077, Sweep 4.228), Slots 64.67 GB, reserve 2.42 GB, free after open 2.18 GB
+vram GPU 1: card 101.97 GB (planned 101.74), claims 32.27 GB (Exchange 0.002, Backbone 17.139, Cache 10.199, LayerScratch 0.658, Round 0.042, Sweep 4.228), Slots 64.67 GB, reserve 2.42 GB, free after open 4.15 GB
+prompt (sweep, wave 512, cohort 16384): 39200 tokens in 139.37 s (281.3 tok/s); 38942 store reads (104 read ahead, not routed), 5699 from RAM, miss wait 31.08 s
+logits hash: 862c9f769504581e over 39200 prompt tokens
+generate: 128 tokens in 14.71 s (8.70 tok/s); misses 8.6% (51.7 per token: 17.3 from RAM, 34.4 store reads; 24.2 deferred), miss wait 7.91 s
+generated: 62 2528 198 220 829 25 330 3825 44 12 20 13 18 12 12627 20318 94482 698 220 10267 25 330 29314 11692 19 698 220 1379 12518 25 220 101135 17 102573 17 99752 99752 198 220 1629 6745 25 220 23 101729 98503 18 126743 198 220 1629 52992 1506 6745 25 220 23 100933 107271 198 220 2477 52992 1506 6745 25 220 101663 19 18 198 220 1629 14205 15534 25 220 116265 198 220 1629 26010 25 220 99695 198 220 1629 70586 26010 25 220 100899 198 220 1629 72062 26010 25 220 20 198 220 1629 96254 75712 25 220 23 198 220 1629 96254 20364 25 220 16 198 220 1968 10786 25 220 109295 198 220 8176 2368

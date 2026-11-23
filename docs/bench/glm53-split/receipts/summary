@@ -1,0 +1,54 @@
+400k                       72 Slots | (19.7 tok/s) (7.81 tok/s)  | 
+attn                        |  | 
+gate2-base-df0             94 Slots | (4.8 tok/s) (8.14 tok/s)  | logits hash: 6c2467f9294170c2 over 192 prompt tokens
+gate2-base                 94 Slots | (4.7 tok/s) (6.81 tok/s)  | logits hash: 6c2467f9294170c2 over 192 prompt tokens
+gate2-split-df0            98 Slots | (4.8 tok/s) (8.80 tok/s)  | logits hash: 6c2467f9294170c2 over 192 prompt tokens
+gate2-split                98 Slots | (4.8 tok/s) (7.24 tok/s)  | logits hash: 6c2467f9294170c2 over 192 prompt tokens
+hash-base                  99 Slots | (70.5 tok/s) (2.58 tok/s)  | logits hash: bec364f75ef70233 over 2800 prompt tokens
+hash-split-c512            95 Slots | (19.3 tok/s) (2.47 tok/s)  | logits hash: bec364f75ef70233 over 2800 prompt tokens
+hash-split                 99 Slots | (70.5 tok/s) (2.55 tok/s)  | logits hash: bec364f75ef70233 over 2800 prompt tokens
+hash-split-rounds          99 Slots | (4.7 tok/s) (3.43 tok/s)  | logits hash: bec364f75ef70233 over 2800 prompt tokens
+long-base                  72 Slots | (425.3 tok/s)  | 
+long-split                 84 Slots | (429.7 tok/s)  | 
+serve                       |  | 
+speed-c0-base              74 Slots | (19.7 tok/s) (7.22 tok/s)  | 
+speed-c0-base-r2           74 Slots | (19.7 tok/s) (7.21 tok/s)  | 
+speed-c0-split             86 Slots | (19.7 tok/s) (7.35 tok/s)  | 
+speed-c0-split-pinned      74 Slots | (19.7 tok/s) (7.14 tok/s)  | 
+speed-c0-split-pinned-r2   74 Slots | (19.7 tok/s) (7.13 tok/s)  | 
+speed-c0-split-r2          86 Slots | (19.7 tok/s) (7.34 tok/s)  | 
+speed-c1-base              74 Slots | (19.7 tok/s) (5.94 tok/s)  | 
+speed-c1-base-r2           74 Slots | (19.7 tok/s) (5.94 tok/s)  | 
+speed-c1-split             86 Slots | (19.7 tok/s) (7.09 tok/s)  | 
+speed-c1-split-pinned      74 Slots | (19.7 tok/s) (5.88 tok/s)  | 
+speed-c1-split-pinned-r2   74 Slots | (19.7 tok/s) (5.87 tok/s)  | 
+speed-c1-split-r2          86 Slots | (19.7 tok/s) (7.08 tok/s)  | 
+== generated ids, base vs split
+gate2-base != gate2-split DIFFER
+gate2-base-df0 != gate2-split-df0 DIFFER
+hash-base = hash-split
+hash-base = hash-split-c512
+hash-base = hash-split-rounds
+== gate2 against the --check receipts (docs/bench/glm53-defer/receipts)
+gate2-split != check-base DIFFER
+gate2-split-df0 != check-df0 DIFFER
+== attn, serve
+PASS: bit-identical
+== gate2 at the base's 94 Slots
+gate2-split-pinned = gate2-base (generated)
+gate2-split-pinned-df0 = gate2-base-df0 (generated)
+gate2-split-pinned = check-base (generated)
+gate2-split-pinned-df0 = check-df0 (generated)
+/tmp/glm53-split-run/gate2-base-df0.out:logits hash: 6c2467f9294170c2 over 192 prompt tokens
+/tmp/glm53-split-run/gate2-base.out:logits hash: 6c2467f9294170c2 over 192 prompt tokens
+/tmp/glm53-split-run/gate2-split-df0.out:logits hash: 6c2467f9294170c2 over 192 prompt tokens
+/tmp/glm53-split-run/gate2-split.out:logits hash: 6c2467f9294170c2 over 192 prompt tokens
+/tmp/glm53-split-run/gate2-split-pinned-df0.out:logits hash: 6c2467f9294170c2 over 192 prompt tokens
+/tmp/glm53-split-run/gate2-split-pinned.out:logits hash: 6c2467f9294170c2 over 192 prompt tokens
+== serve
+PASS: every resumed conversation is bit-identical to a fresh run
+== decode after p39200 at 202,752
+longdec-base           74 Slots | (7.62 tok/s); misses 11.4% | logits hash: 862c9f769504581e over 39200 prompt tokens
+longdec-split-pinned   74 Slots | (7.41 tok/s); misses 11.4% | logits hash: 862c9f769504581e over 39200 prompt tokens
+longdec-split          86 Slots | (8.70 tok/s); misses 8.6% | logits hash: 862c9f769504581e over 39200 prompt tokens
+longdec-split-pinned = longdec-base (generated)

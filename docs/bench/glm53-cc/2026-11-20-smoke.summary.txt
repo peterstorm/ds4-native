@@ -1,0 +1,13 @@
+exact: perplexity 4300.2762 over 23 next tokens
+exact-cc0.03 vs exact: KL mean 0.2502 median 0.1126 p90 0.4865 max 1.872 nats over 24 positions; top-1 agrees 16/24; perplexity 4129.0353; Routes differing 1439/1800
+exact-cc10 vs exact: KL mean 5.881 median 5.088 p90 10.31 max 13.96 nats over 24 positions; top-1 agrees 2/24; perplexity 84338.3234; Routes differing 1725/1800
+Expert cache model (LRU, 84 Slots per Sparse layer, positions 0 on): misses of picks, prompt | generated
+  exact                     47.92% of 14400 |  27.25% of 1200
+  exact-cc0.03              36.90% of 14400 |  17.17% of 1200
+  exact-cc10                 4.17% of 14400 |   0.00% of 1200
+prompt 0 exact generated 20077 52 284
+prompt 0 exact-cc0.03 generated 22550 52 6165
+prompt 0 exact-cc10 generated 40 13 220
+routes: 1950, min margin 1.91e-06, below 1e-3: 454, below 1e-5: 7, ties: 0
+Selections: 546 on Full layers, 0 dropping positions (prompts up to index_topk keep all)
+total 426.3 s

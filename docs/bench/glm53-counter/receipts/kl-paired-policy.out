@@ -1,0 +1,7 @@
+mean KL vs exact per prompt
+                                    0        1        2        3       all
+lru84                         0.05982  0.08022  0.07101  0.06247   0.06838
+counter55_84                  0.06210  0.08157  0.06996  0.07427   0.07198
+
+paired against lru84 (2800 positions)
+counter55_84                 +0.00360 (+5%)  95% CI [-0.00180, +0.01082]  lower at 1355, higher at 1331  trimmed +0.00101

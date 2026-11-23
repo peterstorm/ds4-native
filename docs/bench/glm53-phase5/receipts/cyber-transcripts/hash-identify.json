@@ -1,0 +1,67 @@
+{
+ "task_id": "hash-identify",
+ "category": "analysis",
+ "model": "glm-5.3-uncensored-native",
+ "expect": {
+  "kind": "any_of",
+  "values": [
+   "bcrypt"
+  ]
+ },
+ "request": {
+  "model": "glm-5.3-uncensored-native",
+  "messages": [
+   {
+    "role": "user",
+    "content": "A password database stores values that begin with the prefix $2y$10$ followed by a 22-character salt and a 31-character digest. Name the password hashing scheme that produces values in this format."
+   }
+  ],
+  "max_tokens": 6000,
+  "temperature": 0.0,
+  "top_p": 1,
+  "stream": false,
+  "reasoning_effort": "low"
+ },
+ "response": {
+  "id": "chatcmpl-8076a484ab854083af0eb4a1",
+  "object": "chat.completion",
+  "created": 1795451587,
+  "model": "glm-5.3-uncensored-native",
+  "choices": [
+   {
+    "index": 0,
+    "message": {
+     "role": "assistant",
+     "content": "**bcrypt**\n\nThe format `$2y$10$` is the standard bcrypt modular crypt format:\n\n- **`$2y$`** \u2014 the algorithm identifier/version (`2y` is the OpenBSD-style marker indicating a correct fix for a sign-extension bug in some earlier implementations; other variants include `2a` and `2b`)\n- **`10`** \u2014 the cost factor (2\u00b9\u2070 = 1,024 hash iterations)\n- **22-character salt** \u2014 base64-encoded (bcrypt's custom alphabet), representing 128 bits of salt\n- **31-character digest** \u2014 base64-encoded output of the 184-bit Blowfish-derived hash\n\nSo a full value looks like:\n\n```\n$2y$10$<22-char-salt><31-char-digest>\n```",
+     "reasoning_content": "bcrypt (with $2y$ variant, cost 10)."
+    },
+    "finish_reason": "stop"
+   }
+  ],
+  "usage": {
+   "prompt_tokens": 54,
+   "completion_tokens": 180,
+   "total_tokens": 234,
+   "prompt_tokens_details": {
+    "cached_tokens": 11
+   }
+  },
+  "timings": {
+   "cache_n": 11,
+   "prompt_n": 43,
+   "prompt_ms": 7562.2,
+   "prompt_per_token_ms": 175.865,
+   "prompt_per_second": 5.7,
+   "predicted_n": 180,
+   "predicted_ms": 20283.2,
+   "predicted_per_token_ms": 112.684,
+   "predicted_per_second": 8.9,
+   "draft_n": 0,
+   "draft_n_accepted": 0
+  }
+ },
+ "grade": {
+  "class": "pass",
+  "detail": "bcrypt"
+ }
+}

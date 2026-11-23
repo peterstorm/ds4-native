@@ -1,0 +1,30 @@
+## capacity 12288, RAM auto: long-prompt.txt (2,800 tokens), then long4-prompt.txt (11,200 = long-prompt x4), generate 4
+open: 79.4 s, 95 Slots per Sparse layer (37% of the Experts), RAM tier 40 per layer, 1 store replica(s), capacity 12288, λ 0
+prompt (sweep): 2800 tokens in 39.23 s (71.4 tok/s); 19188 store reads (13 read ahead, not routed), 0 from RAM, miss wait 23.92 s
+generate: 4 tokens in 1.23 s (3.26 tok/s); misses 26.3% (158.0 per token: 44.0 from RAM, 114.0 store reads), miss wait 1.12 s
+open: 79.5 s, 95 Slots per Sparse layer (37% of the Experts), RAM tier 40 per layer, 1 store replica(s), capacity 12288, λ 0
+prompt (sweep): 11200 tokens in 64.33 s (174.1 tok/s); 19200 store reads (0 read ahead, not routed), 0 from RAM, miss wait 0.68 s
+generate: 4 tokens in 1.57 s (2.55 tok/s); misses 35.8% (214.5 per token: 62.5 from RAM, 152.0 store reads), miss wait 1.45 s
+
+## turn 1 speed-prompt.txt, generate 32, turn 2 first700.txt
+open: 80.0 s, 98 Slots per Sparse layer (38% of the Experts), RAM tier 40 per layer, 1 store replica(s), capacity 4096, λ 0
+prompt (sweep): 700 tokens in 35.64 s (19.6 tok/s); 18536 store reads (243 read ahead, not routed), 0 from RAM, miss wait 31.14 s
+generate: 32 tokens in 8.18 s (3.91 tok/s); misses 24.9% (149.3 per token: 61.9 from RAM, 87.4 store reads), miss wait 7.36 s
+then (sweep, warm): 700 tokens in 17.40 s (40.2 tok/s); 8739 store reads (214 read ahead, not routed), 2955 from RAM, miss wait 12.91 s
+## turn 1 speed-prompt.txt, generate 32, turn 2 t128.txt
+open: 80.0 s, 98 Slots per Sparse layer (38% of the Experts), RAM tier 40 per layer, 1 store replica(s), capacity 4096, λ 0
+prompt (sweep): 700 tokens in 35.62 s (19.7 tok/s); 18535 store reads (243 read ahead, not routed), 0 from RAM, miss wait 31.12 s
+generate: 32 tokens in 8.19 s (3.91 tok/s); misses 24.9% (149.3 per token: 61.9 from RAM, 87.4 store reads), miss wait 7.38 s
+then (sweep, warm): 128 tokens in 13.43 s (9.5 tok/s); 6396 store reads (130 read ahead, not routed), 2493 from RAM, miss wait 12.13 s
+## turn 1 long-prompt.txt, generate 16, turn 2 first700.txt
+open: 80.2 s, 98 Slots per Sparse layer (38% of the Experts), RAM tier 41 per layer, 1 store replica(s), capacity 4096, λ 0
+prompt (sweep): 2800 tokens in 38.36 s (73.0 tok/s); 19189 store reads (10 read ahead, not routed), 0 from RAM, miss wait 22.76 s
+generate: 16 tokens in 4.97 s (3.22 tok/s); misses 30.0% (179.8 per token: 66.4 from RAM, 113.4 store reads), miss wait 4.54 s
+then (sweep, warm): 700 tokens in 17.33 s (40.4 tok/s); 8668 store reads (191 read ahead, not routed), 3024 from RAM, miss wait 12.57 s
+
+## turn 1 first 64 of first700.txt, generate 2, turn 2 first 64 of third700.txt (also: --then with --check refused, rc=1)
+ds4n-glm53-decode: --then is a timing run: not with --check
+open: 80.3 s, 98 Slots per Sparse layer (38% of the Experts), RAM tier 40 per layer, 1 store replica(s), capacity 4096, λ 0
+prompt (sweep): 64 tokens in 21.88 s (2.9 tok/s); 11002 store reads (0 read ahead, not routed), 0 from RAM, miss wait 20.82 s
+generate: 2 tokens in 0.52 s (3.84 tok/s); misses 22.9% (137.5 per token: 46.5 from RAM, 91.0 store reads), miss wait 0.47 s
+then (sweep, warm): 64 tokens in 8.51 s (7.5 tok/s); 3746 store reads (0 read ahead, not routed), 2009 from RAM, miss wait 7.40 s

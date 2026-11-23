@@ -1,0 +1,4 @@
+open: 78.8 s, 84 Slots per Sparse layer (33% of the Experts; equal, 84 .. 84), RAM tier 38 per layer, 1 store replica(s), capacity 202752, λ 0, eviction lru, deferral none
+vram GPU 0: card 101.97 GB (planned 101.74), claims 34.21 GB (Exchange 0.002, Backbone 19.042, Cache 10.199, LayerScratch 0.658, Round 0.077, Sweep 4.228), Slots 63.17 GB, reserve 4.03 GB, free after open 3.68 GB
+vram GPU 1: card 101.97 GB (planned 101.74), claims 32.27 GB (Exchange 0.002, Backbone 17.139, Cache 10.199, LayerScratch 0.658, Round 0.042, Sweep 4.228), Slots 63.17 GB, reserve 4.03 GB, free after open 5.65 GB
+prompt (sweep, wave 512, cohort 16384): 39200 tokens in 91.23 s (429.7 tok/s); 39240 store reads (109 read ahead, not routed), 5699 from RAM, miss wait 30.57 s

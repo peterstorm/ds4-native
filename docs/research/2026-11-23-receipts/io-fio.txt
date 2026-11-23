@@ -1,0 +1,14 @@
+# 2026-11-23, desktop, Samsung SSD 9100 PRO 2TB (PCIe 5.0 x4 at 32 GT/s, 48 °C, no warnings), rpool 96% full.
+# fio 3.42, randread, O_DIRECT, io_uring, 15 s each. ZFS: rpool/models/glm53-store (recordsize 1M, zle,
+# checksum on), zfs_vdev_sync_read_max_active=64. Raw: /dev/nvme0n1 with --readonly.
+ZFS file  bs=10M qd=4   11.03 GB/s  lat mean 3.8 ms
+ZFS file  bs=10M qd=16  11.04 GB/s  lat mean 15.2 ms
+ZFS file  bs=10M qd=64  11.04 GB/s  lat mean 60.8 ms
+ZFS file  bs=10M qd=128 11.03 GB/s  lat mean 121.6 ms
+ZFS file  bs=1M  qd=16  11.23 GB/s
+ZFS file  bs=1M  qd=128 11.24 GB/s
+raw nvme  bs=10M qd=4   10.65 GB/s  lat mean 3.9 ms
+raw nvme  bs=10M qd=16  10.62 GB/s  lat mean 15.8 ms
+raw nvme  bs=10M qd=64  9.41 GB/s  lat mean 71.2 ms
+raw nvme  seq 1M qd=64 11.03 GB/s
+prefill >=45 s (full re-reads): 324 s of 1197

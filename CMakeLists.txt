@@ -19,6 +19,26 @@ add_library(ds4n_core STATIC
   src/core/engram.cpp
   src/core/moe_reference.cpp
   src/core/safetensors.cpp
+  src/core/glm53/store.cpp
+  src/core/glm53/backbone.cpp
+  src/core/glm53/config.cpp
+  src/core/glm53/reference.cpp
+  src/core/glm53/dequant.cpp
+  src/core/glm53/precision.cpp
+  src/core/glm53/exact_attention.cpp
+  src/core/glm53/exact_moe.cpp
+  src/core/glm53/moe_roundings.cpp
+  src/core/glm53/moe_plan.cpp
+  src/core/glm53/expert_tiles.cpp
+  src/core/glm53/layer_expert_cache.cpp
+  src/core/glm53/victim_tier.cpp
+  src/core/glm53/sessions.cpp
+  src/core/glm53/cohort.cpp
+  src/core/glm53/ledger.cpp
+  src/core/glm53/slot_profile.cpp
+  src/core/glm53/deferral.cpp
+  src/core/meminfo.cpp
+  src/core/glm53/pruning.cpp
   src/core/indexer.cpp
   src/core/compressor.cpp
   src/core/layer_reference.cpp
@@ -56,6 +76,19 @@ target_compile_options(ds4n_engine PRIVATE -Wall -Wextra -Wpedantic -Werror)
 
 add_executable(ds4n-store-build src/tools/store_build.cpp)
 target_link_libraries(ds4n-store-build PRIVATE ds4n_io)
+# GLM-5.3 shell: Backbone parts, the Expert store, and reading both back as FP32 weights. Its own library,
+# so ds4n_io (linked by the DS4.1 engine) is unchanged.
+add_library(ds4n_glm53_io STATIC src/io/glm53_backbone.cpp src/io/glm53_store.cpp src/io/glm53_weights.cpp)
+target_link_libraries(ds4n_glm53_io PUBLIC ds4n_io)
+target_compile_options(ds4n_glm53_io PRIVATE -Wall -Wextra -Wpedantic -Werror)
+add_executable(ds4n-glm53-readbench src/tools/glm53_read_bench.cpp)
+target_link_libraries(ds4n-glm53-readbench PRIVATE ds4n_glm53_io)
+add_executable(ds4n-glm53-store-build src/tools/glm53_store_build.cpp)
+target_link_libraries(ds4n-glm53-store-build PRIVATE ds4n_glm53_io)
+add_executable(ds4n-glm53-backbone-extract src/tools/glm53_backbone_extract.cpp)
+target_link_libraries(ds4n-glm53-backbone-extract PRIVATE ds4n_glm53_io)
+add_executable(ds4n-glm53-oracle-run src/tools/glm53_oracle_run.cpp)
+target_link_libraries(ds4n-glm53-oracle-run PRIVATE ds4n_glm53_io)
 add_executable(ds4n-readbench src/tools/read_bench.cpp)
 target_link_libraries(ds4n-readbench PRIVATE ds4n_io)
 add_executable(ds4n-cache-study src/tools/cache_study.cpp)
@@ -69,7 +102,7 @@ if(DS4N_CUDA)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
   set(CMAKE_CUDA_ARCHITECTURES OFF)
   set(DS4N_CUDA_FLAGS -gencode=arch=compute_120a,code=sm_120a -lineinfo -Xcompiler=-Wall)
-  add_library(ds4n_cuda STATIC src/cuda/mx_gemv.cu src/cuda/glue.cu src/cuda/attn.cu src/cuda/moe.cu src/cuda/exchange.cu src/cuda/indexer.cu src/cuda/select.cu src/cuda/compressor.cu src/cuda/engram.cu src/cuda/planes.cu src/cuda/resolve.cu src/cuda/fused.cu src/cuda/dspark.cu src/cuda/chunk.cu)
+  add_library(ds4n_cuda STATIC src/cuda/mx_gemv.cu src/cuda/glue.cu src/cuda/attn.cu src/cuda/moe.cu src/cuda/exchange.cu src/cuda/indexer.cu src/cuda/select.cu src/cuda/compressor.cu src/cuda/engram.cu src/cuda/planes.cu src/cuda/resolve.cu src/cuda/fused.cu src/cuda/dspark.cu src/cuda/chunk.cu src/cuda/glm53/moe.cu src/cuda/glm53/grouped_moe.cu src/cuda/glm53/attention.cu src/cuda/glm53/indexer.cu src/cuda/glm53/attention_layer.cu)
   target_compile_options(ds4n_cuda PRIVATE ${DS4N_CUDA_FLAGS})
   target_link_libraries(ds4n_cuda PUBLIC ds4n_core)
   add_executable(ds4n-mx-check src/tools/mx_check.cu)
@@ -122,6 +155,31 @@ if(DS4N_CUDA)
   add_executable(ds4n-moe-check src/tools/moe_check.cu)
   target_compile_options(ds4n-moe-check PRIVATE ${DS4N_CUDA_FLAGS})
   target_link_libraries(ds4n-moe-check PRIVATE ds4n_cuda ds4n_io)
+  add_executable(ds4n-glm53-attn-check src/tools/glm53_attn_check.cu)
+  target_compile_options(ds4n-glm53-attn-check PRIVATE ${DS4N_CUDA_FLAGS})
+  target_link_libraries(ds4n-glm53-attn-check PRIVATE ds4n_cuda ds4n_glm53_io)
+  add_executable(ds4n-glm53-moe-check src/tools/glm53_moe_check.cu)
+  target_compile_options(ds4n-glm53-moe-check PRIVATE ${DS4N_CUDA_FLAGS})
+  target_link_libraries(ds4n-glm53-moe-check PRIVATE ds4n_cuda ds4n_glm53_io)
+  # GLM-5.3's engine: the decoder on two GPUs, and its gate.
+  add_library(ds4n_glm53_engine STATIC src/engine/glm53/decoder.cu src/engine/glm53/conversation.cu)
+  target_compile_options(ds4n_glm53_engine PRIVATE ${DS4N_CUDA_FLAGS})
+  target_link_libraries(ds4n_glm53_engine PUBLIC ds4n_cuda ds4n_glm53_io ds4n_io)
+  add_executable(ds4n-glm53-decode src/tools/glm53_decode.cu)
+  target_compile_options(ds4n-glm53-decode PRIVATE ${DS4N_CUDA_FLAGS})
+  target_link_libraries(ds4n-glm53-decode PRIVATE ds4n_glm53_engine)
+  add_executable(ds4n-glm53-ledger src/tools/glm53_ledger.cu)
+  target_compile_options(ds4n-glm53-ledger PRIVATE ${DS4N_CUDA_FLAGS})
+  target_link_libraries(ds4n-glm53-ledger PRIVATE ds4n_glm53_engine)
+  add_executable(ds4n-glm53-serve src/tools/glm53_serve.cu)
+  target_compile_options(ds4n-glm53-serve PRIVATE ${DS4N_CUDA_FLAGS})
+  target_link_libraries(ds4n-glm53-serve PRIVATE ds4n_glm53_engine)
+  add_executable(ds4n-glm53-serve-check src/tools/glm53_serve_check.cu)
+  target_compile_options(ds4n-glm53-serve-check PRIVATE ${DS4N_CUDA_FLAGS})
+  target_link_libraries(ds4n-glm53-serve-check PRIVATE ds4n_glm53_engine)
+  # The oracle tool gains its GPU path (--gpu) in a CUDA build.
+  target_link_libraries(ds4n-glm53-oracle-run PRIVATE ds4n_cuda CUDA::cudart)
+  target_compile_definitions(ds4n-glm53-oracle-run PRIVATE DS4N_GLM53_GPU)
 endif()
 
 enable_testing()
@@ -141,6 +199,27 @@ add_executable(ds4n_tests
   tests/core/test_moe_reference.cpp
   tests/core/test_det_math.cpp
   tests/core/test_safetensors.cpp
+  tests/core/glm53/test_store.cpp
+  tests/core/glm53/test_backbone.cpp
+  tests/core/glm53/test_config.cpp
+  tests/core/glm53/test_reference.cpp
+  tests/core/glm53/test_dequant.cpp
+  tests/core/glm53/test_precision.cpp
+  tests/core/glm53/test_exact_attention.cpp
+  tests/core/glm53/test_exact_moe.cpp
+  tests/core/glm53/test_moe_roundings.cpp
+  tests/core/glm53/test_moe_plan.cpp
+  tests/core/glm53/test_expert_tiles.cpp
+  tests/core/glm53/test_layer_expert_cache.cpp
+  tests/core/glm53/test_victim_tier.cpp
+  tests/core/glm53/test_sessions.cpp
+  tests/core/glm53/test_cohort.cpp
+  tests/core/glm53/test_ledger.cpp
+  tests/core/glm53/test_slot_profile.cpp
+  tests/core/glm53/test_deferral.cpp
+  tests/core/glm53/test_latent_split.cpp
+  tests/core/test_meminfo.cpp
+  tests/core/glm53/test_pruning.cpp
   tests/core/test_indexer.cpp
   tests/core/test_compressor.cpp
   tests/core/test_compare.cpp
@@ -162,4 +241,13 @@ add_executable(ds4n_tests
 )
 target_link_libraries(ds4n_tests PRIVATE ds4n_core doctest::doctest)
 target_compile_options(ds4n_tests PRIVATE -Wall -Wextra)
+# Tests that read checked-in reference files (ref/, tests/data/) find them from here.
+target_compile_definitions(ds4n_tests PRIVATE DS4N_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 add_test(NAME core COMMAND ds4n_tests)
+
+# I/O-boundary tests (temp files): the GLM-5.3 Backbone part writer and verifier.
+add_executable(ds4n_glm53_io_tests tests/main.cpp tests/io/test_glm53_backbone.cpp tests/io/test_glm53_store.cpp
+               tests/io/test_glm53_weights.cpp)
+target_link_libraries(ds4n_glm53_io_tests PRIVATE ds4n_glm53_io doctest::doctest)
+target_compile_options(ds4n_glm53_io_tests PRIVATE -Wall -Wextra)
+add_test(NAME glm53_io COMMAND ds4n_glm53_io_tests)

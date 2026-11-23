@@ -1,0 +1,39 @@
+2026-11-22T09:39:39+01:00 prompts
+2026-11-22T09:39:39+01:00 start speed-l0-lru-r1
+2026-11-22T09:42:36+01:00 end speed-l0-lru-r1 exit 0
+2026-11-22T09:42:36+01:00 start speed-l0-counter55-r1
+2026-11-22T09:45:28+01:00 end speed-l0-counter55-r1 exit 0
+2026-11-22T09:45:28+01:00 start speed-l0.03-lru-r1
+2026-11-22T09:47:54+01:00 end speed-l0.03-lru-r1 exit 0
+2026-11-22T09:47:54+01:00 start speed-l0.03-counter55-r1
+2026-11-22T09:50:24+01:00 end speed-l0.03-counter55-r1 exit 0
+2026-11-22T09:50:24+01:00 start speed-l0-lru-r2
+2026-11-22T09:53:19+01:00 end speed-l0-lru-r2 exit 0
+2026-11-22T09:53:19+01:00 start speed-l0-counter55-r2
+2026-11-22T09:56:11+01:00 end speed-l0-counter55-r2 exit 0
+2026-11-22T09:56:11+01:00 start speed-l0.03-lru-r2
+2026-11-22T09:58:38+01:00 end speed-l0.03-lru-r2 exit 0
+2026-11-22T09:58:38+01:00 start speed-l0.03-counter55-r2
+2026-11-22T10:01:09+01:00 end speed-l0.03-counter55-r2 exit 0
+2026-11-22T10:01:09+01:00 start cohort-8192
+2026-11-22T10:04:31+01:00 end cohort-8192 exit 0
+2026-11-22T10:04:31+01:00 start cohort-16384
+2026-11-22T10:07:25+01:00 end cohort-16384 exit 0
+2026-11-22T10:07:25+01:00 start cohort-32768
+2026-11-22T10:10:04+01:00 end cohort-32768 exit 0
+2026-11-22T10:10:04+01:00 start cohort-65536
+2026-11-22T10:12:34+01:00 end cohort-65536 exit 0
+2026-11-22T10:12:34+01:00 start hash-cohort-512
+2026-11-22T10:16:11+01:00 end hash-cohort-512 exit 0
+2026-11-22T10:16:11+01:00 start hash-cohort-1024
+2026-11-22T10:18:49+01:00 end hash-cohort-1024 exit 0
+2026-11-22T10:18:49+01:00 start hash-cohort-16384
+2026-11-22T10:20:44+01:00 end hash-cohort-16384 exit 0
+2026-11-22T10:20:44+01:00 start hash-rounds
+2026-11-22T10:32:03+01:00 end hash-rounds exit 0
+2026-11-22T10:32:03+01:00 start check-l0.03-lru (detached)
+2026-11-22T10:34:35+01:00 check-l0.03-lru: GPU part done, replay running
+2026-11-22T10:34:35+01:00 start check-l0.03-counter55 (detached)
+2026-11-22T10:37:06+01:00 check-l0.03-counter55: GPU part done, replay running
+2026-11-22T10:37:06+01:00 start kl (detached, GPU 0)
+2026-11-22T10:37:07+01:00 launched; the checks' replays and kl continue in their containers

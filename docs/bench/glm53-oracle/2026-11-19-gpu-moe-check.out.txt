@@ -1,0 +1,92 @@
+== --layer 40 --tokens 5 --chunk 300 --seed 3
+Round: router logits bit-identical (0 of 1280 floats differ, max error 0 of the largest); Routes: Expert ids identical, weights bit-identical (0 of 40 floats differ, max error 0 of the largest)
+Round: Plan identical, 37 jobs for 5 tokens
+Round: hidden fragments (SwiGLU + act_quant) bit-identical: 0 of 95040 bytes differ
+Round: per-GPU partials bit-identical (0 of 61440 floats differ, max error 0 of the largest)
+Round: MoE output (BF16, after the Exchange) bit-identical (0 of 30720 floats differ, max error 0 of the largest)
+sweep: router logits bit-identical (0 of 76800 floats differ, max error 0 of the largest); Routes: Expert ids identical, weights bit-identical (0 of 2400 floats differ, max error 0 of the largest)
+sweep: 300 tokens, 428 groups (390 routed over 205 Experts, 38 shared), 3.18 ms on the GPU for both Halves
+sweep: per-GPU partials bit-identical (0 of 3686400 floats differ, max error 0 of the largest)
+sweep: MoE output (BF16, after the Exchange) bit-identical (0 of 1843200 floats differ, max error 0 of the largest)
+timing: one GPU's Round MoE (5 tokens, 37 routed Halves + shared, 384.2 MB): 256.7 us launched back to back, 1496 GB/s
+Round, after timing: per-GPU partials bit-identical (0 of 61440 floats differ, max error 0 of the largest)
+Round, after timing: MoE output (BF16, after the Exchange) bit-identical (0 of 30720 floats differ, max error 0 of the largest)
+PASS: the GPU MoE is the Reference configuration, bit for bit
+exit 0
+== --layer 75 --tokens 8 --chunk 64 --seed 4
+Round: router logits bit-identical (0 of 2048 floats differ, max error 0 of the largest); Routes: Expert ids identical, weights bit-identical (0 of 64 floats differ, max error 0 of the largest)
+Round: Plan identical, 51 jobs for 8 tokens
+Round: hidden fragments (SwiGLU + act_quant) bit-identical: 0 of 152064 bytes differ
+Round: per-GPU partials bit-identical (0 of 98304 floats differ, max error 0 of the largest)
+Round: MoE output (BF16, after the Exchange) bit-identical (0 of 49152 floats differ, max error 0 of the largest)
+sweep: router logits bit-identical (0 of 16384 floats differ, max error 0 of the largest); Routes: Expert ids identical, weights bit-identical (0 of 512 floats differ, max error 0 of the largest)
+sweep: 64 tokens, 181 groups (173 routed over 168 Experts, 8 shared), 2.45 ms on the GPU for both Halves
+sweep: per-GPU partials bit-identical (0 of 786432 floats differ, max error 0 of the largest)
+sweep: MoE output (BF16, after the Exchange) bit-identical (0 of 393216 floats differ, max error 0 of the largest)
+timing: one GPU's Round MoE (8 tokens, 51 routed Halves + shared, 524.6 MB): 348.2 us launched back to back, 1506 GB/s
+Round, after timing: per-GPU partials bit-identical (0 of 98304 floats differ, max error 0 of the largest)
+Round, after timing: MoE output (BF16, after the Exchange) bit-identical (0 of 49152 floats differ, max error 0 of the largest)
+PASS: the GPU MoE is the Reference configuration, bit for bit
+exit 0
+== --layer 3 --tokens 8 --chunk 64 --seed 7
+Round: router logits bit-identical (0 of 2048 floats differ, max error 0 of the largest); Routes: Expert ids identical, weights bit-identical (0 of 64 floats differ, max error 0 of the largest)
+Round: Plan identical, 22 jobs for 8 tokens
+Round: hidden fragments (SwiGLU + act_quant) bit-identical: 0 of 152064 bytes differ
+Round: per-GPU partials bit-identical (0 of 98304 floats differ, max error 0 of the largest)
+Round: MoE output (after the Exchange) bit-identical (0 of 49152 floats differ, max error 0 of the largest)
+sweep: router logits bit-identical (0 of 16384 floats differ, max error 0 of the largest); Routes: Expert ids identical, weights bit-identical (0 of 512 floats differ, max error 0 of the largest)
+sweep: 64 tokens over 36 Experts
+sweep, reference: 42 ms (Expert uploads included)
+sweep, reference: per-GPU partials bit-identical (0 of 786432 floats differ, max error 0 of the largest)
+sweep, reference: MoE output (after the Exchange) bit-identical (0 of 393216 floats differ, max error 0 of the largest)
+sweep, weight-after-down: 51 ms (Expert uploads included)
+sweep, weight-after-down: per-GPU partials bit-identical (0 of 786432 floats differ, max error 0 of the largest)
+sweep, weight-after-down: MoE output (after the Exchange) bit-identical (0 of 393216 floats differ, max error 0 of the largest)
+sweep, fp32-exchange: 53 ms (Expert uploads included)
+sweep, fp32-exchange: per-GPU partials bit-identical (0 of 786432 floats differ, max error 0 of the largest)
+sweep, fp32-exchange: MoE output (after the Exchange) bit-identical (0 of 393216 floats differ, max error 0 of the largest)
+timing: one GPU's Round MoE (8 tokens, 22 routed Halves + shared, 233.8 MB): 173.4 us launched back to back, 1348 GB/s
+Round, after timing: per-GPU partials bit-identical (0 of 98304 floats differ, max error 0 of the largest)
+Round, after timing: MoE output (after the Exchange) bit-identical (0 of 49152 floats differ, max error 0 of the largest)
+PASS: the GPU MoE is the Reference configuration, bit for bit
+exit 0
+== --layer 77 --tokens 8 --rounds 2 --chunk 64 --seed 11 --iters 20
+SwiGLU element function: bit-identical (0 of 16777216 floats differ, max error 0 of the largest)
+Round 0: router logits bit-identical (0 of 2048 floats differ, max error 0 of the largest); Routes: Expert ids identical, weights bit-identical (0 of 64 floats differ, max error 0 of the largest)
+Round 0: Plan identical, 51 jobs for 8 tokens
+Round 0: hidden fragments (SwiGLU + act_quant) bit-identical: 0 of 152064 bytes differ
+Round 0: per-GPU partials bit-identical (0 of 98304 floats differ, max error 0 of the largest)
+Round 0: MoE output (after the Exchange) bit-identical (0 of 49152 floats differ, max error 0 of the largest)
+Round 1: router logits bit-identical (0 of 2048 floats differ, max error 0 of the largest); Routes: Expert ids identical, weights bit-identical (0 of 64 floats differ, max error 0 of the largest)
+Round 1: Plan identical, 52 jobs for 8 tokens
+Round 1: hidden fragments (SwiGLU + act_quant) bit-identical: 0 of 152064 bytes differ
+Round 1: per-GPU partials bit-identical (0 of 98304 floats differ, max error 0 of the largest)
+Round 1: MoE output (after the Exchange) bit-identical (0 of 49152 floats differ, max error 0 of the largest)
+sweep: router logits bit-identical (0 of 16384 floats differ, max error 0 of the largest); Routes: Expert ids identical, weights bit-identical (0 of 512 floats differ, max error 0 of the largest)
+sweep: 64 tokens over 161 Experts
+sweep, reference: 168 ms (Expert uploads included)
+sweep, reference: per-GPU partials bit-identical (0 of 786432 floats differ, max error 0 of the largest)
+sweep, reference: MoE output (after the Exchange) bit-identical (0 of 393216 floats differ, max error 0 of the largest)
+sweep, weight-after-down: 181 ms (Expert uploads included)
+sweep, weight-after-down: per-GPU partials bit-identical (0 of 786432 floats differ, max error 0 of the largest)
+sweep, weight-after-down: MoE output (after the Exchange) bit-identical (0 of 393216 floats differ, max error 0 of the largest)
+sweep, fp32-exchange: 184 ms (Expert uploads included)
+sweep, fp32-exchange: per-GPU partials bit-identical (0 of 786432 floats differ, max error 0 of the largest)
+sweep, fp32-exchange: MoE output (after the Exchange) bit-identical (0 of 393216 floats differ, max error 0 of the largest)
+timing: one GPU's Round MoE (8 tokens, 51 routed Halves + shared, 524.6 MB): 349.4 us launched back to back, 1501 GB/s
+Round, after timing: per-GPU partials bit-identical (0 of 98304 floats differ, max error 0 of the largest)
+Round, after timing: MoE output (after the Exchange) bit-identical (0 of 49152 floats differ, max error 0 of the largest)
+PASS: the GPU MoE is the Reference configuration, bit for bit
+exit 0
+== --layer 77 --tokens 1 --chunk 0 --seed 12 --iters 50
+SwiGLU element function: bit-identical (0 of 16777216 floats differ, max error 0 of the largest)
+Round: router logits bit-identical (0 of 256 floats differ, max error 0 of the largest); Routes: Expert ids identical, weights bit-identical (0 of 8 floats differ, max error 0 of the largest)
+Round: Plan identical, 8 jobs for 1 token
+Round: hidden fragments (SwiGLU + act_quant) bit-identical: 0 of 19008 bytes differ
+Round: per-GPU partials bit-identical (0 of 12288 floats differ, max error 0 of the largest)
+Round: MoE output (after the Exchange) bit-identical (0 of 6144 floats differ, max error 0 of the largest)
+timing: one GPU's Round MoE (1 token, 8 routed Halves + shared, 93.4 MB): 43.7 us launched back to back, 2136 GB/s
+Round, after timing: per-GPU partials bit-identical (0 of 12288 floats differ, max error 0 of the largest)
+Round, after timing: MoE output (after the Exchange) bit-identical (0 of 6144 floats differ, max error 0 of the largest)
+PASS: the GPU MoE is the Reference configuration, bit for bit
+exit 0

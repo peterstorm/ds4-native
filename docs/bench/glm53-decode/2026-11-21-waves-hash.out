@@ -1,0 +1,17 @@
+== --prefill rounds
+open: 72.1 s, 98 Slots per Sparse layer (38% of the Experts), RAM tier 0 per layer, 1 store replica(s), capacity 4096, λ 0
+prompt (rounds): 2800 tokens in 855.54 s (3.3 tok/s); 422778 store reads (0 read ahead, not routed), 0 from RAM, miss wait 827.71 s
+logits hash: bec364f75ef70233 over 2800 prompt tokens
+== --wave 8
+open: 72.1 s, 99 Slots per Sparse layer (39% of the Experts), RAM tier 0 per layer, 1 store replica(s), capacity 4096, λ 0
+prompt (sweep, wave 8): 2800 tokens in 41.47 s (67.5 tok/s); 19189 store reads (11 read ahead, not routed), 0 from RAM, miss wait 23.82 s
+logits hash: bec364f75ef70233 over 2800 prompt tokens
+== --wave 64
+open: 72.5 s, 99 Slots per Sparse layer (39% of the Experts), RAM tier 0 per layer, 1 store replica(s), capacity 4096, λ 0
+prompt (sweep, wave 64): 2800 tokens in 39.88 s (70.2 tok/s); 19177 store reads (8 read ahead, not routed), 0 from RAM, miss wait 33.21 s
+logits hash: bec364f75ef70233 over 2800 prompt tokens
+== --wave 512
+open: 73.0 s, 98 Slots per Sparse layer (38% of the Experts), RAM tier 0 per layer, 1 store replica(s), capacity 4096, λ 0
+prompt (sweep, wave 512): 2800 tokens in 39.92 s (70.1 tok/s); 19176 store reads (8 read ahead, not routed), 0 from RAM, miss wait 33.72 s
+logits hash: bec364f75ef70233 over 2800 prompt tokens
+exit=0

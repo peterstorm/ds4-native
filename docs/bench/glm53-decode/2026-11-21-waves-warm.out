@@ -1,0 +1,12 @@
+## capacity 16384, wave 8: turn 1 long-prompt.txt (2,800), generate 4, turn 2 long4-prompt.txt (11,200, warm)
+open: 80.0 s, 97 Slots per Sparse layer (38% of the Experts), RAM tier 40 per layer, 1 store replica(s), capacity 16384, λ 0
+prompt (sweep, wave 8): 2800 tokens in 38.99 s (71.8 tok/s); 19188 store reads (11 read ahead, not routed), 0 from RAM, miss wait 23.44 s
+generate: 4 tokens in 1.22 s (3.28 tok/s); misses 25.9% (155.5 per token: 43.0 from RAM, 112.5 store reads), miss wait 1.11 s
+generated: 12160 4532 760 5162
+then (sweep, warm): 11200 tokens in 65.77 s (170.3 tok/s); 8925 store reads (0 read ahead, not routed), 2997 from RAM, miss wait 0.45 s
+## capacity 16384, wave 64: turn 1 long-prompt.txt (2,800), generate 4, turn 2 long4-prompt.txt (11,200, warm)
+open: 80.4 s, 96 Slots per Sparse layer (38% of the Experts), RAM tier 40 per layer, 1 store replica(s), capacity 16384, λ 0
+prompt (sweep, wave 64): 2800 tokens in 36.94 s (75.8 tok/s); 19178 store reads (8 read ahead, not routed), 0 from RAM, miss wait 32.61 s
+generate: 4 tokens in 1.23 s (3.25 tok/s); misses 26.0% (156.0 per token: 42.8 from RAM, 113.2 store reads), miss wait 1.12 s
+generated: 12160 4532 760 5162
+then (sweep, warm): 11200 tokens in 21.34 s (524.9 tok/s); 9000 store reads (9 read ahead, not routed), 2997 from RAM, miss wait 1.82 s

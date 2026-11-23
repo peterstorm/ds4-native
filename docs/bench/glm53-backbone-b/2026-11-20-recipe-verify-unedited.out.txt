@@ -1,0 +1,30 @@
+model.layers.0.self_attn.o_proj.weight: FP8 recovery, 100663296/100663296 BF16 values identical
+model.layers.1.self_attn.o_proj.weight: FP8 recovery, 100663296/100663296 BF16 values identical
+model.layers.2.self_attn.o_proj.weight: FP8 recovery, 100663296/100663296 BF16 values identical
+model.layers.3.self_attn.o_proj.weight: FP8 recovery, 100663296/100663296 BF16 values identical
+model.layers.4.self_attn.o_proj.weight: FP8 recovery, 100663296/100663296 BF16 values identical
+model.layers.5.self_attn.o_proj.weight: FP8 recovery, 100663296/100663296 BF16 values identical
+model.layers.6.self_attn.o_proj.weight: FP8 recovery, 100663296/100663296 BF16 values identical
+model.layers.7.self_attn.o_proj.weight: FP8 recovery, 100663296/100663296 BF16 values identical
+model.layers.8.self_attn.o_proj.weight: FP8 recovery, 100663296/100663296 BF16 values identical
+model.layers.9.self_attn.o_proj.weight: FP8 recovery, 100663296/100663296 BF16 values identical
+model.layers.10.self_attn.o_proj.weight: FP8 recovery, 100663296/100663296 BF16 values identical
+model.layers.11.self_attn.o_proj.weight: FP8 recovery, 100663296/100663296 BF16 values identical
+model.layers.3.mlp.shared_experts.down_proj.weight: MXFP4 RTN, codes 6291456/6291456 bytes, scales 393216/393216 identical
+model.layers.4.mlp.shared_experts.down_proj.weight: MXFP4 RTN, codes 6291456/6291456 bytes, scales 393216/393216 identical
+model.layers.5.mlp.shared_experts.down_proj.weight: MXFP4 RTN, codes 6291456/6291456 bytes, scales 393216/393216 identical
+model.layers.6.mlp.shared_experts.down_proj.weight: MXFP4 RTN, codes 6291456/6291456 bytes, scales 393216/393216 identical
+model.layers.7.mlp.shared_experts.down_proj.weight: MXFP4 RTN, codes 6291456/6291456 bytes, scales 393216/393216 identical
+model.layers.8.mlp.shared_experts.down_proj.weight: MXFP4 RTN, codes 6291456/6291456 bytes, scales 393216/393216 identical
+model.layers.9.mlp.shared_experts.down_proj.weight: MXFP4 RTN, codes 6291456/6291456 bytes, scales 393216/393216 identical
+model.layers.10.mlp.shared_experts.down_proj.weight: MXFP4 RTN, codes 6291456/6291456 bytes, scales 393216/393216 identical
+model.layers.11.mlp.shared_experts.down_proj.weight: MXFP4 RTN, codes 6291456/6291456 bytes, scales 393216/393216 identical
+model.layers.12.mlp.shared_experts.down_proj.weight: MXFP4 RTN, codes 6291456/6291456 bytes, scales 393216/393216 identical
+model.layers.13.mlp.shared_experts.down_proj.weight: MXFP4 RTN, codes 6291456/6291456 bytes, scales 393216/393216 identical
+model.layers.14.mlp.shared_experts.down_proj.weight: MXFP4 RTN, codes 6291456/6291456 bytes, scales 393216/393216 identical
+model.layers.15.mlp.shared_experts.down_proj.weight: MXFP4 RTN, codes 6291456/6291456 bytes, scales 393216/393216 identical
+model.layers.16.mlp.shared_experts.down_proj.weight: MXFP4 RTN, codes 6291456/6291456 bytes, scales 393216/393216 identical
+model.layers.17.mlp.shared_experts.down_proj.weight: MXFP4 RTN, codes 6291456/6291456 bytes, scales 393216/393216 identical
+model.layers.18.mlp.shared_experts.down_proj.weight: MXFP4 RTN, codes 6291456/6291456 bytes, scales 393216/393216 identical
+model.layers.19.mlp.shared_experts.down_proj.weight: MXFP4 RTN, codes 6291456/6291456 bytes, scales 393216/393216 identical
+VERIFIED: bit-exact

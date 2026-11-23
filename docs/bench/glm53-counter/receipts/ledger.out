@@ -1,0 +1,7 @@
+cards 102.64 GB, runtime reserve 5.10 GB, wave 512, Cohort 16384, a Cache position 95232 B per GPU
+  capacity  Slots/layer    claims GB    unused GB
+      4096           99        22.89         0.20
+     65536           89        29.99         0.62
+cards 102.64 GB, runtime reserve 5.10 GB, wave 512, Cohort 65536, a Cache position 95232 B per GPU
+  capacity  Slots/layer    claims GB    unused GB
+     65536           83        34.96         0.16
