@@ -410,12 +410,17 @@ struct Decoder::State {
    * `at` .. at + n - 1 (sized for the whole prompt). The length is the caller's to advance.
    */
   void sweep(std::span<const int32_t> tokens, int64_t first, size_t at, std::vector<std::vector<float>>* capture);
+  /** Where a call's earlier Latent rows come from: a Round gathers them from both GPUs' halves, a sweep's wave reads its layer staged. */
+  enum class Earlier { Gathered, Staged };
   /**
-   * Each GPU attends layer L for `n` tokens, a Round or a sweep's wave (`shared`: each GPU's last
-   * Full layer's Selections for them), Exchange, finish.
+   * Each GPU attends layer L for `n` tokens, a Round (Gathered) or a sweep's wave (Staged, after
+   * stage_layer) (`shared`: each GPU's last Full layer's Selections for them), Exchange, finish.
    */
   Result<std::array<gpu::Selections, 2>, std::string> attend(int L, int n, int64_t first, const std::array<Rows, 2>& rows,
-                                                             const std::array<const gpu::Selections*, 2>& shared);
+                                                             const std::array<const gpu::Selections*, 2>& shared,
+                                                             Earlier earlier);
+  /** Each GPU stages layer L's Latent rows [0, n) whole in its layer scratch, its half and the peer's (a Cohort's sweep). */
+  void stage_layer(int L, int64_t n);
   /** Dense layer L's MLP for `n` tokens (a Round or a wave), Exchange, residual. */
   void dense(int L, int n, const std::array<Rows, 2>& rows);
   /** Why `tokens` cannot be appended now (an earlier failure, the capacity, an id), or nothing. */
@@ -454,12 +459,19 @@ Result<KvRows, std::string> Decoder::save(int64_t n) const {
   if (s.broken) return R::err("an earlier Round failed part way: open a new Decoder");
   if (n < 0 || n > s.length) return R::err("a save takes 0 .. length() positions");
   Gpu& G0 = *s.gpus[0];
-  if (cudaSetDevice(G0.device) != cudaSuccess) return R::err("cudaSetDevice");
   auto layers = std::make_unique<KvRows::Layers>();
   for (int L = 0; L < s.d.layers; L++) {
-    auto p = G0.attention[static_cast<size_t>(L)]->save_positions(n, G0.stream);
+    auto p = G0.attention[static_cast<size_t>(L)]->host_positions(n);
     if (!p) return R::err("layer " + std::to_string(L) + ": " + p.error());
     layers->layer.push_back(std::move(p).value());
+  }
+  // Each GPU's half of the Latent rows (GPU 0's save brings the index keys).
+  for (const auto& G : s.gpus) {
+    if (cudaSetDevice(G->device) != cudaSuccess) return R::err("cudaSetDevice");
+    for (int L = 0; L < s.d.layers; L++)
+      if (auto r = G->attention[static_cast<size_t>(L)]->save_positions(layers->layer[static_cast<size_t>(L)], n, G->stream);
+          !r)
+        return R::err("layer " + std::to_string(L) + ": " + r.error());
   }
   return R::ok(KvRows(n, std::move(layers)));
 }
@@ -1453,14 +1465,18 @@ bool Decoder::State::fetch_pump(bool block) {
 }
 
 Result<std::array<gpu::Selections, 2>, std::string> Decoder::State::attend(
-    int L, int n, int64_t first, const std::array<Rows, 2>& rows, const std::array<const gpu::Selections*, 2>& shared) {
+    int L, int n, int64_t first, const std::array<Rows, 2>& rows, const std::array<const gpu::Selections*, 2>& shared,
+    Earlier earlier) {
   using R = Result<std::array<gpu::Selections, 2>, std::string>;
   std::array<gpu::Selections, 2> made;
   for (size_t g = 0; g < 2; g++) {
     Gpu& G = *gpus[g];
     ck(cudaSetDevice(G.device), "cudaSetDevice");
     auto& att = *G.attention[static_cast<size_t>(L)];
-    auto sel = att.attend(rows[g].x, n, first, att.indexer() == g53::IndexerKind::Shared ? shared[g] : nullptr,
+    const gpu::RowSource source = earlier == Earlier::Gathered
+                                      ? gpu::RowSource{gpu::FromHalves{&*gpus[1 - g]->attention[static_cast<size_t>(L)]}}
+                                      : gpu::RowSource{gpu::FromStaged{}};
+    auto sel = att.attend(rows[g].x, n, first, att.indexer() == g53::IndexerKind::Shared ? shared[g] : nullptr, source,
                           *G.layer_scratch, G.partial, G.stream);
     if (!sel) return R::err(sel.error());
     made[g] = std::move(sel).value();
@@ -1468,6 +1484,16 @@ Result<std::array<gpu::Selections, 2>, std::string> Decoder::State::attend(
     att.finish(rows[g].x, G.out, n, rows[g].mid, rows[g].ffn, G.stream);
   }
   return R::ok(std::move(made));
+}
+
+void Decoder::State::stage_layer(int L, int64_t n) {
+  for (size_t g = 0; g < 2; g++) {
+    Gpu& G = *gpus[g];
+    ck(cudaSetDevice(G.device), "cudaSetDevice");
+    const auto& peer = *gpus[1 - g]->attention[static_cast<size_t>(L)];
+    if (auto r = G.attention[static_cast<size_t>(L)]->stage(n, peer, *G.layer_scratch, G.stream); !r)
+      throw Failure("layer " + std::to_string(L) + ": " + r.error());
+  }
 }
 
 void Decoder::State::dense(int L, int n, const std::array<Rows, 2>& rows) {
@@ -1526,7 +1552,8 @@ Result<std::vector<float>, std::string> Decoder::round(std::span<const int32_t> 
     std::array<std::optional<gpu::Selections>, 2> full;  // each GPU's Selections from the last Full layer
     for (int L = 0; L < d.layers; L++) {
       const auto where = "layer " + std::to_string(L) + ": ";
-      auto sel = s.attend(L, n, s.length, rows, {full[0] ? &*full[0] : nullptr, full[1] ? &*full[1] : nullptr});
+      auto sel = s.attend(L, n, s.length, rows, {full[0] ? &*full[0] : nullptr, full[1] ? &*full[1] : nullptr},
+                          State::Earlier::Gathered);
       if (!sel) return R::err(where + sel.error());
       if (s.gpus[0]->attention[static_cast<size_t>(L)]->indexer() == g53::IndexerKind::Full)
         for (size_t g = 0; g < 2; g++) full[g] = std::move(sel.value()[g]);
@@ -1599,6 +1626,8 @@ void Decoder::State::sweep(std::span<const int32_t> tokens, int64_t first, size_
       for (auto& l : lengths) l.clear();
     else if (lengths[0].size() != static_cast<size_t>(n))
       throw Failure(where + "a Shared layer before any Full layer");
+    // The layer's rows before this Cohort, whole on each GPU (core/glm53/latent_split); each wave adds its own.
+    stage_layer(L, first);
     for (int t0 = 0; t0 < n; t0 += wave) {
       const int m = std::min(wave, n - t0);
       std::array<gpu::Selections, 2> saved;
@@ -1609,7 +1638,7 @@ void Decoder::State::sweep(std::span<const int32_t> tokens, int64_t first, size_
                     std::vector<int>(from, from + m)};
         shared[g] = &saved[g];
       }
-      auto sel = attend(L, m, first + t0, rows_at(t0), shared);
+      auto sel = attend(L, m, first + t0, rows_at(t0), shared, Earlier::Staged);
       if (!sel) throw Failure(where + sel.error());
       fetch_pump(false);  // a read-ahead keeps the drive busy through the attention
       if (full)

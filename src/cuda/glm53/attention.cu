@@ -1,4 +1,5 @@
 #include "core/det_math.hpp"
+#include "core/glm53/latent_split.hpp"
 #include "cuda/glm53/attention.cuh"
 #include "cuda/glm53/mma_bf16.cuh"
 
@@ -308,7 +309,72 @@ __global__ void __launch_bounds__(kLatent) combine_kernel(int splits, LatentScra
   ctx[(static_cast<size_t>(row) * kHeadsPerGpu + h) * kLatent + c] = __float2bfloat16_rn(__fdiv_rn(acc, l));
 }
 
+// ---- The Latent split: rows from the two halves ----
+
+/** Position p's row: the Round's own (p >= first), else its owner's half's (core/glm53/latent_split). */
+__device__ __forceinline__ const uint4* row_of(int64_t p, int64_t first, const __nv_bfloat16* round_rows,
+                                                const __nv_bfloat16* even, const __nv_bfloat16* odd) {
+  const __nv_bfloat16* row = p >= first ? round_rows + (p - first) * kKeyWidth
+                                        : (ds4n::glm53::latent_owner(p) ? odd : even) +
+                                              ds4n::glm53::latent_index(p) * kKeyWidth;
+  return reinterpret_cast<const uint4*>(row);
+}
+
+/** One thread per (row t, entry j, 16-byte quad q): adjacent threads copy adjacent quads of a row. */
+__global__ void gather_selected_kernel(const int32_t* __restrict__ selection, int n, int stride, int rows, int64_t first,
+                                       const __nv_bfloat16* round_rows, const __nv_bfloat16* even,
+                                       const __nv_bfloat16* odd, __nv_bfloat16* __restrict__ gathered,
+                                       int32_t* __restrict__ gathered_sel) {
+  const size_t total = static_cast<size_t>(rows) * n * kRowQuads;
+  for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < total;
+       i += static_cast<size_t>(gridDim.x) * blockDim.x) {
+    const int q = static_cast<int>(i % kRowQuads);
+    const size_t tj = i / kRowQuads;
+    const int j = static_cast<int>(tj % n), t = static_cast<int>(tj / n);
+    const size_t at = static_cast<size_t>(t) * stride + j;
+    const int32_t p = selection[at];
+    if (q == 0) gathered_sel[at] = p >= 0 ? static_cast<int32_t>(at) : -1;
+    if (p < 0) continue;  // padding: latent_attention reads zeros for it, not the row
+    reinterpret_cast<uint4*>(gathered + at * kKeyWidth)[q] = row_of(p, first, round_rows, even, odd)[q];
+  }
+}
+
+__global__ void stage_rows_kernel(const __nv_bfloat16* even, const __nv_bfloat16* odd, int64_t n,
+                                  __nv_bfloat16* __restrict__ out) {
+  const size_t total = static_cast<size_t>(n) * kRowQuads;
+  for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < total;
+       i += static_cast<size_t>(gridDim.x) * blockDim.x) {
+    const auto p = static_cast<int64_t>(i / kRowQuads);
+    const int q = static_cast<int>(i % kRowQuads);
+    reinterpret_cast<uint4*>(out + p * kKeyWidth)[q] = row_of(p, n, nullptr, even, odd)[q];
+  }
+}
+
+constexpr int kCopyThreads = 256;
+constexpr int kCopyMaxBlocks = 4096;  // grid-stride past it
+
+int copy_blocks(size_t quads) {
+  const size_t blocks = (quads + kCopyThreads - 1) / kCopyThreads;
+  return static_cast<int>(blocks < kCopyMaxBlocks ? blocks : kCopyMaxBlocks);
+}
+
 }  // namespace
+
+cudaError_t gather_selected(const int32_t* selection, int n, int stride, int rows, int64_t first,
+                            const __nv_bfloat16* round_rows, const __nv_bfloat16* even, const __nv_bfloat16* odd,
+                            __nv_bfloat16* gathered, int32_t* gathered_sel, cudaStream_t stream) {
+  if (n < 1 || n > kMaxSelection || stride < n || stride > kMaxSelection || rows < 1 || rows > kMaxAttentionRows)
+    return cudaErrorInvalidValue;
+  const size_t quads = static_cast<size_t>(rows) * n * kRowQuads;
+  gather_selected_kernel<<<copy_blocks(quads), kCopyThreads, 0, stream>>>(selection, n, stride, rows, first, round_rows,
+                                                                          even, odd, gathered, gathered_sel);
+  return cudaGetLastError();
+}
+
+void stage_rows(const __nv_bfloat16* even, const __nv_bfloat16* odd, int64_t n, __nv_bfloat16* out, cudaStream_t stream) {
+  if (n < 1) return;
+  stage_rows_kernel<<<copy_blocks(static_cast<size_t>(n) * kRowQuads), kCopyThreads, 0, stream>>>(even, odd, n, out);
+}
 
 void head_gemv(const __nv_bfloat16* w, size_t w_head_stride, int rows, int k, const __nv_bfloat16* x, int x_stride,
                int tokens, __nv_bfloat16* out, int out_stride, cudaStream_t stream) {

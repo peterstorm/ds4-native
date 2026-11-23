@@ -113,4 +113,26 @@ cudaError_t latent_attention(const __nv_bfloat16* queries, const __nv_bfloat16* 
                              int n, int stride, int rows, float scale, LatentScratch scratch, __nv_bfloat16* ctx,
                              cudaStream_t stream);
 
+// The Latent split (core/glm53/latent_split): a GPU holds the Latent rows of half the positions, GPU 0
+// the even ones and GPU 1 the odd ones, each at index position / 2 of its half (`even`, `odd`: the two
+// halves, one of them the peer's, read over P2P). Attention reads the rows it needs whole, from one of
+// two copies, so latent_attention sees the bytes the replicated cache held, in the same order.
+
+/**
+ * A Round's selected rows gathered for latent_attention: for t < rows and j < n, with p =
+ * selection[t * stride + j], gathered[t * stride + j] = position p's row and gathered_sel[t * stride +
+ * j] = t * stride + j; where p is -1 (a shorter row's padding), gathered_sel is -1 and the row unread.
+ * Position p's row is round_rows[p - first] when p >= first (the Round's own, which both GPUs make),
+ * else its owner's: (p odd ? odd : even)[p / 2]. latent_attention(queries, gathered, gathered_sel, n,
+ * stride, rows, ...) then gives the bits latent_attention(queries, cache, selection, ...) gave over the
+ * replicated cache. n is 1 .. kMaxSelection, stride n .. kMaxSelection, rows 1 .. kMaxAttentionRows;
+ * otherwise nothing runs and cudaErrorInvalidValue is returned.
+ */
+cudaError_t gather_selected(const int32_t* selection, int n, int stride, int rows, int64_t first,
+                            const __nv_bfloat16* round_rows, const __nv_bfloat16* even, const __nv_bfloat16* odd,
+                            __nv_bfloat16* gathered, int32_t* gathered_sel, cudaStream_t stream);
+
+/** out[p] = position p's row for p < n ([n][kKeyWidth] BF16), from its owner's half: the replicated layout of [0, n). */
+void stage_rows(const __nv_bfloat16* even, const __nv_bfloat16* odd, int64_t n, __nv_bfloat16* out, cudaStream_t stream);
+
 }  // namespace ds4n::cuda::glm53

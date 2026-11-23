@@ -13,10 +13,13 @@
 // refuses to open when a claim differs from this (Decoder::vram() reports both),
 // so the two cannot drift apart unnoticed.
 //
-// What grows with the capacity is only the caches (a Latent row per layer and an
-// index key per Full layer, Decoder::position_bytes) and one Round's index scores
-// (32 B a position): a prompt sweep's buffers are sized for a Cohort
-// (core/glm53/cohort), and everything else is fixed.
+// What grows with the capacity is only the caches -- each GPU's half of the
+// Latent rows (core/glm53/latent_split: 44,928 B a position on average) and
+// every index key (5,376 B) -- and, in the layer scratch, one Round's index
+// scores (32 B) and the layer a sweep stages whole (1,152 B): a prompt sweep's
+// buffers are sized for a Cohort (core/glm53/cohort), and everything else is
+// fixed. Before the Latent split both GPUs held every Latent row: 95,264 B a
+// position on each, now 51,488.
 #include <array>
 #include <cstdint>
 #include <string>
@@ -83,7 +86,11 @@ struct LedgerError {
 Result<std::array<Claims, 2>, LedgerError> vram_claims(const Config& config, const EngineShapes& e,
                                                        const VramSettings& s);
 
-/** One Cache position's bytes on each GPU, over every layer: what the Cache claim grows by per position. */
+/**
+ * One position's cache bytes over every layer, both GPUs' halves together: its Latent rows and its index
+ * keys, what a checkpoint holds per position in host memory (Decoder::position_bytes). On the GPUs each
+ * holds its half of the rows (latent_rows) and every index key.
+ */
 uint64_t position_bytes(const Config& config);
 
 /**
@@ -111,7 +118,8 @@ constexpr uint64_t planned_card_bytes(uint64_t total) { return total / kCardQuan
  * 64K, a sweep then taking the whole capacity), so adopting the Ledger changed no Slot count. Any reserve
  * in [3.390, 4.057] GiB does, on the planned kRtxPro6000Bytes (docs/bench/glm53-counter/2026-11-22-
  * counter-report.md, §4). On the card itself it keeps 3.97 GiB, the quantum's remainder with it; a 64K
- * decode's peak left ~3.1 GiB of that unused: each 0.70 GiB less is a Slot per layer more.
+ * decode's peak left ~3.1 GiB of that unused: each 0.70 GiB less is a Slot per layer more. (Those Slot
+ * counts are the replicated cache's: the Latent split frees more, so the same reserve now opens more.)
  */
 inline constexpr uint64_t kDefaultRuntimeReserve = 15ull << 28;
 

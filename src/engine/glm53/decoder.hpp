@@ -63,12 +63,20 @@
 // The store may have replicas, one per drive: each Half is read from the one
 // with fewest reads in flight, so the drives' bandwidth adds up.
 //
+// The Latent rows are split between the GPUs by position (core/glm53/latent_split):
+// GPU 0 holds the even positions', GPU 1 the odd ones', so each GPU's cache costs
+// half the rows (the index keys stay on both). A Round's attention gathers the rows
+// its tokens selected from both halves, the peer's over P2P (~1.2 MB a layer a
+// token); a sweep stages each layer's rows whole once per Cohort, then its waves
+// read them there. The attention core reads the bytes it read before, in the same
+// order: the same bits.
+//
 // Every cache is indexed by position, so a server keeps conversations with three
 // moves (core/glm53/sessions plans them): rewind() shortens the caches to a
 // prompt's shared prefix, save() copies positions [0, n) of every layer to host
-// memory (both GPUs hold the same rows: GPU 0's), restore() copies them back into
-// both GPUs. The bytes are the caches' own, so a resumed conversation's logits are
-// the bits of one that never left.
+// memory (each GPU its half of the rows, into one layout), restore() copies each
+// GPU's half back. The bytes are the caches' own, so a resumed conversation's
+// logits are the bits of one that never left.
 //
 // Every output is exact: ds4n-glm53-decode --check replays each layer on the
 // CPU oracle from the residual streams this decoder captures, bit for bit.
@@ -212,9 +220,9 @@ class Decoder {
   Result<int64_t, std::string> rewind(int64_t n);
   /** Positions [0, n) (n in 0 .. length()) of every layer's caches, copied to host memory. */
   Result<KvRows, std::string> save(int64_t n) const;
-  /** Positions [0, n) of `rows` (n <= rows.positions()) copied into both GPUs' caches; the length is then n. */
+  /** Positions [0, n) of `rows` (n <= rows.positions()) copied into the GPUs' caches, each its half; the length is then n. */
   Result<int64_t, std::string> restore(const KvRows& rows, int64_t n);
-  /** One position's cache bytes over every layer: what save() takes in host memory per position. */
+  /** One position's cache bytes over every layer, both GPUs' halves: what save() takes in host memory per position. */
   uint64_t position_bytes() const;
 
   int64_t length() const;

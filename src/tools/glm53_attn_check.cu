@@ -45,16 +45,25 @@
 // (crossing index_topk inside the Round) and the cache's end; and waves (the
 // linears over the whole wave, the core a Round at a time) of 77 from 0, 200
 // from 1950 (Rounds off the multiples of 8, crossing index_topk) and 512 ending
-// at the cache's end. The oracle decodes the tokens one by one: per token, each
-// GPU's o_proj partial (FP32), the cache row, the index key and the Selection
-// against exact::attend; mid and ffn_in against exact::begin_layer; the Dense
-// MLP's partials and output against exact::dense_mlp; and the head's logits (a
-// Round of 2) against exact::logits. Token t's past is the cache plus the GPU's
-// rows of the tokens before it, each of which is checked against the oracle's
-// own row, so it is the oracle's past; with every past fixed in advance the
-// tokens run on all the host's threads. Refusals too: a scratch for waves of 0,
-// 7 or 520 tokens or no positions, more tokens than a scratch's wave, a scratch
-// for a smaller cache than the layer's.
+// at the cache's end. Each share holds its half of the Latent rows (the Latent
+// split, core/glm53/latent_split; the capacity odd, so the halves differ): a
+// call of a Round's size runs both ways, its earlier rows gathered from both
+// halves (as a Round reads them) and from the layer staged whole (as a sweep's
+// last wave can), a wave staged. The oracle decodes the tokens one by one: per
+// token, each GPU's o_proj partial (FP32), the cache row (from the share that
+// holds it), the index key and the Selection against exact::attend; mid and
+// ffn_in against exact::begin_layer; the Dense MLP's partials and output against
+// exact::dense_mlp; and the head's logits (a Round of 2) against exact::logits.
+// Token t's past is the cache plus the GPU's rows of the tokens before it, each
+// of which is checked against the oracle's own row, so it is the oracle's past;
+// with every past fixed in advance the tokens run on all the host's threads.
+// After each call both halves are saved, overwritten and restored: every row and
+// index key back bit for bit. Refusals too: a scratch for waves of 0, 7 or 520
+// tokens or no positions, more tokens than a scratch's wave, a scratch for a
+// smaller cache than the layer's; a wave that gathers, a peer that is not the
+// other half, a wave without its layer staged to its first position (nothing
+// staged, staged elsewhere, staged for the other share), a stage from a non-peer
+// or past the cache, a save into another size's memory, a restore of one half.
 // Any difference exits 1. --iters times one decode token (rows 1, n 2048) and a
 // Round of 8 (default 50), and with --backbone each layer's attention of 512
 // tokens in Rounds of 8 and in one wave (one GPU's share).
@@ -79,6 +88,7 @@
 
 #include "core/glm53/config.hpp"
 #include "core/glm53/exact_attention.hpp"
+#include "core/glm53/latent_split.hpp"
 #include "core/hc_reference.hpp"
 #include "core/mx_reference.hpp"
 #include "cuda/glm53/attention.cuh"
@@ -706,21 +716,33 @@ WaveOracle oracle_wave(const exact::AttentionLayer& a, std::span<const float> in
   return o;
 }
 
+/** Where a call's earlier rows come from: a Round's gathered from both halves, or the layer staged whole. */
+gpu::RowSource source_of(bool gathered, const gpu::DeviceAttention& peer) {
+  return gathered ? gpu::RowSource{gpu::FromHalves{&peer}} : gpu::RowSource{gpu::FromStaged{}};
+}
+
 /**
  * Mean milliseconds of `att` attending `tokens` tokens ([tokens][hidden] at `d_x`) at `first` in
- * calls of `step` tokens (`shared`: a Shared layer's Selections for all of them), on this GPU.
+ * calls of `step` tokens (`shared`: a Shared layer's Selections for all of them), on this GPU: Rounds
+ * gather their rows from both halves (`peer`'s too), a wave stages the layer first, as the engine runs
+ * them. Timing only: `peer` holds the rows the check before wrote, its half of these tokens' too.
  */
-double time_attend(gpu::DeviceAttention& att, gpu::LayerScratch& w, int hidden, const float* d_x, int tokens,
-                   int64_t first, const gpu::Selections* shared, float* d_partial, int step, int iters) {
+double time_attend(gpu::DeviceAttention& att, const gpu::DeviceAttention& peer, gpu::LayerScratch& w, int hidden,
+                   const float* d_x, int tokens, int64_t first, const gpu::Selections* shared, float* d_partial, int step,
+                   int iters) {
   const auto H = static_cast<size_t>(hidden);
+  const bool rounds = step <= gpu::kMaxRound;
   auto pass = [&] {
+    if (!rounds)
+      if (auto r = att.stage(first, peer, w, nullptr); !r) die(r.error());
     for (int t0 = 0; t0 < tokens; t0 += step) {
       const int n = std::min(step, tokens - t0);
       std::optional<gpu::Selections> part;
       if (shared)
         part = gpu::Selections{shared->rows + static_cast<size_t>(t0) * shared->stride, shared->stride,
                                std::vector<int>(shared->lengths.begin() + t0, shared->lengths.begin() + t0 + n)};
-      const auto sel = att.attend(d_x + t0 * H, n, first + t0, part ? &*part : nullptr, w, d_partial + t0 * H, nullptr);
+      const auto sel = att.attend(d_x + t0 * H, n, first + t0, part ? &*part : nullptr, source_of(rounds, peer), w,
+                                  d_partial + t0 * H, nullptr);
       if (!sel) die(sel.error());
     }
   };
@@ -739,9 +761,14 @@ double time_attend(gpu::DeviceAttention& att, gpu::LayerScratch& w, int hidden, 
   return ms / iters;
 }
 
-/** A refused call: what attend says to a count past the scratch's wave or a scratch for a smaller cache. */
-size_t check_attend_refusals(const glm53::Dims& d, gpu::DeviceAttention& att, int capacity, const float* d_x,
-                             float* d_partial) {
+/**
+ * A refused call: what attend says to a count past the scratch's wave or a scratch for a smaller cache,
+ * and to a row source the call cannot use; what stage, save_positions and restore_positions say to
+ * theirs. `att` and `peer` are one layer's two halves. Each refusal must name its reason (`why`), so a
+ * call refused for another (a Shared layer's missing Selections) does not pass for it.
+ */
+size_t check_attend_refusals(const glm53::Dims& d, gpu::DeviceAttention& att, gpu::DeviceAttention& peer, int capacity,
+                             const float* d_x, float* d_partial) {
   size_t bad = 0;
   for (const auto& [wave, cap] : std::vector<std::pair<int, int>>{{0, capacity}, {7, capacity}, {gpu::kMaxWave + 8, capacity},
                                                                   {gpu::kMaxRound, 0}})
@@ -751,17 +778,83 @@ size_t check_attend_refusals(const glm53::Dims& d, gpu::DeviceAttention& att, in
     }
   auto round = gpu::LayerScratch::create(d, gpu::kMaxRound, capacity);
   auto small = gpu::LayerScratch::create(d, gpu::kMaxRound, capacity - 1);
-  if (!round || !small) die("a Round's scratch: " + (round ? small.error() : round.error()));
-  if (att.attend(d_x, gpu::kMaxRound + 1, 0, nullptr, round.value(), d_partial, nullptr)) {
-    std::fprintf(stderr, "  %d tokens on a scratch for 8: not refused\n", gpu::kMaxRound + 1);
-    bad++;
+  auto wave = gpu::LayerScratch::create(d, gpu::kMaxWave, capacity);
+  if (!round || !small || !wave) die("a refusal's scratch failed to open");
+  const auto refused = [&bad](const char* what, const auto& result, const char* why) {
+    if (result) {
+      std::fprintf(stderr, "  %s: not refused\n", what);
+      bad++;
+    } else if (result.error().find(why) == std::string::npos) {
+      std::fprintf(stderr, "  %s: refused for another reason (%s)\n", what, result.error().c_str());
+      bad++;
+    }
+  };
+  const gpu::RowSource halves = gpu::FromHalves{&peer};
+  refused("9 tokens on a scratch for 8", att.attend(d_x, gpu::kMaxRound + 1, 0, nullptr, halves, round.value(), d_partial, nullptr),
+          "tokens");
+  refused("a scratch for a smaller cache", att.attend(d_x, 1, 0, nullptr, halves, small.value(), d_partial, nullptr),
+          "smaller cache");
+  // The row source: a wave cannot gather, a peer must be the other half, a staged call needs its stage.
+  gpu::LayerScratch& w = wave.value();
+  refused("a wave of 9 gathering", att.attend(d_x, gpu::kMaxRound + 1, 0, nullptr, halves, w, d_partial, nullptr), "Round");
+  refused("itself as the peer", att.attend(d_x, 1, 0, nullptr, gpu::FromHalves{&att}, w, d_partial, nullptr), "peer");
+  refused("no peer", att.attend(d_x, 1, 0, nullptr, gpu::FromHalves{nullptr}, w, d_partial, nullptr), "peer");
+  refused("staged, nothing staged", att.attend(d_x, 1, 0, nullptr, gpu::FromStaged{}, w, d_partial, nullptr), "staged");
+  if (auto r = att.stage(0, peer, w, nullptr); !r) die(r.error());
+  refused("staged to 0, a wave at 8", att.attend(d_x, 1, 8, nullptr, gpu::FromStaged{}, w, d_partial, nullptr), "staged");
+  if (auto r = peer.stage(0, att, w, nullptr); !r) die(r.error());
+  refused("staged for the other half", att.attend(d_x, 1, 0, nullptr, gpu::FromStaged{}, w, d_partial, nullptr), "staged");
+  refused("a stage from itself", att.stage(0, att, w, nullptr), "peer");
+  refused("a stage past the cache", att.stage(capacity + 1, peer, w, nullptr), "outside");
+  refused("a stage on a smaller cache's scratch", att.stage(0, peer, small.value(), nullptr), "smaller cache");
+  // Checkpoints: a save fills memory made for its size; a restore takes both halves.
+  auto host = att.host_positions(4);
+  if (!host) die(host.error());
+  refused("a save of 3 into memory for 4", att.save_positions(host.value(), 3, nullptr), "positions");
+  if (auto r = att.save_positions(host.value(), 4, nullptr); !r) die(r.error());
+  refused("a restore of one half", att.restore_positions(host.value(), 4, nullptr), "both");
+  refused("a restore past the save", peer.restore_positions(host.value(), 5, nullptr), "outside");
+  std::printf("scratch, wave and split refusals (waves of 0, 7, %d, no positions; %d tokens on a Round's scratch; a "
+              "smaller cache's scratch; a gathering wave, a wrong or missing peer, a missing or stale stage; a stage from "
+              "a non-peer, past the cache or on a small scratch; a save of the wrong size, a restore of one half): %s\n",
+              gpu::kMaxWave + 8, gpu::kMaxRound + 1, bad ? "FAILED" : "all refused");
+  return bad;
+}
+
+/** Positions [0, n) of the layer's Latent rows, each from the share that holds it: the replicated layout. */
+std::vector<float> pair_rows(const std::vector<gpu::DeviceAttention>& share, int64_t n) {
+  constexpr size_t kRow = gpu::kKeyWidth * sizeof(__nv_bfloat16);
+  std::vector<__nv_bfloat16> all(static_cast<size_t>(n) * gpu::kKeyWidth);
+  for (int g = 0; g < 2; g++)
+    if (const auto run = glm53::owned_run(0, n, g); run.count > 0)
+      ck(cudaMemcpy2D(all.data() + static_cast<size_t>(run.first_position) * gpu::kKeyWidth, 2 * kRow,
+                      share[static_cast<size_t>(g)].cache_row(run.first_position), kRow, kRow,
+                      static_cast<size_t>(run.count), cudaMemcpyDeviceToHost),
+         "a half's rows");
+  return as_float(all);
+}
+
+/**
+ * Both halves of positions [0, n) saved, overwritten by a random past and restored: the number of
+ * rows' and index keys' values that came back different.
+ */
+size_t check_round_trip(std::vector<gpu::DeviceAttention>& share, int64_t n, bool full, std::mt19937& rng) {
+  const auto keys_of = [&](size_t g) {
+    return full ? as_float(download(share[g].index_key(0), static_cast<size_t>(n) * gpu::kIndexHeadDim)) : std::vector<float>{};
+  };
+  const auto rows = pair_rows(share, n);
+  const std::array<std::vector<float>, 2> keys{keys_of(0), keys_of(1)};
+  auto host = share[0].host_positions(n);
+  if (!host) die(host.error());
+  for (auto& s : share)
+    if (auto r = s.save_positions(host.value(), n, nullptr); !r) die(r.error());
+  const auto other = random_past(rng, n, full);
+  for (auto& s : share) {
+    if (auto r = s.load_cache(other); !r) die(r.error());
+    if (auto r = s.restore_positions(host.value(), n, nullptr); !r) die(r.error());
   }
-  if (att.attend(d_x, 1, 0, nullptr, small.value(), d_partial, nullptr)) {
-    std::fprintf(stderr, "  a scratch for a smaller cache: not refused\n");
-    bad++;
-  }
-  std::printf("scratch and wave refusals (waves of 0, 7, %d, no positions; %d tokens on a Round's scratch; a "
-              "smaller cache's scratch): %s\n", gpu::kMaxWave + 8, gpu::kMaxRound + 1, bad ? "FAILED" : "all refused");
+  size_t bad = compare_bits<float>("restored row", rows, pair_rows(share, n));
+  for (size_t g = 0; g < 2; g++) bad += compare_bits<float>("restored index key", keys[g], keys_of(g));
   return bad;
 }
 
@@ -803,7 +896,7 @@ bool check_layer(const glm53::Config& config, const io::BackboneParts& parts, in
   auto* d_mid = device_alloc<float>(R * H);
   auto* d_ffn = device_alloc<__nv_bfloat16>(R * H);
   auto* d_shared = device_alloc<int32_t>(R * gpu::kMaxSelection);
-  size_t bad = check_attend_refusals(d, share[0], kCapacity, d_x, d_partial[0]);
+  size_t bad = check_attend_refusals(d, share[0], share[1], kCapacity, d_x, d_partial[0]);
   // Calls (first position, tokens): decode tokens at the edges; Rounds of 8 that start in the cache,
   // cross index_topk (rows 0-3 keep every position, rows 4-7 select) and end at the capacity; waves of
   // 77 from 0 (every token keeps every position; the last Round a part one), of 200 from 1950 (Rounds
@@ -842,44 +935,64 @@ bool check_layer(const glm53::Config& config, const io::BackboneParts& parts, in
     if (!full)
       ck(cudaMemcpy(d_shared, shared_rows.data(), shared_rows.size() * sizeof(int32_t), cudaMemcpyHostToDevice),
          "shared");
-    // Both GPUs' shares: their partials, cache rows, index keys and Selections.
-    std::array<std::vector<float>, 2> partial;
-    std::array<glm53::LayerCache, 2> rows;
-    std::array<std::vector<std::vector<int32_t>>, 2> made;
-    for (int g = 0; g < 2; g++) {
-      if (auto r = share[g].load_cache(past); !r) die(r.error());
-      const auto sel = share[g].attend(d_x, tokens, first, full ? nullptr : &shared, w, d_partial[g], nullptr);
-      if (!sel) die(sel.error());
-      ck(cudaDeviceSynchronize(), "attend");
-      partial[g] = download(d_partial[g], T * H);
-      const auto r = as_float(download(share[g].cache_row(first), T * gpu::kKeyWidth));
-      for (size_t t = 0; t < T; t++) {
-        const auto row = r.begin() + static_cast<ptrdiff_t>(t * gpu::kKeyWidth);
-        rows[g].latent.insert(rows[g].latent.end(), row, row + gpu::kLatent);
-        rows[g].k_rope.insert(rows[g].k_rope.end(), row + gpu::kLatent, row + gpu::kKeyWidth);
-        made[g].push_back(download(sel.value().rows + t * sel.value().stride, static_cast<size_t>(sel.value().lengths[t])));
+    // Both halves of the past, before either share attends (each reads the other's).
+    for (auto& s : share)
+      if (auto r = s.load_cache(past); !r) die(r.error());
+    // Both GPUs' shares, each way the call can take its earlier rows: their partials, index keys and
+    // Selections; the cache rows, each from the share that holds it.
+    struct Made {
+      bool gathered;
+      std::array<std::vector<float>, 2> partial, keys;
+      std::array<std::vector<std::vector<int32_t>>, 2> selections;
+      glm53::LayerCache rows;
+    };
+    std::vector<Made> ways;
+    for (const bool gathered : tokens <= gpu::kMaxRound ? std::vector<bool>{true, false} : std::vector<bool>{false}) {
+      Made m{gathered, {}, {}, {}, {}};
+      for (size_t g = 0; g < 2; g++) {
+        const gpu::DeviceAttention& peer = share[1 - g];
+        if (!gathered)
+          if (auto r = share[g].stage(first, peer, w, nullptr); !r) die(r.error());
+        const auto sel = share[g].attend(d_x, tokens, first, full ? nullptr : &shared, source_of(gathered, peer), w,
+                                         d_partial[g], nullptr);
+        if (!sel) die(sel.error());
+        ck(cudaDeviceSynchronize(), "attend");
+        m.partial[g] = download(d_partial[g], T * H);
+        for (size_t t = 0; t < T; t++)
+          m.selections[g].push_back(
+              download(sel.value().rows + t * sel.value().stride, static_cast<size_t>(sel.value().lengths[t])));
+        if (full) m.keys[g] = as_float(download(share[g].index_key(first), T * gpu::kIndexHeadDim));
       }
-      if (full) rows[g].index_keys = as_float(download(share[g].index_key(first), T * gpu::kIndexHeadDim));
-      rows[g].length = tokens;
+      const auto all = pair_rows(share, first + tokens);
+      for (size_t t = 0; t < T; t++) {
+        const auto row = all.begin() + static_cast<ptrdiff_t>((static_cast<size_t>(first) + t) * gpu::kKeyWidth);
+        m.rows.latent.insert(m.rows.latent.end(), row, row + gpu::kLatent);
+        m.rows.k_rope.insert(m.rows.k_rope.end(), row + gpu::kLatent, row + gpu::kKeyWidth);
+      }
+      m.rows.index_keys = m.keys[0];
+      m.rows.length = tokens;
+      ways.push_back(std::move(m));
     }
-    const WaveOracle want = oracle_wave(a.value(), bound.value().input_norm, d.rms_eps, past, xs, rows[0], selections);
+    const WaveOracle want = oracle_wave(a.value(), bound.value().input_norm, d.rms_eps, past, xs, ways[0].rows, selections);
     size_t here = 0;
     const auto token_of = [&](const std::vector<float>& all, size_t t, size_t width) {
       return std::vector<float>(all.begin() + static_cast<ptrdiff_t>(t * width),
                                 all.begin() + static_cast<ptrdiff_t>((t + 1) * width));
     };
-    for (int g = 0; g < 2; g++)
+    for (const Made& m : ways)
       for (size_t t = 0; t < T; t++) {
         const auto& o = want.attend[t];
-        here += compare_bits<float>("partial", o.o.partial[g], token_of(partial[g], t, H));
-        here += compare_bits<float>("latent", o.row.latent, token_of(rows[g].latent, t, gpu::kLatent));
-        here += compare_bits<float>("k_rope", o.row.k_rope, token_of(rows[g].k_rope, t, gpu::kKeyRope));
-        if (full)
-          here += compare_bits<float>("index key", o.row.index_key, token_of(rows[g].index_keys, t, gpu::kIndexHeadDim));
-        if (made[g][t] != o.selection) {
-          here++;
-          std::fprintf(stderr, "  layer %d position %lld: the Selection differs (%zu vs %zu entries)\n", L,
-                       static_cast<long long>(first) + static_cast<long long>(t), made[g][t].size(), o.selection.size());
+        here += compare_bits<float>("latent", o.row.latent, token_of(m.rows.latent, t, gpu::kLatent));
+        here += compare_bits<float>("k_rope", o.row.k_rope, token_of(m.rows.k_rope, t, gpu::kKeyRope));
+        for (size_t g = 0; g < 2; g++) {
+          here += compare_bits<float>("partial", o.o.partial[g], token_of(m.partial[g], t, H));
+          if (full) here += compare_bits<float>("index key", o.row.index_key, token_of(m.keys[g], t, gpu::kIndexHeadDim));
+          if (m.selections[g][t] != o.selection) {
+            here++;
+            std::fprintf(stderr, "  layer %d position %lld (%s): the Selection differs (%zu vs %zu entries)\n", L,
+                         static_cast<long long>(first) + static_cast<long long>(t), m.gathered ? "gathered" : "staged",
+                         m.selections[g][t].size(), o.selection.size());
+          }
         }
       }
     const size_t n = T * H;
@@ -911,16 +1024,20 @@ bool check_layer(const glm53::Config& config, const io::BackboneParts& parts, in
       for (size_t t = 0; t < T; t++)
         here += compare_bits<float>("dense out", mlp_want[t].out, token_of(dense_out, t, H));
     }
-    std::printf("layer %2d (%s, %s) %s of %3d at %4lld: Selections %4zu .. %4zu, %zu differ\n", L,
-                full ? "Full" : "Shared", dense ? "Dense" : "Sparse", tokens <= gpu::kMaxRound ? "Round" : "wave ",
-                tokens, static_cast<long long>(first), want.attend.front().selection.size(),
-                want.attend.back().selection.size(), here);
+    const size_t restored = check_round_trip(share, first + tokens, full, rng);
+    std::printf("layer %2d (%s, %s) %s of %3d at %4lld (%s): Selections %4zu .. %4zu, %zu differ; save and restore of "
+                "both halves: %zu differ\n",
+                L, full ? "Full" : "Shared", dense ? "Dense" : "Sparse", tokens <= gpu::kMaxRound ? "Round" : "wave ",
+                tokens, static_cast<long long>(first), ways.size() == 2 ? "gathered, staged" : "staged",
+                want.attend.front().selection.size(), want.attend.back().selection.size(), here, restored);
     std::fflush(stdout);
-    bad += here;
+    bad += here + restored;
     if (iters > 0 && tokens == gpu::kMaxWave) {
       const gpu::Selections* sh = full ? nullptr : &shared;
-      const double rounds = time_attend(share[0], w, d.hidden, d_x, tokens, first, sh, d_partial[0], gpu::kMaxRound, iters);
-      const double wave = time_attend(share[0], w, d.hidden, d_x, tokens, first, sh, d_partial[0], gpu::kMaxWave, iters);
+      const double rounds =
+          time_attend(share[0], share[1], w, d.hidden, d_x, tokens, first, sh, d_partial[0], gpu::kMaxRound, iters);
+      const double wave =
+          time_attend(share[0], share[1], w, d.hidden, d_x, tokens, first, sh, d_partial[0], gpu::kMaxWave, iters);
       std::printf("layer %2d: %d tokens' attention, one GPU's share: in Rounds of 8 %.2f ms (%.1f us/token), "
                   "in a wave %.2f ms (%.1f us/token), %.2fx\n",
                   L, tokens, rounds, 1000.0 * rounds / tokens, wave, 1000.0 * wave / tokens, rounds / wave);

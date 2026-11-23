@@ -80,7 +80,8 @@ int main(int argc, char** argv) {
   if (!size) die(size.error().what);
   const auto reserve = static_cast<uint64_t>(reserve_gib * static_cast<double>(1ull << 30));
 
-  std::printf("cards %.2f GB (planned %.2f GB), runtime reserve %.2f GB, wave %d, Cohort %d, a Cache position %llu B per GPU\n",
+  std::printf("cards %.2f GB (planned %.2f GB), runtime reserve %.2f GB, wave %d, Cohort %d, a position's cache %llu B "
+              "(each GPU holds half its Latent rows, core/glm53/latent_split)\n",
               gb(vram), gb(g53::planned_card_bytes(vram)), gb(reserve), wave, size.value().tokens(),
               static_cast<unsigned long long>(g53::position_bytes(config.value())));
   std::printf("%10s %12s %12s %12s\n", "capacity", "Slots/layer", "claims GB", "unused GB");

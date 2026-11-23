@@ -59,3 +59,8 @@ the measured 92 → 74), the split frees 47,616 B a position:
 
 So after the split, 400K costs what 202,752 costs today, and 202,752 costs little. That makes
 the split the lever for long context; raising `CONTEXT` is the stopgap.
+
+**Built and measured the same day** (`docs/bench/glm53-split/2026-11-23-split-report.md`, branch
+`glm53/latent-split`): 86 Slots at 202,752 and 72 at 409,600 (51,488 B a position a GPU, the staged layer
+included), bit-identical to this engine. In the served shape at 202,752 decode gains +2% to +19% by
+conversation, +14% after a 39,200-token prompt; the gather costs 3.75 ms a token at full Selections.

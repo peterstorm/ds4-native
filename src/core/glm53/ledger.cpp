@@ -5,6 +5,7 @@
 #include <span>
 
 #include "core/glm53/exact_moe.hpp"
+#include "core/glm53/latent_split.hpp"
 #include "core/glm53/moe_plan.hpp"
 #include "core/glm53/store.hpp"
 #include "core/ledger.hpp"
@@ -105,7 +106,12 @@ Result<std::array<Claims, 2>, LedgerError> vram_claims(const Config& config, con
         + W * ih * ihd * kBf16 + W * ih * (kBf16 + kF32)                   // index_q_, head_w_bf16_, head_w_
         + rows8 * u(s.capacity) * kF32                                     // scores_: one Round's, every position
         + W * sel * kI32                                                   // selected_
-        + W * H * kF32 + 4 * W * inter * kF32 + W * (inter / 2) * kF32;    // mlp_x_, gate/up_sum_, hid_, ones_, hid_half_
+        + W * H * kF32 + 4 * W * inter * kF32 + W * (inter / 2) * kF32     // mlp_x_, gate/up_sum_, hid_, ones_, hid_half_
+        // The Latent split's: a Round's own rows, its selected rows gathered from both halves and their
+        // Selection remapped onto them; a sweep's layer staged whole, every position.
+        + rows8 * key_width * kBf16                                        // round_rows_
+        + rows8 * sel * (key_width * kBf16 + kI32)                         // gathered_, gathered_sel_
+        + u(s.capacity) * key_width * kBf16;                               // layer_rows_
 
     // Every layer: DeviceAttention::upload (weights and caches), then the Dense MLP or the Sparse layer's.
     const uint64_t kv_b_rows = u(d.nope + d.v_head);
@@ -113,7 +119,7 @@ Result<std::array<Claims, 2>, LedgerError> vram_claims(const Config& config, con
       uint64_t w = (Q * H + hpg * qk * Q + key_width * H + hpg * latent * u(d.nope) + hpg * kv_b_rows * latent +
                     H * o_half) * kBf16                                              // q_a, q_b, kv_a, W_k, kv_b, o
                    + (2 * H + Q + latent + u(d.rope / 2)) * kF32;                    // the norms, the RoPE table
-      uint64_t cache = u(s.capacity) * key_width * kBf16;                            // the Latent rows
+      uint64_t cache = u(latent_rows(s.capacity, static_cast<int>(g))) * key_width * kBf16;  // its half of the Latent rows
       if (config.indexer(L) == IndexerKind::Full) {
         w += (ih * ihd * Q + ihd * H + ih * H) * kBf16 + 2 * ihd * kF32;            // wq_b, wk, weights_proj, k_norm
         cache += u(s.capacity) * ihd * kBf16;                                        // the index keys

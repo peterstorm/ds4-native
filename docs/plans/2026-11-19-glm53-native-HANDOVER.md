@@ -361,6 +361,25 @@ An independent audit (python, read-only, against the index) found:
      - **Adopted and served** (owner: "go ahead with --defer 4"): dotfiles `70f446d3` on main
        (`DEFER=4`, `DS4N_COMMIT=1ceb9d49`), primary `uncensored-native` relaunched: 92 Slots, **8.50
        tok/s served** through Maya (four 300-token chats; 6.2–7.1 on 2026-11-21).
+   - **Served at 202,752 context, 2026-11-23** (owner: "i needed that upped"; report
+     `docs/bench/glm53-context/2026-11-23-context-cost.md`): `CONTEXT=202752` on the same engine, 74 Slots,
+     6.84 tok/s served (−19.5%); a 165,942-token prompt read in 6 min 10 s and answered correctly.
+   - **The Latent split, 2026-11-23** (owner: "do the latent split"; branch `glm53/latent-split` from
+     `e746d94`, worktree `~/dev/ds4-native-glm53-latent`; report
+     `docs/bench/glm53-split/2026-11-23-split-report.md`, receipts beside it):
+     - **Built:** `core/glm53/latent_split` (GPU 0 the even positions' Latent rows, GPU 1 the odd ones',
+       at index position / 2; index keys on both). `DeviceAttention::attend` takes a `RowSource`: a Round
+       gathers its selected rows from both halves into staging (`gather_selected`, the peer's over P2P);
+       a sweep stages each layer whole once per Cohort (`stage`, `stage_rows`). `split_kernel` reads the
+       replicated cache's bytes in its order. Checkpoints by halves into the replicated host layout.
+       The Ledger: 51,488 B a position a GPU (was 95,264).
+     - **Gates PASS:** attn-check (4 layer kinds, gathered and staged, save/restore, 13 refusals);
+       one λ 0 hash across Cohorts 16K / 512 (odd capacity) / `--prefill rounds`; at equal Slots the
+       gate-2 ids equal the base's and its `--check` PASS receipts; the served shape's 256 / 128 ids
+       equal the base's at 202,752; serve-check.
+     - **Slots:** 86 at 202,752 (was 74); **409,600 opens at 72** (the replicated layout: 48, refused).
+     - **Speed** (served shape, 202,752): +1.8% / +19% on two prompts, **+14% after a 39,200-token
+       prompt** (7.62 → 8.70); the gather costs 3.75 ms a token at full Selections.
    - **Next, in order:**
      1. **Owner's call:** push `glm53/counter-eviction`, then merge dotfiles `inference/glm53-speed`
         (moves `DS4N_COMMIT` to this branch's head; adds `EVICTION`, `RUNTIME_RESERVE_GIB`,
@@ -382,6 +401,10 @@ An independent audit (python, read-only, against the index) found:
      4. The second NVMe (`M.2_3`/`M.2_4`). MTP is deprioritized by the replay study.
      5. Merge `glm53/engine-core` into main once Phase 5 decides keep (DS4.1's sources are
         untouched on the branch).
+     6. **Owner's call: serve the Latent split.** Move `DS4N_COMMIT` to `glm53/latent-split`'s head,
+        `--install`, relaunch at `CONTEXT=202752` (86 Slots), and record the served speed. Raising
+        `CONTEXT` toward 409,600 (72 Slots, about what 202,752 cost before) is a second, separate call;
+        its quality under λ at 72 Slots is the λ study's to measure.
 
 ## Environment facts (the things that cost time to rediscover)
 
@@ -445,6 +468,10 @@ An independent audit (python, read-only, against the index) found:
   (McNemar), as KL is with `kl_paired.py`.
 - An oracle KL run with 2–4 streams takes ~70–145 s a layer alone on 32 threads (~1.5–3 h); two
   oracles at 16 threads each, or one beside a `--check` replay, ~100–300 s a layer.
+- **Bit-comparing a change that frees VRAM under λ needs `--slots-per-layer` pinned** to the base's
+  count: more Slots means more resident Experts, so λ routes differently by design (the Latent split's
+  first gate-2 differed at 98 vs 94 Slots; pinned, it matched). Prompt hashes are routed exactly and
+  compare without pinning.
 
 ## Doc map
 
@@ -453,7 +480,7 @@ An independent audit (python, read-only, against the index) found:
 | The plan (phases, decisions, budget of truth) | `ds4-native/docs/plans/2026-11-19-glm53-native.md` |
 | This handover | `ds4-native/docs/plans/2026-11-19-glm53-native-HANDOVER.md` |
 | Pinned GLM-5.3 reference + why | `ds4-native/ref/glm-5.3/README.md` |
-| GLM terms (Selection, Full/Shared layer, Latent row, Backbone part, Semantics oracle, Activation precision, Claim, Route margin) | `ds4-native/CONTEXT.md`, GLM-5.3 section |
+| GLM terms (Selection, Full/Shared layer, Latent row, Latent split, Backbone part, Semantics oracle, Activation precision, Claim, Route margin) | `ds4-native/CONTEXT.md`, GLM-5.3 section |
 | GLM-5.3 Reference configuration (MoE fixed; attention by operation) | `ds4-native/docs/design/glm53-reference-configuration.md` |
 | Speed trade-offs (decode and prefill cost model, levers) | `ds4-native/docs/research/2026-11-20-glm53-speed-tradeoffs.md` |
 | Findings reports (one per measurement: method, results, interpretation, receipts) | `ds4-native/docs/bench/glm53-*/*-report.md`: `glm53-oracle/2026-11-19-gpu-moe-report.md` (GPU MoE gate + departures KL), `glm53-chat/2026-11-20-chat-report.md` (first answers), `glm53-backbone-b/2026-11-20-backbone-b-report.md` (cyber Backbone), `glm53-locality/2026-11-20-locality-report.md` (Expert miss rate → decode speed), `glm53-cc/2026-11-20-cc-report.md` (cache-conditional routing), `glm53-slim/2026-11-20-slim-report.md` (pruning, λ 0.1, KL floor) |
@@ -467,6 +494,8 @@ An independent audit (python, read-only, against the index) found:
 | counter55 on the GPUs (λ 0 +4.4%; λ 0.03 +10% at KL 0.072 vs 0.068), the Cohort and Ledger GPU gates, the reserve recalibrated | `ds4-native/docs/bench/glm53-counter/2026-11-22-counter-report.md` (branch `glm53/counter-eviction`) |
 | Every speed lever at λ 0.03 (counter:55, the Slot profile, the reserve, λ 0.035/0.04; the paired KL test) | `ds4-native/docs/bench/glm53-counter/2026-11-22-frontier-report.md` (branch `glm53/counter-eviction`) |
 | Deferring Misses one Sparse layer (`--defer N`; the Loads rewrite; KL, top-1, speed at equal reads) | `ds4-native/docs/bench/glm53-defer/2026-11-23-defer-report.md` (branch `glm53/deferred-misses`) |
+| What a longer served context costs; served at 202,752 | `ds4-native/docs/bench/glm53-context/2026-11-23-context-cost.md` (branch `glm53/deferred-misses`) |
+| The Latent split (half the Latent rows a GPU, bit-identical; 86 Slots at 202,752, 409,600 opens) | `ds4-native/docs/bench/glm53-split/2026-11-23-split-report.md` (branch `glm53/latent-split`) |
 | GLM-5.3 ops runbook (primary `glm-native`) | `.dotfiles/scripts/inference/runbooks/glm53-native-runbook-2026-11-21.md` |
 | Hyperflare/GLM-Flash-uncensored story | `.dotfiles/scripts/inference/runbooks/glm53-flash-hyperflare-tp2-v16-runbook-2026-11-13.md` |
 

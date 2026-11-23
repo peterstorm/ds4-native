@@ -217,6 +217,7 @@ add_executable(ds4n_tests
   tests/core/glm53/test_ledger.cpp
   tests/core/glm53/test_slot_profile.cpp
   tests/core/glm53/test_deferral.cpp
+  tests/core/glm53/test_latent_split.cpp
   tests/core/test_meminfo.cpp
   tests/core/glm53/test_pruning.cpp
   tests/core/test_indexer.cpp

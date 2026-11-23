@@ -8,6 +8,7 @@
 #include <utility>
 #include <vector>
 
+#include "core/glm53/latent_split.hpp"
 #include "core/mx_reference.hpp"
 #include "cuda/glm53/attention.cuh"
 #include "cuda/glm53/indexer.cuh"
@@ -98,6 +99,8 @@ uint64_t bytes_of(const A&... a) {
 constexpr int kVHead = 256;  // v_head_dim
 constexpr int kPerHead = kNope + kVHead;  // kv_b rows per head: W_k, then W_v
 constexpr size_t kRows = kMaxRound;  // a Round's rows: the attention core's, the index scores', the head's
+constexpr size_t kRowBytes = kKeyWidth * sizeof(__nv_bfloat16);  // a Latent row
+constexpr size_t kKeyBytes = kIndexHeadDim * sizeof(__nv_bfloat16);  // an index key
 
 }  // namespace
 
@@ -148,6 +151,10 @@ Result<LayerScratch, std::string> LayerScratch::create(const g53::Dims& d, int w
     t.head_w_ = DeviceArray<float>(W * kIndexHeads);
     t.scores_ = DeviceArray<float>(kRows * static_cast<size_t>(capacity));
     t.selected_ = DeviceArray<int32_t>(W * kMaxSelection);
+    t.round_rows_ = DeviceArray<__nv_bfloat16>(kRows * kKeyWidth);
+    t.gathered_ = DeviceArray<__nv_bfloat16>(kRows * kMaxSelection * kKeyWidth);
+    t.gathered_sel_ = DeviceArray<int32_t>(kRows * kMaxSelection);
+    t.layer_rows_ = DeviceArray<__nv_bfloat16>(static_cast<size_t>(capacity) * kKeyWidth);
     const auto inter = static_cast<size_t>(d.intermediate);
     t.mlp_x_ = DeviceArray<float>(W * d.hidden);
     t.gate_sum_ = DeviceArray<float>(W * inter);
@@ -173,6 +180,7 @@ Result<DeviceAttention, std::string> DeviceAttention::upload(const exact::Attent
     DeviceAttention t;
     t.d_ = d;
     t.kind_ = a.indexer();
+    t.gpu_ = gpu;
     t.capacity_ = capacity;
     const auto& w = a.weights();
     const auto& at = w.attention;
@@ -194,7 +202,9 @@ Result<DeviceAttention, std::string> DeviceAttention::upload(const exact::Attent
     t.q_a_norm_ = f32_of(at.q_a_norm);
     t.kv_a_norm_ = f32_of(at.kv_a_norm);
     t.freqs_ = f32_of(a.freqs());
-    t.rows_ = DeviceArray<__nv_bfloat16>(static_cast<size_t>(capacity) * kKeyWidth);
+    // Its half of the Latent rows (none at all when it holds no position: the Ledger counts 0 B).
+    if (const int64_t mine_rows = g53::latent_rows(capacity, gpu); mine_rows > 0)
+      t.rows_ = DeviceArray<__nv_bfloat16>(static_cast<size_t>(mine_rows) * kKeyWidth);
     if (t.kind_ == g53::IndexerKind::Full) {
       const auto& ix = *at.indexer;
       t.wq_b_ = bf16_of(ix.wq_b.w, "indexer wq_b");
@@ -218,15 +228,20 @@ Result<int, std::string> DeviceAttention::load_cache(const g53::LayerCache& past
   if (kind_ == g53::IndexerKind::Full && past.index_keys.size() != n * kIndexHeadDim)
     return R::err("the cache's index keys do not match its length");
   try {
-    std::vector<float> rows(n * kKeyWidth);
-    for (size_t p = 0; p < n; p++) {
+    // This GPU's half: positions gpu, gpu + 2, ... at indices 0, 1, ... of its half
+    const g53::OwnedRun run = g53::owned_run(0, past.length, gpu_);
+    std::vector<float> rows(static_cast<size_t>(run.count) * kKeyWidth);
+    for (size_t i = 0; i < static_cast<size_t>(run.count); i++) {
+      const auto p = static_cast<size_t>(run.first_position) + 2 * i;
       std::copy_n(past.latent.begin() + static_cast<std::ptrdiff_t>(p * kLatent), kLatent,
-                  rows.begin() + static_cast<std::ptrdiff_t>(p * kKeyWidth));
+                  rows.begin() + static_cast<std::ptrdiff_t>(i * kKeyWidth));
       std::copy_n(past.k_rope.begin() + static_cast<std::ptrdiff_t>(p * kKeyRope), kKeyRope,
-                  rows.begin() + static_cast<std::ptrdiff_t>(p * kKeyWidth + kLatent));
+                  rows.begin() + static_cast<std::ptrdiff_t>(i * kKeyWidth + kLatent));
     }
-    const auto r = bf16_of(rows, "a cache row");
-    ck(cudaMemcpy(rows_.get(), r.get(), r.size() * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice), "load_cache");
+    if (!rows.empty()) {
+      const auto r = bf16_of(rows, "a cache row");
+      ck(cudaMemcpy(rows_.get(), r.get(), r.size() * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice), "load_cache");
+    }
     if (kind_ == g53::IndexerKind::Full) {
       const auto k = bf16_of(past.index_keys, "an index key");
       ck(cudaMemcpy(index_keys_.get(), k.get(), k.size() * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice),
@@ -238,9 +253,7 @@ Result<int, std::string> DeviceAttention::load_cache(const g53::LayerCache& past
   }
 }
 
-uint64_t DeviceAttention::position_bytes() const {
-  return (static_cast<uint64_t>(kKeyWidth) + (index_keys_.get() ? kIndexHeadDim : 0)) * sizeof(__nv_bfloat16);
-}
+uint64_t DeviceAttention::position_bytes() const { return kRowBytes + (index_keys_.get() ? kKeyBytes : 0); }
 
 uint64_t DeviceAttention::weight_bytes() const {
   return bytes_of(q_a_, q_b_, kv_a_, wk_t_, kv_b_, o_, wq_b_, wk_, weights_proj_, input_norm_, post_norm_, q_a_norm_,
@@ -251,8 +264,8 @@ uint64_t DeviceAttention::cache_bytes() const { return bytes_of(rows_, index_key
 
 uint64_t LayerScratch::bytes() const {
   return bytes_of(planes_, pos_, selected_, h_f32_, q_resid_f32_, heads_f32_, head_w_, scores_, m_, l_, o_part_, h_,
-                  q_a_out_, q_resid_, q_, ckv_, queries_, ctx_, heads_, index_q_, head_w_bf16_, mlp_x_, gate_sum_,
-                  up_sum_, hid_, hid_half_, ones_);
+                  q_a_out_, q_resid_, q_, ckv_, queries_, ctx_, heads_, index_q_, head_w_bf16_, round_rows_, gathered_,
+                  layer_rows_, gathered_sel_, mlp_x_, gate_sum_, up_sum_, hid_, hid_half_, ones_);
 }
 
 uint64_t DeviceDenseMlp::bytes() const { return bytes_of(gate_, up_, down_); }
@@ -261,25 +274,35 @@ uint64_t DeviceHead::weight_bytes() const { return bytes_of(head_, norm_); }
 
 uint64_t DeviceHead::scratch_bytes() const { return bytes_of(h_, h_f32_, planes_); }
 
-Result<HostPositions, std::string> DeviceAttention::save_positions(int64_t n, cudaStream_t s) const {
+Result<HostPositions, std::string> DeviceAttention::host_positions(int64_t n) const {
   using R = Result<HostPositions, std::string>;
   if (n < 0 || n > capacity_) return R::err("positions outside the cache");
+  HostPositions h;
+  h.positions_ = n;
+  const auto N = static_cast<size_t>(n);
+  // Pageable host memory: copied synchronously, and it does not take from the pinned RAM tier.
+  h.rows_ = std::make_unique_for_overwrite<std::byte[]>(std::max<size_t>(N * kRowBytes, 1));
+  if (index_keys_.get()) h.keys_ = std::make_unique_for_overwrite<std::byte[]>(std::max<size_t>(N * kKeyBytes, 1));
+  return R::ok(std::move(h));
+}
+
+Result<int64_t, std::string> DeviceAttention::save_positions(HostPositions& to, int64_t n, cudaStream_t s) const {
+  using R = Result<int64_t, std::string>;
+  if (n < 0 || n != to.positions_ || n > capacity_) return R::err("positions other than the host memory's, or outside the cache");
+  if ((to.keys_ != nullptr) != (index_keys_.get() != nullptr)) return R::err("host memory for a layer of another kind");
   try {
-    HostPositions h;
-    h.positions_ = n;
-    const auto N = static_cast<size_t>(n);
-    // Pageable host memory: copied synchronously, and it does not take from the pinned RAM tier.
-    h.rows_ = std::make_unique_for_overwrite<std::byte[]>(std::max<size_t>(N * kKeyWidth * sizeof(__nv_bfloat16), 1));
-    ck(cudaMemcpyAsync(h.rows_.get(), rows_.get(), N * kKeyWidth * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost, s),
-       "save rows");
-    if (index_keys_.get()) {
-      h.keys_ = std::make_unique_for_overwrite<std::byte[]>(std::max<size_t>(N * kIndexHeadDim * sizeof(__nv_bfloat16), 1));
-      ck(cudaMemcpyAsync(h.keys_.get(), index_keys_.get(), N * kIndexHeadDim * sizeof(__nv_bfloat16),
-                         cudaMemcpyDeviceToHost, s),
+    // This GPU's rows, indices 0 .. count - 1, to every other host row from its first position.
+    const g53::OwnedRun run = g53::owned_run(0, n, gpu_);
+    if (run.count > 0)
+      ck(cudaMemcpy2DAsync(to.rows_.get() + run.first_position * kRowBytes, 2 * kRowBytes, rows_.get(), kRowBytes,
+                           kRowBytes, static_cast<size_t>(run.count), cudaMemcpyDeviceToHost, s),
+         "save rows");
+    if (gpu_ == 0 && index_keys_.get())
+      ck(cudaMemcpyAsync(to.keys_.get(), index_keys_.get(), static_cast<size_t>(n) * kKeyBytes, cudaMemcpyDeviceToHost, s),
          "save index keys");
-    }
     ck(cudaStreamSynchronize(s), "save positions");
-    return R::ok(std::move(h));
+    to.saved_[static_cast<size_t>(gpu_)] = true;
+    return R::ok(n);
   } catch (const std::runtime_error& e) {
     return R::err(e.what());
   }
@@ -288,14 +311,16 @@ Result<HostPositions, std::string> DeviceAttention::save_positions(int64_t n, cu
 Result<int64_t, std::string> DeviceAttention::restore_positions(const HostPositions& from, int64_t n, cudaStream_t s) {
   using R = Result<int64_t, std::string>;
   if (n < 0 || n > from.positions_ || n > capacity_) return R::err("positions outside the saved ones or the cache");
+  if (!from.complete()) return R::err("a save holds both GPUs' halves before it restores");
   if ((from.keys_ != nullptr) != (index_keys_.get() != nullptr)) return R::err("saved from a layer of another kind");
   try {
-    const auto N = static_cast<size_t>(n);
-    ck(cudaMemcpyAsync(rows_.get(), from.rows_.get(), N * kKeyWidth * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice, s),
-       "restore rows");
+    const g53::OwnedRun run = g53::owned_run(0, n, gpu_);
+    if (run.count > 0)
+      ck(cudaMemcpy2DAsync(rows_.get(), kRowBytes, from.rows_.get() + run.first_position * kRowBytes, 2 * kRowBytes,
+                           kRowBytes, static_cast<size_t>(run.count), cudaMemcpyHostToDevice, s),
+         "restore rows");
     if (index_keys_.get())
-      ck(cudaMemcpyAsync(index_keys_.get(), from.keys_.get(), N * kIndexHeadDim * sizeof(__nv_bfloat16),
-                         cudaMemcpyHostToDevice, s),
+      ck(cudaMemcpyAsync(index_keys_.get(), from.keys_.get(), static_cast<size_t>(n) * kKeyBytes, cudaMemcpyHostToDevice, s),
          "restore index keys");
     ck(cudaStreamSynchronize(s), "restore positions");
     return R::ok(n);
@@ -304,21 +329,53 @@ Result<int64_t, std::string> DeviceAttention::restore_positions(const HostPositi
   }
 }
 
-const __nv_bfloat16* DeviceAttention::cache_row(int64_t p) const { return rows_.get() + p * kKeyWidth; }
+bool DeviceAttention::pairs_with(const DeviceAttention& peer) const {
+  return peer.gpu_ == 1 - gpu_ && peer.kind_ == kind_ && peer.capacity_ == capacity_ && peer.d_.hidden == d_.hidden &&
+         peer.d_.q_lora == d_.q_lora;
+}
+
+std::pair<const __nv_bfloat16*, const __nv_bfloat16*> DeviceAttention::halves(const DeviceAttention& peer) const {
+  return gpu_ == 0 ? std::pair{rows_.get(), peer.rows_.get()} : std::pair{peer.rows_.get(), rows_.get()};
+}
+
+Result<int64_t, std::string> DeviceAttention::stage(int64_t n, const DeviceAttention& peer, LayerScratch& w,
+                                                    cudaStream_t s) const {
+  using R = Result<int64_t, std::string>;
+  if (n < 0 || n > capacity_) return R::err("positions outside the cache");
+  if (w.capacity() < capacity_) return R::err("the scratch is sized for a smaller cache");
+  if (!pairs_with(peer)) return R::err("the peer is not this layer's other half");
+  const auto [even, odd] = halves(peer);
+  stage_rows(even, odd, n, w.layer_rows_.get(), s);
+  if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess) return R::err(std::string("stage: ") + cudaGetErrorString(e));
+  w.staged_for_ = this;
+  w.staged_until_ = n;
+  return R::ok(n);
+}
+
+const __nv_bfloat16* DeviceAttention::cache_row(int64_t p) const {
+  return g53::latent_owner(p) == gpu_ ? rows_.get() + g53::latent_index(p) * kKeyWidth : nullptr;
+}
 
 const __nv_bfloat16* DeviceAttention::index_key(int64_t p) const {
   return index_keys_.get() ? index_keys_.get() + p * kIndexHeadDim : nullptr;
 }
 
 Result<Selections, std::string> DeviceAttention::attend(const float* x, int tokens, int64_t first,
-                                                        const Selections* shared, LayerScratch& w, float* partial,
-                                                        cudaStream_t s) {
+                                                        const Selections* shared, RowSource source, LayerScratch& w,
+                                                        float* partial, cudaStream_t s) {
   using R = Result<Selections, std::string>;
   const g53::Dims& d = d_;
   if (tokens < 1 || tokens > w.wave())
     return R::err("a call takes 1 .. " + std::to_string(w.wave()) + " tokens (its scratch's wave)");
   if (w.capacity() < capacity_) return R::err("the scratch is sized for a smaller cache");
   if (first < 0 || first + tokens > capacity_) return R::err("the wave's positions are outside the cache");
+  const FromHalves* gather = std::get_if<FromHalves>(&source);
+  if (gather) {
+    if (tokens > kMaxRound) return R::err("a call that gathers its rows from both halves is a Round: 1 .. 8 tokens");
+    if (gather->peer == nullptr || !pairs_with(*gather->peer)) return R::err("the peer is not this layer's other half");
+  } else if (w.staged_for_ != this || w.staged_until_ != first) {
+    return R::err("the scratch does not hold this layer staged up to the wave's first position (stage() first)");
+  }
   if (kind_ == g53::IndexerKind::Shared) {
     if (shared == nullptr || shared->rows == nullptr || shared->lengths.size() != static_cast<size_t>(tokens))
       return R::err("a Shared layer needs the Full layer's Selections for these tokens");
@@ -341,15 +398,21 @@ Result<Selections, std::string> DeviceAttention::attend(const float* x, int toke
                 s);
     rope(w.q_.get(), tokens, kHeadsPerGpu, static_cast<size_t>(kHeadsPerGpu) * kQkHead, kQkHead, kNope, freqs_.get(),
          w.pos_.get(), s);
-    // The wave's cache rows, rmsnorm(latent) | RoPE(k_rope), straight into the cache, before any token attends.
+    // The wave's rows, rmsnorm(latent) | RoPE(k_rope), before any token attends: both GPUs make all of
+    // them, into the staged layer at their positions (a sweep) or the Round's rows; then this GPU's half
+    // of them into its cache, every other row at consecutive indices (core/glm53/latent_split).
     linear_bf16(kv_a_.get(), w.h_f32_.get(), kKeyWidth, d.hidden, tokens, w.planes_.get(), w.ckv_.get(), s);
-    __nv_bfloat16* rows = rows_.get() + first * kKeyWidth;
+    __nv_bfloat16* rows = gather ? w.round_rows_.get() : w.layer_rows_.get() + first * kKeyWidth;
     rmsnorm(w.ckv_.get(), kKeyWidth, kv_a_norm_.get(), kLatent, tokens, g53::kLatentNormEps, rows, kKeyWidth, s);
-    ck(cudaMemcpy2DAsync(rows + kLatent, kKeyWidth * sizeof(__nv_bfloat16), w.ckv_.get() + kLatent,
-                         kKeyWidth * sizeof(__nv_bfloat16), kKeyRope * sizeof(__nv_bfloat16), T,
-                         cudaMemcpyDeviceToDevice, s),
+    ck(cudaMemcpy2DAsync(rows + kLatent, kRowBytes, w.ckv_.get() + kLatent, kRowBytes, kKeyRope * sizeof(__nv_bfloat16),
+                         T, cudaMemcpyDeviceToDevice, s),
        "k_rope");
     rope(rows + kLatent, tokens, 1, kKeyWidth, kKeyRope, 0, freqs_.get(), w.pos_.get(), s);
+    if (const g53::OwnedRun run = g53::owned_run(first, tokens, gpu_); run.count > 0)
+      ck(cudaMemcpy2DAsync(rows_.get() + run.first_index * kKeyWidth, kRowBytes,
+                           rows + (run.first_position - first) * kKeyWidth, 2 * kRowBytes, kRowBytes,
+                           static_cast<size_t>(run.count), cudaMemcpyDeviceToDevice, s),
+         "the cache's half");
     // The Selections (A7): every token's index key (and, where any Round scores, index query and head
     // weights) at once, then a Round at a time, each Round deciding as a Round of its own would.
     Selections sel;
@@ -395,6 +458,8 @@ Result<Selections, std::string> DeviceAttention::attend(const float* x, int toke
       }
     }
     // MLA over the Selections a Round at a time, then W_v and this GPU's o_proj partials over the wave (A5, A6).
+    // A sweep's waves read the staged layer; a Round reads its selected rows gathered from both halves,
+    // at remapped Selection entries: the same bytes in the same order either way.
     absorbed_queries(w.q_.get(), wk_t_.get(), tokens, w.queries_.get(), s);
     const float scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(kQkHead)));
     const LatentScratch core{w.m_.get(), w.l_.get(), w.o_part_.get()};
@@ -402,11 +467,26 @@ Result<Selections, std::string> DeviceAttention::attend(const float* x, int toke
       const int n = std::min(kMaxRound, tokens - r);
       const auto lengths = sel.lengths.begin() + r;
       const int longest = *std::max_element(lengths, lengths + n);
-      ck(latent_attention(w.queries_.get() + static_cast<size_t>(r) * kHeadsPerGpu * kKeyWidth, rows_.get(),
-                          sel.rows + static_cast<size_t>(r) * sel.stride, longest, sel.stride, n, scale, core,
-                          w.ctx_.get() + static_cast<size_t>(r) * kHeadsPerGpu * kLatent, s),
+      const int32_t* selection = sel.rows + static_cast<size_t>(r) * sel.stride;
+      const __nv_bfloat16* cache = w.layer_rows_.get();
+      if (gather) {
+        const auto [even, odd] = halves(*gather->peer);
+        ck(gather_selected(selection, longest, sel.stride, n, first, w.round_rows_.get(), even, odd, w.gathered_.get(),
+                           w.gathered_sel_.get(), s),
+           "gather_selected");
+        cache = w.gathered_.get();
+        selection = w.gathered_sel_.get();
+      }
+      ck(latent_attention(w.queries_.get() + static_cast<size_t>(r) * kHeadsPerGpu * kKeyWidth, cache, selection,
+                          longest, sel.stride, n, scale, core, w.ctx_.get() + static_cast<size_t>(r) * kHeadsPerGpu * kLatent,
+                          s),
          "latent_attention");
     }
+    // A sweep's stage now reaches past the wave; a Round wrote rows under any stage of this layer: drop it.
+    if (!gather)
+      w.staged_until_ = first + tokens;
+    else if (w.staged_for_ == this)
+      w.staged_for_ = nullptr;
     head_gemv(kv_b_.get() + static_cast<size_t>(kNope) * kLatent, static_cast<size_t>(kPerHead) * kLatent, kVHead,
               kLatent, w.ctx_.get(), kLatent, tokens, w.heads_.get(), kVHead, s);
     bf16_to_f32(w.heads_.get(), T * kHeadsPerGpu * kVHead, w.heads_f32_.get(), s);
