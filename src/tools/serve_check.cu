@@ -10,8 +10,8 @@
 //                    [--timing FILE] [--long FILE,FILE,... [--long-tokens N]] [--lanes N] [--sweep-slots N] [--round-graphs-mb N]
 //                    [--split-min N] [--replica-depth N]
 //
-// --store S,S,...: Store replicas, as ds4n-serve takes them: every scenario reads through them, and
-// --expect against a dump made with one store shows replicas change no bit.
+// --store S,S,... (or --store repeated): Store replicas, as ds4n-serve takes them: every scenario
+// reads through them, and --expect against a dump made with one store shows replicas change no bit.
 // FILE (--tokens) is an antirez --dump-tokens prompt (ids on the first line); --system a long one
 // whose first 3,000 tokens stand for a system prompt that several conversations share. --expect
 // compares the greedy reply with a ds4n-model-run dump of the same prompt (its steps' selected ids).
@@ -201,7 +201,7 @@ int main(int argc, char** argv) {
     if (i + 1 >= argc) die("missing value for " + a);
     const std::string v = argv[++i];
     if (a == "--backbone") mc.backbone = v;
-    else if (a == "--store") mc.stores = replicas::paths_named(v);
+    else if (a == "--store") mc.stores = replicas::paths_named(v, std::move(mc.stores));
     else if (a == "--replica-depth") mc.replica_depth = static_cast<uint32_t>(std::stoul(v));
     else if (a == "--gguf") mc.gguf = v;
     else if (a == "--dspark") mc.dspark = v;

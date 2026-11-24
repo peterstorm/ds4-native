@@ -19,9 +19,9 @@ namespace fs = std::filesystem;
 
 namespace {
 
-/** A DS4.1 store: this build's header, then one record of random bytes (the rest of the file sparse). */
-std::string make_store(const fs::path& dir, std::mt19937& rng) {
-  const auto path = (dir / "experts.ds4n").string();
+/** A DS4.1 store named `name`: this build's header, then one record of random bytes. */
+std::string make_store(const fs::path& dir, std::mt19937& rng, const std::string& name = "experts.ds4n") {
+  const auto path = (dir / name).string();
   { std::ofstream create(path, std::ios::binary); }
   fs::resize_file(path, store::kHeaderBytes + store::kRecordStride);
   write_at(path, 0, store::encode_header(store::current_header("test")));
@@ -138,6 +138,53 @@ TEST_CASE("a ReplicaReader lands every read once with its bytes, from whichever 
     }
 }
 
+TEST_CASE("a ReplicaReader reads each read from the replica it sent it to") {
+  // Replicas of different bytes (a ReplicaReader does not check them; open_replicas would refuse):
+  // every landed read must match exactly one file, and the reads matching each file are the ones
+  // served() credits to it.
+  TempDir dir;
+  std::mt19937 rng(71);
+  std::vector<std::string> paths;
+  std::vector<std::vector<std::byte>> files;
+  for (int k = 0; k < 3; k++) {
+    paths.push_back(make_store(dir.path, rng, "replica" + std::to_string(k) + ".ds4n"));
+    const uint64_t size = fs::file_size(paths.back());
+    files.emplace_back(size);
+    std::ifstream(paths.back(), std::ios::binary)
+        .read(reinterpret_cast<char*>(files.back().data()), static_cast<std::streamsize>(size));
+  }
+  const uint64_t size = files[0].size();
+  for (const uint32_t depth : {1u, 3u, 8u})
+    for (const size_t replicas : {size_t{2}, size_t{3}}) {
+      CAPTURE(depth);
+      CAPTURE(replicas);
+      auto reader = io::ReplicaReader::create(fds_of({paths.begin(), paths.begin() + static_cast<std::ptrdiff_t>(replicas)}),
+                                              depth, 64, false);
+      REQUIRE(reader.is_ok());
+      std::vector<uint64_t> from(replicas, 0);
+      for (int batch = 0; batch < 5; batch++) {
+        std::vector<std::vector<std::byte>> buffers;
+        // Past the header: the files differ only in their records.
+        std::vector<io::StoreRead> reads = random_reads(1 + rng() % 40, 4096, size - store::kHeaderBytes, buffers, rng);
+        for (auto& r : reads) r.offset += store::kHeaderBytes;
+        REQUIRE(reader.value().read(reads, [](size_t) {}).is_ok());
+        for (size_t i = 0; i < reads.size(); i++) {
+          int matches = 0;
+          for (size_t k = 0; k < replicas; k++) {
+            const auto at = files[k].begin() + static_cast<std::ptrdiff_t>(reads[i].offset);
+            if (std::equal(buffers[i].begin(), buffers[i].end(), at)) {
+              matches++;
+              from[k]++;
+            }
+          }
+          CHECK(matches == 1);
+        }
+      }
+      const auto served = reader.value().served();
+      CHECK(std::vector<uint64_t>(served.begin(), served.end()) == from);
+    }
+}
+
 TEST_CASE("a ReplicaReader refuses what it cannot read") {
   TempDir dir;
   std::mt19937 rng(67);
@@ -166,5 +213,19 @@ TEST_CASE("a ReplicaReader refuses what it cannot read") {
     int count = 0;
     CHECK(reader.read(next, [&](size_t) { count++; }).is_ok());
     CHECK(count == 4);
+  }
+  SUBCASE("once a read fails nothing more is sent, and the error names the replica") {
+    // Depth 1 over two replicas: reads 0 and 1 go out first, one to each, and both fail; the other
+    // eight could only go out after a completion, which is a failure, so none is ever sent.
+    auto one_deep = io::ReplicaReader::create(fds_of({store, store}), 1, 16, false).value();
+    auto reads = random_reads(10, 4096, size, buffers, rng);
+    reads[0].offset = reads[1].offset = size;  // read 0 bytes
+    std::vector<int> landed(reads.size(), 0);
+    const auto failed = one_deep.read(reads, [&](size_t i) { landed[i]++; });
+    REQUIRE_FALSE(failed.is_ok());
+    CHECK(failed.error().what.find("Expert store replica ") != std::string::npos);
+    CHECK(failed.error().what.find(" (of 2, in --store order from 0)") != std::string::npos);
+    for (int n : landed) CHECK(n == 0);
+    for (uint64_t n : one_deep.served()) CHECK(n == 0);
   }
 }

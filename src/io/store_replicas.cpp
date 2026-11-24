@@ -62,7 +62,6 @@ ReplicaReader::ReplicaReader(std::vector<Fd> replicas, UringReader reader, uint3
       reader_(std::move(reader)),
       depth_(depth),
       queue_depth_(queue_depth),
-      in_flight_(replicas_.size(), 0),
       served_(replicas_.size(), 0) {}
 
 Result<ReplicaReader, IoError> ReplicaReader::create(std::vector<Fd> replicas, uint32_t depth, unsigned queue_depth,
@@ -86,41 +85,39 @@ Result<bool, IoError> ReplicaReader::read(std::span<const StoreRead> reads, cons
   if (reads.size() > queue_depth_)
     return R::err(IoError{"a batch of " + std::to_string(reads.size()) + " reads is more than the reader's " +
                           std::to_string(queue_depth_)});
-  replica_of_.assign(reads.size(), 0);
-  size_t sent = 0, done = 0;
-  std::optional<IoError> failure;  // once set, nothing more is sent; what is in flight still lands
+  replicas::Spread spread(reads.size(), replicas_.size(), depth_);
+  // Set once, where the Spread fails (a refused submit or its Fail): a failed Spread sends nothing
+  // more and returns no second Fail, so neither branch below can find it already set.
+  std::optional<IoError> failure;
   std::vector<ReadRequest> batch;
-  for (;;) {
-    batch.clear();
-    while (!failure && sent < reads.size()) {
-      const auto r = replicas::next_replica(in_flight_, depth_);
-      if (!r) break;
-      batch.push_back({replicas_[*r].get(), reads[sent].offset, reads[sent].dest, sent});
-      replica_of_[sent] = static_cast<uint32_t>(*r);
-      in_flight_[*r]++;
-      sent++;
-    }
-    if (!batch.empty())
+  while (!spread.settled()) {
+    const auto sends = spread.send();
+    if (!sends.empty()) {
+      batch.clear();
+      for (const replicas::Send& s : sends)
+        batch.push_back({replicas_[s.replica].get(), reads[s.read].offset, reads[s.read].dest, s.read});
       if (auto s = reader_.submit(batch); !s) {  // none of the batch went out
-        for (const ReadRequest& q : batch) in_flight_[replica_of_[q.tag]]--;
-        sent -= batch.size();
+        spread.refuse(sends);
         failure = std::move(s).error();
+        continue;
       }
-    if (done == sent) break;
+    }
     auto completions = reader_.wait(1);
     if (!completions) return R::err(std::move(completions).error());  // the ring itself failed: nothing more lands
     for (const Completion& c : completions.value()) {
       const auto i = static_cast<size_t>(c.tag);
-      in_flight_[replica_of_[i]]--;
-      done++;
-      if (c.result != static_cast<int32_t>(reads[i].dest.size())) {
-        if (!failure)
-          failure = IoError{"Expert store: short or failed read (" + std::to_string(c.result) + " of " +
+      const size_t r = spread.replica_of(i);
+      const bool whole = c.result == static_cast<int32_t>(reads[i].dest.size());
+      if (whole) served_[r]++;
+      switch (spread.complete(i, whole)) {
+        case replicas::Landing::Land: landed(i); break;
+        case replicas::Landing::Fail:
+          failure = IoError{"Expert store replica " + std::to_string(r) + " (of " + std::to_string(replicas_.size()) +
+                            ", in --store order from 0): short or failed read (" + std::to_string(c.result) + " of " +
                             std::to_string(reads[i].dest.size()) + " bytes at " + std::to_string(reads[i].offset) + ")"};
-        continue;
+          break;
+        case replicas::Landing::Drop: break;
       }
-      served_[replica_of_[i]]++;
-      if (!failure) landed(i);
     }
   }
   if (failure) return R::err(std::move(*failure));

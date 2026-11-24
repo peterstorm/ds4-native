@@ -7,8 +7,9 @@
 //                  [--access-log FILE] [--vram-policy lru|picks] [--hints 0|1] [--dspark DIR [--verify-rows N]]
 //                  [--replica-depth N]
 //
-// Several --store paths are Store replicas, one per drive (core/store_replicas): the Misses read through
-// them, each at most --replica-depth reads deep (default 16), and each prompt reports how its reads split.
+// Several --store paths (comma separated, or --store repeated) are Store replicas, one per drive
+// (core/store_replicas): the Misses read through them, each at most --replica-depth reads deep
+// (default 16), and each prompt reports how its reads split.
 // For each name, DIR/<name>.tokens is antirez's --dump-tokens output (ids on the first line). The
 // prompt runs from position 0 as a prompt sweep (engine::Decoder::prefill: chunks of up to N Rounds
 // of 8 rows, each chunk layer by layer; --sweep, default 8192: a 64K-token chunk)
@@ -169,7 +170,7 @@ int main(int argc, char** argv) {
     const std::string s = argv[i];
     if (i + 1 >= argc) die("missing value for " + s);
     if (s == "--backbone") backbone_path = argv[++i];
-    else if (s == "--store") store_paths = replicas::paths_named(argv[++i]);
+    else if (s == "--store") store_paths = replicas::paths_named(argv[++i], std::move(store_paths));
     else if (s == "--gguf") gguf_path = argv[++i];
     else if (s == "--tokens") tokens_dir = argv[++i];
     else if (s == "--names") names_arg = argv[++i];

@@ -8,9 +8,9 @@
 //              [--sweep-min N] [--checkpoint-gb G] [--keep-min N] [--split-min N] [--stops 1,128803]
 //              [--sweep-slots N] [--round-graphs-mb N] [--replica-depth N]
 //
-// --store S,S,...: Store replicas, copies of the Expert store on separate drives; a step's reads
-// spread over them, the faster drive taking more (--replica-depth N, default 16: each replica's
-// reads in flight at most).
+// --store S,S,... (or --store repeated): Store replicas, copies of the Expert store on separate
+// drives; a step's reads spread over them, the faster drive taking more (--replica-depth N, default
+// 16: each replica's reads in flight at most).
 // --sweep-slots N (default 512, at least 384): the Slots prompt sweeps load into, VRAM that --slots
 // cannot use; fewer of them leave room for that many more --slots.
 // --round-graphs-mb N (default 512): the device memory a GPU's captured Round graphs may hold
@@ -166,7 +166,7 @@ int main(int argc, char** argv) {
     if (i + 1 >= argc) die("missing value for " + a);
     const std::string v = argv[++i];
     if (a == "--backbone") mc.backbone = v;
-    else if (a == "--store") mc.stores = replicas::paths_named(v);
+    else if (a == "--store") mc.stores = replicas::paths_named(v, std::move(mc.stores));
     else if (a == "--replica-depth") mc.replica_depth = static_cast<uint32_t>(std::stoul(v));
     else if (a == "--gguf") mc.gguf = v;
     else if (a == "--dspark") mc.dspark = v;

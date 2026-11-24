@@ -8,7 +8,8 @@
 //                     [--ram-per-layer R|auto] [--ram-reserve-gib G] [--read-ahead SHARE]
 //                     [--prefill sweep|rounds] [--wave W] [--cohort K] [--capacity C] [--devices A,B]
 //                     [--threads T] [--then "ID ID ..."] [--logits-hash] [--check]
-// --store takes replicas of one store, one per drive (the decoder spreads its reads over them).
+// --store takes replicas of one store, one per drive, comma separated or --store repeated (the decoder
+// spreads its reads over them).
 // --prompt-file reads the ids (whitespace-separated) from FILE: a prompt past ~20K tokens is longer
 // than one command-line argument may be (Linux's MAX_ARG_STRLEN, 128 KiB).
 // The Slots are the Ledger's (core/glm53/ledger; ds4n-glm53-ledger prints them without a GPU): the
@@ -132,8 +133,7 @@ Args parse(int argc, char** argv) {
     const std::string v = argv[++i];
     if (k == "--config") a.config = v;
     else if (k == "--backbone") a.backbone = v;
-    else if (k == "--store")
-      for (std::string& path : replicas::paths_named(v)) a.stores.push_back(std::move(path));
+    else if (k == "--store") a.stores = replicas::paths_named(v, std::move(a.stores));
     else if (k == "--generate") a.generate = std::stoi(v);
     else if (k == "--prefill") a.prefill = v;
     else if (k == "--round") a.round = std::stoi(v);

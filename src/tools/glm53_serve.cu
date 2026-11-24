@@ -154,8 +154,7 @@ int main(int argc, char** argv) {
     const std::string v = argv[++i];
     if (a == "--config") config_path = v;
     else if (a == "--backbone") backbone = v;
-    else if (a == "--store")
-      for (std::string& p : replicas::paths_named(v)) stores.push_back(std::move(p));
+    else if (a == "--store") stores = replicas::paths_named(v, std::move(stores));  // repeated: more replicas
     else if (a == "--max-context") dc.capacity = std::stoi(v);
     else if (a == "--lambda") dc.route_bonus = std::stof(v);
     else if (a == "--eviction") {

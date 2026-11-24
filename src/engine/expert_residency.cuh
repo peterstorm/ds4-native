@@ -97,11 +97,11 @@ struct ResidencyConfig {
   uint32_t sweep_slots = 512;
   // With two or more Store replicas, the 1 MiB reads each has in flight at most: the drive that
   // finishes sooner takes the next, so a faster drive serves more of a step with several Misses (a
-  // lone Miss's 18 reads split 9 / 9). 16: the depth at which 1 MiB reads reach the 9100 PRO's
-  // full bandwidth (fio; docs/design/serving.md, Store replicas); shallower starves a drive. One replica takes a
-  // step's reads all at once, as a single drive always did.
-  uint32_t replica_depth = kReplicaDepth;
+  // lone Miss's 18 reads split 9 / 9). 16: 1 MiB reads at that depth reach the 9100 PRO's full
+  // bandwidth (fio, docs/research/2026-11-23-receipts/io-fio.txt; docs/design/serving.md, Store
+  // replicas). One replica takes a step's reads all at once, as a single drive always did.
   static constexpr uint32_t kReplicaDepth = 16;
+  uint32_t replica_depth = kReplicaDepth;
 };
 
 /** Counters since open(); a Hit is a needed Expert found in a VRAM Slot. */

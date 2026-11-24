@@ -24,7 +24,7 @@ The file(s) holding every Expert record, read with direct I/O.
 _Avoid_: model file, pack
 
 **Store replica**:
-A copy of the Expert store on a drive of its own (`--store A,B`), checked against the first: same header, size and sampled pages (`io::open_replicas`). Reads spread over the replicas, each going to the one with fewest reads in flight (`replicas::next_replica`). On DS4.1 each replica holds at most `--replica-depth` reads (`io::ReplicaReader`), so the faster drive takes more; GLM-5.3 issues a layer's Halves at once, which alternates them.
+A copy of the Expert store on a drive of its own (`--store A,B`, or `--store` repeated), checked against the first: same header, size and sampled pages (`io::open_replicas`). Reads spread over the replicas, each going to the one with fewest reads in flight (`replicas::next_replica`). On DS4.1 each replica holds at most `--replica-depth` reads, a batch going out as `replicas::Spread` decides (read by `io::ReplicaReader`), so the faster drive takes more; GLM-5.3 issues a layer's Halves at once, which alternates them.
 _Avoid_: mirror (ZFS's word for its own redundancy), stripe (each replica holds every Expert record)
 
 **Backbone**:

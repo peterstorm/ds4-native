@@ -155,6 +155,8 @@ struct ExpertResidency::State {
   void publish(std::span<const cache::Load> loads);
   /** A resident key's Slot in pool numbering. */
   uint32_t slot_of(cache::ExpertKey key) const;
+  /** The 1 MiB reads each Store replica served so far; under `placement` (or before the service starts). */
+  std::vector<uint64_t> replica_reads() const { return {reader.served().begin(), reader.served().end()}; }
   // Held by the service around each step and by place(): the caches, the reader and the copy
   // streams have one user at a time.
   std::mutex placement;
@@ -432,7 +434,7 @@ void ExpertResidency::State::serve() {
       std::vector<uint64_t> served;
       {
         std::lock_guard placing(placement);
-        served.assign(reader.served().begin(), reader.served().end());
+        served = replica_reads();
       }
       std::lock_guard lock(mutex);
       stats.replica_reads = std::move(served);
@@ -552,7 +554,7 @@ std::unique_ptr<ExpertResidency> ExpertResidency::open(const ResidencyConfig& co
   *s->mailbox = {};
   *s->board = {};
   s->stats.warm_ms = ms_since(t0);
-  s->stats.replica_reads.assign(s->reader.served().begin(), s->reader.served().end());
+  s->stats.replica_reads = s->replica_reads();
 
   for (int g = 0; g < 2; g++) {
     engine::check(cudaSetDevice(config.devices[g]), "cudaSetDevice");
@@ -606,7 +608,7 @@ std::vector<uint32_t> ExpertResidency::place(int layer, std::span<const int32_t>
       counts.exposed_ms += ms_since(t0);
     }
     for (const cache::ExpertKey k : keys) slots.push_back(s.slot_of(k));
-    served.assign(s.reader.served().begin(), s.reader.served().end());
+    served = s.replica_reads();
   }
   std::lock_guard lock(s.mutex);
   s.stats.replica_reads = std::move(served);

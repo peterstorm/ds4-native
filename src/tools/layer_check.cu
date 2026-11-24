@@ -20,8 +20,9 @@
 // The decoder's Experts come through engine::ExpertResidency: by default a Slot for every Expert the
 // steps can touch (at most 8,000); --slots N --ram-records R set the VRAM Slots and RAM tier records,
 // Misses read from the store. Outputs must not change with N (the Slot-count invariance gate); the
-// Hit, RAM and store counts are reported. Several --store paths are Store replicas: the Misses read
-// through them (outputs must not change with them either); the oracle reads the first.
+// Hit, RAM and store counts are reported. Several --store paths (comma separated, or --store
+// repeated) are Store replicas: the Misses read through them (outputs must not change with them
+// either); the oracle reads the first.
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -122,7 +123,7 @@ int main(int argc, char** argv) {
     const std::string s = argv[i];
     if (i + 1 >= argc) die("missing value for " + s);
     if (s == "--backbone") backbone_path = argv[++i];
-    else if (s == "--store") store_paths = replicas::paths_named(argv[++i]);
+    else if (s == "--store") store_paths = replicas::paths_named(argv[++i], std::move(store_paths));
     else if (s == "--layers") layers = std::stoi(argv[++i]);
     else if (s == "--steps") steps = std::stoi(argv[++i]);
     else if (s == "--first") first = std::stoi(argv[++i]);

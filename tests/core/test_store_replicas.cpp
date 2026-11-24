@@ -86,12 +86,134 @@ TEST_CASE("under a depth limit no replica exceeds it, and a faster drive takes m
   }
 }
 
+namespace {
+
+/** What a Spread did to one batch under a random ring: completions in random order, some short, some sends refused. */
+struct Trace {
+  std::vector<int> sent, landed;  // per read: times sent (net of refusals), times landed
+  int fails = 0;
+  bool refused = false;
+  size_t landed_after_failure = 0, sent_after_failure = 0;
+};
+
+Trace run_batch(size_t reads, size_t replicas, uint32_t depth, double short_rate, double refuse_rate, std::mt19937& rng) {
+  Spread spread(reads, replicas, depth);
+  Trace t;
+  t.sent.assign(reads, 0);
+  t.landed.assign(reads, 0);
+  std::bernoulli_distribution is_short(short_rate), is_refused(refuse_rate);
+  std::vector<size_t> ring;  // reads in flight, completing in any order
+  size_t next_read = 0;
+  int guard = 0;
+  while (!spread.settled()) {
+    REQUIRE(++guard < 100000);
+    const bool failed_before = spread.failed();
+    const auto sends = spread.send();
+    if (failed_before) t.sent_after_failure += sends.size();
+    for (const Send& s : sends) {
+      REQUIRE(s.read == next_read++);  // in order, each once
+      REQUIRE(s.replica < replicas);
+      CHECK(spread.replica_of(s.read) == s.replica);
+      t.sent[s.read]++;
+    }
+    for (size_t r = 0; r < replicas; r++) REQUIRE(spread.in_flight()[r] <= depth);  // the bound, always
+    if (!sends.empty() && is_refused(rng)) {
+      spread.refuse(sends);
+      for (const Send& s : sends) t.sent[s.read]--;
+      next_read -= sends.size();
+      t.refused = true;
+      CHECK(spread.failed());
+      continue;
+    }
+    for (const Send& s : sends) ring.push_back(s.read);
+    REQUIRE_FALSE(ring.empty());  // not settled: something is in flight to complete
+    std::uniform_int_distribution<size_t> pick(0, ring.size() - 1);
+    const size_t k = pick(rng);
+    const size_t read = ring[k];
+    ring.erase(ring.begin() + static_cast<std::ptrdiff_t>(k));
+    const bool failed = spread.failed();
+    switch (spread.complete(read, !is_short(rng))) {
+      case Landing::Land:
+        t.landed[read]++;
+        if (failed) t.landed_after_failure++;
+        break;
+      case Landing::Fail: t.fails++; break;
+      case Landing::Drop: break;
+    }
+  }
+  CHECK(ring.empty());
+  for (uint32_t n : spread.in_flight()) CHECK(n == 0);
+  return t;
+}
+
+}  // namespace
+
+TEST_CASE("a Spread sends each read once, in order, never past the depth, and lands every read of a whole batch") {
+  std::mt19937 rng(17);
+  std::uniform_int_distribution<size_t> reads(0, 60), replicas(1, 4);
+  std::uniform_int_distribution<uint32_t> depths(1, 8);
+  for (int trial = 0; trial < 3000; trial++) {
+    const size_t n = reads(rng), r = replicas(rng);
+    const uint32_t depth = trial % 5 == 0 ? kUnlimited : depths(rng);
+    const Trace t = run_batch(n, r, depth, 0.0, 0.0, rng);
+    CHECK(t.fails == 0);
+    for (size_t i = 0; i < n; i++) {
+      CHECK(t.sent[i] == 1);
+      CHECK(t.landed[i] == 1);
+    }
+  }
+}
+
+TEST_CASE("after a Spread fails nothing more is sent or landed, and what was in flight still completes") {
+  std::mt19937 rng(19);
+  std::uniform_int_distribution<size_t> reads(1, 60), replicas(1, 4);
+  std::uniform_int_distribution<uint32_t> depths(1, 8);
+  for (int trial = 0; trial < 3000; trial++) {
+    const size_t n = reads(rng), r = replicas(rng);
+    const uint32_t depth = trial % 5 == 0 ? kUnlimited : depths(rng);
+    const Trace t = run_batch(n, r, depth, 0.1, 0.05, rng);
+    CHECK(t.sent_after_failure == 0);
+    CHECK(t.landed_after_failure == 0);
+    CHECK(t.fails <= 1);                            // one first failure at most
+    if (t.refused) CHECK(t.fails == 0);             // a refused send is the failure; no short read after it is
+    for (size_t i = 0; i < n; i++) {
+      CHECK(t.sent[i] <= 1);
+      CHECK(t.landed[i] <= t.sent[i]);
+    }
+  }
+}
+
+TEST_CASE("a Spread refuses what breaks its protocol") {
+  CHECK_THROWS(Spread(4, 0, 1));
+  CHECK_THROWS(Spread(4, 2, 0));
+  Spread spread(4, 2, 1);
+  const auto first = spread.send();
+  REQUIRE(first.size() == 2);  // one per replica at depth 1
+  CHECK(spread.send().empty());  // both full
+  CHECK_THROWS(spread.complete(3, true));  // never sent
+  CHECK(spread.complete(first[0].read, true) == Landing::Land);
+  CHECK_THROWS(spread.complete(first[0].read, true));  // completed twice
+  const auto second = spread.send();
+  REQUIRE(second.size() == 1);
+  CHECK_THROWS(spread.refuse(first));  // not the last sent
+  spread.refuse(second);
+  CHECK(spread.failed());
+  CHECK(spread.send().empty());
+  CHECK_FALSE(spread.settled());  // first[1] still in flight
+  CHECK(spread.complete(first[1].read, true) == Landing::Drop);
+  CHECK(spread.settled());
+  CHECK(Spread(0, 1, 1).settled());
+}
+
 TEST_CASE("the replicas a command line names: split at commas, empty entries dropped") {
   CHECK(paths_named("") == std::vector<std::string>{});
   CHECK(paths_named("/a/experts.ds4n") == std::vector<std::string>{"/a/experts.ds4n"});
   CHECK(paths_named("/a/s,/b/s") == std::vector<std::string>{"/a/s", "/b/s"});
   CHECK(paths_named(",/a/s,,/b/s,") == std::vector<std::string>{"/a/s", "/b/s"});
   CHECK(paths_named(",,") == std::vector<std::string>{});
+  // A repeated --store adds to what came before: folding "A" then "B" names what "A,B" does.
+  CHECK(paths_named("/b/s", paths_named("/a/s")) == paths_named("/a/s,/b/s"));
+  CHECK(paths_named("", {"/a/s"}) == std::vector<std::string>{"/a/s"});
 
   // Round trip: any list of comma-free, non-empty paths joined with commas parses back to itself.
   std::mt19937 rng(3);

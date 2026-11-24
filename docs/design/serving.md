@@ -357,9 +357,9 @@ turns, it holds the queue). DSpark gains little in shared Rounds: each Session d
 
 ## Store replicas (2026-11-24)
 
-The Expert store can sit on several drives at once. `--store A,B` names copies of it, one per NVMe,
-and a step's store reads spread over them so the drives' bandwidth adds up (`io::ReplicaReader`;
-**Store replica** in CONTEXT.md). `io::open_replicas` refuses copies that are not one store: each
+The Expert store can sit on several drives at once. `--store A,B` (or `--store A --store B`, in
+every tool) names copies of it, one per NVMe, and a step's store reads spread over them so the
+drives' bandwidth adds up (`io::ReplicaReader`; **Store replica** in CONTEXT.md). `io::open_replicas` refuses copies that are not one store: each
 must pass the header check, all must have one size, and 64 sampled 4 KiB pages must agree. One
 path is the store alone, read as before: a step's reads all go out at once.
 
@@ -369,8 +369,14 @@ faster drive take more. With every read issued at once, fewest-in-flight only al
 split, paced by the slower drive. With the bound, reads wait for a place, and the drive that
 finishes sooner takes the next one, so a step of several Misses splits by the drives' speeds. A
 lone Miss's 18 reads still split 9 / 9. 16 is the depth at which fio's 1 MiB random reads reach the
-9100 PRO's bandwidth (11.2 GB/s at QD16 on ZFS, `zfs_vdev_sync_read_max_active=64`). Shallower
-starves a drive.
+9100 PRO's bandwidth: 11.23 GB/s at QD16 on ZFS, `zfs_vdev_sync_read_max_active=64`
+(`docs/research/2026-11-23-receipts/io-fio.txt`; 1 MiB reads were not measured shallower, so 16 is
+the least depth known to saturate the drive, not a measured knee).
+
+How a batch goes out is pure: `replicas::Spread` sends reads in order under the bound, fails the
+batch at the first short read or refused submit, sends nothing after it and drops what lands after
+it, and its property tests drive it through random completion orders. `io::ReplicaReader` is the
+io_uring shell around it, and its error names the replica (in `--store` order) whose read failed.
 
 The second drive goes in M.2_3 or M.2_4 (chipset, PCIe 4.0 x4, ~7 GB/s), never M.2_2: that slot
 takes lanes from GPU 2 (docs/bench/glm53-decode/2026-11-21-prefill-analysis.md, C). Expected, not
@@ -379,8 +385,9 @@ whose store reads are a small part of a step.
 
 Replicas change where bytes come from, never which bytes, so outputs must not change. The gates
 are `ds4n-layer-check --slots N --store S,S` (two replicas of one file: the Misses read through
-both and must give the bits one gives) and `ds4n-serve-check --store A,B`. Neither has run yet:
-the GPUs were serving. The io tests (`ds4n_io_tests`) read real files through io_uring, so
+both and must give the bits one gives) and `ds4n-serve-check --store A,B`. Pending as of
+2026-11-24: neither has run, the GPUs serving `ds41-1017-native`; record their outcome and date here
+when they do. The io tests (`ds4n_io_tests`) read real files through io_uring, so
 `scripts/dev.sh test` lifts Docker's seccomp profile as `run` does.
 
 ## Limits

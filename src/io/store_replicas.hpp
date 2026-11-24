@@ -39,17 +39,18 @@ struct StoreRead {
 };
 
 /**
- * A batch of store reads spread over the replicas through one io_uring. Each read goes out as
- * replicas::next_replica allows: to the replica with fewest in flight, at most `depth` deep when
- * there are two or more, so the drive that finishes sooner takes the next read and a faster drive
- * serves more of the batch. One replica takes the whole batch at once, as a single drive always did.
+ * A batch of store reads spread over the replicas through one io_uring: the io shell of
+ * replicas::Spread, which decides what goes out where. Each read goes to the replica with fewest in
+ * flight, at most `depth` deep when there are two or more, so the drive that finishes sooner takes
+ * the next read and a faster drive serves more of the batch. One replica takes the whole batch at
+ * once, as a single drive always did.
  */
 class ReplicaReader {
  public:
   /**
-   * Read through `replicas` (open for the reader's access: O_DIRECT when `direct`). `depth` (>= 1)
-   * bounds each replica's reads in flight when there are two or more, and the replicas' depths
-   * together fit `queue_depth`, the batch's largest under one replica.
+   * Read through `replicas` (open for the reader's access: O_DIRECT when `direct`), at most
+   * `queue_depth` (>= 1) reads a batch. With two or more replicas, `depth` must be in
+   * 1 .. queue_depth / replicas.size() or create() fails; with one, `depth` is ignored.
    */
   static Result<ReplicaReader, IoError> create(std::vector<Fd> replicas, uint32_t depth, unsigned queue_depth,
                                                bool direct = true);
@@ -57,8 +58,9 @@ class ReplicaReader {
   /**
    * Read every one of `reads` (at most queue_depth), calling `landed(i)` once for read i as it lands,
    * in landing order, so a caller can start on each before the rest. Returns once all have landed.
-   * A short or failed read is an error, returned once the reads still in flight have landed (their
-   * buffers are the caller's). An exception from `landed` propagates with reads still in flight.
+   * A short or failed read is an error naming its replica, returned once the reads still in flight
+   * have completed (their buffers are the caller's); nothing is sent after it and nothing completing
+   * after it lands. An exception from `landed` propagates with reads still in flight.
    */
   Result<bool, IoError> read(std::span<const StoreRead> reads, const std::function<void(size_t)>& landed);
 
@@ -71,9 +73,7 @@ class ReplicaReader {
   UringReader reader_;
   uint32_t depth_;
   unsigned queue_depth_;
-  std::vector<uint32_t> in_flight_;  // per replica
-  std::vector<uint64_t> served_;     // per replica
-  std::vector<uint32_t> replica_of_;  // per read of the batch under way
+  std::vector<uint64_t> served_;  // per replica
 };
 
 }  // namespace ds4n::io
