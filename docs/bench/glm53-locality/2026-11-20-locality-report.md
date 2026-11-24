@@ -73,8 +73,12 @@ below 1e-5, 54 exact ties. The chat test gave the same share (21.7%).
      22.6% of Routes inside 1e-3, there is room. DS4.1 measured 52–73% fewer misses; the same
      here would mean 7.8–13.9% misses, **~11–17 tok/s (est.)**. Its KL cost on GLM is unmeasured.
      It is the one experiment that decides whether this engine reaches usable speed.
-   - **A second NVMe** (the deferred M.2_2 drive). Decode is store-bandwidth bound, so about
+   - **A second NVMe** (the deferred drive). Decode is store-bandwidth bound, so about
      1.5–1.8× (est.), ~8–9 tok/s.
+     *Corrected 2026-11-24:* this report first named `M.2_2`. That slot shares lanes with
+     `PCIEX16(G5)_2` and drops GPU 2 to x4. The drive goes in `M.2_3`/`M.2_4` (chipset, PCIe
+     4.0 x4, ~6.5–7 GB/s), which gives ≈ 1.6× read bandwidth. The current estimate is in
+     `docs/bench/glm53-decode/2026-11-21-prefill-analysis.md` §C.
    - **More VRAM residency.** The FP8 Latent and smaller workspaces buy a few percent, worth about
      1 tok/s per 5% of residency around 33%.
    - **What does not help:** prefetching (it hides latency, but the bottleneck is bandwidth),
