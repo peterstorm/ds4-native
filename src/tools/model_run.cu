@@ -1,11 +1,14 @@
 // ds4n-model-run: the whole model on both GPUs -- 40 layers, head, Experts through the
 // Expert cache, real Engram rows -- over prompts given as token ids, against antirez/ds4.
 //
-//   ds4n-model-run --backbone SAFETENSORS --store STORE --gguf MERGED_GGUF --tokens DIR --names a,b
+//   ds4n-model-run --backbone SAFETENSORS --store STORE[,STORE...] --gguf MERGED_GGUF --tokens DIR --names a,b
 //                  --out DIR [--oracle DIR] [--force 1] [--steps N] [--slots N] [--ram-records R] [--prior PROFILE]
 //                  [--prior-weight W] [--ram-policy recent|popular|victim] [--ccr LAMBDA] [--sweep N [--grouped 0|1] | --prefill R]
 //                  [--access-log FILE] [--vram-policy lru|picks] [--hints 0|1] [--dspark DIR [--verify-rows N]]
+//                  [--replica-depth N]
 //
+// Several --store paths are Store replicas, one per drive (core/store_replicas): the Misses read through
+// them, each at most --replica-depth reads deep (default 16), and each prompt reports how its reads split.
 // For each name, DIR/<name>.tokens is antirez's --dump-tokens output (ids on the first line). The
 // prompt runs from position 0 as a prompt sweep (engine::Decoder::prefill: chunks of up to N Rounds
 // of 8 rows, each chunk layer by layer; --sweep, default 8192: a 64K-token chunk)
@@ -61,6 +64,7 @@
 #include "core/engram.hpp"
 #include "core/model.hpp"
 #include "core/speculation.hpp"
+#include "core/store_replicas.hpp"
 #include "cuda/engram.cuh"
 #include "engine/decoder.cuh"
 #include "engine/engram_source.hpp"
@@ -149,7 +153,8 @@ double median(std::vector<double> v) {
 int main(int argc, char** argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   setenv("CUDA_MODULE_LOADING", "EAGER", 1);  // before any CUDA call: see engine/decoder.cuh
-  std::string backbone_path, store_path, gguf_path, tokens_dir, names_arg, out_dir, oracle_dir, prior_path, access_log, dspark_dir;
+  std::string backbone_path, gguf_path, tokens_dir, names_arg, out_dir, oracle_dir, prior_path, access_log, dspark_dir;
+  std::vector<std::string> store_paths;  // Store replicas (core/store_replicas), one per drive
   bool force = false, grouped = true;
   int max_steps = 64, prefill_rows = model::kMaxRows, verify_rows = 0;
   int sweep_rounds = engine::kSweepRounds;  // a 64K-token chunk
@@ -159,11 +164,12 @@ int main(int argc, char** argv) {
   engine::ResidencyConfig defaults;
   cache::Policy vram_policy = defaults.vram_policy;
   bool hints = defaults.hints;
+  uint32_t replica_depth = defaults.replica_depth;
   for (int i = 1; i < argc; i++) {
     const std::string s = argv[i];
     if (i + 1 >= argc) die("missing value for " + s);
     if (s == "--backbone") backbone_path = argv[++i];
-    else if (s == "--store") store_path = argv[++i];
+    else if (s == "--store") store_paths = replicas::paths_named(argv[++i]);
     else if (s == "--gguf") gguf_path = argv[++i];
     else if (s == "--tokens") tokens_dir = argv[++i];
     else if (s == "--names") names_arg = argv[++i];
@@ -183,6 +189,7 @@ int main(int argc, char** argv) {
     else if (s == "--dspark") dspark_dir = argv[++i];
     else if (s == "--verify-rows") verify_rows = std::stoi(argv[++i]);
     else if (s == "--hints") hints = std::string(argv[++i]) == "1";
+    else if (s == "--replica-depth") replica_depth = static_cast<uint32_t>(std::stoul(argv[++i]));
     else if (s == "--vram-policy") {
       const std::string v = argv[++i];
       if (v == "picks") vram_policy = cache::Policy{};
@@ -198,10 +205,10 @@ int main(int argc, char** argv) {
     else die("unknown argument " + s);
   }
   if (!dspark_dir.empty() && force) die("--dspark drafts greedy continuations: it cannot be teacher forced");
-  if (backbone_path.empty() || store_path.empty() || gguf_path.empty() || tokens_dir.empty() || names_arg.empty() ||
+  if (backbone_path.empty() || store_paths.empty() || gguf_path.empty() || tokens_dir.empty() || names_arg.empty() ||
       out_dir.empty() || prefill_rows < 1 || prefill_rows > model::kMaxRows || verify_rows < 0 ||
       verify_rows > model::kVerifyRows || sweep_rounds < 0)
-    die("usage: ds4n-model-run --backbone B --store S --gguf G --tokens DIR --names a,b --out DIR [--oracle DIR]");
+    die("usage: ds4n-model-run --backbone B --store S[,S...] --gguf G --tokens DIR --names a,b --out DIR [--oracle DIR]");
   std::vector<std::string> names;
   for (size_t at = 0; at <= names_arg.size();) {
     const size_t comma = std::min(names_arg.find(',', at), names_arg.size());
@@ -220,8 +227,10 @@ int main(int argc, char** argv) {
     if (!p) die(prior_path + ": " + p.error().what);
     prior = std::move(p).value();
   }
-  auto residency = engine::ExpertResidency::open(
-      {store_path, {0, 1}, slots, ram_records, prior, 40, ram_policy, ccr, !access_log.empty(), vram_policy, hints});
+  engine::ResidencyConfig residency_config{
+      store_paths, {0, 1}, slots, ram_records, prior, 40, ram_policy, ccr, !access_log.empty(), vram_policy, hints};
+  residency_config.replica_depth = replica_depth;
+  auto residency = engine::ExpertResidency::open(residency_config);
   std::printf("Expert cache: %u Slots warm in %.1f s, RAM tier %u records\n", slots, residency->stats().warm_ms / 1e3,
               ram_records);
   const auto t_load = Clock::now();
@@ -518,6 +527,12 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(after.ram_hits - before.ram_hits),
                 static_cast<unsigned long long>(after.store_reads - before.store_reads),
                 static_cast<unsigned long long>(after.demoted - before.demoted), after.exposed_ms - before.exposed_ms);
+    if (after.replica_reads.size() > 1) {  // Store replicas: how the reads split between the drives
+      std::printf("%s store reads by replica (1 MiB each):", name.c_str());
+      for (size_t r = 0; r < after.replica_reads.size(); r++)
+        std::printf(" %llu", static_cast<unsigned long long>(after.replica_reads[r] - before.replica_reads[r]));
+      std::printf("\n");
+    }
     const std::string first_difference = first_disagreement < 0 ? "none" : "step " + std::to_string(first_disagreement);
     if (compared)
       std::printf("%s continuation vs Oracle (%s): greedy choice agrees on %d / %d steps (first difference: %s); "

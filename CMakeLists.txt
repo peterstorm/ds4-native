@@ -46,6 +46,7 @@ add_library(ds4n_core STATIC
   src/core/compare.cpp
   src/core/cache_replay.cpp
   src/core/slot_map.cpp
+  src/core/store_replicas.cpp
   src/core/round_graphs.cpp
   src/core/session_mix.cpp
   src/core/shared_round.cpp
@@ -65,6 +66,7 @@ find_library(URING_LIB uring REQUIRED)
 add_library(ds4n_io STATIC
   src/io/file.cpp
   src/io/uring_reader.cpp
+  src/io/store_replicas.cpp
 )
 target_link_libraries(ds4n_io PUBLIC ds4n_core ${URING_LIB})
 target_compile_options(ds4n_io PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -227,6 +229,7 @@ add_executable(ds4n_tests
   tests/core/test_round.cpp
   tests/core/test_cache_replay.cpp
   tests/core/test_slot_map.cpp
+  tests/core/test_store_replicas.cpp
   tests/core/test_round_graphs.cpp
   tests/core/test_session_mix.cpp
   tests/core/test_shared_round.cpp
@@ -251,3 +254,9 @@ add_executable(ds4n_glm53_io_tests tests/main.cpp tests/io/test_glm53_backbone.c
 target_link_libraries(ds4n_glm53_io_tests PRIVATE ds4n_glm53_io doctest::doctest)
 target_compile_options(ds4n_glm53_io_tests PRIVATE -Wall -Wextra)
 add_test(NAME glm53_io COMMAND ds4n_glm53_io_tests)
+
+# I/O-boundary tests (temp files): Store replicas of a DS4.1 store.
+add_executable(ds4n_io_tests tests/main.cpp tests/io/test_store_replicas.cpp)
+target_link_libraries(ds4n_io_tests PRIVATE ds4n_io doctest::doctest)
+target_compile_options(ds4n_io_tests PRIVATE -Wall -Wextra)
+add_test(NAME io COMMAND ds4n_io_tests)

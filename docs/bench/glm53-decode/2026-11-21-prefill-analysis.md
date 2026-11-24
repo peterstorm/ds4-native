@@ -181,7 +181,11 @@ on the copy engines with 3 bytes a value (5.8% now), the combine, the indexer.
 - M.2_3 and M.2_4 hang off the chipset: PCIe 4.0 x4, behind the chipset's own PCIe 4.0 x4 uplink.
   They take nothing from the GPUs.
 - Expect ~6.5–7 GB/s from that drive. The pair then gives ~17 GB/s, **≈ 1.6×**, not 2×.
-- The replicas' fewest-reads-in-flight rule already lets the faster drive take more.
+- *Corrected 2026-11-24:* GLM-5.3's fewest-reads-in-flight rule lets the faster drive take more
+  only once every staging record is in flight. A layer's Loads go out together, and the rule then
+  alternates them, so a decode step's Halves split evenly and the slower drive paces it. DS4.1's
+  `io::ReplicaReader` bounds each replica's reads in flight (`--replica-depth`) for that reason
+  (serving.md, Store replicas).
 
 **Effect:**
 - Read floor × ≈ 0.6: warm 700-token turn 17.4 → ≈ 11 s; cold whole-model read ≈ 36 → ≈ 22 s.

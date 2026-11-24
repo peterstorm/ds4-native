@@ -16,7 +16,9 @@
 namespace ds4n::engine {
 
 struct FullModelConfig {
-  std::string backbone, store, gguf;
+  std::string backbone, gguf;
+  std::vector<std::string> stores;  // the Expert store's replicas, one per drive (ResidencyConfig::store_paths)
+  uint32_t replica_depth = ResidencyConfig::kReplicaDepth;  // ResidencyConfig::replica_depth
   std::string dspark;              // the checkpoint shards holding mtp.* (empty: no drafting)
   uint32_t slots = 8000, ram_records = 512;
   // A prompt sweep's scratch Slots, beside `slots` in VRAM (ResidencyConfig::sweep_slots). A layer's

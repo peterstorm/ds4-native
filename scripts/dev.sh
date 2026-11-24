@@ -7,6 +7,8 @@
 #   scripts/dev.sh bg NAME -- CMD  the same, detached in container ds4n-NAME (for runs past ~10 min)
 #   scripts/dev.sh log NAME [N]   the last N lines of a bg run, and whether it is still up
 #
+# DS4N_SYNC_DIR (default '$HOME/dev/ds4-native-sync') names the host's mirror: a worktree gives its own.
+#
 # From another machine the checkout is mirrored (without .git or build/) to
 # ~/dev/ds4-native-sync on the host, so the host's own git clone stays clean.
 set -euo pipefail
@@ -20,7 +22,7 @@ if [ "$(hostname)" = "$HOST" ]; then
   on_host() { bash -c "$1"; }
   sync() { :; }
 else
-  REMOTE_DIR='$HOME/dev/ds4-native-sync'
+  REMOTE_DIR=${DS4N_SYNC_DIR:-'$HOME/dev/ds4-native-sync'}  # DS4N_SYNC_DIR: a mirror of its own, beside other checkouts' runs
   on_host() { ssh -o ConnectTimeout=5 "$HOST" "$1" 2> >(grep -v -E 'post-quantum|store now|openssh.com/pq' >&2); }
   sync() {
     tar -C "$ROOT" --exclude=./build --exclude=./.git -czf - . |
@@ -40,7 +42,8 @@ case "${1:-}" in
     ;;
   test)
     sync
-    in_image "" "cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc >/dev/null && cmake --build build && ctest --test-dir build --output-on-failure"
+    # The io tests read through io_uring (io::ReplicaReader), which Docker's default seccomp profile blocks.
+    in_image "--security-opt seccomp=unconfined" "cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc >/dev/null && cmake --build build && ctest --test-dir build --output-on-failure"
     ;;
   run)
     shift
@@ -63,7 +66,7 @@ case "${1:-}" in
     on_host "docker logs ds4n-$2 2>&1 | tail -${3:-40}; docker ps -a --filter name=ds4n-$2 --format '{{.Status}}'"
     ;;
   *)
-    sed -n '2,11p' "$0"
+    sed -n '2,13p' "$0"
     exit 2
     ;;
 esac

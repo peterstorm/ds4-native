@@ -34,8 +34,9 @@ bool is_unwritten(std::span<const std::byte> record) {
   return std::ranges::all_of(record, [](std::byte b) { return b == std::byte{0}; });
 }
 
-/** The store at `path`, open for reading, its header checked against this build. */
-Result<Fd, IoError> open_store(const std::string& path) {
+}  // namespace
+
+Result<Fd, IoError> open_glm53_store(const std::string& path) {
   using R = Result<Fd, IoError>;
   auto fd = open_file(path, Access::ReadBuffered);
   if (!fd) return fd;
@@ -44,8 +45,6 @@ Result<Fd, IoError> open_store(const std::string& path) {
   if (auto h = glm53::decode_header(header); !h) return R::err(IoError{path + ": " + h.error().what});
   return fd;
 }
-
-}  // namespace
 
 Result<StoreCheck, IoError> check_store_tensors(const std::string& store_path,
                                                 const std::vector<std::string>& shard_paths,
@@ -63,7 +62,7 @@ Result<StoreCheck, IoError> check_store_tensors(const std::string& store_path,
 
   if (work.empty()) return R::ok(StoreCheck{});  // nothing to prove: the store need not exist yet
 
-  auto store = open_store(store_path);
+  auto store = open_glm53_store(store_path);
   if (!store) return R::err(std::move(store).error());
 
   std::vector<Fd> shards;
@@ -135,46 +134,8 @@ Result<StoreCheck, IoError> check_store_tensors(const std::string& store_path,
   return R::ok(std::move(out));
 }
 
-Result<std::vector<Fd>, IoError> open_store_replicas(const std::vector<std::string>& paths, Access access,
-                                                     unsigned samples) {
-  using R = Result<std::vector<Fd>, IoError>;
-  if (paths.empty()) return R::err(IoError{"no Expert store given"});
-  if (samples < 2) return R::err(IoError{"comparing replicas takes at least two sample pages"});
-  constexpr uint64_t kPage = 4096;
-  std::vector<Fd> checked;
-  uint64_t size = 0;
-  for (const auto& path : paths) {
-    auto fd = open_store(path);
-    if (!fd) return R::err(std::move(fd).error());
-    auto bytes = file_size(fd.value());
-    if (!bytes) return R::err(std::move(bytes).error());
-    if (checked.empty()) size = bytes.value();
-    if (bytes.value() != size) return R::err(IoError{path + ": not the size of " + paths[0] + ": not a replica of it"});
-    checked.push_back(std::move(fd).value());
-  }
-  const uint64_t pages = size / kPage;
-  std::vector<std::byte> first(kPage), other(kPage);
-  for (unsigned i = 0; i < samples && checked.size() > 1 && pages > 0; i++) {
-    const uint64_t at = (pages - 1) * i / (samples - 1) * kPage;
-    if (auto r = pread_exact(checked[0], first, at); !r) return R::err(std::move(r).error());
-    for (size_t k = 1; k < checked.size(); k++) {
-      if (auto r = pread_exact(checked[k], other, at); !r) return R::err(std::move(r).error());
-      if (first != other)
-        return R::err(IoError{paths[k] + ": differs from " + paths[0] + " at byte " + std::to_string(at) +
-                              ": not a replica of it"});
-    }
-  }
-  std::vector<Fd> out;
-  for (const auto& path : paths) {
-    auto fd = open_file(path, access);
-    if (!fd) return R::err(std::move(fd).error());
-    out.push_back(std::move(fd).value());
-  }
-  return R::ok(std::move(out));
-}
-
 Result<StoreReader, IoError> StoreReader::open(const std::string& path) {
-  auto fd = open_store(path);
+  auto fd = open_glm53_store(path);
   if (!fd) return Result<StoreReader, IoError>::err(std::move(fd).error());
   return Result<StoreReader, IoError>::ok(StoreReader(std::move(fd).value()));
 }

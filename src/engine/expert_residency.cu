@@ -19,7 +19,7 @@
 #include "core/store_layout.hpp"
 #include "engine/device_layer.cuh"
 #include "io/file.hpp"
-#include "io/uring_reader.hpp"
+#include "io/store_replicas.hpp"
 
 namespace ds4n::engine {
 namespace {
@@ -31,7 +31,8 @@ constexpr uint32_t kBatch = moe::kMaxJobs;          // most Loads one step can n
 // as it lands, so the copies run under the reads and only the last chunk's copy is exposed.
 constexpr uint64_t kReadChunk = store::kAlign;
 constexpr uint32_t kChunksPerHalf = static_cast<uint32_t>(store::kHalfStride / kReadChunk);  // 9
-constexpr unsigned kQueueDepth = kBatch * store::kHalves * kChunksPerHalf;
+constexpr uint32_t kChunksPerRecord = store::kHalves * kChunksPerHalf;                         // 18
+constexpr unsigned kQueueDepth = kBatch * kChunksPerRecord;
 static_assert(store::kHalfStride % kReadChunk == 0);
 static_assert(moe::kResidencyKeys == cache::kKeys);
 // The service spins while steps keep coming; after this long without one it polls with short sleeps.
@@ -53,8 +54,7 @@ T* host_mapped(size_t n) {
 
 struct ExpertResidency::State {
   ResidencyConfig config;
-  io::Fd store;
-  io::UringReader reader;
+  io::ReplicaReader reader;  // the store's replicas, one per drive
   cache::ExpertCache vram, ram;
   // The physical Slots behind the decode Slots: under RamPolicy::Victim kBatch of the config's Slots
   // are spares, so a Load fills one while the Expert it evicts is copied out of another; else none.
@@ -84,9 +84,8 @@ struct ExpertResidency::State {
   std::vector<cache::Access> accesses;  // with config.record_accesses
   std::string failure;
 
-  State(ResidencyConfig c, io::Fd fd, io::UringReader r, cache::ExpertCache v, cache::ExpertCache m, cache::SlotMap p)
+  State(ResidencyConfig c, io::ReplicaReader r, cache::ExpertCache v, cache::ExpertCache m, cache::SlotMap p)
       : config(std::move(c)),
-        store(std::move(fd)),
         reader(std::move(r)),
         vram(std::move(v)),
         ram(std::move(m)),
@@ -300,37 +299,26 @@ void ExpertResidency::State::sync_copies() {
 }
 
 void ExpertResidency::State::read_records(std::span<const RecordRead> records_in) {
-  // Tag: index into records_in << 8 | chunk index within the record (Half-major).
-  std::vector<io::ReadRequest> reads;
-  for (size_t i = 0; i < records_in.size(); i++) {
-    const RecordRead& r = records_in[i];
+  // Read n is chunk n % 18 (Half-major) of record n / 18, from whichever replica serves it.
+  std::vector<io::StoreRead> reads;
+  for (const RecordRead& r : records_in) {
     const store::ExpertId id{r.key / store::kExperts, r.key % store::kExperts};
-    for (uint32_t c = 0; c < store::kHalves * kChunksPerHalf; c++)
-      reads.push_back({store.get(), store::record_offset(id) + c * kReadChunk,
-                       std::span(records[r.buffer] + c * kReadChunk, kReadChunk), uint64_t{i} << 8 | c});
+    for (uint32_t c = 0; c < kChunksPerRecord; c++)
+      reads.push_back({store::record_offset(id) + c * kReadChunk, std::span(records[r.buffer] + c * kReadChunk, kReadChunk)});
   }
-  if (!reads.empty()) {
-    if (auto s = reader.submit(reads); !s) fail("Expert store: " + s.error().what);
-    for (size_t landed = 0; landed < reads.size();) {
-      auto done = reader.wait(1);
-      if (!done) fail("Expert store: " + done.error().what);
-      for (const auto& c : done.value()) {
-        if (c.result != static_cast<int32_t>(kReadChunk))
-          fail("Expert store: short or failed read (" + std::to_string(c.result) + ")");
-        const RecordRead& r = records_in[c.tag >> 8];
-        landed++;
-        if (!r.slot) continue;
-        const auto chunk = static_cast<uint32_t>(c.tag & 0xFF);
-        const int h = static_cast<int>(chunk / kChunksPerHalf);
-        const uint64_t at = (chunk % kChunksPerHalf) * kReadChunk;  // within the Half
-        const uint64_t bytes = std::min(kReadChunk, store::kHalfPayloadBytes - at);
-        engine::check(cudaSetDevice(config.devices[h]), "cudaSetDevice");
-        engine::check(cudaMemcpyAsync(slot_ptr(h, *r.slot) + at, records[r.buffer] + h * store::kHalfStride + at, bytes,
-                                      cudaMemcpyHostToDevice, copy[h]),
-                      "Half upload");
-      }
-    }
-  }
+  const auto read = reader.read(reads, [&](size_t n) {
+    const RecordRead& r = records_in[n / kChunksPerRecord];
+    if (!r.slot) return;
+    const auto chunk = static_cast<uint32_t>(n % kChunksPerRecord);
+    const int h = static_cast<int>(chunk / kChunksPerHalf);
+    const uint64_t at = (chunk % kChunksPerHalf) * kReadChunk;  // within the Half
+    const uint64_t bytes = std::min(kReadChunk, store::kHalfPayloadBytes - at);
+    engine::check(cudaSetDevice(config.devices[h]), "cudaSetDevice");
+    engine::check(cudaMemcpyAsync(slot_ptr(h, *r.slot) + at, records[r.buffer] + h * store::kHalfStride + at, bytes,
+                                  cudaMemcpyHostToDevice, copy[h]),
+                  "Half upload");
+  });
+  if (!read) fail("Expert store: " + read.error().what);
 }
 
 void ExpertResidency::State::serve_step(const moe::PostedStep& step, uint64_t s, ResidencyStats& counts,
@@ -441,7 +429,13 @@ void ExpertResidency::State::serve() {
         done = s;
       }
       last_step = Clock::now();
+      std::vector<uint64_t> served;
+      {
+        std::lock_guard placing(placement);
+        served.assign(reader.served().begin(), reader.served().end());
+      }
       std::lock_guard lock(mutex);
+      stats.replica_reads = std::move(served);
       stats.layer_steps += counts.layer_steps;
       stats.hits += counts.hits;
       stats.ram_hits += counts.ram_hits;
@@ -475,13 +469,9 @@ std::unique_ptr<ExpertResidency> ExpertResidency::open(const ResidencyConfig& co
   if (config.key_layers < 1 || config.key_layers > store::kLayers) fail("key_layers must be in 1..40");
   if (config.sweep_slots != 0 && config.sweep_slots < kBatch)
     fail("the sweep Slots, when any, number at least " + std::to_string(kBatch));
-  auto fd = io::open_file(config.store_path, io::Access::ReadDirect);
-  if (!fd) fail(fd.error().what);
-  io::AlignedBuffer header(store::kHeaderBytes);
-  if (auto r = io::pread_exact(fd.value(), header.span(), 0); !r) fail(r.error().what);
-  const auto h = store::decode_header(header.span());
-  if (!h) fail("Expert store header: " + h.error().what);
-  auto reader = io::UringReader::create(kQueueDepth);
+  auto replicas = io::open_replicas(config.store_paths, io::Access::ReadDirect, io::open_store);
+  if (!replicas) fail(replicas.error().what);
+  auto reader = io::ReplicaReader::create(std::move(replicas).value(), config.replica_depth, kQueueDepth);
   if (!reader) fail(reader.error().what);
   // Without a prior, the warm start takes keys in order among those the layers can use.
   std::vector<uint32_t> prior = config.prior;
@@ -506,8 +496,8 @@ std::unique_ptr<ExpertResidency> ExpertResidency::open(const ResidencyConfig& co
   auto ram = ram_prior.empty() ? cache::ExpertCache::empty(config.ram_records, ram_policy)
                                : cache::ExpertCache::create(config.ram_records, ram_prior, ram_policy);
   if (!ram) fail("RAM tier: " + ram.error().what);
-  auto s = std::make_unique<State>(config, std::move(fd).value(), std::move(reader).value(), std::move(vram).value(),
-                                   std::move(ram).value(), std::move(places).value());
+  auto s = std::make_unique<State>(config, std::move(reader).value(), std::move(vram).value(), std::move(ram).value(),
+                                   std::move(places).value());
   if (config.ram_policy == RamPolicy::Victim) s->written_by.assign(config.ram_records, -1);
   if (config.sweep_slots > 0) {
     auto scratch = cache::ExpertCache::empty(config.sweep_slots, cache::Policy{4096, false});
@@ -562,6 +552,7 @@ std::unique_ptr<ExpertResidency> ExpertResidency::open(const ResidencyConfig& co
   *s->mailbox = {};
   *s->board = {};
   s->stats.warm_ms = ms_since(t0);
+  s->stats.replica_reads.assign(s->reader.served().begin(), s->reader.served().end());
 
   for (int g = 0; g < 2; g++) {
     engine::check(cudaSetDevice(config.devices[g]), "cudaSetDevice");
@@ -605,6 +596,7 @@ std::vector<uint32_t> ExpertResidency::place(int layer, std::span<const int32_t>
   }
   ResidencyStats counts;
   std::vector<uint32_t> slots;
+  std::vector<uint64_t> served;
   {
     std::lock_guard placing(s.placement);
     const auto loads = s.plan_keys(keys, {}, true, counts);
@@ -614,8 +606,10 @@ std::vector<uint32_t> ExpertResidency::place(int layer, std::span<const int32_t>
       counts.exposed_ms += ms_since(t0);
     }
     for (const cache::ExpertKey k : keys) slots.push_back(s.slot_of(k));
+    served.assign(s.reader.served().begin(), s.reader.served().end());
   }
   std::lock_guard lock(s.mutex);
+  s.stats.replica_reads = std::move(served);
   s.stats.hits += counts.hits;
   s.stats.ram_hits += counts.ram_hits;
   s.stats.store_reads += counts.store_reads;

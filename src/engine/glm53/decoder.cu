@@ -25,6 +25,7 @@
 #include "core/glm53/victim_tier.hpp"
 #include "core/meminfo.hpp"
 #include "core/mx_reference.hpp"
+#include "core/store_replicas.hpp"
 #include "cuda/exchange.cuh"
 #include "cuda/glm53/attention.cuh"
 #include "cuda/glm53/attention_layer.hpp"
@@ -35,6 +36,7 @@
 #include "cuda/planes.cuh"
 #include "io/file.hpp"
 #include "io/glm53_store.hpp"
+#include "io/store_replicas.hpp"
 #include "io/uring_reader.hpp"
 
 namespace ds4n::engine::glm53 {
@@ -343,7 +345,7 @@ struct Decoder::State {
   /** The read of Half h of layer L's Expert e into staging record `record`, from the replica with fewest in flight. */
   io::ReadRequest half_read(int L, int32_t e, uint32_t h, size_t record) {
     const uint64_t tag = 2 * record + h;
-    const auto r = static_cast<size_t>(std::ranges::min_element(replica_reads) - replica_reads.begin());
+    const size_t r = replicas::next_replica(replica_reads, replicas::kUnlimited).value();
     replica_reads[r]++;
     replica_of_tag[tag] = r;
     return {replicas[r].get(), g53::half_offset({static_cast<uint32_t>(L), static_cast<uint32_t>(e)}, h),
@@ -568,7 +570,7 @@ Result<std::unique_ptr<Decoder>, std::string> Decoder::open(const g53::Config& c
     std::array<g53::Claims, 2> allocated{};  // what open() asks cudaMalloc for, by claim: checked against the plan
 
     // The Expert store's replicas, read with O_DIRECT through io_uring.
-    auto replicas = io::open_store_replicas(store_replicas, io::Access::ReadDirect);
+    auto replicas = io::open_replicas(store_replicas, io::Access::ReadDirect, io::open_glm53_store);
     if (!replicas) return R::err(replicas.error().what);
     s.replicas = std::move(replicas).value();
     s.replica_reads.assign(s.replicas.size(), 0);

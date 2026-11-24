@@ -3,11 +3,14 @@
 // the server renders the chat (DeepSeek-V4.1's encoding), tokenizes, starts `ds4n-serve --serve
 // ARGS...` and speaks GEN / T / DONE with it over stdin and stdout.
 //
-//   ds4n-serve --serve --backbone B --store S --gguf G [--dspark DIR] [--slots N] [--ram-records R]
+//   ds4n-serve --serve --backbone B --store S[,S...] --gguf G [--dspark DIR] [--slots N] [--ram-records R]
 //              [--lanes N] [--prior PROFILE] [--ram-policy recent|popular|victim] [--rewind-points N]
 //              [--sweep-min N] [--checkpoint-gb G] [--keep-min N] [--split-min N] [--stops 1,128803]
-//              [--sweep-slots N] [--round-graphs-mb N]
+//              [--sweep-slots N] [--round-graphs-mb N] [--replica-depth N]
 //
+// --store S,S,...: Store replicas, copies of the Expert store on separate drives; a step's reads
+// spread over them, the faster drive taking more (--replica-depth N, default 16: each replica's
+// reads in flight at most).
 // --sweep-slots N (default 512, at least 384): the Slots prompt sweeps load into, VRAM that --slots
 // cannot use; fewer of them leave room for that many more --slots.
 // --round-graphs-mb N (default 512): the device memory a GPU's captured Round graphs may hold
@@ -37,6 +40,7 @@
 #include <string>
 #include <thread>
 
+#include "core/store_replicas.hpp"
 #include "core/wire.hpp"
 #include "engine/conversation.cuh"
 #include "engine/device_layer.cuh"
@@ -162,7 +166,8 @@ int main(int argc, char** argv) {
     if (i + 1 >= argc) die("missing value for " + a);
     const std::string v = argv[++i];
     if (a == "--backbone") mc.backbone = v;
-    else if (a == "--store") mc.store = v;
+    else if (a == "--store") mc.stores = replicas::paths_named(v);
+    else if (a == "--replica-depth") mc.replica_depth = static_cast<uint32_t>(std::stoul(v));
     else if (a == "--gguf") mc.gguf = v;
     else if (a == "--dspark") mc.dspark = v;
     else if (a == "--slots") mc.slots = static_cast<uint32_t>(std::stoul(v));
@@ -197,8 +202,8 @@ int main(int argc, char** argv) {
     }
     else die("unknown argument " + a);
   }
-  if (!serve || mc.backbone.empty() || mc.store.empty() || mc.gguf.empty())
-    die("usage: ds4n-serve --serve --backbone B --store S --gguf G [--dspark DIR] [--slots N] [--ram-records R] [--lanes N]");
+  if (!serve || mc.backbone.empty() || mc.stores.empty() || mc.gguf.empty())
+    die("usage: ds4n-serve --serve --backbone B --store S[,S...] --gguf G [--dspark DIR] [--slots N] [--ram-records R] [--lanes N]");
   // More Rewind points than Lanes: no Lane's last prompt's end is lost to another Lane's points
   // (rewind::next_buffer), so each Session's next turn resumes there.
   const auto lanes = static_cast<uint32_t>(mc.lanes.value());

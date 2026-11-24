@@ -355,6 +355,34 @@ Prompt reads are left out on both sides (a sweep would hold a shared Round's oth
 turns, it holds the queue). DSpark gains little in shared Rounds: each Session drafts on its own
 (2.1 ms each), so plain rows win from 4 Sessions up unless drafts are batched too.
 
+## Store replicas (2026-11-24)
+
+The Expert store can sit on several drives at once. `--store A,B` names copies of it, one per NVMe,
+and a step's store reads spread over them so the drives' bandwidth adds up (`io::ReplicaReader`;
+**Store replica** in CONTEXT.md). `io::open_replicas` refuses copies that are not one store: each
+must pass the header check, all must have one size, and 64 sampled 4 KiB pages must agree. One
+path is the store alone, read as before: a step's reads all go out at once.
+
+With two or more, each 1 MiB read goes to the replica with the fewest in flight
+(`replicas::next_replica`), at most `--replica-depth` deep (default 16). The bound is what lets the
+faster drive take more. With every read issued at once, fewest-in-flight only alternates: an even
+split, paced by the slower drive. With the bound, reads wait for a place, and the drive that
+finishes sooner takes the next one, so a step of several Misses splits by the drives' speeds. A
+lone Miss's 18 reads still split 9 / 9. 16 is the depth at which fio's 1 MiB random reads reach the
+9100 PRO's bandwidth (11.2 GB/s at QD16 on ZFS, `zfs_vdev_sync_read_max_active=64`). Shallower
+starves a drive.
+
+The second drive goes in M.2_3 or M.2_4 (chipset, PCIe 4.0 x4, ~7 GB/s), never M.2_2: that slot
+takes lanes from GPU 2 (docs/bench/glm53-decode/2026-11-21-prefill-analysis.md, C). Expected, not
+yet measured: ~18 GB/s together, so ≈ 1.6× on read-bound prompts and a few per cent on decode,
+whose store reads are a small part of a step.
+
+Replicas change where bytes come from, never which bytes, so outputs must not change. The gates
+are `ds4n-layer-check --slots N --store S,S` (two replicas of one file: the Misses read through
+both and must give the bits one gives) and `ds4n-serve-check --store A,B`. Neither has run yet:
+the GPUs were serving. The io tests (`ds4n_io_tests`) read real files through io_uring, so
+`scripts/dev.sh test` lifts Docker's seccomp profile as `run` does.
+
 ## Limits
 
 - **One request at a time by default.** With one Lane conversations take turns on the GPUs (each

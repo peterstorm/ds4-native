@@ -186,7 +186,7 @@ class Decoder {
  public:
   /**
    * The Backbone from `parts` into VRAM on both GPUs, the Slots, the RAM tier pinned, the Expert store
-   * opened: `store_replicas` are copies of one store (io::open_store_replicas), one per drive.
+   * opened: `store_replicas` are copies of one store (io::open_replicas with io::open_glm53_store), one per drive.
    */
   static Result<std::unique_ptr<Decoder>, std::string> open(const ds4n::glm53::Config& config,
                                                             const io::BackboneParts& parts,

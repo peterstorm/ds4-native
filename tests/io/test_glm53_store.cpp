@@ -14,6 +14,7 @@
 #include "core/glm53/store.hpp"
 #include "io/glm53_backbone.hpp"
 #include "io/glm53_store.hpp"
+#include "io/store_replicas.hpp"
 #include "glm53_fixtures.hpp"
 
 using namespace ds4n;
@@ -221,7 +222,9 @@ TEST_CASE("StoreReader reads an Expert back as its source tensors, byte for byte
   CHECK_FALSE(io::StoreReader::open((dir.path / "missing.ds4n").string()).is_ok());
 }
 
-TEST_CASE("open_store_replicas opens copies of one store and refuses what is not one") {
+// What makes copies replicas (size, sampled pages) is io/store_replicas's, tested in
+// tests/io/test_store_replicas.cpp; here only that GLM's opener admits GLM copies and no others.
+TEST_CASE("GLM-5.3 Store replicas open through its own header check") {
   TempDir dir;
   std::mt19937 rng(47);
   const auto store = make_store(dir.path);
@@ -229,28 +232,12 @@ TEST_CASE("open_store_replicas opens copies of one store and refuses what is not
   const auto copy = (dir.path / "copy.ds4n").string();
   fs::copy_file(store, copy);
 
-  const auto one = io::open_store_replicas({store}, io::Access::ReadBuffered);
-  REQUIRE(one.is_ok());
-  CHECK(one.value().size() == 1);
-  const auto two = io::open_store_replicas({store, copy}, io::Access::ReadBuffered);
+  const auto two = io::open_replicas({store, copy}, io::Access::ReadBuffered, io::open_glm53_store);
   REQUIRE(two.is_ok());
   CHECK(two.value().size() == 2);
-  CHECK(two.value()[0].get() != two.value()[1].get());
 
-  CHECK_FALSE(io::open_store_replicas({}, io::Access::ReadBuffered).is_ok());
-  CHECK_FALSE(io::open_store_replicas({store, copy}, io::Access::ReadBuffered, 1).is_ok());
-  CHECK_FALSE(io::open_store_replicas({store, (dir.path / "missing.ds4n").string()}, io::Access::ReadBuffered).is_ok());
-
-  SUBCASE("a copy that differs in a sampled page is not a replica") {
-    write_at(copy, fs::file_size(copy) - 4096, {std::byte{0x5a}});  // the last page is always sampled
-    CHECK_FALSE(io::open_store_replicas({store, copy}, io::Access::ReadBuffered).is_ok());
-  }
-  SUBCASE("a copy of another size is not a replica") {
-    fs::resize_file(copy, fs::file_size(copy) + 4096);
-    CHECK_FALSE(io::open_store_replicas({store, copy}, io::Access::ReadBuffered).is_ok());
-  }
   SUBCASE("a copy with a foreign header is not a store") {
     write_at(copy, 0, std::vector<std::byte>(4));
-    CHECK_FALSE(io::open_store_replicas({store, copy}, io::Access::ReadBuffered).is_ok());
+    CHECK_FALSE(io::open_replicas({store, copy}, io::Access::ReadBuffered, io::open_glm53_store).is_ok());
   }
 }

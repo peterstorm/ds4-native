@@ -45,14 +45,10 @@ Result<StoreCheck, IoError> check_store_tensors(const std::string& store_path,
                                                 uint32_t first, uint32_t last, unsigned threads);
 
 /**
- * Open `paths` as replicas of one Expert store, each with `access` (the decoder: O_DIRECT, one
- * replica per drive, its reads spread over them). Each must carry this build's header, all must be
- * the same size, and they must agree byte for byte on `samples` 4 KiB pages spread over the file
- * (the first, the last and evenly between): a cheap check that they are copies of one store, not a
- * proof. No paths, or `samples` < 2, is an error.
+ * The GLM-5.3 Expert store at `path`, open buffered, its header checked against this build. The
+ * decoder opens its Store replicas with it (io::open_replicas, io/store_replicas.hpp).
  */
-Result<std::vector<Fd>, IoError> open_store_replicas(const std::vector<std::string>& paths, Access access,
-                                                     unsigned samples = 64);
+Result<Fd, IoError> open_glm53_store(const std::string& path);
 
 /** An Expert store open for reading routed Experts back. */
 class StoreReader {

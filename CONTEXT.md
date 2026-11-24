@@ -1,7 +1,7 @@
 # ds4-native
 
 An inference engine that serves DeepSeek-V4.1-Flash-1017 at released precision on
-two discrete GPUs, streaming routed experts from one NVMe into a VRAM cache.
+two discrete GPUs, streaming routed experts from NVMe (one drive, or Store replicas on several) into a VRAM cache.
 
 ## Language
 
@@ -22,6 +22,10 @@ _Avoid_: shard (reserved for files), slice
 **Expert store**:
 The file(s) holding every Expert record, read with direct I/O.
 _Avoid_: model file, pack
+
+**Store replica**:
+A copy of the Expert store on a drive of its own (`--store A,B`), checked against the first: same header, size and sampled pages (`io::open_replicas`). Reads spread over the replicas, each going to the one with fewest reads in flight (`replicas::next_replica`). On DS4.1 each replica holds at most `--replica-depth` reads (`io::ReplicaReader`), so the faster drive takes more; GLM-5.3 issues a layer's Halves at once, which alternates them.
+_Avoid_: mirror (ZFS's word for its own redundancy), stripe (each replica holds every Expert record)
 
 **Backbone**:
 All non-routed weights (attention, shared expert, router, mHC, norms, embedding, head), always resident.
@@ -221,7 +225,7 @@ A Miss being served in a Round (`Decoder::State::Load`): its Expert's evicted pr
 - An **Expert** has one **Expert record** in the **Expert store** and, under tensor parallelism, two **Halves**
 - A **Slot** holds at most one **Expert**; the **Ledger** fixes how many **Slots** each GPU has
 - On GLM-5.3 a GPU's VRAM is its **Claims**, its **Slots** and the **Runtime reserve**; a longer capacity takes **Slots**, a larger **Cohort** too, nothing else does
-- A **Miss** is served from the **RAM tier** if present there, otherwise from the **Expert store**
+- A **Miss** is served from the **RAM tier** if present there, otherwise from the **Expert store**, from any of its **Store replicas**
 - A **Round** contains one to eight rows; a **Step** is a one-row **Round**; a **Round**'s **Routing plan** is the union of its rows' Experts, whatever their **Lanes**
 - A live **Session** occupies one **Lane**; a **KV checkpoint** is a Session in no Lane
 - A **KV checkpoint** holds one **Session** at one position; a later checkpoint of the same conversation replaces it

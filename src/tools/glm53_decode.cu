@@ -68,6 +68,7 @@
 #include "core/glm53/exact_moe.hpp"
 #include "core/glm53/layer_expert_cache.hpp"
 #include "core/glm53/reference.hpp"
+#include "core/store_replicas.hpp"
 #include "engine/glm53/decoder.hpp"
 #include "io/glm53_store.hpp"
 #include "io/glm53_weights.hpp"
@@ -131,11 +132,8 @@ Args parse(int argc, char** argv) {
     const std::string v = argv[++i];
     if (k == "--config") a.config = v;
     else if (k == "--backbone") a.backbone = v;
-    else if (k == "--store") {
-      std::istringstream in(v);
-      for (std::string path; std::getline(in, path, ',');)
-        if (!path.empty()) a.stores.push_back(path);
-    }
+    else if (k == "--store")
+      for (std::string& path : replicas::paths_named(v)) a.stores.push_back(std::move(path));
     else if (k == "--generate") a.generate = std::stoi(v);
     else if (k == "--prefill") a.prefill = v;
     else if (k == "--round") a.round = std::stoi(v);

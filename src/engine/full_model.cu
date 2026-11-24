@@ -46,7 +46,8 @@ FullModel load_full_model(const FullModelConfig& c) {
     throw std::runtime_error("sweep Slots: " + std::to_string(c.sweep_slots) + " given, at least " + std::to_string(store::kExperts) +
                              " (the Experts one layer's sweep can read)");
   ResidencyConfig rc;
-  rc.store_path = c.store;
+  rc.store_paths = c.stores;
+  rc.replica_depth = c.replica_depth;
   rc.slots = c.slots;
   rc.ram_records = c.ram_records;
   rc.sweep_slots = c.sweep_slots;
@@ -55,6 +56,8 @@ FullModel load_full_model(const FullModelConfig& c) {
   m.residency = ExpertResidency::open(rc);
   std::fprintf(stderr, "ds4n: Expert cache: %u Slots warm in %.1f s (and %u for prompt sweeps), RAM tier %u records\n", c.slots,
                m.residency->stats().warm_ms / 1e3, c.sweep_slots, c.ram_records);
+  if (c.stores.size() > 1)
+    std::fprintf(stderr, "ds4n: Expert store: %zu replicas, each at most %u reads deep\n", c.stores.size(), c.replica_depth);
 
   const auto t_load = Clock::now();
   const Backbone backbone = take(open_backbone(c.backbone), c.backbone);

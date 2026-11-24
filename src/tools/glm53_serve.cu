@@ -44,12 +44,12 @@
 #include <fstream>
 #include <optional>
 #include <random>
-#include <sstream>
 #include <string>
 #include <vector>
 
 #include "core/glm53/config.hpp"
 #include "core/glm53/layer_expert_cache.hpp"
+#include "core/store_replicas.hpp"
 #include "core/wire.hpp"
 #include "engine/glm53/conversation.hpp"
 #include "engine/glm53/decoder.hpp"
@@ -154,11 +154,8 @@ int main(int argc, char** argv) {
     const std::string v = argv[++i];
     if (a == "--config") config_path = v;
     else if (a == "--backbone") backbone = v;
-    else if (a == "--store") {
-      std::istringstream in(v);
-      for (std::string p; std::getline(in, p, ',');)
-        if (!p.empty()) stores.push_back(p);
-    }
+    else if (a == "--store")
+      for (std::string& p : replicas::paths_named(v)) stores.push_back(std::move(p));
     else if (a == "--max-context") dc.capacity = std::stoi(v);
     else if (a == "--lambda") dc.route_bonus = std::stof(v);
     else if (a == "--eviction") {

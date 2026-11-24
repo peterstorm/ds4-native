@@ -4,7 +4,7 @@
 // Every layer of every step compares the attention slots, the routing plan,
 // the attention and MoE outputs after their exchanges, and the stream. Engram
 // table rows are random (identical on both sides) unless real tables are given.
-//   ds4n-layer-check --backbone SAFETENSORS --store STORE [--first L] [--layers N] [--steps S]
+//   ds4n-layer-check --backbone SAFETENSORS --store STORE[,STORE...] [--first L] [--layers N] [--steps S]
 //                    [--expert-layers M] [--gguf-meta GGUF --engram-shards A,B,...] [--head 1]
 //                    [--round R] [--timing N] [--launches graphs|eager] [--per-layer 1] [--slots N --ram-records R]
 // --round R (1 to 8, default 1) runs the decoder's steps in Rounds of R rows, layer by layer; the
@@ -20,7 +20,8 @@
 // The decoder's Experts come through engine::ExpertResidency: by default a Slot for every Expert the
 // steps can touch (at most 8,000); --slots N --ram-records R set the VRAM Slots and RAM tier records,
 // Misses read from the store. Outputs must not change with N (the Slot-count invariance gate); the
-// Hit, RAM and store counts are reported.
+// Hit, RAM and store counts are reported. Several --store paths are Store replicas: the Misses read
+// through them (outputs must not change with them either); the oracle reads the first.
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -41,6 +42,7 @@
 #include "core/layer_reference.hpp"
 #include "core/mx_tiles.hpp"
 #include "core/store_layout.hpp"
+#include "core/store_replicas.hpp"
 #include "cuda/engram.cuh"
 #include "engine/decoder.cuh"
 #include "engine/engram_source.hpp"
@@ -107,7 +109,8 @@ struct Compare {
 int main(int argc, char** argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);  // progress shows even if a step hangs
   setenv("CUDA_MODULE_LOADING", "EAGER", 1);  // before any CUDA call: see engine/decoder.cuh
-  std::string backbone_path, store_path;
+  std::string backbone_path;
+  std::vector<std::string> store_paths;  // Store replicas (core/store_replicas)
   int first = 0, layers = 4, steps = 3, expert_layers = model::kLayers, round_rows = 1;
   std::string gguf_meta, engram_shards;
   bool with_head = false;
@@ -119,7 +122,7 @@ int main(int argc, char** argv) {
     const std::string s = argv[i];
     if (i + 1 >= argc) die("missing value for " + s);
     if (s == "--backbone") backbone_path = argv[++i];
-    else if (s == "--store") store_path = argv[++i];
+    else if (s == "--store") store_paths = replicas::paths_named(argv[++i]);
     else if (s == "--layers") layers = std::stoi(argv[++i]);
     else if (s == "--steps") steps = std::stoi(argv[++i]);
     else if (s == "--first") first = std::stoi(argv[++i]);
@@ -140,7 +143,7 @@ int main(int argc, char** argv) {
     }
     else die("unknown argument " + s);
   }
-  if (backbone_path.empty() || store_path.empty() || layers < 1 || first < 0 || first + layers > model::kLayers ||
+  if (backbone_path.empty() || store_paths.empty() || layers < 1 || first < 0 || first + layers > model::kLayers ||
       expert_layers < 1 || round_rows < 1 || round_rows > model::kMaxRows)
     die("bad arguments");
 
@@ -158,7 +161,7 @@ int main(int argc, char** argv) {
     prior.assign(moe::kResidencyKeys, 0);
     std::fill(prior.begin() + first * moe::kExperts, prior.begin() + (first + layers) * moe::kExperts, 1u);
   }
-  auto residency = engine::ExpertResidency::open({store_path, {0, 1}, slot_count, ram_records, prior, key_layers});
+  auto residency = engine::ExpertResidency::open({store_paths, {0, 1}, slot_count, ram_records, prior, key_layers});
   std::printf("Expert cache: %u Slots warm in %.0f ms, RAM tier %u records\n", slot_count, residency->stats().warm_ms,
               ram_records);
   auto report_cache = [&](const char* when) {
@@ -175,7 +178,7 @@ int main(int argc, char** argv) {
 
   auto backbone = engine::open_backbone(backbone_path);
   if (!backbone) die(backbone.error().what);
-  StoreReader store(store_path);
+  StoreReader store(store_paths.front());
   std::vector<HostLayer> host;
   engine::Decoder decoder({0, 1}, {residency->directory(0), residency->directory(1)}, launches);
   for (int l = first; l < first + layers; l++) {

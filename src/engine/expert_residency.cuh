@@ -12,7 +12,9 @@
 // the RAM tier's pinned record buffers (RamPolicy). A Slot index means the same Expert on both
 // GPUs, GPU r holding Half r. A Load comes from its RAM tier record when there,
 // otherwise from the store in 1 MiB O_DIRECT chunks into a host buffer, each
-// chunk copied to its GPU as it lands. Under RamPolicy::Victim a Load fills a spare
+// chunk copied to its GPU as it lands. The store may have Store replicas, one per
+// drive (io::ReplicaReader): a step's chunks spread over them, so one Miss reads
+// from every drive at once. Under RamPolicy::Victim a Load fills a spare
 // physical Slot (core/slot_map) and the Expert it evicts is copied down from the one
 // it leaves into a RAM tier record once the step's Loads landed, beside the GPUs'
 // next layers. Only after both GPUs' copies up landed does the table name the new
@@ -63,7 +65,9 @@ enum class RamPolicy { Recent, Popular, Victim };
 std::optional<RamPolicy> ram_policy_named(std::string_view name);
 
 struct ResidencyConfig {
-  std::string store_path;
+  // Store replicas: copies of one Expert store, one per drive (core/store_replicas); one path is the
+  // store alone. Each is checked against this build's header and against the first (io::open_replicas).
+  std::vector<std::string> store_paths;
   std::array<int, 2> devices{0, 1};  // device of Half 0, Half 1
   uint32_t slots = 0;                // VRAM Slots, at least moe::kMaxJobs (under RamPolicy::Victim, 48 of them spares)
   // RAM tier record buffers (18 MiB pinned each), at least moe::kMaxJobs; 48 more stage a prompt
@@ -91,6 +95,13 @@ struct ResidencyConfig {
   // per chunk. 0: sweeps load into the
   // decode Slots. At least moe::kMaxJobs when set; a layer's sweep needs up to 384.
   uint32_t sweep_slots = 512;
+  // With two or more Store replicas, the 1 MiB reads each has in flight at most: the drive that
+  // finishes sooner takes the next, so a faster drive serves more of a step with several Misses (a
+  // lone Miss's 18 reads split 9 / 9). 16: the depth at which 1 MiB reads reach the 9100 PRO's
+  // full bandwidth (fio; docs/design/serving.md, Store replicas); shallower starves a drive. One replica takes a
+  // step's reads all at once, as a single drive always did.
+  uint32_t replica_depth = kReplicaDepth;
+  static constexpr uint32_t kReplicaDepth = 16;
 };
 
 /** Counters since open(); a Hit is a needed Expert found in a VRAM Slot. */
@@ -99,6 +110,8 @@ struct ResidencyStats {
   uint64_t demoted = 0;     // evicted Experts copied down into the RAM tier (RamPolicy::Victim)
   double exposed_ms = 0.0;  // service time of steps with Loads (the GPUs wait that long)
   double warm_ms = 0.0;     // filling the Slots at open()
+  // Per Store replica, the 1 MiB store reads it served (the warm start's too): how the reads split.
+  std::vector<uint64_t> replica_reads;
 };
 
 class ExpertResidency {
