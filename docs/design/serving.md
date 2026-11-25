@@ -390,6 +390,46 @@ both and must give the bits one gives) and `ds4n-serve-check --store A,B`. Pendi
 when they do. The io tests (`ds4n_io_tests`) read real files through io_uring, so
 `scripts/dev.sh test` lifts Docker's seccomp profile as `run` does.
 
+## Engram copy (2026-11-25)
+
+A fresh prompt's largest load on the drive is its Engram rows, not its Experts: 48 scattered
+264-byte rows a token, each a ZFS record read at ZFS's per-read cost (~125-250K rows a second, and
+~54 KB of Expert bandwidth a row; forward-pass.md, Engram rows on the drive). An **Engram copy**
+(CONTEXT.md) moves them to a drive of their own, ideally a bare partition, where a row is an aligned
+direct read at the NVMe's own rate (~1M a second).
+
+- `ds4n-engram-copy --out PATH GGUF...` writes it to a partition or a file (~190 GiB: the two
+  tables, each padded to 4 KiB): a zero header first (synced), the tables in 64 MiB direct writes
+  (progress on stderr), a sync, every row read back from the copy and compared with the GGUF, and
+  only then the header. A copy interrupted or wrong has no header and is never opened; for a block
+  device the device's size is checked first. Writing over an older copy is safe for the same reason.
+- `ds4n-engram-copy --check PATH GGUF...` runs the open-time check alone.
+- `--engram PATH` (`ds4n-serve`, `ds4n-serve-check`, `ds4n-model-run`, and `ds4n-layer-check` with
+  `--gguf-meta`/`--engram-shards`) reads the rows from the copy instead of the GGUF.
+  `EngramRows::open_copy` refuses a copy unless its header parses (magic, version, row size), its
+  row counts and size are the ones the GGUF's tables give, the device or file holds that size, and
+  64 sampled rows a table equal the GGUF's. Reads are io_uring, 1,024 in flight, each an O_DIRECT
+  window of 4 or 8 KiB (`engram::copy_window`) into aligned staging, the row copied out.
+
+The layout and its arithmetic are pure (`core/engram_copy`: the header's encoding and parsing, the
+windows, the sampled rows), with property tests: every window aligned, holding its row, minimal and
+inside the copy; the header round-tripping, each wrong field refused. The io tests read a GGUF and
+its copy as real files: every row and `read_tokens` the same bytes from both, each refusal above.
+With `DS4N_TEST_PARTITION` (and `DS4N_TEST_SMALL_PARTITION`) set to loop devices, a copy is written
+to a real block device, sized from it and checked (passed 2026-11-25).
+
+Where it goes: the second NVMe (M.2_3 or M.2_4, as for Store replicas), a partition beside a
+replica's. The dotfiles profile takes it as `ENGRAM=/dev/disk/by-partlabel/...`. Expected, not yet
+measured: the random-token 60K prompt waits 2.7-3.6 s of its 19.7-21.6 s on rows today; off the
+Expert drive that should fall well under 1 s and the Experts get their drive back -- ~15-25 % on
+fresh prompts, nothing on decode or on prompts the ARC already holds.
+
+The copy changes where the bytes come from, never which, so outputs must not change. The gates are
+`ds4n-layer-check --gguf-meta G --engram-shards G --engram COPY` (both GPUs and the oracle take the
+copy's rows), `ds4n-serve-check --engram COPY --expect` against a dump made from the GGUF's rows,
+and the fresh 60K prompt timed on the new partition. Pending as of 2026-11-25: none has run (no GPU
+build, no second drive yet); record their outcome and date here when they do.
+
 ## Limits
 
 - **One request at a time by default.** With one Lane conversations take turns on the GPUs (each

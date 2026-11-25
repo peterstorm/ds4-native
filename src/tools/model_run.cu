@@ -5,11 +5,12 @@
 //                  --out DIR [--oracle DIR] [--force 1] [--steps N] [--slots N] [--ram-records R] [--prior PROFILE]
 //                  [--prior-weight W] [--ram-policy recent|popular|victim] [--ccr LAMBDA] [--sweep N [--grouped 0|1] | --prefill R]
 //                  [--access-log FILE] [--vram-policy lru|picks] [--hints 0|1] [--dspark DIR [--verify-rows N]]
-//                  [--replica-depth N]
+//                  [--replica-depth N] [--engram PATH]
 //
 // Several --store paths (comma separated, or --store repeated) are Store replicas, one per drive
 // (core/store_replicas): the Misses read through them, each at most --replica-depth reads deep
 // (default 16), and each prompt reports how its reads split.
+// --engram PATH reads the Engram rows from an Engram copy (ds4n-engram-copy) instead of the GGUF.
 // For each name, DIR/<name>.tokens is antirez's --dump-tokens output (ids on the first line). The
 // prompt runs from position 0 as a prompt sweep (engine::Decoder::prefill: chunks of up to N Rounds
 // of 8 rows, each chunk layer by layer; --sweep, default 8192: a 64K-token chunk)
@@ -154,7 +155,7 @@ double median(std::vector<double> v) {
 int main(int argc, char** argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   setenv("CUDA_MODULE_LOADING", "EAGER", 1);  // before any CUDA call: see engine/decoder.cuh
-  std::string backbone_path, gguf_path, tokens_dir, names_arg, out_dir, oracle_dir, prior_path, access_log, dspark_dir;
+  std::string backbone_path, gguf_path, engram_copy, tokens_dir, names_arg, out_dir, oracle_dir, prior_path, access_log, dspark_dir;
   std::vector<std::string> store_paths;  // Store replicas (core/store_replicas), one per drive
   bool force = false, grouped = true;
   int max_steps = 64, prefill_rows = model::kMaxRows, verify_rows = 0;
@@ -172,6 +173,7 @@ int main(int argc, char** argv) {
     if (s == "--backbone") backbone_path = argv[++i];
     else if (s == "--store") store_paths = replicas::paths_named(argv[++i], std::move(store_paths));
     else if (s == "--gguf") gguf_path = argv[++i];
+    else if (s == "--engram") engram_copy = argv[++i];
     else if (s == "--tokens") tokens_dir = argv[++i];
     else if (s == "--names") names_arg = argv[++i];
     else if (s == "--out") out_dir = argv[++i];
@@ -218,7 +220,7 @@ int main(int argc, char** argv) {
   }
 
   // The model: the Expert cache first (the decoder resolves against it), then every layer and the
-  // head on both GPUs, Engram from the GGUF.
+  // head on both GPUs, Engram from the GGUF (or its copy, --engram).
   std::vector<uint32_t> prior;
   if (!prior_path.empty()) {
     std::ifstream f(prior_path, std::ios::binary);
@@ -282,8 +284,9 @@ int main(int argc, char** argv) {
   }
   auto layout = engine::load_engram_layout(gguf_path);
   if (!layout) die(layout.error().what);
-  auto rows = engine::EngramRows::open({gguf_path});
+  auto rows = engram_copy.empty() ? engine::EngramRows::open({gguf_path}) : engine::EngramRows::open_copy({gguf_path}, engram_copy);
   if (!rows) die(rows.error().what);
+  if (!engram_copy.empty()) std::printf("Engram rows from the copy %s\n", engram_copy.c_str());
   auto header = io::read_gguf_header(gguf_path);
   if (!header) die(header.error().what);
   const uint64_t* eos = gguf::find_uint(header.value(), "tokenizer.ggml.eos_token_id");

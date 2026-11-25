@@ -35,7 +35,12 @@ class Fd {
 
 enum class Access { ReadBuffered, ReadDirect, WriteDirect };
 Result<Fd, IoError> open_file(const std::string& path, Access access);
+/** A file's size in bytes, or a block device's (a partition's). */
 Result<uint64_t, IoError> file_size(const Fd& fd);
+/** Whether `fd` is a block device (a partition) rather than a file. */
+Result<bool, IoError> is_block_device(const Fd& fd);
+/** Flush what was written to `fd` to the drive (fdatasync). */
+Result<bool, IoError> sync_data(const Fd& fd);
 
 /** Read exactly `out.size()` bytes at `offset` (buffered or direct; caller aligns for direct). */
 Result<bool, IoError> pread_exact(const Fd& fd, std::span<std::byte> out, uint64_t offset);

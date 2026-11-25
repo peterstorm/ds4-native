@@ -35,6 +35,10 @@ _Avoid_: dense model, base weights
 One 264-byte FP8 n-gram embedding (256 values + 8 E8M0 scales) read from disk by hashed address; 48 per token.
 _Avoid_: ngram cache entry
 
+**Engram copy**:
+The two Engram tables copied out of the GGUF onto a drive of their own (a partition or a file), written by `ds4n-engram-copy --out` and read by `--engram PATH` with direct I/O (`engine::EngramRows::open_copy`). Layout (`core/engram_copy`): a 4 KiB header, then table 0 and table 1, each from a 4 KiB boundary, so a row is one aligned 4 or 8 KiB read. Checked on open against the GGUF it was copied from: the header's row counts and size, 64 sampled rows a table. The header is written last, after every row was compared, so a copy cut short is never accepted. The GGUF stays the source; without `--engram` the rows come from it as before.
+_Avoid_: mirror (ZFS's word), cache (it holds every row, nothing is evicted), Engram store (the Expert store is another thing)
+
 ### Residency
 
 **Slot**:
@@ -226,6 +230,7 @@ A Miss being served in a Round (`Decoder::State::Load`): its Expert's evicted pr
 - A **Slot** holds at most one **Expert**; the **Ledger** fixes how many **Slots** each GPU has
 - On GLM-5.3 a GPU's VRAM is its **Claims**, its **Slots** and the **Runtime reserve**; a longer capacity takes **Slots**, a larger **Cohort** too, nothing else does
 - A **Miss** is served from the **RAM tier** if present there, otherwise from the **Expert store**, from any of its **Store replicas**
+- **Engram rows** come from the GGUF or, given one, its **Engram copy**: the same bytes, so the choice changes only which drive serves them
 - A **Round** contains one to eight rows; a **Step** is a one-row **Round**; a **Round**'s **Routing plan** is the union of its rows' Experts, whatever their **Lanes**
 - A live **Session** occupies one **Lane**; a **KV checkpoint** is a Session in no Lane
 - A **KV checkpoint** holds one **Session** at one position; a later checkpoint of the same conversation replaces it

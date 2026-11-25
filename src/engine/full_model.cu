@@ -88,7 +88,13 @@ FullModel load_full_model(const FullModelConfig& c) {
   }
 
   m.layout = take(load_engram_layout(c.gguf), c.gguf);
-  m.rows = take(EngramRows::open({c.gguf}), c.gguf);
+  if (c.engram.empty()) {
+    m.rows = take(EngramRows::open({c.gguf}), c.gguf);
+  } else {
+    m.rows = take(EngramRows::open_copy({c.gguf}, c.engram), "--engram");
+    std::fprintf(stderr, "ds4n: Engram rows from the copy %s (header, size and %u rows of each table checked)\n", c.engram.c_str(),
+                 EngramRows::kCopySamples);
+  }
   const gguf::Header header = take(io::read_gguf_header(c.gguf), c.gguf);
   const uint64_t* eos = gguf::find_uint(header, "tokenizer.ggml.eos_token_id");
   if (eos == nullptr) throw std::runtime_error(c.gguf + ": no tokenizer.ggml.eos_token_id");

@@ -6,11 +6,13 @@
 //   ds4n-serve --serve --backbone B --store S[,S...] --gguf G [--dspark DIR] [--slots N] [--ram-records R]
 //              [--lanes N] [--prior PROFILE] [--ram-policy recent|popular|victim] [--rewind-points N]
 //              [--sweep-min N] [--checkpoint-gb G] [--keep-min N] [--split-min N] [--stops 1,128803]
-//              [--sweep-slots N] [--round-graphs-mb N] [--replica-depth N]
+//              [--sweep-slots N] [--round-graphs-mb N] [--replica-depth N] [--engram PATH]
 //
 // --store S,S,... (or --store repeated): Store replicas, copies of the Expert store on separate
 // drives; a step's reads spread over them, the faster drive taking more (--replica-depth N, default
 // 16: each replica's reads in flight at most).
+// --engram PATH: Engram rows from an Engram copy (ds4n-engram-copy) on a drive of its own, read by
+// direct I/O, instead of from the GGUF; checked against the GGUF's tables at open.
 // --sweep-slots N (default 512, at least 384): the Slots prompt sweeps load into, VRAM that --slots
 // cannot use; fewer of them leave room for that many more --slots.
 // --round-graphs-mb N (default 512): the device memory a GPU's captured Round graphs may hold
@@ -169,6 +171,7 @@ int main(int argc, char** argv) {
     else if (a == "--store") mc.stores = replicas::paths_named(v, std::move(mc.stores));
     else if (a == "--replica-depth") mc.replica_depth = static_cast<uint32_t>(std::stoul(v));
     else if (a == "--gguf") mc.gguf = v;
+    else if (a == "--engram") mc.engram = v;
     else if (a == "--dspark") mc.dspark = v;
     else if (a == "--slots") mc.slots = static_cast<uint32_t>(std::stoul(v));
     else if (a == "--ram-records") mc.ram_records = static_cast<uint32_t>(std::stoul(v));
@@ -203,7 +206,7 @@ int main(int argc, char** argv) {
     else die("unknown argument " + a);
   }
   if (!serve || mc.backbone.empty() || mc.stores.empty() || mc.gguf.empty())
-    die("usage: ds4n-serve --serve --backbone B --store S[,S...] --gguf G [--dspark DIR] [--slots N] [--ram-records R] [--lanes N]");
+    die("usage: ds4n-serve --serve --backbone B --store S[,S...] --gguf G [--engram PATH] [--dspark DIR] [--slots N] [--ram-records R] [--lanes N]");
   // More Rewind points than Lanes: no Lane's last prompt's end is lost to another Lane's points
   // (rewind::next_buffer), so each Session's next turn resumes there.
   const auto lanes = static_cast<uint32_t>(mc.lanes.value());
