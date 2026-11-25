@@ -17,6 +17,7 @@ namespace ds4n::engine {
 
 struct FullModelConfig {
   std::string backbone, gguf;
+  std::string engram;               // an Engram copy of the GGUF's tables, on a drive of its own (empty: rows from the GGUF)
   std::vector<std::string> stores;  // the Expert store's replicas, one per drive (ResidencyConfig::store_paths)
   uint32_t replica_depth = ResidencyConfig::kReplicaDepth;  // ResidencyConfig::replica_depth
   std::string dspark;              // the checkpoint shards holding mtp.* (empty: no drafting)

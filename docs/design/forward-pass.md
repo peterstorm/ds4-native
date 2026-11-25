@@ -563,6 +563,8 @@ fresh prompts the Engram rows, not the Experts, are the drive's largest load, an
 taking them off the Expert drive (a second NVMe, ideally without ZFS's per-read cost: a raw
 partition does ~1M rows a second), not smaller records. More RAM tier records would cut the
 Experts' share (RAM is the limit today).
+The Engram copy (`--engram PATH`, serving.md) is that move: the tables on a partition of their
+own, read with direct I/O.
 
 ## Expert residency
 

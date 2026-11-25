@@ -17,6 +17,7 @@ add_library(ds4n_core STATIC
   src/core/hc_reference.cpp
   src/core/attn_reference.cpp
   src/core/engram.cpp
+  src/core/engram_copy.cpp
   src/core/moe_reference.cpp
   src/core/safetensors.cpp
   src/core/glm53/store.cpp
@@ -71,13 +72,15 @@ add_library(ds4n_io STATIC
 target_link_libraries(ds4n_io PUBLIC ds4n_core ${URING_LIB})
 target_compile_options(ds4n_io PRIVATE -Wall -Wextra -Wpedantic -Werror)
 
-# Engine shell (host side): loading Backbone layers.
+# Engine shell (host side): loading Backbone layers, and Engram rows from the GGUF or an Engram copy.
 add_library(ds4n_engine STATIC src/engine/host_layer.cpp src/engine/engram_source.cpp)
 target_link_libraries(ds4n_engine PUBLIC ds4n_io)
 target_compile_options(ds4n_engine PRIVATE -Wall -Wextra -Wpedantic -Werror)
 
 add_executable(ds4n-store-build src/tools/store_build.cpp)
 target_link_libraries(ds4n-store-build PRIVATE ds4n_io)
+add_executable(ds4n-engram-copy src/tools/engram_copy.cpp)
+target_link_libraries(ds4n-engram-copy PRIVATE ds4n_engine)
 # GLM-5.3 shell: Backbone parts, the Expert store, and reading both back as FP32 weights. Its own library,
 # so ds4n_io (linked by the DS4.1 engine) is unchanged.
 add_library(ds4n_glm53_io STATIC src/io/glm53_backbone.cpp src/io/glm53_store.cpp src/io/glm53_weights.cpp)
@@ -198,6 +201,7 @@ add_executable(ds4n_tests
   tests/core/test_hc_reference.cpp
   tests/core/test_attn_reference.cpp
   tests/core/test_engram.cpp
+  tests/core/test_engram_copy.cpp
   tests/core/test_moe_reference.cpp
   tests/core/test_det_math.cpp
   tests/core/test_safetensors.cpp
@@ -255,8 +259,8 @@ target_link_libraries(ds4n_glm53_io_tests PRIVATE ds4n_glm53_io doctest::doctest
 target_compile_options(ds4n_glm53_io_tests PRIVATE -Wall -Wextra)
 add_test(NAME glm53_io COMMAND ds4n_glm53_io_tests)
 
-# I/O-boundary tests (temp files): Store replicas of a DS4.1 store.
-add_executable(ds4n_io_tests tests/main.cpp tests/io/test_store_replicas.cpp)
-target_link_libraries(ds4n_io_tests PRIVATE ds4n_io doctest::doctest)
+# I/O-boundary tests (temp files): Store replicas of a DS4.1 store, and Engram copies.
+add_executable(ds4n_io_tests tests/main.cpp tests/io/test_store_replicas.cpp tests/io/test_engram_copy.cpp)
+target_link_libraries(ds4n_io_tests PRIVATE ds4n_engine doctest::doctest)
 target_compile_options(ds4n_io_tests PRIVATE -Wall -Wextra)
 add_test(NAME io COMMAND ds4n_io_tests)

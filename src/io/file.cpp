@@ -1,6 +1,8 @@
 #include "io/file.hpp"
 
 #include <fcntl.h>
+#include <linux/fs.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -43,7 +45,23 @@ Result<Fd, IoError> open_file(const std::string& path, Access access) {
 Result<uint64_t, IoError> file_size(const Fd& fd) {
   struct stat st {};
   if (::fstat(fd.get(), &st) != 0) return Result<uint64_t, IoError>::err(errno_error("fstat"));
+  if (S_ISBLK(st.st_mode)) {  // a partition: st_size is 0, the device knows its size
+    uint64_t bytes = 0;
+    if (::ioctl(fd.get(), BLKGETSIZE64, &bytes) != 0) return Result<uint64_t, IoError>::err(errno_error("BLKGETSIZE64"));
+    return Result<uint64_t, IoError>::ok(bytes);
+  }
   return Result<uint64_t, IoError>::ok(static_cast<uint64_t>(st.st_size));
+}
+
+Result<bool, IoError> is_block_device(const Fd& fd) {
+  struct stat st {};
+  if (::fstat(fd.get(), &st) != 0) return Result<bool, IoError>::err(errno_error("fstat"));
+  return Result<bool, IoError>::ok(S_ISBLK(st.st_mode));
+}
+
+Result<bool, IoError> sync_data(const Fd& fd) {
+  if (::fdatasync(fd.get()) != 0) return Result<bool, IoError>::err(errno_error("fdatasync"));
+  return Result<bool, IoError>::ok(true);
 }
 
 Result<bool, IoError> pread_exact(const Fd& fd, std::span<std::byte> out, uint64_t offset) {

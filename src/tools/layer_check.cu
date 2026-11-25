@@ -5,7 +5,7 @@
 // the attention and MoE outputs after their exchanges, and the stream. Engram
 // table rows are random (identical on both sides) unless real tables are given.
 //   ds4n-layer-check --backbone SAFETENSORS --store STORE[,STORE...] [--first L] [--layers N] [--steps S]
-//                    [--expert-layers M] [--gguf-meta GGUF --engram-shards A,B,...] [--head 1]
+//                    [--expert-layers M] [--gguf-meta GGUF --engram-shards A,B,... [--engram PATH]] [--head 1]
 //                    [--round R] [--timing N] [--launches graphs|eager] [--per-layer 1] [--slots N --ram-records R]
 // --round R (1 to 8, default 1) runs the decoder's steps in Rounds of R rows, layer by layer; the
 // oracle still decodes one token at a time, so every row must match sequential decode.
@@ -14,7 +14,8 @@
 // --launches picks how the decoder issues kernels: replayed CUDA graphs (the default) or eager
 // launches. Timing launches one graph per Round (decode_round) unless --per-layer 1 launches one per layer.
 // With --gguf-meta (a GGUF carrying deepseek41.engram.*) and --engram-shards (the files holding
-// the Engram tables), Engram layers hash the tokens and read real table rows.
+// the Engram tables), Engram layers hash the tokens and read real table rows; --engram PATH reads
+// them from an Engram copy of those tables instead (the GPUs and the oracle take the same rows).
 // --expert-layers M reads layer L's Experts from store layer L % M (a store holding only the
 // first M layers can still exercise later layers: exactness needs the same Experts on both sides).
 // The decoder's Experts come through engine::ExpertResidency: by default a Slot for every Expert the
@@ -113,7 +114,7 @@ int main(int argc, char** argv) {
   std::string backbone_path;
   std::vector<std::string> store_paths;  // Store replicas (core/store_replicas)
   int first = 0, layers = 4, steps = 3, expert_layers = model::kLayers, round_rows = 1;
-  std::string gguf_meta, engram_shards;
+  std::string gguf_meta, engram_shards, engram_copy;
   bool with_head = false;
   int timing_steps = 0;
   uint32_t slot_count = 0, ram_records = 0;
@@ -130,6 +131,7 @@ int main(int argc, char** argv) {
     else if (s == "--expert-layers") expert_layers = std::stoi(argv[++i]);
     else if (s == "--gguf-meta") gguf_meta = argv[++i];
     else if (s == "--engram-shards") engram_shards = argv[++i];
+    else if (s == "--engram") engram_copy = argv[++i];
     else if (s == "--head" && argv[++i] == std::string("1")) with_head = true;
     else if (s == "--timing") timing_steps = std::stoi(argv[++i]);
     else if (s == "--round") round_rows = std::stoi(argv[++i]);
@@ -230,9 +232,11 @@ int main(int argc, char** argv) {
       shards.push_back(engram_shards.substr(start, comma == std::string::npos ? std::string::npos : comma - start));
       start = comma == std::string::npos ? engram_shards.size() : comma + 1;
     }
-    auto rows = engine::EngramRows::open(shards);
+    auto rows = engram_copy.empty() ? engine::EngramRows::open(shards) : engine::EngramRows::open_copy(shards, engram_copy);
     if (!rows) die(rows.error().what);
     engram_rows = std::move(rows).value();
+  } else if (!engram_copy.empty()) {
+    die("--engram needs --gguf-meta and --engram-shards, the tables it is checked against");
   }
   engram::History history;
   std::mt19937 rng(21);

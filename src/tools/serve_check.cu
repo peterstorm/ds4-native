@@ -8,10 +8,12 @@
 //   ds4n-serve-check --backbone B --store S[,S...] --gguf G --tokens FILE --system FILE [--dspark DIR]
 //                    [--expect LOGPROBS] [--slots N] [--ram-records R] [--prior P] [--ram-policy P]
 //                    [--timing FILE] [--long FILE,FILE,... [--long-tokens N]] [--lanes N] [--sweep-slots N] [--round-graphs-mb N]
-//                    [--split-min N] [--replica-depth N]
+//                    [--split-min N] [--replica-depth N] [--engram PATH]
 //
 // --store S,S,... (or --store repeated): Store replicas, as ds4n-serve takes them: every scenario
 // reads through them, and --expect against a dump made with one store shows replicas change no bit.
+// --engram PATH: Engram rows from an Engram copy, as ds4n-serve takes it; --expect against a dump
+// made from the GGUF's rows shows the copy changes no bit.
 // FILE (--tokens) is an antirez --dump-tokens prompt (ids on the first line); --system a long one
 // whose first 3,000 tokens stand for a system prompt that several conversations share. --expect
 // compares the greedy reply with a ds4n-model-run dump of the same prompt (its steps' selected ids).
@@ -204,6 +206,7 @@ int main(int argc, char** argv) {
     else if (a == "--store") mc.stores = replicas::paths_named(v, std::move(mc.stores));
     else if (a == "--replica-depth") mc.replica_depth = static_cast<uint32_t>(std::stoul(v));
     else if (a == "--gguf") mc.gguf = v;
+    else if (a == "--engram") mc.engram = v;
     else if (a == "--dspark") mc.dspark = v;
     else if (a == "--slots") mc.slots = static_cast<uint32_t>(std::stoul(v));
     else if (a == "--ram-records") mc.ram_records = static_cast<uint32_t>(std::stoul(v));
